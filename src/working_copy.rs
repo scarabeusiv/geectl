@@ -2375,7 +2375,7 @@ fn checkout_file_plan(
         // server moved under the read.
         let link_text = client.cat(&cur_project, &cur_package, "_link", Some(cur_pin))?;
         let doc = XmlDoc::parse(&link_text)?;
-        let (link_project, link_package) = link_target(&doc, &cur_project)?;
+        let (link_project, link_package) = link_target(&doc, &cur_project, &cur_package)?;
         if link_project != target_project || link_package != target_package {
             return Err(GeectlError::new(
                 ErrorKind::ServerError,
@@ -3191,7 +3191,7 @@ fn link_target_coords(
     let link_content = index_content(wc, "_link")?;
     let link_text = String::from_utf8_lossy(&link_content);
     let doc = XmlDoc::parse(&link_text)?;
-    let (link_project, link_package) = link_target(&doc, &wc.project)?;
+    let (link_project, link_package) = link_target(&doc, &wc.project, &wc.package)?;
     let pin = match doc.root_attr("baserev") {
         Some(baserev) => Some(RevisionSpec::parse(&baserev)?),
         None => None,
@@ -6156,7 +6156,7 @@ fn read_link(wc: &WorkingCopy) -> Result<(String, String, String), GeectlError> 
     let link_content = index_content(wc, "_link")?;
     let link_text = String::from_utf8_lossy(&link_content);
     let doc = XmlDoc::parse(&link_text)?;
-    let (link_project, link_package) = link_target(&doc, &wc.project)?;
+    let (link_project, link_package) = link_target(&doc, &wc.project, &wc.package)?;
     let old_baserev = doc.root_attr("baserev").ok_or_else(|| {
         GeectlError::new(
             ErrorKind::InvalidInput,
@@ -6174,25 +6174,27 @@ fn read_link_target(wc: &WorkingCopy) -> Result<(String, String), GeectlError> {
     let link_content = index_content(wc, "_link")?;
     let link_text = String::from_utf8_lossy(&link_content);
     let doc = XmlDoc::parse(&link_text)?;
-    link_target(&doc, &wc.project)
+    link_target(&doc, &wc.project, &wc.package)
 }
 
 /// The project and package a parsed `_link` document points at.
 /// A link with no `project` attribute points at a package in the
-/// link's own project (`link_package` omits `project` when source
-/// and target share it), so the caller passes that project as the
-/// default.
-fn link_target(doc: &XmlDoc, default_project: &str) -> Result<(String, String), GeectlError> {
+/// link's own project, and a link with no `package` attribute
+/// points at the same-named package, so the caller passes both as
+/// the defaults.
+fn link_target(
+    doc: &XmlDoc,
+    default_project: &str,
+    default_package: &str,
+) -> Result<(String, String), GeectlError> {
     let link_project = match doc.root_attr("project") {
         Some(project) => project,
         None => default_project.to_string(),
     };
-    let link_package = doc.root_attr("package").ok_or_else(|| {
-        GeectlError::new(
-            ErrorKind::InvalidInput,
-            "the _link file has no package attribute",
-        )
-    })?;
+    let link_package = match doc.root_attr("package") {
+        Some(package) => package,
+        None => default_package.to_string(),
+    };
     Ok((link_project, link_package))
 }
 
@@ -7612,6 +7614,76 @@ mod tests {
             )
     }
 
+    fn same_name_link_diff_http() -> FakeHttp {
+        let foo_rev1 = format!(
+            "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+            <entry md5=\"9ad883724cc96ab256841479b3abca10\" mtime=\"1282047302\" name=\"_link\" size=\"71\" />\
+            <entry md5=\"80783c104f8d73dba07eca77249120a2\" mtime=\"1282047302\" name=\"notes.txt\" size=\"11\" />\
+            <entry md5=\"6f273a56360232f10af47fa5176c08ea\" mtime=\"1282047302\" name=\"bar.spec\" size=\"15\" />\
+            </directory>"
+        );
+        let foo_at_baserev = format!(
+            "<directory name=\"foo\" rev=\"5\" srcmd5=\"{LINK_OLD_BASEREV}\" vrev=\"5\">\
+            <entry md5=\"cf0d04a286833ebd00a5f5b2d54474a9\" mtime=\"1282047303\" name=\"bar.spec\" size=\"10\" />\
+            <entry md5=\"0c2710c14e36d184252ea92fc65093f4\" mtime=\"1282047303\" name=\"shared.txt\" size=\"7\" />\
+            </directory>"
+        );
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo",
+                &foo_rev1,
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/_link?rev=1",
+                b"<link project=\"home:alice\" baserev=\"dddddddddddddddddddddddddddddddd\"/>",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/notes.txt?rev=1",
+                b"link notes\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/bar.spec?rev=1",
+                b"Name: bar-link\n",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo?rev=dddddddddddddddddddddddddddddddd",
+                &foo_at_baserev,
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/bar.spec?rev=dddddddddddddddddddddddddddddddd",
+                b"Name: bar\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/shared.txt?rev=dddddddddddddddddddddddddddddddd",
+                b"shared\n",
+            )
+    }
+
+    fn package_less_link_http(link: &[u8], link_md5: &str, link_size: usize) -> FakeHttp {
+        let foo_rev1 = format!(
+            "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+            <entry md5=\"{link_md5}\" mtime=\"1282047302\" name=\"_link\" size=\"{link_size}\" />\
+            </directory>"
+        );
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo",
+                &foo_rev1,
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/_link?rev=1",
+                link,
+            )
+    }
+
     fn link_diff_checkout(http: &FakeHttp) -> (TempDirGuard, WorkingCopy) {
         let client = ObsClient::with_credentials(http, basic_credentials()).unwrap();
         let dir = TempDirGuard::new("link-diff");
@@ -7649,6 +7721,20 @@ mod tests {
         // and `_link` itself is not linked content.
         assert!(!out.contains("shared.txt"), "diff: {out}");
         assert!(!out.contains("_link"), "diff: {out}");
+    }
+
+    #[test]
+    fn diff_on_a_same_name_link_reads_the_link_target() {
+        let http = same_name_link_diff_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (_dir, wc) = link_diff_checkout(&http);
+        let (out, note) = diff(&wc, Some(&client)).unwrap();
+        assert!(note.is_none(), "the link read succeeded: {note:?}");
+        assert!(
+            out.contains("Link diff (home:alice/foo at dddddddddddddddddddddddddddddddd):"),
+            "diff: {out}"
+        );
+        assert!(out.contains("-Name: bar\n+Name: bar-link"), "diff: {out}");
     }
 
     #[test]
@@ -8966,16 +9052,59 @@ mod tests {
     fn link_target_defaults_a_missing_project_to_the_links_own() {
         let doc = XmlDoc::parse("<link package=\"foo\"/>").unwrap();
         assert_eq!(
-            link_target(&doc, "home:alice").unwrap(),
+            link_target(&doc, "home:alice", "foo").unwrap(),
             ("home:alice".to_string(), "foo".to_string())
         );
         let doc = XmlDoc::parse("<link project=\"home:bob\" package=\"foo\"/>").unwrap();
         assert_eq!(
-            link_target(&doc, "home:alice").unwrap(),
+            link_target(&doc, "home:alice", "foo").unwrap(),
             ("home:bob".to_string(), "foo".to_string())
         );
         let doc = XmlDoc::parse("<link project=\"home:bob\"/>").unwrap();
-        assert!(link_target(&doc, "home:alice").is_err());
+        assert_eq!(
+            link_target(&doc, "home:alice", "foo").unwrap(),
+            ("home:bob".to_string(), "foo".to_string())
+        );
+    }
+
+    #[test]
+    fn link_target_defaults_a_missing_package_to_the_links_own() {
+        let doc = XmlDoc::parse("<link project=\"home:alice\"/>").unwrap();
+        assert_eq!(
+            link_target(&doc, "home:alice", "foo").unwrap(),
+            ("home:alice".to_string(), "foo".to_string())
+        );
+        let doc = XmlDoc::parse("<link/>").unwrap();
+        assert_eq!(
+            link_target(&doc, "home:alice", "foo").unwrap(),
+            ("home:alice".to_string(), "foo".to_string())
+        );
+    }
+
+    #[test]
+    fn commit_on_a_package_less_link_names_the_defaulted_target() {
+        // A `_link` with no `package` attribute points at the
+        // same-named package: the commit-time check reads it
+        // instead of failing on the missing attribute.
+        let http = package_less_link_http(
+            b"<link project=\"home:alice\" baserev=\"dddddddddddddddddddddddddddddddd\"/>",
+            "9ad883724cc96ab256841479b3abca10",
+            71,
+        );
+        let (_dir, wc) = link_diff_checkout(&http);
+        assert!(refuse_link_to_other_project(&wc).is_ok());
+        let http = package_less_link_http(
+            b"<link project=\"openSUSE:Factory\" baserev=\"dddddddddddddddddddddddddddddddd\"/>",
+            "9fcfe040129182326a9537ad6ad68685",
+            77,
+        );
+        let (_dir, wc) = link_diff_checkout(&http);
+        let err = refuse_link_to_other_project(&wc).unwrap_err();
+        assert!(
+            err.context
+                .contains("branch_package openSUSE:Factory/foo into home:alice/foo"),
+            "err: {err}"
+        );
     }
 
     #[test]
