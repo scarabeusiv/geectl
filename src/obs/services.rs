@@ -496,6 +496,9 @@ impl ObsClient<'_> {
     /// not fail on a read it cannot make. Live still fails on the
     /// read error.
     ///
+    /// The `_project` package is rejected: the server's `runservice`
+    /// behaviour on a project's own services is untested.
+    ///
     /// An agent triggers the services of the package it just changed
     /// so the server re-runs them without waiting for a commit.
     pub fn trigger_service(
@@ -512,6 +515,12 @@ impl ObsClient<'_> {
                     format!("invalid OBS {label} name: {value:?}"),
                 ));
             }
+        }
+        if package == "_project" {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "cannot trigger services for _project: the server's runservice behaviour on a project's own services is untested",
+            ));
         }
         if let Some(service) = service {
             if service.chars().count() < 3 || service.contains('/') {
@@ -1872,6 +1881,23 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
             ]
         );
         assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn trigger_on_project_package_is_rejected() {
+        // `runservice` on `_project` is untested server behaviour:
+        // the trigger refuses it rather than guessing.
+        let http = FakeHttp::new().with_post(TRIGGER_URL, "<status code=\"ok\"/>");
+        let client = authed_client(&http);
+        assert_eq!(
+            client
+                .trigger_service("openSUSE:Factory", "_project", None, &DryRun::new(false))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
     }
 
     #[test]
