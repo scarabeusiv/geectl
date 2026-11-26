@@ -12,6 +12,9 @@ Issue: https://github.com/scarabeusiv/geectl/issues/23 — the git vs OBS workfl
 | `geectl --live pull-request merge <reference>` (forwards after merge; `--no-forward` skips it) | scmsync syncs the merged branch into the devel project package; forward SR filed from the devel package to its link parent; devel check (recorded project and package) runs first; home package deleted, and the test project when it holds no other package | PR merges; accepting the PR files the Factory submit automatically; a refused forward reports, the merge stands |
 | `geectl --live request accept <id>` | Factory SR accepted; package lands in Factory | Home package deleted, and the test project when it holds no other package |
 | `geectl gitea cleanup-forks` | Home test projects of gone forks deleted (home package, then project when empty) | Gone forks listed with their home test projects |
+
+A package whose HEAD contains `_link` stays at its last synced revision — observed live on the real instance (scmsync harness run 2026-11-26, tag `20261126-104007`): a HEAD with `_link` did not sync within 300 s, and removing the `_link` restored the sync in ~10 s. Place the `_link` while scmsync is cleared, or before scmsync is first set, and never push it into a scmsync-managed HEAD. `service trigger` posts `cmd=runservice` for the package; in the same live run the trigger queued and the sync landed 9.1 s later, though the bridge may also have fired, so the trigger alone is not proven to force it. A HEAD containing `_link` needs the `_link` removed first — the trigger does not fix that case.
+
 ## Maintenance
 
 | geectl command | OBS flow | Gitea flow |
