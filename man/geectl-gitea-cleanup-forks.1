@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH geectl-gitea-cleanup-forks 1  "geectl-gitea-cleanup-forks 0.2.2" 
+.TH geectl-gitea-cleanup-forks 1  "geectl-gitea-cleanup-forks 0.2.3" 
 .SH NAME
 geectl\-gitea\-cleanup\-forks \- List obsolete Gitea forks and their OBS home test projects, and delete them. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the deletion. A project is deleted only when its description marker names a fork that no longer exists on Gitea; every other project is listed and left in place
 .SH SYNOPSIS
@@ -15,4 +15,4 @@ The OBS user whose `home:<user>:branches:*` projects are listed; defaults to the
 \fB\-h\fR, \fB\-\-help\fR
 Print help
 .SH VERSION
-v0.2.2
+v0.2.3

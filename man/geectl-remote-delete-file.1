@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH geectl-remote-delete-file 1  "geectl-remote-delete-file 0.2.2" 
+.TH geectl-remote-delete-file 1  "geectl-remote-delete-file 0.2.3" 
 .SH NAME
 geectl\-remote\-delete\-file \- Delete a file from a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the deletion. The general form of `delete\-link`: deleting `_link` here issues the same delete as `delete\-link`. Deleting a file that is already gone is refused by the server (NotFound). The server records the delete with the fixed comment `removed <file>`
 .SH SYNOPSIS
@@ -21,4 +21,4 @@ The package the file lives in
 <\fIFILE\fR>
 The file to delete
 .SH VERSION
-v0.2.2
+v0.2.3

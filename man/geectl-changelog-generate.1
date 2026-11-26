@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH geectl-changelog-generate 1  "geectl-changelog-generate 0.2.2" 
+.TH geectl-changelog-generate 1  "geectl-changelog-generate 0.2.3" 
 .SH NAME
 geectl\-changelog\-generate \- Generate a skeleton `.changes` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball. The output is a draft: what the diff cannot supply arrives as explicit `TODO` slots for a human to fill. `\-\-write` prepends the draft into the package\*(Aqs `.changes` file, and refuses an incomplete draft (V9 needs\-detail)
 .SH SYNOPSIS
@@ -30,4 +30,4 @@ Print help
 [\fIDIR\fR] [default: .]
 The package directory (default: the current directory)
 .SH VERSION
-v0.2.2
+v0.2.3

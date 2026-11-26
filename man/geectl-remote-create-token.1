@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH geectl-remote-create-token 1  "geectl-remote-create-token 0.2.2" 
+.TH geectl-remote-create-token 1  "geectl-remote-create-token 0.2.3" 
 .SH NAME
 geectl\-remote\-create\-token \- Create an operation\-scoped trigger token for the authenticated user. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the creation. The secret prints once, at creation: store it now. Project and package go together: give both to scope the token to a package, or neither for a global token
 .SH SYNOPSIS
@@ -38,4 +38,4 @@ A description identifying the token, at most 64 characters
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .SH VERSION
-v0.2.2
+v0.2.3

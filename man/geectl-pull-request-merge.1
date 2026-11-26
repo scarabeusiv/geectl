@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH geectl-pull-request-merge 1  "geectl-pull-request-merge 0.2.2" 
+.TH geectl-pull-request-merge 1  "geectl-pull-request-merge 0.2.3" 
 .SH NAME
 geectl\-pull\-request\-merge \- Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless `\-\-no\-forward` is given. The forwarded request\*(Aqs `.changes` entry is the original description on the OBS arm and the pull request\*(Aqs text on the Gitea arm, overridable with `\-m` / `\-\-forward\-message`. Dry\-run by default; mutates only with `\-\-live`
 .SH SYNOPSIS
@@ -46,4 +46,4 @@ Print help
 <\fIREFERENCE\fR>
 The pull\-request handle: `obs:<id>` or `gitea:<owner>/<repo>#<number>`
 .SH VERSION
-v0.2.2
+v0.2.3

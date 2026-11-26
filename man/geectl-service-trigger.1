@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH geectl-service-trigger 1  "geectl-service-trigger 0.2.2" 
+.TH geectl-service-trigger 1  "geectl-service-trigger 0.2.3" 
 .SH NAME
 geectl\-service\-trigger \- Trigger a server\-side run of a package\*(Aqs services. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the trigger. The trigger only queues the run: the server runs the services asynchronously, so a successful trigger says the run was queued. Check the outcome with `service state`
 .SH SYNOPSIS
@@ -21,4 +21,4 @@ The project the package lives in
 <\fIPACKAGE\fR>
 The package to trigger the services of
 .SH VERSION
-v0.2.2
+v0.2.3

@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH geectl-local-build-log 1  "geectl-local-build-log 0.2.2" 
+.TH geectl-local-build-log 1  "geectl-local-build-log 0.2.3" 
 .SH NAME
 geectl\-local\-build\-log \- Read the log of the last local build: the `<root>/.build.log` the build\*(Aqs coordinates name. A read: no `\-\-live` needed. The text is the log verbatim (design rule 4); the verdict, exit code, log path, and truncation flag ride in the JSON payload
 .SH SYNOPSIS
@@ -33,4 +33,4 @@ The architecture the root was built for
 <\fISPEC\fR>
 The source directory (spec + sources); the package comes from the spec file in it, like the build
 .SH VERSION
-v0.2.2
+v0.2.3
