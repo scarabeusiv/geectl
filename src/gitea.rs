@@ -2850,14 +2850,24 @@ impl<'a> GiteaClient<'a> {
     /// Search pull requests across the instance (`GET
     /// /api/v1/repos/issues/search?type=pulls&state=…`): the
     /// search answers issues, so the items carry the repo and the
-    /// merged flag but no head/base endpoints. Paginates
-    /// internally and is bounded like `repo_list`. The token
-    /// needs the `read:issue` scope: the server gates the issues
-    /// search on it (403 without it).
-    pub fn pr_search(&self, state: GiteaPullRequestState) -> Result<Vec<GiteaIssue>, GeectlError> {
+    /// merged flag but no head/base endpoints. A creator scopes
+    /// the search server-side (`created_by`); without one the
+    /// search answers every pull request and the caller filters.
+    /// Paginates internally and is bounded like `repo_list`. The
+    /// token needs the `read:issue` scope: the server gates the
+    /// issues search on it (403 without it).
+    pub fn pr_search(
+        &self,
+        state: GiteaPullRequestState,
+        creator: Option<&str>,
+    ) -> Result<Vec<GiteaIssue>, GeectlError> {
+        let mut params: Vec<(&str, &str)> = vec![("type", "pulls"), ("state", state.as_str())];
+        if let Some(creator) = creator {
+            params.push(("created_by", creator));
+        }
         self.list_paged::<GiteaIssue>(
             &["api", "v1", "repos", "issues", "search"],
-            &[("type", "pulls"), ("state", state.as_str())],
+            &params,
             "pull requests on the instance",
             "the list is bounded at 500 entries",
         )
@@ -6785,7 +6795,7 @@ mod tests {
             &format!("[{}]", issue_json(122, "open", false)),
         );
         let items = client(&http)
-            .pr_search(GiteaPullRequestState::Open)
+            .pr_search(GiteaPullRequestState::Open, None)
             .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].number, 122);
@@ -6806,7 +6816,7 @@ mod tests {
             "null",
         );
         let items = client(&http)
-            .pr_search(GiteaPullRequestState::Closed)
+            .pr_search(GiteaPullRequestState::Closed, None)
             .unwrap();
         assert!(items.is_empty());
     }

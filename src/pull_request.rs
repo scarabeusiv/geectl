@@ -893,14 +893,14 @@ impl<'a> PullRequestClient<'a> {
 
     /// Search pull requests as the list shape. With no backend
     /// both arms run, OBS first then Gitea; a backend scopes the
-    /// search to that arm. The OBS arm filters server-side (the
-    /// state mapping and the creator); the Gitea arm queries the
-    /// wire state the requested states need and filters
-    /// client-side to the exact states and creator, since the
-    /// server has no unified-state or author filter for the list
-    /// and search endpoints. A repo-scoped search needs the Gitea
-    /// backend; without it the search fails as invalid input
-    /// instead of returning unscoped OBS hits.
+    /// search to that arm. Both arms filter server-side (the
+    /// state mapping and the creator); the Gitea arm filters
+    /// client-side to the exact states and creator as a backstop,
+    /// since the repo-scoped list has no author filter and the
+    /// wire states do not map one-to-one to the unified states.
+    /// A repo-scoped search needs the Gitea backend; without it
+    /// the search fails as invalid input instead of returning
+    /// unscoped OBS hits.
     pub fn search(
         &self,
         query: &PullRequestSearch,
@@ -930,7 +930,7 @@ impl<'a> PullRequestClient<'a> {
                     .map(|pr| PullRequestSummary::from_gitea(owner, repo, pr))
                     .collect::<Result<Vec<_>, _>>()?,
                 None => gitea
-                    .pr_search(wire)?
+                    .pr_search(wire, query.creator.as_deref())?
                     .iter()
                     .map(PullRequestSummary::from_gitea_issue)
                     .collect::<Result<Vec<_>, _>>()?,
@@ -2610,19 +2610,51 @@ mod tests {
     }
 
     #[test]
-    fn search_gitea_filters_creator_client_side() {
+    fn search_gitea_scopes_creator_server_side() {
+        // The creator reaches the server as `created_by`: the
+        // mock URL pins the parameter, so a search that dropped
+        // it would answer nothing. The answer carries another
+        // author's pull request too, so the client-side retain
+        // is what drops it: an older server silently ignoring
+        // `created_by` still answers only the creator.
         let http = FakeHttp::new().with_get(
-            "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&page=1&limit=50",
+            "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&created_by=plusky&page=1&limit=50",
             &format!(
                 "[{}, {}]",
-                issue_json(122, "open", false, "scarabeusiv"),
                 issue_json(123, "open", false, "plusky"),
+                issue_json(124, "open", false, "scarabeusiv"),
             ),
         );
         let gitea = gitea_client(&http);
         let client = PullRequestClient::new(None, Some(&gitea));
         let query = PullRequestSearch {
             backend: Some(PullRequestBackend::Gitea),
+            creator: Some("plusky".to_string()),
+            ..Default::default()
+        };
+        let summaries = client.search(&query).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].author, "plusky");
+    }
+
+    #[test]
+    fn search_gitea_repo_scoped_creator_filters_client_side() {
+        // The repo-scoped list has no author filter, so the
+        // creator is still filtered client-side there: the list
+        // answers every pull request of the repo and the retain
+        // drops the other authors.
+        let other = PR_JSON
+            .replace("\"number\": 122", "\"number\": 123")
+            .replace("\"login\": \"scarabeusiv\"", "\"login\": \"plusky\"");
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls?state=open&page=1&limit=50",
+            &format!("[{PR_JSON}, {other}]"),
+        );
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Gitea),
+            repo: Some(("openSUSE".to_string(), "geectl".to_string())),
             creator: Some("plusky".to_string()),
             ..Default::default()
         };
