@@ -1206,11 +1206,14 @@ fn dotenv_error(path: &Path, lineno: usize, what: &str) -> GeectlError {
 /// `GEECTL_*` key is a near-miss typo for a geectl variable, so it
 /// fails rather than being silently ignored, like a malformed
 /// `GEECTL_*` suffix. A key glued to `export` (`exportGEECTL_A`) is
-/// the same kind of typo and fails too. A line with no `=`, an
-/// unterminated quote, text after a quoted value, a near-miss `GEEC`
-/// prefix, a key glued to `export`, or a `GEECTL_*` key with
-/// anything but ASCII letters, digits, or `_` after the prefix is a
-/// `ConfigError` naming the file and the line.
+/// the same kind of typo and fails too. The filter runs before the
+/// syntax check: a line with no `=` is ignored unless it names a
+/// geectl variable (or a near-miss typo for one), so a bare word in a
+/// project `.env` for other tools cannot fail a run. A `GEECTL_*`
+/// line with no `=`, an unterminated quote, text after a quoted
+/// value, a near-miss `GEEC` prefix, a key glued to `export`, or a
+/// `GEECTL_*` key with anything but ASCII letters, digits, or `_`
+/// after the prefix is a `ConfigError` naming the file and the line.
 ///
 /// An unquoted value runs to the end of the line, except that a `#`
 /// preceded by whitespace starts a comment; a `#` inside quotes, or
@@ -1237,10 +1240,16 @@ fn parse_dotenv(content: &str, path: &Path) -> Result<HashMap<String, String>, G
             .filter(|rest| rest.starts_with(char::is_whitespace))
             .map(str::trim_start)
             .unwrap_or(line);
-        let Some(eq) = line.find('=') else {
-            return Err(dotenv_error(path, lineno, "expected KEY=value"));
+        // The filter runs before the syntax check: the candidate key
+        // is the text before `=`, or the whole line when there is no
+        // `=`. A line naming no geectl variable (and no near-miss typo
+        // for one) is ignored whole, `=` or not — a project `.env`
+        // for other tools may hold bare words. Only our own namespace
+        // fails closed on a missing `=` or a bad suffix.
+        let key = match line.find('=') {
+            Some(eq) => line[..eq].trim_end(),
+            None => line.trim_end(),
         };
-        let key = line[..eq].trim_end();
         if key.is_empty() {
             return Err(dotenv_error(path, lineno, "expected KEY=value"));
         }
@@ -1261,6 +1270,9 @@ fn parse_dotenv(content: &str, path: &Path) -> Result<HashMap<String, String>, G
             }
             continue;
         }
+        let Some(eq) = line.find('=') else {
+            return Err(dotenv_error(path, lineno, "expected KEY=value"));
+        };
         // A GEECTL_* key that is not a plain variable name is a typo
         // for a geectl variable, so it fails rather than being
         // silently ignored: the user meant to configure geectl.
@@ -2949,12 +2961,36 @@ mod tests {
 
     #[test]
     fn dotenv_line_without_equals_is_a_config_error_naming_file_and_line() {
-        let err =
-            parse_dotenv("GEECTL_A=sekrit-value\nNOT_A_PAIR\n", Path::new(".env")).unwrap_err();
+        let err = parse_dotenv("GEECTL_A=sekrit-value\nGEECTL_B\n", Path::new(".env")).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(err.context.contains(".env"), "{}", err.context);
         assert!(err.context.contains("line 2"), "{}", err.context);
         assert!(!err.context.contains("sekrit-value"), "{}", err.context);
+    }
+
+    #[test]
+    fn dotenv_bare_non_geectl_line_is_ignored() {
+        let map = parse_dotenv(
+            "GEECTL_A=1\nNOT_A_PAIR\nFOO BAR\nexport FOO\nGEECTL_B=2\n",
+            Path::new(".env"),
+        )
+        .unwrap();
+        assert_eq!(map["GEECTL_A"], "1");
+        assert_eq!(map["GEECTL_B"], "2");
+    }
+
+    #[test]
+    fn dotenv_bare_geectl_line_is_a_config_error() {
+        for bad in [
+            "GEECTL_A=1\nGEECTL_B\n",
+            // A near-miss typo fails even without `=`.
+            "GEECTL_A=1\nGEECFOO\n",
+            "GEECTL_A=1\nexportGEECTL_B\n",
+        ] {
+            let err = parse_dotenv(bad, Path::new(".env")).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ConfigError);
+            assert!(err.context.contains("line 2"), "{}", err.context);
+        }
     }
 
     #[test]
@@ -3083,7 +3119,7 @@ mod tests {
     #[test]
     fn load_dotenv_at_reports_a_malformed_file_with_line() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_dotenv(&dir, b"GEECTL_A=sekrit-value\nBROKEN LINE\n");
+        let path = write_dotenv(&dir, b"GEECTL_A=sekrit-value\nGEECTL_B\n");
         let err = load_dotenv_at(&path).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(

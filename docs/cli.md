@@ -102,7 +102,7 @@ key starting with `GEEC` that fails the `GEECTL_*` shape, or a
 the prefix, is a typo for a geectl variable and fails as a config
 error. The syntax is minimal —
 `KEY=value`, `#` comments, blank lines, an optional `export` prefix
-followed by whitespace (a key glued to `export` is malformed), and optional single or double quotes — values stay literal, one line each. A duplicate key keeps
+followed by whitespace (a key glued to `export` is malformed), and optional single or double quotes — values stay literal, one line each. A line with no `=` is ignored unless it names a `GEECTL_*` key (or a near-miss typo for one). A duplicate key keeps
 its last value, and quoted values are literal inside the quotes. The file must be a regular file, at most 64 KiB, and
 readable only by its owner (`chmod 600`) on Unix — on non-Unix the
 mode goes unchecked, and the opt-in is the guard there. A missing

@@ -315,7 +315,7 @@ fn real_environment_overrides_dotenv() {
 #[test]
 fn dotenv_malformed_file_fails_fast() {
     let dir = TempDir::new();
-    write_dotenv(&dir, "GEECTL_OBS_PASSWORD=s3cr3t-value\nBROKEN LINE\n");
+    write_dotenv(&dir, "GEECTL_OBS_PASSWORD=s3cr3t-value\nGEECTL_BROKEN\n");
     let out = geectl_isolated(&dir)
         .env("GEECTL_DOTENV", "1")
         .arg("version")
