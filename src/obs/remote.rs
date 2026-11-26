@@ -13811,4 +13811,57 @@ mod tests {
             ["retry: create_package registration probe 1/30s: still not found".to_string()]
         );
     }
+
+    #[test]
+    fn project_meta_rejects_text_inside_attribute_only_children() {
+        // An attribute-only child is read by its attributes alone,
+        // so text inside one would vanish: the gate rejects it, at
+        // every level the project parser covers.
+        for (body, child, element) in [
+            (
+                "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><path project=\"a\" repository=\"b\">junk</path></repository></project>",
+                "path",
+                "repository",
+            ),
+            (
+                "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><releasetarget project=\"a\" repository=\"b\">junk</releasetarget></repository></project>",
+                "releasetarget",
+                "repository",
+            ),
+            (
+                "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><hostsystem project=\"a\" repository=\"b\">junk</hostsystem></repository></project>",
+                "hostsystem",
+                "repository",
+            ),
+            (
+                "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://m.example.com\">junk</master></download></repository></project>",
+                "master",
+                "download",
+            ),
+            (
+                "<project name=\"p\"><devel project=\"a\">junk</devel></project>",
+                "devel",
+                "project",
+            ),
+            (
+                "<project name=\"p\"><person userid=\"alice\" role=\"maintainer\">junk</person></project>",
+                "person",
+                "project",
+            ),
+            (
+                "<project name=\"p\"><group groupid=\"g\" role=\"maintainer\">junk</group></project>",
+                "group",
+                "project",
+            ),
+        ] {
+            let err = parse_project_meta(body).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError);
+            assert!(
+                err.context
+                    .contains(&format!("text in <{child}> in <{element}>")),
+                "{body}: {}",
+                err.context
+            );
+        }
+    }
 }

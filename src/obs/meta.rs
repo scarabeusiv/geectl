@@ -1337,6 +1337,36 @@ mod tests {
         assert!(http.put_calls().is_empty());
     }
 
+    fn set_project_meta_fails_closed_on_content_inside_an_attribute_only_child(
+        fetched: &str,
+        child: &str,
+        element: &str,
+        what: &str,
+    ) {
+        // The fetched meta never reaches the rewrite refusal: the
+        // parse rejects the content inside the attribute-only child
+        // first, so the write fails closed with a server error and
+        // no PUT happens.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            fetched,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories = vec![replacement_repository()];
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(
+            err.context
+                .contains(&format!("{what} in <{child}> in <{element}>")),
+            "{}",
+            err.context
+        );
+        assert!(http.put_calls().is_empty());
+    }
+
     #[test]
     fn set_project_meta_puts_only_the_changed_title_and_keeps_the_rest() {
         let http = FakeHttp::new()
@@ -1845,33 +1875,52 @@ mod tests {
     }
 
     #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_master_with_a_child() {
+    fn set_project_meta_fails_closed_on_a_child_inside_a_master() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://master.example.com\"><foo/></master></download></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
+        set_project_meta_fails_closed_on_content_inside_an_attribute_only_child(
+            META, "master", "download", "markup",
+        );
     }
 
     #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_master_with_text() {
+    fn set_project_meta_fails_closed_on_text_inside_a_master() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://master.example.com\">junk</master></download></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
+        set_project_meta_fails_closed_on_content_inside_an_attribute_only_child(
+            META, "master", "download", "text",
+        );
     }
 
     #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_releasetarget_with_content() {
+    fn set_project_meta_fails_closed_on_text_inside_a_releasetarget() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\">junk</releasetarget></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
+        set_project_meta_fails_closed_on_content_inside_an_attribute_only_child(
+            META,
+            "releasetarget",
+            "repository",
+            "text",
+        );
     }
 
     #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_hostsystem_with_content() {
+    fn set_project_meta_fails_closed_on_text_inside_a_hostsystem() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\">junk</hostsystem></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
+        set_project_meta_fails_closed_on_content_inside_an_attribute_only_child(
+            META,
+            "hostsystem",
+            "repository",
+            "text",
+        );
     }
 
     #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_path_with_content() {
+    fn set_project_meta_fails_closed_on_text_inside_a_path() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\">junk</path></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
+        set_project_meta_fails_closed_on_content_inside_an_attribute_only_child(
+            META,
+            "path",
+            "repository",
+            "text",
+        );
     }
 
     #[test]

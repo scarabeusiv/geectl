@@ -9163,4 +9163,42 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(http.post_calls().is_empty());
     }
+
+    #[test]
+    fn parse_repositories_rejects_text_inside_attribute_only_children() {
+        // An attribute-only child is read by its attributes alone,
+        // so text inside one would vanish: the gate rejects it, at
+        // every level the repositories parser covers.
+        for (body, child, element) in [
+            (
+                "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><path project=\"a\" repository=\"b\">junk</path></repository></project>",
+                "path",
+                "repository",
+            ),
+            (
+                "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><releasetarget project=\"a\" repository=\"b\">junk</releasetarget></repository></project>",
+                "releasetarget",
+                "repository",
+            ),
+            (
+                "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><hostsystem project=\"a\" repository=\"b\">junk</hostsystem></repository></project>",
+                "hostsystem",
+                "repository",
+            ),
+            (
+                "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://m.example.com\">junk</master></download></repository></project>",
+                "master",
+                "download",
+            ),
+        ] {
+            let err = parse_repositories(body).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError);
+            assert!(
+                err.context
+                    .contains(&format!("text in <{child}> in <{element}>")),
+                "{body}: {}",
+                err.context
+            );
+        }
+    }
 }

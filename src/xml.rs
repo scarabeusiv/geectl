@@ -1369,10 +1369,22 @@ pub(crate) fn xml_child_elements<'a>(
 /// unterminated comment, not a closed one. A section inside a modeled
 /// text child is rejected: the readers decode entities only, so it
 /// would read as the literal wrapper in the field value. Any markup
-/// inside such a child is rejected for the same reason, and a modeled
-/// tag hidden in skipped content is rejected too: the descendant
+/// inside such a child is rejected for the same reason, and text
+/// inside an attribute-only child is rejected too: the readers take
+/// its attributes only, so the text would vanish. A modeled
+/// tag hidden in skipped content is rejected as well: the descendant
 /// readers search raw text and would still find it there. Errors carry
 /// the byte offset of the offending content within `inner`.
+/// What a modeled child of a gated element holds: plain text the
+/// readers decode, attributes only with no text, or a structured
+/// child whose own inner is gated separately.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModeledChildKind {
+    Text,
+    AttributeOnly,
+    Structured,
+}
+
 pub(crate) fn xml_reject_stray_text(inner: &str, element: &str) -> Result<(), GeectlError> {
     let stray_text = |at: usize| {
         GeectlError::new(
@@ -1396,6 +1408,12 @@ pub(crate) fn xml_reject_stray_text(inner: &str, element: &str) -> Result<(), Ge
             format!("unexpected OBS project meta response: CDATA section in <{child}> in <{element}> at offset {at}"),
         )
     };
+    let text_in_child = |child: &str, at: usize| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected OBS project meta response: text in <{child}> in <{element}> at offset {at}"),
+        )
+    };
     let markup_in_child = |child: &str, at: usize| {
         GeectlError::new(
             ErrorKind::ServerError,
@@ -1408,29 +1426,40 @@ pub(crate) fn xml_reject_stray_text(inner: &str, element: &str) -> Result<(), Ge
             format!("unexpected OBS project meta response: hidden <{tag}> in <{element}> at offset {at}"),
         )
     };
-    // The tags the typed parsers read out of this element. The
-    // descendant readers search raw text, so a modeled tag hidden
-    // in skipped content would still be found: any occurrence of
-    // one in skipped content is rejected, markup or not.
-    let modeled_tags: &[&str] = match element {
-        "repository" => &["arch", "path", "download", "releasetarget", "hostsystem"],
-        "download" => &["archfilter", "master", "pubkey"],
+    // The tags the typed parsers read out of this element, and
+    // what each holds. The descendant readers search raw text, so a
+    // modeled tag hidden in skipped content would still be found:
+    // any occurrence of one in skipped content is rejected, markup
+    // or not.
+    let modeled_children: &[(&str, ModeledChildKind)] = match element {
+        "repository" => &[
+            ("arch", ModeledChildKind::Text),
+            ("path", ModeledChildKind::AttributeOnly),
+            ("download", ModeledChildKind::Structured),
+            ("releasetarget", ModeledChildKind::AttributeOnly),
+            ("hostsystem", ModeledChildKind::AttributeOnly),
+        ],
+        "download" => &[
+            ("archfilter", ModeledChildKind::Text),
+            ("master", ModeledChildKind::AttributeOnly),
+            ("pubkey", ModeledChildKind::Text),
+        ],
         "project" => &[
-            "repository",
-            "devel",
-            "person",
-            "group",
-            "title",
-            "description",
-            "url",
-            "scmsync",
+            ("repository", ModeledChildKind::Structured),
+            ("devel", ModeledChildKind::AttributeOnly),
+            ("person", ModeledChildKind::AttributeOnly),
+            ("group", ModeledChildKind::AttributeOnly),
+            ("title", ModeledChildKind::Text),
+            ("description", ModeledChildKind::Text),
+            ("url", ModeledChildKind::Text),
+            ("scmsync", ModeledChildKind::Text),
         ],
         _ => &[],
     };
     // The offset of a modeled tag's open marker in `span`, if one
     // occurs as a tag (not as a longer name like `<archx>`).
     let hidden_tag = |span: &str| -> Option<(&str, usize)> {
-        for &tag in modeled_tags {
+        for &(tag, _) in modeled_children {
             let marker = format!("<{tag}");
             let mut from = 0;
             while let Some(rel) = span[from..].find(&marker) {
@@ -1516,28 +1545,24 @@ pub(crate) fn xml_reject_stray_text(inner: &str, element: &str) -> Result<(), Ge
                 elem_end,
                 self_closing,
             } => {
+                // Every child's tag span is checked past its own tag
+                // name, so the name itself is not read as hidden: a
+                // modeled tag in an attribute value would still be
+                // found by the descendant readers.
+                let after_name = start + 1 + tag_name.len();
+                if let Some((tag, rel)) = hidden_tag(&inner[after_name..tag_end]) {
+                    return Err(hidden_modeled_tag(tag, after_name + rel));
+                }
+                let kind = modeled_children
+                    .iter()
+                    .find(|&&(tag, _)| tag == tag_name)
+                    .map(|&(_, kind)| kind);
                 if self_closing {
-                    // Self-closing child: skip it whole, past its own tag
-                    // name so the name itself is not read as hidden.
-                    let after_name = start + 1 + tag_name.len();
-                    if let Some((tag, rel)) = hidden_tag(&inner[after_name..tag_end]) {
-                        return Err(hidden_modeled_tag(tag, after_name + rel));
-                    }
-                // A modeled text child holds plain text only: the readers
-                // decode entities only, so any markup inside it would read
-                // as the literal value. Any other child is skipped whole,
-                // but a modeled tag hidden in one would still be found by
-                // the descendant readers, so any occurrence is rejected.
-                } else if matches!(
-                    (element, tag_name),
-                    ("repository", "arch")
-                        | ("download", "archfilter")
-                        | ("download", "pubkey")
-                        | ("project", "title")
-                        | ("project", "description")
-                        | ("project", "url")
-                        | ("project", "scmsync")
-                ) {
+                    // Self-closing child: nothing more to check.
+                } else if kind == Some(ModeledChildKind::Text) {
+                    // A modeled text child holds plain text only: the
+                    // readers decode entities only, so any markup
+                    // inside it would read as the literal value.
                     let tail = &inner[tag_end..elem_end];
                     let close = tail.rfind('<').unwrap_or(tail.len());
                     if let Some(rel) = tail[..close].find('<') {
@@ -1547,8 +1572,61 @@ pub(crate) fn xml_reject_stray_text(inner: &str, element: &str) -> Result<(), Ge
                         }
                         return Err(markup_in_child(tag_name, at));
                     }
+                } else if kind == Some(ModeledChildKind::AttributeOnly) {
+                    // An attribute-only child holds no text: the
+                    // readers take its attributes only, so text
+                    // inside it would vanish. Its inner span is
+                    // walked and any text, CDATA section, or nested
+                    // element is rejected; a modeled tag hidden in a
+                    // comment or processing instruction is rejected
+                    // like anywhere else.
+                    let tail = &inner[tag_end..elem_end];
+                    let close = tail.rfind('<').unwrap_or(tail.len());
+                    for inner_child in XmlChildren::new(&tail[..close]) {
+                        match inner_child {
+                            Ok(XmlChild::Text { start, text }) => {
+                                if !xml_content_blank(text) {
+                                    return Err(text_in_child(
+                                        tag_name,
+                                        tag_end + start + first_content(text),
+                                    ));
+                                }
+                            }
+                            Ok(XmlChild::Cdata { start }) => {
+                                return Err(cdata_in_child(tag_name, tag_end + start));
+                            }
+                            Ok(XmlChild::Element { start, .. })
+                            | Ok(XmlChild::CloseTag { start }) => {
+                                return Err(markup_in_child(tag_name, tag_end + start));
+                            }
+                            Ok(XmlChild::Comment { start, text })
+                            | Ok(XmlChild::Pi { start, text })
+                            | Ok(XmlChild::Markup { start, text }) => {
+                                if let Some((tag, rel)) = hidden_tag(text) {
+                                    return Err(hidden_modeled_tag(tag, tag_end + start + rel));
+                                }
+                            }
+                            Err(XmlScanError::Unterminated { at, child }) => {
+                                return Err(match child {
+                                    Some(child) => unterminated_child(child, tag_end + at),
+                                    None => unterminated(tag_end + at),
+                                });
+                            }
+                            Err(XmlScanError::EmptyName { at }) => {
+                                return Err(GeectlError::new(
+                                    ErrorKind::ServerError,
+                                    format!(
+                                        "unexpected OBS response: empty tag name in <{element}> at offset {}",
+                                        tag_end + at
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                 } else {
-                    let after_name = start + 1 + tag_name.len();
+                    // Any other child is skipped whole, but a modeled
+                    // tag hidden in one would still be found by the
+                    // descendant readers, so any occurrence is rejected.
                     if let Some((tag, rel)) = hidden_tag(&inner[after_name..elem_end]) {
                         return Err(hidden_modeled_tag(tag, after_name + rel));
                     }
@@ -2649,5 +2727,80 @@ mod tests {
         let found = xml_elements(body, "result").unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0], "<result><result>x</result></result>");
+    }
+
+    #[test]
+    fn xml_reject_stray_text_rejects_text_inside_attribute_only_children() {
+        // The readers take an attribute-only child by its attributes
+        // alone, so text inside one would vanish: the gate rejects
+        // it, at every level the gate covers.
+        assert!(xml_reject_stray_text(
+            "<path project=\"a\" repository=\"b\">junk</path>",
+            "repository"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<releasetarget project=\"a\" repository=\"b\">junk</releasetarget>",
+            "repository"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<hostsystem project=\"a\" repository=\"b\">junk</hostsystem>",
+            "repository"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<master url=\"https://example.com\">junk</master>",
+            "download"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text("<devel project=\"a\">junk</devel>", "project").is_err());
+        assert!(xml_reject_stray_text(
+            "<person userid=\"alice\" role=\"maintainer\">junk</person>",
+            "project"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<group groupid=\"g\" role=\"maintainer\">junk</group>",
+            "project"
+        )
+        .is_err());
+        // Whitespace alone inside one is not text.
+        assert!(xml_reject_stray_text(
+            "<path project=\"a\" repository=\"b\">  \n </path>",
+            "repository"
+        )
+        .is_ok());
+        // A CDATA section or a nested element inside one is rejected
+        // the same way.
+        assert!(xml_reject_stray_text(
+            "<path project=\"a\" repository=\"b\"><![CDATA[junk]]></path>",
+            "repository"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<path project=\"a\" repository=\"b\"><b>junk</b></path>",
+            "repository"
+        )
+        .is_err());
+        // A modeled tag hidden in a comment inside one is still
+        // rejected.
+        assert!(xml_reject_stray_text(
+            "<path project=\"a\" repository=\"b\"><!-- <arch>x</arch> --></path>",
+            "repository"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn xml_reject_stray_text_rejects_a_modeled_tag_hidden_in_a_tag_attribute() {
+        // A modeled tag hiding in an attribute value would still be
+        // found by the descendant readers, so the gate checks every
+        // child's tag span past its own name.
+        assert!(xml_reject_stray_text(
+            "<title foo='<repository name=\"x\"/>'>t</title>",
+            "project"
+        )
+        .is_err());
     }
 }
