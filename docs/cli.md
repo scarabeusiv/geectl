@@ -160,7 +160,7 @@ directory's `.env` only.
 - `geectl remote search-packages-by-person <USERID>` — Search packages by a person's login: every package whose meta names the login in a role.
 - `geectl remote count-scmsync-projects <URL_PREFIX>` — Count the projects syncing from a git URL prefix.
 - `geectl remote list-scmsync-projects <URL_PREFIX>` — List the projects syncing from a git URL prefix; key flags: --limit <LIMIT>, --offset <OFFSET>
-- `geectl remote owners <PROJECT> <PACKAGE>` — Show the owners of a package (project/package scope); key flags: --verbose
+- `geectl remote owners <PROJECT> <PACKAGE>` — Show the owners of a package (project/package scope); key flags: --verbose (the verbose form omits the role)
 - `geectl remote owners-for-binary <BINARY>` — Show the owners of a binary package; key flags: --verbose
 - `geectl remote owners-for-package <PACKAGE>` — Show the owners of a package by name alone, in the owner root projects; key flags: --verbose
 - `geectl remote maintainers <PROJECT> <PACKAGE>` — Show the maintainers of a package.
