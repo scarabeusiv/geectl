@@ -518,6 +518,18 @@ pub fn prepend_entry(old_bytes: &[u8], entry: &str) -> Result<PrependedEntry, St
     let old_content = report.text;
     let source_encoding = report.source_encoding;
     let guessed_single_byte = report.guessed_single_byte;
+    // A fresh file ends with exactly one newline: the entry's
+    // trailing blank line separates it from older entries, and with
+    // no older entries there is nothing to separate from — leaving
+    // it would fail the V11 end-of-file check on the file just
+    // written.
+    let entry = if old_content.is_empty() && entry.ends_with("\n\n") {
+        // Drop the blank line only: the last bullet keeps its
+        // newline, so the fresh file ends with exactly one.
+        &entry[..entry.len() - 1]
+    } else {
+        entry
+    };
     let new_content = format!("{entry}{old_content}");
     let old_seps = old_content
         .lines()
@@ -936,9 +948,9 @@ mod tests {
 
     #[test]
     fn message_entry_validates_clean() {
-        // The generated entry with a message, as a `.changes`
-        // file, passes the V-rules: the `--write` path writes
-        // exactly this text.
+        // The generated entry with a message, written to a fresh
+        // `.changes` file the way `--write` writes it, passes the
+        // V-rules.
         let local = snapshot(&[("foo.spec", SPEC_V2)]);
         let gen = generate(
             &local,
@@ -951,7 +963,11 @@ mod tests {
             ]),
         )
         .expect("generation runs");
-        let written = snapshot(&[("foo.spec", SPEC_V2), ("foo.changes", &gen.entry)]);
+        let written_content = prepend_entry(b"", &gen.entry)
+            .expect("prepend onto an empty file runs")
+            .content;
+        assert!(written_content.ends_with('\n') && !written_content.ends_with("\n\n"));
+        let written = snapshot(&[("foo.spec", SPEC_V2), ("foo.changes", &written_content)]);
         let report = validate(
             &written,
             None,
