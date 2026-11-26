@@ -37,7 +37,7 @@ impl Format {
     name = "geectl",
     bin_name = "geectl",
     version,
-    about = "Geeko Controller — a CLI for openSUSE packaging workflows (OBS + src.opensuse.org)",
+    about = "Geeko Controller — a CLI for openSUSE packaging workflows",
     long_about = None
 )]
 pub struct Cli {

@@ -6,9 +6,9 @@
 **Geeko Controller — a CLI for openSUSE packaging workflows.**
 
 geectl drives openSUSE packaging workflows from the command line, built for
-automation and scripting, with human-readable text output via `--format text`. It talks to the OBS (Open Build Service) API
-directly (primary goal) and, as a secondary goal, to the src.opensuse.org git
-workflow (Gitea), hiding the backend choice.
+automation and scripting, with human-readable text output via `--format text`.
+One operation surface covers the OBS and Git workflows, hiding the
+backend choice.
 
 ## Usage
 
@@ -26,11 +26,9 @@ functionality?"** No agent use case, no implementation. The full scope is not en
 upfront; the gate does the work. There is no 1:1 parity goal with anything:
 only the parts needed for management and processing as agents.
 
-- **Primary goal: OBS.** The operations the packaging skill needs, against
-  the OBS API.
-- **Secondary goal: git flow, seamlessly.** Integrating the src.opensuse.org
-  / Gitea workflow so the agent does not have to know whether it is talking
-  to OBS directly or via git. This is **not** initial work and not on the roadmap.
+- **Both backends, one surface.** The operations the packaging skill needs,
+  against the OBS and Git workflows, so the agent does not have to know
+  whether it is talking to OBS directly or via git.
 
 ## How it differs from osc
 
