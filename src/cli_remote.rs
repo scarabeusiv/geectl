@@ -93,7 +93,7 @@ use crate::obs::{
     DeleteProjectOptions, DryRun, FilePatch, FilePatchStatus, HistoryEntry, NamedRole, ObsClient,
     Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person, ProjectMatch,
     ProjectMeta, ReleaseOptions, Repository, RevisionPatch, RevisionRange, RevisionSpec, RoleGrant,
-    ScmsyncProjectList, SourceFile, StagedRequest, StagingProject, StagingReadOptions,
+    ScmsyncProjectList, SourceFile, StagedRequest, StagingProject, StagingReadOptions, TokenEntry,
     TokenOperation, FACTORY_PROJECT,
 };
 use clap::Subcommand;
@@ -641,6 +641,16 @@ pub enum RemoteCommand {
         #[arg(long)]
         scm_token: Option<String>,
     },
+    /// List the authenticated user's operation-scoped tokens.
+    /// A read, always live.
+    ListTokens,
+    /// Delete one of the authenticated user's operation-scoped
+    /// tokens, by id. A mutation: dry-run is the default (only
+    /// the plan is printed); `--live` performs the deletion.
+    DeleteToken {
+        /// The id of the token to delete.
+        id: u64,
+    },
     /// Delete a package. A mutation: dry-run is the default (only
     /// the plan is printed); `--live` performs the deletion.
     /// Without `--force` a package with open submit requests is
@@ -893,6 +903,7 @@ pub fn run_remote(
         RemoteCommand::CreateProject { .. } if !live => Credentials::None,
         RemoteCommand::CreatePackage { .. } if !live => Credentials::None,
         RemoteCommand::CreateToken { .. } if !live => Credentials::None,
+        RemoteCommand::DeleteToken { .. } if !live => Credentials::None,
         RemoteCommand::SetProjectMeta { .. } if !live => Credentials::None,
         RemoteCommand::SetPackageMeta { .. } if !live => Credentials::None,
         RemoteCommand::UpdatePackageMetaFromSpec { .. } if !live => Credentials::None,
@@ -1718,6 +1729,20 @@ pub fn run_remote(
                 plan,
             ))
         }
+        RemoteCommand::ListTokens => {
+            let tokens = client.list_tokens()?;
+            Ok(list_tokens_result(tokens))
+        }
+        RemoteCommand::DeleteToken { id } => {
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.delete_token(id, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(delete_token_result(id, dry_run.enabled(), plan))
+        }
         RemoteCommand::DeletePackage {
             project,
             package,
@@ -2350,6 +2375,79 @@ fn create_token_result(
         text.push_str(&secret_line);
     }
     (payload, text)
+}
+
+/// The `list-tokens` result: the payload carries the tokens; the
+/// text renders them as a table, or `no tokens`. The secret rides
+/// both: listing is how a token is recovered, like `osc token`.
+fn list_tokens_result(tokens: Vec<TokenEntry>) -> (Value, String) {
+    let payload = json!({
+        "tokens": tokens.iter().map(token_entry_json).collect::<Vec<_>>(),
+    });
+    (payload, render_token_entries(&tokens))
+}
+
+fn token_entry_json(entry: &TokenEntry) -> Value {
+    json!({
+        "id": entry.id,
+        "token": entry.token,
+        "kind": entry.kind,
+        "description": entry.description,
+        "enabled": entry.enabled,
+        "triggered_at": entry.triggered_at,
+        "project": entry.project,
+        "package": entry.package,
+    })
+}
+
+/// The tokens as a table. An empty list reads `no tokens`, not an
+/// empty table.
+fn render_token_entries(tokens: &[TokenEntry]) -> String {
+    if tokens.is_empty() {
+        return "no tokens".to_string();
+    }
+    let rows: Vec<Vec<String>> = tokens
+        .iter()
+        .map(|entry| {
+            vec![
+                entry.id.to_string(),
+                entry.token.clone(),
+                entry.kind.clone(),
+                entry.description.clone().unwrap_or_default(),
+                entry.enabled.to_string(),
+                entry.triggered_at.clone().unwrap_or_default(),
+                entry.project.clone().unwrap_or_default(),
+                entry.package.clone().unwrap_or_default(),
+            ]
+        })
+        .collect();
+    render_table(
+        &[
+            "ID",
+            "TOKEN",
+            "KIND",
+            "DESCRIPTION",
+            "ENABLED",
+            "TRIGGERED AT",
+            "PROJECT",
+            "PACKAGE",
+        ],
+        &rows,
+    )
+}
+
+/// The `delete-token` result: the payload carries the id; the text
+/// states the deletion, or the dry-run plan.
+fn delete_token_result(id: u64, dry_run: bool, plan: Option<Vec<String>>) -> (Value, String) {
+    let payload = json!({
+        "id": id,
+    });
+    let result_line = if dry_run {
+        format!("dry-run: would delete token {id}")
+    } else {
+        format!("deleted token {id}")
+    };
+    mutation_result(payload, format!("token: {id}"), result_line, dry_run, plan)
 }
 
 /// The `delete-package` result: the payload carries `force` and the
@@ -5225,6 +5323,16 @@ mod tests {
     }
 
     #[test]
+    fn list_tokens_and_delete_token_parse() {
+        let parsed = parse(&["geectl", "remote", "list-tokens"]);
+        assert!(matches!(parsed, RemoteCommand::ListTokens));
+        let parsed = parse(&["geectl", "remote", "delete-token", "42"]);
+        assert!(matches!(parsed, RemoteCommand::DeleteToken { id: 42 }));
+        assert!(Cli::try_parse_from(["geectl", "remote", "delete-token"]).is_err());
+        assert!(Cli::try_parse_from(["geectl", "remote", "delete-token", "nope"]).is_err());
+    }
+
+    #[test]
     fn create_package_result_carries_scmsync_in_both_formats() {
         let (payload, text) = create_package_result(
             "P",
@@ -5418,6 +5526,64 @@ mod tests {
         assert_eq!(
             text,
             "operation: runservice\ndry_run: true\ndry-run: would create runservice token\n[dry-run] would: create runservice token"
+        );
+    }
+
+    #[test]
+    fn list_tokens_result_renders_table_or_empty_line() {
+        let tokens = vec![
+            TokenEntry {
+                id: 12795,
+                token: "ybtQ9GiEPCyhqQbjaXpYzjzX".to_string(),
+                kind: "token".to_string(),
+                description: None,
+                enabled: true,
+                triggered_at: None,
+                project: None,
+                package: None,
+            },
+            TokenEntry {
+                id: 3,
+                token: "s3cr3t".to_string(),
+                kind: "runservice".to_string(),
+                description: Some("nightly".to_string()),
+                enabled: false,
+                triggered_at: Some("2026-11-20T10:00:00Z".to_string()),
+                project: Some("home:scarabeus_iv".to_string()),
+                package: Some("geectl".to_string()),
+            },
+        ];
+        let (payload, text) = list_tokens_result(tokens);
+        assert_eq!(payload["tokens"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["tokens"][0]["id"], 12795);
+        assert_eq!(payload["tokens"][0]["token"], "ybtQ9GiEPCyhqQbjaXpYzjzX");
+        assert_eq!(payload["tokens"][1]["kind"], "runservice");
+        assert!(text.contains("12795"));
+        assert!(text.contains("ybtQ9GiEPCyhqQbjaXpYzjzX"));
+        assert!(text.contains("nightly"));
+        assert!(text.contains("home:scarabeus_iv"));
+        let (payload, text) = list_tokens_result(Vec::new());
+        assert_eq!(payload["tokens"].as_array().unwrap().len(), 0);
+        assert_eq!(text, "no tokens");
+    }
+
+    #[test]
+    fn delete_token_result_states_the_deletion_in_both_formats() {
+        let (payload, text) = delete_token_result(42, false, None);
+        assert_eq!(payload["id"], 42);
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(text, "token: 42\ndry_run: false\ndeleted token 42");
+        let (payload, text) = delete_token_result(
+            42,
+            true,
+            Some(vec!["[dry-run] would: delete token 42".to_string()]),
+        );
+        assert_eq!(payload["id"], 42);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(payload["plan"][0], "[dry-run] would: delete token 42");
+        assert_eq!(
+            text,
+            "token: 42\ndry_run: true\ndry-run: would delete token 42\n[dry-run] would: delete token 42"
         );
     }
 

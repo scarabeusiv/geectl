@@ -658,6 +658,29 @@ workflow\:"Run SCM/CI workflows\: the \`workflow\` trigger"))' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(list-tokens)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(delete-token)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':id -- The id of the token to delete:_default' \
+&& ret=0
+;;
 (delete-package)
 _arguments "${_arguments_options[@]}" : \
 '--message=[A message recorded on the delete, sent as the server'\''s \`comment\` query parameter]:MESSAGE:_default' \
@@ -1001,6 +1024,14 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (create-token)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list-tokens)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(delete-token)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -3958,6 +3989,14 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(list-tokens)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(delete-token)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (delete-package)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -6122,6 +6161,8 @@ _geectl__subcmd__help__subcmd__remote_commands() {
 'create-project:Create a project. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation' \
 'create-package:Create a package. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation. Without \`--scmsync\` and \`--force\` the package is created directly; with either, the creation goes through the options form, which refuses an existing package unless \`--force\` is set and refuses a project managed in git' \
 'create-token:Create an operation-scoped trigger token for the authenticated user. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation. The secret prints once, at creation\: store it now. Project and package go together\: give both to scope the token to a package, or neither for a global token' \
+'list-tokens:List the authenticated user'\''s operation-scoped tokens. A read, always live' \
+'delete-token:Delete one of the authenticated user'\''s operation-scoped tokens, by id. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion' \
 'delete-package:Delete a package. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. Without \`--force\` a package with open submit requests is refused' \
 'delete-link:Delete a \`_link\` file from a package. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. The package keeps its files and meta, but stops tracking the source' \
 'delete-file:Delete a file from a package. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. The general form of \`delete-link\`\: deleting \`_link\` here issues the same delete as \`delete-link\`. Deleting a file that is already gone is refused by the server (NotFound). The server records the delete with the fixed comment \`removed <file>\`; there is no \`--message\` option, unlike \`delete-package\` — the asymmetry is intentional' \
@@ -6198,6 +6239,11 @@ _geectl__subcmd__help__subcmd__remote__subcmd__delete-project_commands() {
     local commands; commands=()
     _describe -t commands 'geectl help remote delete-project commands' commands "$@"
 }
+(( $+functions[_geectl__subcmd__help__subcmd__remote__subcmd__delete-token_commands] )) ||
+_geectl__subcmd__help__subcmd__remote__subcmd__delete-token_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help remote delete-token commands' commands "$@"
+}
 (( $+functions[_geectl__subcmd__help__subcmd__remote__subcmd__devel-project_commands] )) ||
 _geectl__subcmd__help__subcmd__remote__subcmd__devel-project_commands() {
     local commands; commands=()
@@ -6242,6 +6288,11 @@ _geectl__subcmd__help__subcmd__remote__subcmd__list-scmsync-projects_commands() 
 _geectl__subcmd__help__subcmd__remote__subcmd__list-staging-projects_commands() {
     local commands; commands=()
     _describe -t commands 'geectl help remote list-staging-projects commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__help__subcmd__remote__subcmd__list-tokens_commands] )) ||
+_geectl__subcmd__help__subcmd__remote__subcmd__list-tokens_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help remote list-tokens commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help__subcmd__remote__subcmd__lock_commands] )) ||
 _geectl__subcmd__help__subcmd__remote__subcmd__lock_commands() {
@@ -7118,6 +7169,8 @@ _geectl__subcmd__remote_commands() {
 'create-project:Create a project. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation' \
 'create-package:Create a package. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation. Without \`--scmsync\` and \`--force\` the package is created directly; with either, the creation goes through the options form, which refuses an existing package unless \`--force\` is set and refuses a project managed in git' \
 'create-token:Create an operation-scoped trigger token for the authenticated user. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation. The secret prints once, at creation\: store it now. Project and package go together\: give both to scope the token to a package, or neither for a global token' \
+'list-tokens:List the authenticated user'\''s operation-scoped tokens. A read, always live' \
+'delete-token:Delete one of the authenticated user'\''s operation-scoped tokens, by id. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion' \
 'delete-package:Delete a package. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. Without \`--force\` a package with open submit requests is refused' \
 'delete-link:Delete a \`_link\` file from a package. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. The package keeps its files and meta, but stops tracking the source' \
 'delete-file:Delete a file from a package. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. The general form of \`delete-link\`\: deleting \`_link\` here issues the same delete as \`delete-link\`. Deleting a file that is already gone is refused by the server (NotFound). The server records the delete with the fixed comment \`removed <file>\`; there is no \`--message\` option, unlike \`delete-package\` — the asymmetry is intentional' \
@@ -7195,6 +7248,11 @@ _geectl__subcmd__remote__subcmd__delete-project_commands() {
     local commands; commands=()
     _describe -t commands 'geectl remote delete-project commands' commands "$@"
 }
+(( $+functions[_geectl__subcmd__remote__subcmd__delete-token_commands] )) ||
+_geectl__subcmd__remote__subcmd__delete-token_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl remote delete-token commands' commands "$@"
+}
 (( $+functions[_geectl__subcmd__remote__subcmd__devel-project_commands] )) ||
 _geectl__subcmd__remote__subcmd__devel-project_commands() {
     local commands; commands=()
@@ -7248,6 +7306,8 @@ _geectl__subcmd__remote__subcmd__help_commands() {
 'create-project:Create a project. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation' \
 'create-package:Create a package. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation. Without \`--scmsync\` and \`--force\` the package is created directly; with either, the creation goes through the options form, which refuses an existing package unless \`--force\` is set and refuses a project managed in git' \
 'create-token:Create an operation-scoped trigger token for the authenticated user. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation. The secret prints once, at creation\: store it now. Project and package go together\: give both to scope the token to a package, or neither for a global token' \
+'list-tokens:List the authenticated user'\''s operation-scoped tokens. A read, always live' \
+'delete-token:Delete one of the authenticated user'\''s operation-scoped tokens, by id. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion' \
 'delete-package:Delete a package. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. Without \`--force\` a package with open submit requests is refused' \
 'delete-link:Delete a \`_link\` file from a package. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. The package keeps its files and meta, but stops tracking the source' \
 'delete-file:Delete a file from a package. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. The general form of \`delete-link\`\: deleting \`_link\` here issues the same delete as \`delete-link\`. Deleting a file that is already gone is refused by the server (NotFound). The server records the delete with the fixed comment \`removed <file>\`; there is no \`--message\` option, unlike \`delete-package\` — the asymmetry is intentional' \
@@ -7325,6 +7385,11 @@ _geectl__subcmd__remote__subcmd__help__subcmd__delete-project_commands() {
     local commands; commands=()
     _describe -t commands 'geectl remote help delete-project commands' commands "$@"
 }
+(( $+functions[_geectl__subcmd__remote__subcmd__help__subcmd__delete-token_commands] )) ||
+_geectl__subcmd__remote__subcmd__help__subcmd__delete-token_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl remote help delete-token commands' commands "$@"
+}
 (( $+functions[_geectl__subcmd__remote__subcmd__help__subcmd__devel-project_commands] )) ||
 _geectl__subcmd__remote__subcmd__help__subcmd__devel-project_commands() {
     local commands; commands=()
@@ -7374,6 +7439,11 @@ _geectl__subcmd__remote__subcmd__help__subcmd__list-scmsync-projects_commands() 
 _geectl__subcmd__remote__subcmd__help__subcmd__list-staging-projects_commands() {
     local commands; commands=()
     _describe -t commands 'geectl remote help list-staging-projects commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__remote__subcmd__help__subcmd__list-tokens_commands] )) ||
+_geectl__subcmd__remote__subcmd__help__subcmd__list-tokens_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl remote help list-tokens commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__remote__subcmd__help__subcmd__lock_commands] )) ||
 _geectl__subcmd__remote__subcmd__help__subcmd__lock_commands() {
@@ -7539,6 +7609,11 @@ _geectl__subcmd__remote__subcmd__list-scmsync-projects_commands() {
 _geectl__subcmd__remote__subcmd__list-staging-projects_commands() {
     local commands; commands=()
     _describe -t commands 'geectl remote list-staging-projects commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__remote__subcmd__list-tokens_commands] )) ||
+_geectl__subcmd__remote__subcmd__list-tokens_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl remote list-tokens commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__remote__subcmd__lock_commands] )) ||
 _geectl__subcmd__remote__subcmd__lock_commands() {

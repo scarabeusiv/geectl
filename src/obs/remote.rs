@@ -54,6 +54,7 @@ use super::ScmsyncProjectList;
 use super::ServiceCode;
 use super::ServiceState;
 use super::SourceFile;
+use super::TokenEntry;
 use super::FACTORY_PROJECT;
 use crate::auth::Credentials;
 use crate::debug::strip_terminal_controls;
@@ -359,6 +360,55 @@ fn parse_created_token(body: &str) -> Result<(u64, String), GeectlError> {
         (Some(id), Some(token)) => Ok((id, token)),
         _ => Err(unexpected()),
     }
+}
+
+/// The tokens of `GET /person/<login>/token`: the `<entry>` items
+/// of the server's `<directory>`. An entry without an id, a
+/// non-numeric id, a missing secret or kind, or an `enabled` other
+/// than `true` or `false` is a server error, never a partial entry.
+/// An empty description or `triggered_at` reads as absent, like a
+/// missing attribute; the kind stays verbatim (see [`TokenEntry`]).
+fn parse_token_list(body: &str) -> Result<Vec<TokenEntry>, GeectlError> {
+    let unexpected = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS token list response".to_string(),
+        )
+    };
+    let mut tokens = Vec::new();
+    for element in xml_elements(body, "entry")? {
+        let (tag, _) = xml_split_element(element, "entry");
+        let attr = |name: &str| xml_attr(tag, name);
+        let id = attr("id")
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(unexpected)?;
+        let token = attr("string")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(unexpected)?;
+        let kind = attr("kind")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(unexpected)?;
+        let enabled = match attr("enabled").as_deref() {
+            Some("true") => true,
+            Some("false") => false,
+            _ => return Err(unexpected()),
+        };
+        // xml_attr already returns the unescaped value, so no
+        // second decode here: a decoded value that still holds
+        // entity-shaped text stays verbatim.
+        let optional = |name: &str| attr(name).filter(|value| !value.is_empty());
+        tokens.push(TokenEntry {
+            id,
+            token,
+            kind,
+            description: optional("description"),
+            enabled,
+            triggered_at: optional("triggered_at"),
+            project: optional("project"),
+            package: optional("package"),
+        });
+    }
+    Ok(tokens)
 }
 
 /// Extract the Version field from a spec file. Returns None if absent.
@@ -5453,6 +5503,68 @@ impl<'a> ObsClient<'a> {
         }))
     }
 
+    /// List the authenticated user's operation-scoped tokens
+    /// (`GET /person/<login>/token`). Requires Basic credentials:
+    /// an API token carries no username, and the tokens belong to
+    /// a login, so a Bearer <redacted> fails closed before any request.
+    /// The list carries each token's secret, like `osc token`.
+    pub fn list_tokens(&self) -> Result<Vec<TokenEntry>, GeectlError> {
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot list tokens without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        let Some(login) = self.credentials.username() else {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "listing tokens requires an OBS username — an API token carries no username (unset the OBS API key first, then set GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        };
+        let url = build_url(&self.base, &["person", login, "token"], &[]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_token_list(&body)
+    }
+
+    /// Delete one of the authenticated user's operation-scoped
+    /// tokens (`DELETE /person/<login>/token/<id>`). Requires Basic
+    /// credentials: an API token carries no username, and the token
+    /// belongs to a login, so a Bearer <redacted> fails closed before
+    /// any request. In dry-run the deletion is recorded in the plan
+    /// and nothing is deleted — the guard runs before the
+    /// credentials check, like `delete_package`.
+    pub fn delete_token(&self, id: u64, dry_run: &DryRun) -> Result<(), GeectlError> {
+        if !dry_run.allow(&format!("delete token {id}")) {
+            return Ok(());
+        }
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot delete a token without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        let Some(login) = self.credentials.username() else {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "deleting a token requires an OBS username — an API token carries no username (unset the OBS API key first, then set GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        };
+        let url = build_url(
+            &self.base,
+            &["person", login, "token", &id.to_string()],
+            &[],
+        );
+        let body = self.http.delete(&url, &self.credentials)?;
+        if parse_status_ok(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS delete-token response for token {id}"),
+            ))
+        }
+    }
+
     /// Create package `package` in project `project` on OBS (`PUT
     /// /source/<project>/<package>/_meta`) with the given title and
     /// description, optionally wiring it to a git repository through
@@ -7917,6 +8029,141 @@ mod tests {
         assert!(!debug.contains("tok-fake-179"));
         assert!(debug.contains("[redacted]"));
         assert!(debug.contains("CreatedToken"));
+    }
+
+    #[test]
+    fn list_tokens_parses_the_live_shape() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/person/scarabeus_iv/token",
+            "<directory count=\"2\">\n  <entry id=\"12795\" string=\"ybtQ9GiEPCyhqQbjaXpYzjzX\" kind=\"token\" description=\"\" enabled=\"true\" triggered_at=\"\"/>\n  <entry id=\"3\" string=\"s3cr3t\" kind=\"runservice\" description=\"nightly\" enabled=\"false\" triggered_at=\"2026-11-20T10:00:00Z\" project=\"home:scarabeus_iv\" package=\"geectl\"/>\n</directory>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let tokens = client.list_tokens().unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                TokenEntry {
+                    id: 12795,
+                    token: "ybtQ9GiEPCyhqQbjaXpYzjzX".to_string(),
+                    kind: "token".to_string(),
+                    description: None,
+                    enabled: true,
+                    triggered_at: None,
+                    project: None,
+                    package: None,
+                },
+                TokenEntry {
+                    id: 3,
+                    token: "s3cr3t".to_string(),
+                    kind: "runservice".to_string(),
+                    description: Some("nightly".to_string()),
+                    enabled: false,
+                    triggered_at: Some("2026-11-20T10:00:00Z".to_string()),
+                    project: Some("home:scarabeus_iv".to_string()),
+                    package: Some("geectl".to_string()),
+                },
+            ]
+        );
+        assert_eq!(http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn list_tokens_decodes_an_entity_encoded_description_once() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/person/scarabeus_iv/token",
+            "<directory count=\"1\"><entry id=\"1\" string=\"s3cr3t\" kind=\"runservice\" description=\"a&amp;amp;b\" enabled=\"true\" triggered_at=\"\"/></directory>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let tokens = client.list_tokens().unwrap();
+        assert_eq!(tokens.len(), 1);
+        // The wire value decodes once to `a&amp;b`; a second decode
+        // would corrupt it to `a&b`.
+        assert_eq!(tokens[0].description, Some("a&amp;b".to_string()));
+    }
+
+    #[test]
+    fn list_tokens_empty_directory_is_an_empty_list() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/person/scarabeus_iv/token",
+            "<directory count=\"0\">\n</directory>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(client.list_tokens().unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn list_tokens_with_non_numeric_id_is_error() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/person/scarabeus_iv/token",
+            "<directory count=\"1\"><entry id=\"nope\" string=\"s3cr3t\" kind=\"runservice\" description=\"\" enabled=\"true\" triggered_at=\"\"/></directory>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client.list_tokens().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn list_tokens_with_other_enabled_is_error() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/person/scarabeus_iv/token",
+            "<directory count=\"1\"><entry id=\"1\" string=\"s3cr3t\" kind=\"runservice\" description=\"\" enabled=\"yes\" triggered_at=\"\"/></directory>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client.list_tokens().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn list_tokens_without_credentials_fails_closed() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let err = client.list_tokens().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_token_deletes_live_and_dry_run_deletes_nothing() {
+        let http = FakeHttp::new().with_delete(
+            "https://api.opensuse.org/person/scarabeus_iv/token/12795",
+            "<status code=\"ok\"><summary>Ok</summary></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        client.delete_token(12795, &DryRun::new(false)).unwrap();
+        assert_eq!(http.delete_calls().len(), 1);
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        client.delete_token(12795, &DryRun::new(true)).unwrap();
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_token_with_non_ok_status_is_error() {
+        let http = FakeHttp::new().with_delete(
+            "https://api.opensuse.org/person/scarabeus_iv/token/12795",
+            "<status code=\"not_found\"><summary>Not found</summary></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client.delete_token(12795, &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn token_entry_debug_redacts_the_secret() {
+        let entry = TokenEntry {
+            id: 1,
+            token: "tok-fake-179".to_string(),
+            kind: "runservice".to_string(),
+            description: None,
+            enabled: true,
+            triggered_at: None,
+            project: None,
+            package: None,
+        };
+        let debug = format!("{entry:?}");
+        assert!(!debug.contains("tok-fake-179"));
+        assert!(debug.contains("[redacted]"));
+        assert!(debug.contains("TokenEntry"));
     }
 
     #[test]

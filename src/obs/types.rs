@@ -1153,6 +1153,49 @@ impl std::fmt::Debug for CreatedToken {
     }
 }
 
+/// One token of the authenticated user, as listed by
+/// [`ObsClient::list_tokens`]: the server's `<entry>` of
+/// `GET /person/<login>/token`. The kind is the server's `kind`
+/// verbatim — it is not always one of the four operations (an
+/// older token lists as `token`), so it is not parsed into
+/// [`TokenOperation`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct TokenEntry {
+    /// The token's id, for deleting it.
+    pub id: u64,
+    /// The token secret, as the server lists it.
+    pub token: String,
+    /// The kind of token, as the server lists it.
+    pub kind: String,
+    /// The description identifying the token, if any.
+    pub description: Option<String>,
+    /// Whether the token is enabled.
+    pub enabled: bool,
+    /// When the token last triggered, if ever.
+    pub triggered_at: Option<String>,
+    /// The project of the package the token is scoped to, if any.
+    pub project: Option<String>,
+    /// The package the token is scoped to, if any.
+    pub package: Option<String>,
+}
+
+impl std::fmt::Debug for TokenEntry {
+    /// The secret is never shown in debug output: the list result
+    /// prints it, and a `{entry:?}` anywhere else must not leak it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenEntry")
+            .field("id", &self.id)
+            .field("token", &"[redacted]")
+            .field("kind", &self.kind)
+            .field("description", &self.description)
+            .field("enabled", &self.enabled)
+            .field("triggered_at", &self.triggered_at)
+            .field("project", &self.project)
+            .field("package", &self.package)
+            .finish()
+    }
+}
+
 /// The status filter for [`ObsClient::wipe_binaries`]: wipe only
 /// the binaries of packages in this build state. The server's
 /// `code` parameter.

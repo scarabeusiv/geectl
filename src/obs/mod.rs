@@ -291,6 +291,7 @@ pub use self::types::ScmsyncProjectList;
 pub use self::types::ServiceCode;
 pub use self::types::ServiceState;
 pub use self::types::SourceFile;
+pub use self::types::TokenEntry;
 pub use self::types::TokenOperation;
 pub use self::types::WipeBinariesOptions;
 pub use self::types::WipeCode;

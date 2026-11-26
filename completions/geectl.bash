@@ -796,6 +796,9 @@ _geectl() {
             geectl__subcmd__help__subcmd__remote,delete-project)
                 cmd="geectl__subcmd__help__subcmd__remote__subcmd__delete__subcmd__project"
                 ;;
+            geectl__subcmd__help__subcmd__remote,delete-token)
+                cmd="geectl__subcmd__help__subcmd__remote__subcmd__delete__subcmd__token"
+                ;;
             geectl__subcmd__help__subcmd__remote,devel-project)
                 cmd="geectl__subcmd__help__subcmd__remote__subcmd__devel__subcmd__project"
                 ;;
@@ -822,6 +825,9 @@ _geectl() {
                 ;;
             geectl__subcmd__help__subcmd__remote,list-staging-projects)
                 cmd="geectl__subcmd__help__subcmd__remote__subcmd__list__subcmd__staging__subcmd__projects"
+                ;;
+            geectl__subcmd__help__subcmd__remote,list-tokens)
+                cmd="geectl__subcmd__help__subcmd__remote__subcmd__list__subcmd__tokens"
                 ;;
             geectl__subcmd__help__subcmd__remote,lock)
                 cmd="geectl__subcmd__help__subcmd__remote__subcmd__lock"
@@ -1249,6 +1255,9 @@ _geectl() {
             geectl__subcmd__remote,delete-project)
                 cmd="geectl__subcmd__remote__subcmd__delete__subcmd__project"
                 ;;
+            geectl__subcmd__remote,delete-token)
+                cmd="geectl__subcmd__remote__subcmd__delete__subcmd__token"
+                ;;
             geectl__subcmd__remote,devel-project)
                 cmd="geectl__subcmd__remote__subcmd__devel__subcmd__project"
                 ;;
@@ -1278,6 +1287,9 @@ _geectl() {
                 ;;
             geectl__subcmd__remote,list-staging-projects)
                 cmd="geectl__subcmd__remote__subcmd__list__subcmd__staging__subcmd__projects"
+                ;;
+            geectl__subcmd__remote,list-tokens)
+                cmd="geectl__subcmd__remote__subcmd__list__subcmd__tokens"
                 ;;
             geectl__subcmd__remote,lock)
                 cmd="geectl__subcmd__remote__subcmd__lock"
@@ -1396,6 +1408,9 @@ _geectl() {
             geectl__subcmd__remote__subcmd__help,delete-project)
                 cmd="geectl__subcmd__remote__subcmd__help__subcmd__delete__subcmd__project"
                 ;;
+            geectl__subcmd__remote__subcmd__help,delete-token)
+                cmd="geectl__subcmd__remote__subcmd__help__subcmd__delete__subcmd__token"
+                ;;
             geectl__subcmd__remote__subcmd__help,devel-project)
                 cmd="geectl__subcmd__remote__subcmd__help__subcmd__devel__subcmd__project"
                 ;;
@@ -1425,6 +1440,9 @@ _geectl() {
                 ;;
             geectl__subcmd__remote__subcmd__help,list-staging-projects)
                 cmd="geectl__subcmd__remote__subcmd__help__subcmd__list__subcmd__staging__subcmd__projects"
+                ;;
+            geectl__subcmd__remote__subcmd__help,list-tokens)
+                cmd="geectl__subcmd__remote__subcmd__help__subcmd__list__subcmd__tokens"
                 ;;
             geectl__subcmd__remote__subcmd__help,lock)
                 cmd="geectl__subcmd__remote__subcmd__help__subcmd__lock"
@@ -5716,7 +5734,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__help__subcmd__remote)
-            opts="cat download list-files list-packages list-projects list-staging-projects staging-project package-log revision-patch project-meta set-project-meta package-meta set-package-meta update-package-meta-from-spec search-packages search-projects search-projects-by-person search-packages-by-person count-scmsync-projects list-scmsync-projects owners owners-for-binary owners-for-package maintainers whois link-target project-diff diff-packages devel-project repo-add repo-remove upload-file create-project create-package create-token delete-package delete-link delete-file delete-project undelete-package undelete-project aggregate-package release-package release-project lock unlock add-channels add-containers"
+            opts="cat download list-files list-packages list-projects list-staging-projects staging-project package-log revision-patch project-meta set-project-meta package-meta set-package-meta update-package-meta-from-spec search-packages search-projects search-projects-by-person search-packages-by-person count-scmsync-projects list-scmsync-projects owners owners-for-binary owners-for-package maintainers whois link-target project-diff diff-packages devel-project repo-add repo-remove upload-file create-project create-package create-token list-tokens delete-token delete-package delete-link delete-file delete-project undelete-package undelete-project aggregate-package release-package release-project lock unlock add-channels add-containers"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5897,6 +5915,20 @@ _geectl() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        geectl__subcmd__help__subcmd__remote__subcmd__delete__subcmd__token)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         geectl__subcmd__help__subcmd__remote__subcmd__devel__subcmd__project)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
@@ -6010,6 +6042,20 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__help__subcmd__remote__subcmd__list__subcmd__staging__subcmd__projects)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__help__subcmd__remote__subcmd__list__subcmd__tokens)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -8688,7 +8734,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__remote)
-            opts="-h --format --debug --debug-body --live --instance --help cat download list-files list-packages list-projects list-staging-projects staging-project package-log revision-patch project-meta set-project-meta package-meta set-package-meta update-package-meta-from-spec search-packages search-projects search-projects-by-person search-packages-by-person count-scmsync-projects list-scmsync-projects owners owners-for-binary owners-for-package maintainers whois link-target project-diff diff-packages devel-project repo-add repo-remove upload-file create-project create-package create-token delete-package delete-link delete-file delete-project undelete-package undelete-project aggregate-package release-package release-project lock unlock add-channels add-containers help"
+            opts="-h --format --debug --debug-body --live --instance --help cat download list-files list-packages list-projects list-staging-projects staging-project package-log revision-patch project-meta set-project-meta package-meta set-package-meta update-package-meta-from-spec search-packages search-projects search-projects-by-person search-packages-by-person count-scmsync-projects list-scmsync-projects owners owners-for-binary owners-for-package maintainers whois link-target project-diff diff-packages devel-project repo-add repo-remove upload-file create-project create-package create-token list-tokens delete-token delete-package delete-link delete-file delete-project undelete-package undelete-project aggregate-package release-package release-project lock unlock add-channels add-containers help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -9029,6 +9075,28 @@ _geectl() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        geectl__subcmd__remote__subcmd__delete__subcmd__token)
+            opts="-h --format --debug --debug-body --live --instance --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -W "json text" -- "${cur}"))
+                    return 0
+                    ;;
+                --instance)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         geectl__subcmd__remote__subcmd__devel__subcmd__project)
             opts="-h --target-project --format --debug --debug-body --live --instance --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -9108,7 +9176,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__remote__subcmd__help)
-            opts="cat download list-files list-packages list-projects list-staging-projects staging-project package-log revision-patch project-meta set-project-meta package-meta set-package-meta update-package-meta-from-spec search-packages search-projects search-projects-by-person search-packages-by-person count-scmsync-projects list-scmsync-projects owners owners-for-binary owners-for-package maintainers whois link-target project-diff diff-packages devel-project repo-add repo-remove upload-file create-project create-package create-token delete-package delete-link delete-file delete-project undelete-package undelete-project aggregate-package release-package release-project lock unlock add-channels add-containers help"
+            opts="cat download list-files list-packages list-projects list-staging-projects staging-project package-log revision-patch project-meta set-project-meta package-meta set-package-meta update-package-meta-from-spec search-packages search-projects search-projects-by-person search-packages-by-person count-scmsync-projects list-scmsync-projects owners owners-for-binary owners-for-package maintainers whois link-target project-diff diff-packages devel-project repo-add repo-remove upload-file create-project create-package create-token list-tokens delete-token delete-package delete-link delete-file delete-project undelete-package undelete-project aggregate-package release-package release-project lock unlock add-channels add-containers help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -9289,6 +9357,20 @@ _geectl() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        geectl__subcmd__remote__subcmd__help__subcmd__delete__subcmd__token)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         geectl__subcmd__remote__subcmd__help__subcmd__devel__subcmd__project)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
@@ -9416,6 +9498,20 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__remote__subcmd__help__subcmd__list__subcmd__staging__subcmd__projects)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__remote__subcmd__help__subcmd__list__subcmd__tokens)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -9931,6 +10027,28 @@ _geectl() {
             ;;
         geectl__subcmd__remote__subcmd__list__subcmd__staging__subcmd__projects)
             opts="-h --no-requests --no-status --format --debug --debug-body --live --instance --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -W "json text" -- "${cur}"))
+                    return 0
+                    ;;
+                --instance)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__remote__subcmd__list__subcmd__tokens)
+            opts="-h --format --debug --debug-body --live --instance --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

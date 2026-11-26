@@ -1,0 +1,18 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-delete-token 1  "geectl-remote-delete-token 0.2.3" 
+.SH NAME
+geectl\-remote\-delete\-token \- Delete one of the authenticated user\*(Aqs operation\-scoped tokens, by id. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the deletion
+.SH SYNOPSIS
+\fBgeectl remote delete\-token\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIID\fR> 
+.SH DESCRIPTION
+Delete one of the authenticated user\*(Aqs operation\-scoped tokens, by id. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the deletion
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIID\fR>
+The id of the token to delete
+.SH VERSION
+v0.2.3
