@@ -10571,6 +10571,37 @@ fn changelog_generate_message_hotfix_carries_only_the_message() {
 }
 
 #[test]
+fn changelog_identity_instance_flag_resolves_the_author_on_the_flagged_instance() {
+    // #440 P2: `changelog identity` built the OBS client from the
+    // default endpoint even with `--instance X`, so the author
+    // resolved on the default instance. The fixture is the flagged
+    // instance only and no plain credentials are set, so success
+    // proves the author came from the flagged instance's whois.
+    let addr = serve_routes(&[("/person/Admin", ADMIN_PERSON_BODY)]);
+    let dir = TempDir::new();
+    let pkg = dir.0.join("pkg");
+    fs::create_dir_all(&pkg).unwrap();
+    write_instances_config(&dir, &format!("[instances]\nexample = \"http://{addr}\"\n"));
+    let out = geectl_isolated(&dir)
+        .current_dir(&pkg)
+        .args(["--instance", "example", "changelog", "identity", "."])
+        .env("GEECTL_OBS_USERNAME_EXAMPLE", "Admin")
+        .env("GEECTL_OBS_PASSWORD_EXAMPLE", "secret")
+        .env_remove("VC_REALNAME")
+        .env_remove("VC_MAILADDR")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["author"], "Admin User <admin@example.com>");
+}
+
+#[test]
 fn changelog_generate_message_hotfix_skips_news() {
     // The hotfix shape with upstream NEWS: the version is
     // unchanged, so no NEWS is extracted — no highlights slot, no

@@ -1,0 +1,18 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-changelog-identity 1  "geectl-changelog-identity 0.2.3" 
+.SH NAME
+geectl\-changelog\-identity \- Print the resolved `.changes` entry author in `Name <email>` form — the same value a bare `changelog generate` would write. The author resolves through the identity chain (#405): config `[identity]`, then `VC_REALNAME` / `VC_MAILADDR`, then the OBS account, then git identity; the command refuses when none yields an identity
+.SH SYNOPSIS
+\fBgeectl changelog identity\fR [\fB\-h\fR|\fB\-\-help\fR] [\fIDIR\fR] 
+.SH DESCRIPTION
+Print the resolved `.changes` entry author in `Name <email>` form — the same value a bare `changelog generate` would write. The author resolves through the identity chain (#405): config `[identity]`, then `VC_REALNAME` / `VC_MAILADDR`, then the OBS account, then git identity; the command refuses when none yields an identity
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+[\fIDIR\fR] [default: .]
+The package directory (default: the current directory). The git level reads identity from here
+.SH VERSION
+v0.2.3

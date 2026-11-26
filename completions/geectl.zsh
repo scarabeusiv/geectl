@@ -3503,6 +3503,18 @@ _arguments "${_arguments_options[@]}" : \
 '::dir -- The package directory (default\: the current directory):_files' \
 && ret=0
 ;;
+(identity)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'::dir -- The package directory (default\: the current directory). The git level reads identity from here:_files' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_geectl__subcmd__changelog__subcmd__help_commands" \
@@ -3520,6 +3532,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (generate)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(identity)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -4578,6 +4594,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(identity)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -5120,6 +5140,7 @@ _geectl__subcmd__changelog_commands() {
     local commands; commands=(
 'validate:Validate the \`.changes\` entries in a package directory against the V1–V12 rules. Local-only by default; with \`--target-project\`/\`--target-package\` the target-relative rules (V2, V4, V5 newest-vs-target, V11 older entries) run against the target'\''s current files. Exits non-zero naming the failing rule' \
 'generate:Generate a skeleton \`.changes\` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball. The output is a draft\: what the diff cannot supply arrives as explicit \`TODO\` slots for a human to fill. \`--write\` prepends the draft into the package'\''s \`.changes\` file, and refuses an incomplete draft (V9 needs-detail)' \
+'identity:Print the resolved \`.changes\` entry author in \`Name <email>\` form — the same value a bare \`changelog generate\` would write. The author resolves through the identity chain (#405)\: config \`\[identity\]\`, then \`VC_REALNAME\` / \`VC_MAILADDR\`, then the OBS account, then git identity; the command refuses when none yields an identity' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl changelog commands' commands "$@"
@@ -5134,6 +5155,7 @@ _geectl__subcmd__changelog__subcmd__help_commands() {
     local commands; commands=(
 'validate:Validate the \`.changes\` entries in a package directory against the V1–V12 rules. Local-only by default; with \`--target-project\`/\`--target-package\` the target-relative rules (V2, V4, V5 newest-vs-target, V11 older entries) run against the target'\''s current files. Exits non-zero naming the failing rule' \
 'generate:Generate a skeleton \`.changes\` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball. The output is a draft\: what the diff cannot supply arrives as explicit \`TODO\` slots for a human to fill. \`--write\` prepends the draft into the package'\''s \`.changes\` file, and refuses an incomplete draft (V9 needs-detail)' \
+'identity:Print the resolved \`.changes\` entry author in \`Name <email>\` form — the same value a bare \`changelog generate\` would write. The author resolves through the identity chain (#405)\: config \`\[identity\]\`, then \`VC_REALNAME\` / \`VC_MAILADDR\`, then the OBS account, then git identity; the command refuses when none yields an identity' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl changelog help commands' commands "$@"
@@ -5148,10 +5170,20 @@ _geectl__subcmd__changelog__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'geectl changelog help help commands' commands "$@"
 }
+(( $+functions[_geectl__subcmd__changelog__subcmd__help__subcmd__identity_commands] )) ||
+_geectl__subcmd__changelog__subcmd__help__subcmd__identity_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl changelog help identity commands' commands "$@"
+}
 (( $+functions[_geectl__subcmd__changelog__subcmd__help__subcmd__validate_commands] )) ||
 _geectl__subcmd__changelog__subcmd__help__subcmd__validate_commands() {
     local commands; commands=()
     _describe -t commands 'geectl changelog help validate commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__changelog__subcmd__identity_commands] )) ||
+_geectl__subcmd__changelog__subcmd__identity_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl changelog identity commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__changelog__subcmd__validate_commands] )) ||
 _geectl__subcmd__changelog__subcmd__validate_commands() {
@@ -5660,6 +5692,7 @@ _geectl__subcmd__help__subcmd__changelog_commands() {
     local commands; commands=(
 'validate:Validate the \`.changes\` entries in a package directory against the V1–V12 rules. Local-only by default; with \`--target-project\`/\`--target-package\` the target-relative rules (V2, V4, V5 newest-vs-target, V11 older entries) run against the target'\''s current files. Exits non-zero naming the failing rule' \
 'generate:Generate a skeleton \`.changes\` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball. The output is a draft\: what the diff cannot supply arrives as explicit \`TODO\` slots for a human to fill. \`--write\` prepends the draft into the package'\''s \`.changes\` file, and refuses an incomplete draft (V9 needs-detail)' \
+'identity:Print the resolved \`.changes\` entry author in \`Name <email>\` form — the same value a bare \`changelog generate\` would write. The author resolves through the identity chain (#405)\: config \`\[identity\]\`, then \`VC_REALNAME\` / \`VC_MAILADDR\`, then the OBS account, then git identity; the command refuses when none yields an identity' \
     )
     _describe -t commands 'geectl help changelog commands' commands "$@"
 }
@@ -5667,6 +5700,11 @@ _geectl__subcmd__help__subcmd__changelog_commands() {
 _geectl__subcmd__help__subcmd__changelog__subcmd__generate_commands() {
     local commands; commands=()
     _describe -t commands 'geectl help changelog generate commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__help__subcmd__changelog__subcmd__identity_commands] )) ||
+_geectl__subcmd__help__subcmd__changelog__subcmd__identity_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help changelog identity commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help__subcmd__changelog__subcmd__validate_commands] )) ||
 _geectl__subcmd__help__subcmd__changelog__subcmd__validate_commands() {

@@ -1,6 +1,6 @@
 # `changelog` — `.changes` validation and generation
 
-`changelog validate` and `changelog generate` work on a package directory on disk,
+`changelog validate`, `changelog generate` and `changelog identity` work on a package directory on disk,
 before filing, and file nothing. `commit` runs the changelog gate on the
 staged `.changes` entries, before anything is filed.
 
@@ -9,10 +9,11 @@ staged `.changes` entries, before anything is filed.
 ```sh
 geectl changelog validate <dir> [--target-project P --target-package PKG] [--entries N]
 geectl changelog generate <dir> [--target-project P --target-package PKG] [--author 'Name <email>'] [--write]
+geectl changelog identity [<dir>]
 ```
 
 `dir` defaults to `.`. The target flags pass as a pair.
-`--author` is required for `generate` (geectl reads the identity from the flag only). `changelog` accepts `--live` and runs locally regardless; `--write` is the explicit local-write flag.
+`--author` wins over the identity chain for `generate`; without it the author resolves from the config `[identity]` section, then `VC_REALNAME`/`VC_MAILADDR`, then the OBS account, then git identity, refusing when none yields an identity. `identity` prints that resolved author. `changelog` accepts `--live` and runs locally regardless; `--write` is the explicit local-write flag.
 
 ## Rules (V1–V12)
 

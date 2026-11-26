@@ -140,7 +140,7 @@ directory's `.env` only.
 - `geectl pull-request` — Read and act on pull requests: OBS submit requests and Gitea pull requests as one surface.
 - `geectl person` — Search for a person: the OBS projects naming the login and the Gitea users matching the keyword, as one operation.
 - `geectl meta` — Set the meta of an OBS project, an OBS package, or a Gitea repository as one operation: the target selects the backend.
-- `geectl changelog` — Validate and generate `.changes` entries in a package directory, pre-file.
+- `geectl changelog` — Validate and generate `.changes` entries in a package directory, pre-file, and print the resolved entry author.
 - `geectl prjconf` — Read, validate and clean a project's prjconf.
 - `geectl version` — Print version information as the result payload.
 - `geectl config` — Inspect or initialise the config file.
@@ -348,6 +348,7 @@ without evaluating trust.
 
 - `geectl changelog validate [DIR]` — Validate the `.changes` entries in a package directory against the V1–V12 rules; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --entries <ENTRIES>
 - `geectl changelog generate [DIR]` — Generate a skeleton `.changes` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball; the author resolves from the config `[identity]` section, then `VC_REALNAME`/`VC_MAILADDR`, then the OBS account, then git, and the command refuses when none yields an identity; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --author <AUTHOR>, --message <MESSAGE>, --write
+- `geectl changelog identity [DIR]` — Print the resolved `.changes` entry author in `Name <email>` form, the same value a bare `changelog generate` would write; refuses when no level of the identity chain yields an identity
 
 ## Working copy — git working copy
 

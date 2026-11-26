@@ -105,6 +105,18 @@ pub enum ChangelogCommand {
         #[arg(long)]
         write: bool,
     },
+    /// Print the resolved `.changes` entry author in `Name <email>`
+    /// form — the same value a bare `changelog generate` would
+    /// write. The author resolves through the identity chain
+    /// (#405): config `[identity]`, then `VC_REALNAME` /
+    /// `VC_MAILADDR`, then the OBS account, then git identity; the
+    /// command refuses when none yields an identity.
+    Identity {
+        /// The package directory (default: the current directory).
+        /// The git level reads identity from here.
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
 }
 
 pub fn run_changelog(
@@ -160,6 +172,7 @@ pub fn run_changelog(
                 instance,
             )
         }
+        ChangelogCommand::Identity { dir } => run_identity(&dir, debug, instance),
     }
 }
 
@@ -578,6 +591,41 @@ fn refuse_symlink_destination(path: &Path) -> Result<(), GeectlError> {
         ));
     }
     Ok(())
+}
+
+/// Print the resolved `.changes` entry author: the same value a
+/// bare `changelog generate` writes, from the same identity chain
+/// (#405). The text is the author line itself, so a caller can
+/// capture it directly; the payload carries the author and the
+/// directory the git level read from.
+fn run_identity(
+    dir: &Path,
+    debug: &Debug,
+    instance: Option<&str>,
+) -> Result<(Value, String), GeectlError> {
+    identity_output(
+        &crate::config::load_config()?,
+        &crate::auth::snapshot_env(&[VC_REALNAME_VAR, VC_MAILADDR_VAR])?,
+        dir,
+        || obs_identity(debug, instance),
+    )
+}
+
+/// The identity leaf with its inputs injected: the resolution order
+/// is `resolve_changelog_identity`'s, the leaf only shapes the
+/// output.
+fn identity_output(
+    config: &Config,
+    env: &HashMap<String, String>,
+    dir: &Path,
+    obs_lookup: impl FnOnce() -> Result<Option<Identity>, GeectlError>,
+) -> Result<(Value, String), GeectlError> {
+    let author = resolve_changelog_identity(config, env, dir, obs_lookup)?;
+    let payload = json!({
+        "dir": dir.display().to_string(),
+        "author": author,
+    });
+    Ok((payload, author))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1008,7 +1056,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("foo-2.0.tar.gz"), b"not a tarball at all").unwrap();
         let (debug, lines) = Debug::captured(true, false);
-        let err = run_validate(dir.path(), None, None, 1, &debug)
+        let err = run_validate(dir.path(), None, None, 1, &debug, None)
             .expect_err("a bare update is a V9 finding");
         assert!(err.context.contains("finding(s)"), "{}", err.context);
         let lines = lines.lock().unwrap();
@@ -1017,6 +1065,61 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("upstream NEWS lookup failed")),
             "debug lines: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn identity_prints_the_config_author() {
+        let dir = tempfile::tempdir().unwrap();
+        let (payload, text) =
+            identity_output(&identity_config(), &env_identity(), dir.path(), || {
+                Ok(Some(obs_identity()))
+            })
+            .unwrap();
+        assert_eq!(text, "Config Author <config@example.com>");
+        assert_eq!(payload["author"], "Config Author <config@example.com>");
+        assert_eq!(payload["dir"], dir.path().display().to_string());
+    }
+
+    #[test]
+    fn identity_env_wins_when_config_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (payload, text) =
+            identity_output(&Config::default(), &env_identity(), dir.path(), || {
+                Ok(Some(obs_identity()))
+            })
+            .unwrap();
+        assert_eq!(text, "Env Author <env@example.com>");
+        assert_eq!(payload["author"], "Env Author <env@example.com>");
+    }
+
+    #[test]
+    fn identity_obs_used_when_config_and_env_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, text) = identity_output(&Config::default(), &HashMap::new(), dir.path(), || {
+            Ok(Some(obs_identity()))
+        })
+        .unwrap();
+        assert_eq!(text, "Obs Author <obs@example.com>");
+    }
+
+    #[test]
+    fn identity_refuses_when_nothing_found() {
+        // A missing dir makes the git level read as no identity
+        // without touching the developer's global git config, so
+        // the refusal is deterministic in any checkout.
+        let err = identity_output(
+            &Config::default(),
+            &HashMap::new(),
+            Path::new("/definitely/not/a/real/dir"),
+            || Ok(None),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains("no changelog identity"),
+            "{}",
+            err.context
         );
     }
 }
