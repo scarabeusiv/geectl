@@ -4978,10 +4978,12 @@ impl BuildContainer {
     /// stale log from a reused host root. The RPMs are copied only
     /// on a zero engine exit (a failed build writes none), and only
     /// the files the engine actually wrote — found through the
-    /// `.build.packages` link, so the topdir layout stays the
-    /// engine's business. A missing packages dir means no RPMs:
-    /// the record judges the build failed from the log, not from
-    /// the sync.
+    /// `.build.packages` link (`find -H` follows the link: it is a
+    /// symlink to the topdir, and a plain `find` never descends
+    /// into a symlinked starting point), so the topdir layout
+    /// stays the engine's business. A missing packages dir means
+    /// no RPMs: the record judges the build failed from the log,
+    /// not from the sync.
     fn sync_out(
         &self,
         engine_root: &Path,
@@ -5001,6 +5003,7 @@ impl BuildContainer {
         let output = self.exec(
             &[
                 "find".to_string(),
+                "-H".to_string(),
                 packages.to_string_lossy().to_string(),
                 "-name".to_string(),
                 "*.rpm".to_string(),
@@ -10421,8 +10424,13 @@ if [ "$1" = "exec" ]; then
     if [ -n "$shell_cmd" ]; then echo "shell output: $shell_cmd"; echo "shell error: $shell_cmd" >&2; exit {shell_exit}; fi
     if [ -n "$spec" ]; then
       pkg=$(basename "$spec" .spec)
-      mkdir -p "$root/.build.packages/RPMS"
-      touch "$root/.build.packages/RPMS/$pkg-1.0-1.{arch}.rpm"
+      # The real engine links `.build.packages` to the topdir
+      # (it is a symlink, not a directory): the sync finds the
+      # RPMs through the link, so the stub must too.
+      mkdir -p "$root/topdir/RPMS"
+      touch "$root/topdir/RPMS/$pkg-1.0-1.{arch}.rpm"
+      rm -f "$root/.build.packages"
+      ln -s topdir "$root/.build.packages"
       # A completed init leaves these behind: the image gate reads them.
       mkdir -p "$root/installed-pkg" "$root/.build"
       touch "$root/.build/init_buildsystem.data"
