@@ -2474,6 +2474,9 @@ impl<'a> LocalBuild<'a> {
     }
 
     /// The digest of the local image, or None when it is not pulled.
+    /// A failed inspect errors unless podman says the image is not
+    /// known: any other failure may mean the image exists and the
+    /// engine cannot say so, so callers must not treat it as absent.
     fn podman_digest(&self, podman: &Path) -> Result<Option<String>, GeectlError> {
         let mut cmd = Command::new(podman);
         cmd.args(["image", "inspect", "--format", "{{.Digest}}", DEFAULT_IMAGE]);
@@ -2485,7 +2488,30 @@ impl<'a> LocalBuild<'a> {
                 )
             })?;
         if !output.status.success() {
-            return Ok(None);
+            // A failed inspect is "absent" only when podman says
+            // the image is not known: `Error: <ref>: image not
+            // known` (podman 4.x) or `Error: no such image: <ref>`
+            // (older). Any other failure — a storage or permission
+            // error while the image exists — is a query failure,
+            // not absence: reporting None would let the eviction
+            // plan `rmi` the image in use. The stderr is bounded
+            // in the error; an empty stderr is a failure too.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let lower = stderr.to_lowercase();
+            if lower.contains("image not known") || lower.contains("no such image") {
+                return Ok(None);
+            }
+            let detail: String = stderr.chars().take(500).collect();
+            let detail = detail.trim();
+            let detail = if detail.is_empty() {
+                "no diagnostic on stderr"
+            } else {
+                detail
+            };
+            return Err(GeectlError::new(
+                ErrorKind::ImageUnavailable,
+                format!("podman image inspect {DEFAULT_IMAGE} failed: {detail}"),
+            ));
         }
         let digest = String::from_utf8_lossy(&output.stdout).trim().to_string();
         // Podman prints `<none>` when the image has no digest: that
@@ -5693,12 +5719,17 @@ impl<'a> LocalBuild<'a> {
         locked
     }
 
-    /// The current image digest from the sidecar's refresh record,
-    /// via podman. None when no image is recorded or podman will
-    /// not answer.
-    fn current_image_digest(&self) -> Option<String> {
-        let podman = which(&self.podman)?;
-        self.podman_digest(&podman).ok().flatten()
+    /// The digest of the image the vertical currently runs, if
+    /// there is one. `Ok(None)` is "absent": podman is not on
+    /// PATH (so no image can be current), or the image has no
+    /// digest. `Err` is a query failure — the digest could not
+    /// be read — and callers must not treat it as absent: an
+    /// image whose currency is unknown is never deleted.
+    fn current_image_digest(&self) -> Result<Option<String>, GeectlError> {
+        let Some(podman) = which(&self.podman) else {
+            return Ok(None);
+        };
+        self.podman_digest(&podman)
     }
 
     /// Plan the eviction: when usage is above the cap, select which
@@ -5962,12 +5993,55 @@ impl<'a> LocalBuild<'a> {
     /// root lock is held across its delete the same way, and every
     /// pkg file's project-repo-arch lock is taken non-blocking
     /// before its delete (a file being downloaded is skipped, not
-    /// deleted under the download).
+    /// deleted under the download). Every image's protections are
+    /// re-read before its `rmi`: a digest that became the most
+    /// recent build's digest, or the current digest, after the
+    /// plan is skipped, not deleted. Images have no lock to hold
+    /// across the `rmi` — podman offers no per-image lock — so
+    /// the re-read only narrows the window: a build that records
+    /// this digest as current between the re-read and the `rmi`
+    /// still loses the image. That residual window is accepted:
+    /// no lock exists to close it.
     fn apply_eviction_plan(&self, report: &mut EvictionReport) {
         let planned = std::mem::take(&mut report.evicted);
         let mut freed = 0u64;
         for item in planned {
             let result = if item.kind == "image" {
+                // Re-validate the plan-time image protections: the
+                // plan is stale by now, and a build that started
+                // after the plan may have recorded this digest as
+                // the most recent build's digest, or pulled it as
+                // the current digest. A digest now protected is
+                // skipped, not deleted — the skip is recorded the
+                // way the other arms record a guarded skip.
+                if self.most_recent_build_digest().as_deref() == Some(item.path.as_str()) {
+                    report.failures.push(format!(
+                        "cannot delete {}: it is the digest the most recent build recorded",
+                        item.path
+                    ));
+                    continue;
+                }
+                let current = match self.current_image_digest() {
+                    Ok(current) => current,
+                    Err(e) => {
+                        // A query failure is not "no current
+                        // digest": the digest may be this item,
+                        // and deleting it would remove an image
+                        // in use. Record the failure and skip.
+                        report.failures.push(format!(
+                            "cannot delete {}: the current digest could not be read: {e}",
+                            item.path
+                        ));
+                        continue;
+                    }
+                };
+                if current.as_deref() == Some(item.path.as_str()) {
+                    report.failures.push(format!(
+                        "cannot delete {}: it is the current digest",
+                        item.path
+                    ));
+                    continue;
+                }
                 self.remove_image(Path::new(&item.path))
             } else if item.kind == "root" {
                 let path = Path::new(&item.path);
@@ -6188,13 +6262,11 @@ impl<'a> LocalBuild<'a> {
     /// current digest still are.
     pub fn prune_plan(&self) -> Result<EvictionReport, GeectlError> {
         let images = self.vertical_images();
-        self.evict_plan(
-            &[],
-            &[],
-            self.current_image_digest().as_deref(),
-            None,
-            &images,
-        )
+        // A digest that cannot be read is not "no current
+        // digest": fail the plan instead of planning to delete
+        // an image that may be current.
+        let current = self.current_image_digest()?;
+        self.evict_plan(&[], &[], current.as_deref(), None, &images)
     }
 
     /// Delete what `prune_plan` lists: plan under the shared
@@ -6202,7 +6274,8 @@ impl<'a> LocalBuild<'a> {
     /// failure to delete one entry is recorded and the rest still
     /// go. Returns the report of what was (and was not) deleted.
     pub fn prune_apply(&self) -> Result<EvictionReport, GeectlError> {
-        self.evict(&[], &[], self.current_image_digest().as_deref(), None)
+        let current = self.current_image_digest()?;
+        self.evict(&[], &[], current.as_deref(), None)
     }
 
     /// Remove one image by digest via podman.
@@ -9471,7 +9544,12 @@ fi
             let digest_line = if with_image {
                 "echo \"sha256:fake-digest-1234\""
             } else {
-                "exit 1"
+                // Real podman reports a missing image on stderr
+                // (`Error: <ref>: image not known`): the digest
+                // query distinguishes that from a query failure by
+                // the stderr text, so the stub must print it — a
+                // bare `exit 1` would now read as a storage error.
+                "echo \"Error: image not known\" >&2; exit 1"
             };
             write_script(
                 &script,
@@ -18108,6 +18186,131 @@ exit 0
         }
 
         #[test]
+        fn apply_eviction_plan_skips_an_image_that_became_the_most_recent_build_digest() {
+            // The plan-time image protections are stale by apply
+            // time: a digest the plan listed as superseded may
+            // have become the digest the most recent build
+            // recorded while another build started. The apply
+            // re-reads the protections before each `rmi`, so the
+            // digest survives with a failure recorded and no `rmi`
+            // call; once it stops being the most recent digest
+            // the same plan deletes it.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, call_log) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let cache = dir.path().join("cache");
+            let root = cache
+                .join("build-roots")
+                .join("testproject")
+                .join("foo")
+                .join(format!("standard-{}", host_arch()));
+            fs::create_dir_all(&root).unwrap();
+            let digest = "sha256:stale-digest-9999";
+            let mut marker = valid_marker();
+            marker.image_digest = Some(digest.to_string());
+            marker.last_build_unix = now_unix();
+            fs::write(
+                root.join(ROOT_MARKER),
+                serde_json::to_string(&marker).unwrap(),
+            )
+            .unwrap();
+            let item = || EvictedItem {
+                kind: "image".to_string(),
+                path: digest.to_string(),
+                bytes: 1,
+                reason: "superseded-image".to_string(),
+            };
+            let mut report = EvictionReport {
+                evicted: vec![item()],
+                ..Default::default()
+            };
+            vertical.apply_eviction_plan(&mut report);
+            assert!(report.evicted.is_empty());
+            assert_eq!(report.failures.len(), 1);
+            assert!(report.failures[0].contains("most recent build recorded"));
+            let log = fs::read_to_string(&call_log).unwrap();
+            assert!(!log.contains(&format!("rmi {digest}")));
+            // The digest stops being protected once the marker
+            // goes: the same plan now deletes it.
+            fs::remove_file(root.join(ROOT_MARKER)).unwrap();
+            let report = apply_one_item_soon(&vertical, item());
+            assert_eq!(report.evicted.len(), 1);
+            assert!(report.failures.is_empty());
+            let log = fs::read_to_string(&call_log).unwrap();
+            assert!(log.contains(&format!("rmi {digest}")));
+        }
+
+        #[test]
+        fn apply_eviction_plan_skips_the_current_image_digest() {
+            // The current digest is re-read at apply time too: a
+            // digest the plan listed that is the current digest
+            // by now is skipped, not deleted, and no `rmi` runs
+            // for it.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, call_log) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let digest = "sha256:fake-digest-1234";
+            let mut report = EvictionReport {
+                evicted: vec![EvictedItem {
+                    kind: "image".to_string(),
+                    path: digest.to_string(),
+                    bytes: 1,
+                    reason: "superseded-image".to_string(),
+                }],
+                ..Default::default()
+            };
+            vertical.apply_eviction_plan(&mut report);
+            assert!(report.evicted.is_empty());
+            assert_eq!(report.failures.len(), 1);
+            assert!(report.failures[0].contains("current digest"));
+            let log = fs::read_to_string(&call_log).unwrap();
+            assert!(!log.contains(&format!("rmi {digest}")));
+        }
+
+        #[test]
+        fn apply_eviction_plan_skips_an_image_when_the_current_digest_cannot_be_read() {
+            // A query failure is not "no current digest": the
+            // digest may be this item, and deleting it would
+            // remove an image in use. The item is skipped with
+            // a failure recorded and no `rmi` runs for it.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, call_log) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman.clone());
+            // The digest query can no longer run: the stub is
+            // not executable, so the spawn fails and the query
+            // errors instead of answering.
+            let mut perms = fs::metadata(&podman).unwrap().permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(&podman, perms).unwrap();
+            let digest = "sha256:fake-digest-1234";
+            let mut report = EvictionReport {
+                evicted: vec![EvictedItem {
+                    kind: "image".to_string(),
+                    path: digest.to_string(),
+                    bytes: 1,
+                    reason: "superseded-image".to_string(),
+                }],
+                ..Default::default()
+            };
+            vertical.apply_eviction_plan(&mut report);
+            assert!(report.evicted.is_empty());
+            assert_eq!(report.failures.len(), 1);
+            assert!(report.failures[0].contains("could not be read"));
+            // The stub never ran, so the log may not exist.
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            assert!(!log.contains(&format!("rmi {digest}")));
+        }
+
+        #[test]
         fn build_wipe_refuses_a_locked_root_with_build_root_in_use() {
             // A destructive op refused while a build holds the root
             // is `BuildRootInUse`, not a second build
@@ -18168,6 +18371,88 @@ exit 0
                 vertical.podman_digest(&podman).unwrap().as_deref(),
                 Some("sha256:fake-digest-1234")
             );
+        }
+
+        #[test]
+        fn podman_digest_errors_on_a_failed_inspect() {
+            // A non-zero `image inspect` is "absent" only when
+            // podman says the image is not known. A storage or
+            // permission failure while the image exists must error:
+            // the eviction plan treats an error as "currency
+            // unknown" and skips the image, while None would let
+            // it `rmi` the image in use.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            // A storage failure: non-zero exit, no "not known" text.
+            let failing = dir.path().join("podman-failing");
+            write_script(
+                &failing,
+                "#!/bin/sh\nif [ \"$1\" = \"image\" ] && [ \"$2\" = \"inspect\" ]; then echo \"Error: creating storage: permission denied\" >&2; exit 1; fi\nexit 0\n",
+            );
+            let err = vertical.podman_digest(&failing).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ImageUnavailable);
+            // Both spellings of "not known" still read as absent.
+            let not_known = dir.path().join("podman-not-known");
+            write_script(
+                &not_known,
+                "#!/bin/sh\nif [ \"$1\" = \"image\" ] && [ \"$2\" = \"inspect\" ]; then echo \"Error: registry.opensuse.org/opensuse/tumbleweed:latest: image not known\" >&2; exit 1; fi\nexit 0\n",
+            );
+            assert_eq!(vertical.podman_digest(&not_known).unwrap(), None);
+            let no_such = dir.path().join("podman-no-such");
+            write_script(
+                &no_such,
+                "#!/bin/sh\nif [ \"$1\" = \"image\" ] && [ \"$2\" = \"inspect\" ]; then echo \"Error: no such image: registry.opensuse.org/opensuse/tumbleweed:latest\" >&2; exit 1; fi\nexit 0\n",
+            );
+            assert_eq!(vertical.podman_digest(&no_such).unwrap(), None);
+            // And an empty stderr on a non-zero exit is a failure too.
+            let silent = dir.path().join("podman-silent");
+            write_script(
+                &silent,
+                "#!/bin/sh\nif [ \"$1\" = \"image\" ] && [ \"$2\" = \"inspect\" ]; then exit 1; fi\nexit 0\n",
+            );
+            let err = vertical.podman_digest(&silent).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ImageUnavailable);
+        }
+
+        #[test]
+        fn apply_eviction_plan_skips_an_image_when_the_inspect_fails() {
+            // The same failure at the eviction layer: the digest
+            // may be this item, so it is skipped with a failure
+            // recorded and no `rmi` runs for it.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let setup = Setup::new();
+            let client = setup.client();
+            let call_log = dir.path().join("podman-calls.log");
+            let failing = dir.path().join("podman-failing");
+            write_script(
+                &failing,
+                &format!(
+                    "#!/bin/sh\necho \"$@\" >> \"{call_log}\"\nif [ \"$1\" = \"image\" ] && [ \"$2\" = \"inspect\" ]; then echo \"Error: creating storage: permission denied\" >&2; exit 1; fi\nif [ \"$1\" = \"rmi\" ]; then exit 0; fi\nexit 0\n",
+                    call_log = call_log.display(),
+                ),
+            );
+            let vertical = vertical(&client, dir.path(), engine, failing);
+            let digest = "sha256:fake-digest-1234";
+            let mut report = EvictionReport {
+                evicted: vec![EvictedItem {
+                    kind: "image".to_string(),
+                    path: digest.to_string(),
+                    bytes: 1,
+                    reason: "superseded-image".to_string(),
+                }],
+                ..Default::default()
+            };
+            vertical.apply_eviction_plan(&mut report);
+            assert!(report.evicted.is_empty());
+            assert_eq!(report.failures.len(), 1);
+            assert!(report.failures[0].contains("could not be read"));
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            assert!(!log.contains(&format!("rmi {digest}")));
         }
 
         #[test]
