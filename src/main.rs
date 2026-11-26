@@ -349,6 +349,15 @@ fn config_show_payload(
         "gitea_url_source": effective.gitea_url_source,
         "format": format.as_str(),
         "format_source": format_source,
+        "identity": match &effective.config.identity {
+            Some(identity) => json!(identity.format()),
+            None => json!(null),
+        },
+        "identity_source": if effective.config.identity.is_some() {
+            "config"
+        } else {
+            "none"
+        },
         "build_cache_dir": build_cache_dir,
         "build_cache_dir_source": build_cache_dir_source,
         "build_cache_cap_gib": build_cache_cap_gib,
@@ -430,6 +439,11 @@ fn render_config_show_text(payload: &serde_json::Value) -> String {
             "format: {} ({})",
             payload["format"].as_str().unwrap_or(""),
             payload["format_source"].as_str().unwrap_or("")
+        ),
+        format!(
+            "identity: {} ({})",
+            payload["identity"].as_str().unwrap_or("-"),
+            payload["identity_source"].as_str().unwrap_or("")
         ),
         format!(
             "build_cache_dir: {} ({})",
@@ -910,8 +924,16 @@ mod tests {
         let payload = config_show_payload(Format::Text, "config", None).unwrap();
         assert_eq!(payload["format"], "text");
         assert_eq!(payload["format_source"], "config");
+        assert!(matches!(
+            payload["identity_source"].as_str(),
+            Some("config") | Some("none")
+        ));
         let text = render_config_show_text(&payload);
         assert!(text.contains("format: text (config)"), "{text}");
+        assert!(text.contains("identity: "), "{text}");
+        if payload["identity"].is_null() {
+            assert!(text.contains("identity: - (none)"), "{text}");
+        }
     }
 
     #[test]

@@ -1005,6 +1005,7 @@ mod tests {
                 obs_url: None,
                 gitea_url: None,
                 format: None,
+                identity: None,
                 instances: vec![],
                 build_cache_dir: None,
                 build_cache_cap_gib: None,

@@ -144,7 +144,7 @@ directory's `.env` only.
 - `geectl prjconf` — Read, validate and clean a project's prjconf.
 - `geectl version` — Print version information as the result payload.
 - `geectl config` — Inspect or initialise the config file.
-- `geectl config show` — Show the effective config: endpoint URLs with their source, and credential status (never a secret value).
+- `geectl config show` — Show the effective config: endpoint URLs with their source, the changelog identity with its source (`config` or `none`), and credential status (never a secret value).
 - `geectl config init` — Write the config template (endpoints only); refuses if the file already exists.
 - `geectl config import-oscrc` — Import one instance mapping from an oscrc file (one-time migration); dry-run is the default, `--live` writes the config.
 
@@ -347,7 +347,7 @@ without evaluating trust.
 ## `changelog` — `.changes` validation and generation
 
 - `geectl changelog validate [DIR]` — Validate the `.changes` entries in a package directory against the V1–V12 rules; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --entries <ENTRIES>
-- `geectl changelog generate [DIR]` — Generate a skeleton `.changes` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --author <AUTHOR>, --message <MESSAGE>, --write
+- `geectl changelog generate [DIR]` — Generate a skeleton `.changes` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball; the author resolves from the config `[identity]` section, then `VC_REALNAME`/`VC_MAILADDR`, then the OBS account, then git, and the command refuses when none yields an identity; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --author <AUTHOR>, --message <MESSAGE>, --write
 
 ## Working copy — git working copy
 
@@ -448,7 +448,10 @@ skipped target-relative rules when no target is given. `changelog
 generate` prints a draft entry — a bare version line plus explicit
 `TODO` slots — a draft only; `--write` prepends it into the
 package's `.changes` file and refuses a draft with unfilled
-`TODO` slots or a needs-detail flag. Writing normalizes the whole
+`TODO` slots or a needs-detail flag. The author comes from `--author`
+when given, else the config `[identity]` section, `VC_REALNAME` /
+`VC_MAILADDR`, the OBS account, then git; with none of those the
+command refuses rather than writing an entry with no author. Writing normalizes the whole
 file: trailing ASCII whitespace is stripped from every line,
 CRLF becomes LF, legacy-encoded bytes are transcoded to UTF-8
 (best-effort; valid UTF-8 passes through untouched), a BOM is stripped,

@@ -22,12 +22,14 @@ use crate::changelog::generate::{generate, message_bullets, prepend_entry, versi
 use crate::changelog::news::{extract_news_section, find_tarball, NewsSection};
 use crate::changelog::spec::parse_spec;
 use crate::changelog::validate::{validate, PackageSnapshot, ValidateOptions};
+use crate::config::{Config, Identity, VC_MAILADDR_VAR, VC_REALNAME_VAR};
 use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{Timeout, UreqClient};
-use crate::obs::ObsClient;
+use crate::obs::{ObsClient, Person};
 use clap::Subcommand;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -135,16 +137,29 @@ pub fn run_changelog(
             author,
             message,
             write,
-        } => run_generate(
-            &dir,
-            target_project,
-            target_package,
-            author,
-            message,
-            write,
-            debug,
-            instance,
-        ),
+        } => {
+            // `--author` wins over the whole chain; without it the
+            // author resolves through the identity chain (#405).
+            let author = match author {
+                Some(author) => Some(author),
+                None => Some(resolve_changelog_identity(
+                    &crate::config::load_config()?,
+                    &crate::auth::snapshot_env(&[VC_REALNAME_VAR, VC_MAILADDR_VAR])?,
+                    &dir,
+                    || obs_identity(debug, instance),
+                )?),
+            };
+            run_generate(
+                &dir,
+                target_project,
+                target_package,
+                author,
+                message,
+                write,
+                debug,
+                instance,
+            )
+        }
     }
 }
 
@@ -322,6 +337,85 @@ fn run_validate(
             lines.join("\n")
         ),
     ))
+}
+
+/// Resolve the author for a generated `.changes` entry, in the
+/// order Tom decided (#405): the config `[identity]` section,
+/// then the `VC_REALNAME` / `VC_MAILADDR` environment, then the
+/// OBS account's real name and email, then git identity
+/// (`user.name` / `user.email`) — and refuse when none of those
+/// yields an identity, rather than writing an entry with no
+/// author. The OBS lookup runs only when the config and env
+/// levels yield nothing, so a half-configured OBS credential
+/// never breaks a generate the config or env already identifies;
+/// a failed OBS lookup propagates instead of reading as no
+/// identity. `env` is a snapshot (see [`snapshot_env`]).
+pub(crate) fn resolve_changelog_identity(
+    config: &Config,
+    env: &HashMap<String, String>,
+    dir: &Path,
+    obs_lookup: impl FnOnce() -> Result<Option<Identity>, GeectlError>,
+) -> Result<String, GeectlError> {
+    if let Some(identity) = &config.identity {
+        return Ok(identity.format());
+    }
+    if let Some(identity) = crate::config::identity_from_env_map(env)? {
+        return Ok(identity.format());
+    }
+    if let Some(identity) = obs_lookup()? {
+        return Ok(identity.format());
+    }
+    if let Some(identity) = crate::working_copy::git_identity(dir)? {
+        return Ok(identity.format());
+    }
+    Err(GeectlError::new(
+        ErrorKind::InvalidInput,
+        "no changelog identity found: set [identity] name and email in the config file, VC_REALNAME and VC_MAILADDR in the environment, or pass --author 'Name <email>'",
+    ))
+}
+
+/// The OBS-account level of the identity chain: the authenticated
+/// user's real name and email from `whois`. No username in the
+/// credentials (API-key auth carries none) yields nothing — the
+/// chain falls through to git.
+fn obs_identity(debug: &Debug, instance: Option<&str>) -> Result<Option<Identity>, GeectlError> {
+    let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+    let (base, instances) = crate::cli_remote::obs_endpoint(instance)?;
+    let credentials = crate::auth::EnvObsAuth::credentials_for_url(&base, &base, &instances)?;
+    let client =
+        ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
+    identity_from_obs_client(&client)
+}
+
+fn identity_from_obs_client(client: &ObsClient) -> Result<Option<Identity>, GeectlError> {
+    let Some(login) = client.credentials().username() else {
+        return Ok(None);
+    };
+    let person = client.whois(login)?;
+    Ok(identity_from_person(&person))
+}
+
+/// The OBS `whois` person as a changelog identity: real name and
+/// email, both present and well-shaped, or nothing. A person
+/// carrying only one of the two does not identify an author.
+fn identity_from_person(person: &Person) -> Option<Identity> {
+    let name = person
+        .realname
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let email = person
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    if !crate::config::identity_shape_ok(name, email) {
+        return None;
+    }
+    Some(Identity {
+        name: name.to_string(),
+        email: email.to_string(),
+    })
 }
 
 fn parse_author(author: &str) -> Result<String, GeectlError> {
@@ -613,6 +707,167 @@ mod tests {
 
     /// One generated entry, shared by the write tests.
     const ENTRY: &str = "-------------------------------------------------------------------\nMon Nov 23 00:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.1\n\n";
+
+    fn identity_config() -> Config {
+        Config {
+            identity: Some(Identity {
+                name: "Config Author".to_string(),
+                email: "config@example.com".to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn env_identity() -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        env.insert(VC_REALNAME_VAR.to_string(), "Env Author".to_string());
+        env.insert(VC_MAILADDR_VAR.to_string(), "env@example.com".to_string());
+        env
+    }
+
+    fn obs_identity() -> Identity {
+        Identity {
+            name: "Obs Author".to_string(),
+            email: "obs@example.com".to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_identity_config_wins_and_obs_never_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let obs_called = std::cell::Cell::new(false);
+        let author =
+            resolve_changelog_identity(&identity_config(), &env_identity(), dir.path(), || {
+                obs_called.set(true);
+                Ok(Some(obs_identity()))
+            })
+            .unwrap();
+        assert_eq!(author, "Config Author <config@example.com>");
+        assert!(
+            !obs_called.get(),
+            "the OBS lookup must not run when the config identifies"
+        );
+    }
+
+    #[test]
+    fn resolve_identity_env_wins_over_obs() {
+        let dir = tempfile::tempdir().unwrap();
+        let obs_called = std::cell::Cell::new(false);
+        let author =
+            resolve_changelog_identity(&Config::default(), &env_identity(), dir.path(), || {
+                obs_called.set(true);
+                Ok(Some(obs_identity()))
+            })
+            .unwrap();
+        assert_eq!(author, "Env Author <env@example.com>");
+        assert!(
+            !obs_called.get(),
+            "the OBS lookup must not run when the env identifies"
+        );
+    }
+
+    #[test]
+    fn resolve_identity_env_partial_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = HashMap::new();
+        env.insert(VC_REALNAME_VAR.to_string(), "Env Author".to_string());
+        let err = resolve_changelog_identity(&Config::default(), &env, dir.path(), || {
+            Ok(Some(obs_identity()))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ConfigError);
+        assert!(err.context.contains(VC_MAILADDR_VAR), "{}", err.context);
+    }
+
+    #[test]
+    fn resolve_identity_obs_used_when_config_and_env_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let author =
+            resolve_changelog_identity(&Config::default(), &HashMap::new(), dir.path(), || {
+                Ok(Some(obs_identity()))
+            })
+            .unwrap();
+        assert_eq!(author, "Obs Author <obs@example.com>");
+    }
+
+    #[test]
+    fn resolve_identity_obs_error_propagates() {
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            resolve_changelog_identity(&Config::default(), &HashMap::new(), dir.path(), || {
+                Err(GeectlError::new(ErrorKind::InvalidInput, "whois failed"))
+            })
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidInput);
+        assert!(err.context.contains("whois failed"), "{}", err.context);
+    }
+
+    #[test]
+    fn resolve_identity_refuses_when_nothing_found() {
+        // A missing dir makes the git level read as no identity
+        // without touching the developer's global git config, so
+        // the refusal is deterministic in any checkout.
+        let err = resolve_changelog_identity(
+            &Config::default(),
+            &HashMap::new(),
+            Path::new("/definitely/not/a/real/dir"),
+            || Ok(None),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains("no changelog identity"),
+            "{}",
+            err.context
+        );
+        assert!(err.context.contains("[identity]"), "{}", err.context);
+        assert!(err.context.contains("VC_REALNAME"), "{}", err.context);
+        assert!(err.context.contains("--author"), "{}", err.context);
+    }
+
+    fn test_person(realname: Option<&str>, email: Option<&str>) -> Person {
+        Person {
+            login: "jane".to_string(),
+            email: email.map(str::to_string),
+            realname: realname.map(str::to_string),
+            state: "confirmed".to_string(),
+        }
+    }
+
+    #[test]
+    fn identity_from_person_needs_both() {
+        assert_eq!(
+            identity_from_person(&test_person(
+                Some("Jane Packager"),
+                Some("jane@example.com")
+            )),
+            Some(Identity {
+                name: "Jane Packager".to_string(),
+                email: "jane@example.com".to_string(),
+            })
+        );
+        assert_eq!(
+            identity_from_person(&test_person(Some("Jane Packager"), None)),
+            None
+        );
+        assert_eq!(
+            identity_from_person(&test_person(None, Some("jane@example.com"))),
+            None
+        );
+        assert_eq!(identity_from_person(&test_person(None, None)), None);
+    }
+
+    #[test]
+    fn identity_from_person_rejects_misshapen() {
+        assert_eq!(
+            identity_from_person(&test_person(Some("Jane Packager"), Some("not-an-email"))),
+            None
+        );
+        assert_eq!(
+            identity_from_person(&test_person(Some("  "), Some("jane@example.com"))),
+            None
+        );
+    }
 
     #[test]
     #[cfg(unix)]

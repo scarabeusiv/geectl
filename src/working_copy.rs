@@ -27,7 +27,7 @@
 
 use crate::changelog::changes::normalize_changes_content;
 use crate::changelog::validate::{validate, PackageSnapshot, ValidateOptions};
-use crate::config::Config;
+use crate::config::{Config, Identity};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{validate_gitea_name, GiteaClient};
 use crate::local_build::LocalBuild;
@@ -1498,6 +1498,97 @@ fn git_config_get(dir: &Path, key: &str) -> Result<Option<String>, GeectlError> 
     } else {
         Err(git_error("config", stderr.as_bytes()))
     }
+}
+
+/// The synthesized repo-local identity (see [`write_record`]):
+/// never a real person's identity, so a local value equal to it
+/// reads as unset.
+const SYNTH_NAME: &str = "geectl";
+const SYNTH_EMAIL: &str = "geectl@localhost";
+
+/// The git identity for `dir`: `user.name` / `user.email` as git
+/// itself resolves them, local first, then global, then system.
+/// `Ok(None)` when either is unset, when `dir` holds no work
+/// tree and no wider scope carries the key, or when git is not
+/// installed — the caller falls through to the next identity
+/// source. A broken git config is an error, not a silent
+/// fall-through. The local scope is read jointly: the synthesized
+/// pair only means "no real identity here" when both local values
+/// equal it together, and a working copy's repo-local `geectl`
+/// identity must never shadow the user's own global one. A local
+/// pair with only one placeholder value is a configured pair and
+/// is used as-is — skipping the one key would assemble a pair
+/// never configured together.
+pub(crate) fn git_identity(dir: &Path) -> Result<Option<Identity>, GeectlError> {
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let local_name = git_scope_value(dir, "--local", "user.name")?;
+    let local_email = git_scope_value(dir, "--local", "user.email")?;
+    let identity = match (local_name, local_email) {
+        (Some(name), Some(email)) if !(name == SYNTH_NAME && email == SYNTH_EMAIL) => {
+            Identity { name, email }
+        }
+        _ => {
+            let name = git_user_value(dir, "user.name", SYNTH_NAME)?;
+            let email = git_user_value(dir, "user.email", SYNTH_EMAIL)?;
+            match (name, email) {
+                (Some(name), Some(email)) => Identity { name, email },
+                _ => return Ok(None),
+            }
+        }
+    };
+    if !crate::config::identity_shape_ok(&identity.name, &identity.email) {
+        return Ok(None);
+    }
+    Ok(Some(identity))
+}
+
+/// Read one `user.*` git config value from one scope, without
+/// skipping anything: the caller decides what a placeholder
+/// means. `Ok(None)` when the scope does not carry the key, when
+/// the scope does not exist (no work tree for `--local`), when the
+/// value is empty, or when git is not installed.
+fn git_scope_value(dir: &Path, scope: &str, key: &str) -> Result<Option<String>, GeectlError> {
+    match git_status(dir, "config", &[scope, "--get", key], &[]) {
+        Ok((true, stdout, _)) => {
+            let value = stdout.trim().to_string();
+            if value.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(value))
+            }
+        }
+        Ok((false, _, stderr)) if stderr.is_empty() => Ok(None),
+        Ok((false, _, stderr))
+            if stderr.contains("not a git repository")
+                || stderr.contains("--local can only be used inside a git repository") =>
+        {
+            // No work tree here: the --local scope does not exist.
+            Ok(None)
+        }
+        Ok((false, _, stderr)) => Err(git_error("config", stderr.as_bytes())),
+        Err(err) if err.kind == ErrorKind::NoGit => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Read one `user.*` git config value, skipping a value equal
+/// to the synthesized identity (`placeholder`): the scope chain is
+/// local, then global, then system, and a placeholder in one scope
+/// falls through to the next. The local scope is read jointly by
+/// [`git_identity`] first, so this per-key skip only applies when
+/// the local scope carries no complete pair. `Ok(None)` when no
+/// scope carries the key, or when the key's value is empty.
+fn git_user_value(dir: &Path, key: &str, placeholder: &str) -> Result<Option<String>, GeectlError> {
+    for scope in ["--local", "--global", "--system"] {
+        if let Some(value) = git_scope_value(dir, scope, key)? {
+            if value != placeholder {
+                return Ok(Some(value));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Write one `geectl.*` config key. Values never carry newlines:
@@ -6782,6 +6873,162 @@ mod tests {
             &[],
         )
         .unwrap();
+    }
+
+    /// The tests pinning `git_identity` hold the HOME lock and
+    /// redirect HOME at an empty temp home, so they never read the
+    /// developer's real `~/.gitconfig`.
+    fn empty_home_guard() -> (
+        std::sync::MutexGuard<'static, ()>,
+        TempDirGuard,
+        (RestoreVar, RestoreVar),
+    ) {
+        let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-identity-fake-home");
+        let guard = guard_home(&home);
+        (lock, home, guard)
+    }
+
+    fn set_local_identity(dir: &Path, name: &str, email: &str) {
+        git(dir, "config", &["--local", "user.name", name], &[]).unwrap();
+        git(dir, "config", &["--local", "user.email", email], &[]).unwrap();
+    }
+
+    fn set_global_identity(home: &TempDirGuard, name: &str, email: &str) {
+        std::fs::write(
+            home.path.join(".gitconfig"),
+            format!("[user]\n\tname = {name}\n\temail = {email}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn git_identity_reads_local_identity() {
+        let (_lock, _home, _guard) = empty_home_guard();
+        let dir = TempDirGuard::new("git-identity-local");
+        git(&dir.path, "init", &["--quiet"], &[]).unwrap();
+        set_local_identity(&dir.path, "Jane Packager", "jane@example.com");
+        assert_eq!(
+            git_identity(&dir.path).unwrap(),
+            Some(Identity {
+                name: "Jane Packager".to_string(),
+                email: "jane@example.com".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn git_identity_synthesized_local_identity_is_none() {
+        // A working copy's repo-local `geectl` identity is never a
+        // real person's identity.
+        let (_lock, _home, _guard) = empty_home_guard();
+        let dir = TempDirGuard::new("git-identity-synth");
+        init_repo(&dir.path);
+        assert_eq!(git_identity(&dir.path).unwrap(), None);
+    }
+
+    #[test]
+    fn git_identity_local_placeholder_falls_through_to_global() {
+        // The placeholder local values are skipped, not read: the
+        // user's global identity shows through a working copy.
+        let (_lock, home, _guard) = empty_home_guard();
+        set_global_identity(&home, "Jane Packager", "jane@example.com");
+        let dir = TempDirGuard::new("git-identity-fallthrough");
+        init_repo(&dir.path);
+        assert_eq!(
+            git_identity(&dir.path).unwrap(),
+            Some(Identity {
+                name: "Jane Packager".to_string(),
+                email: "jane@example.com".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn git_identity_local_placeholder_name_uses_local_pair() {
+        // Only one local value is the placeholder: the local pair
+        // is a configured pair, used as-is — the name must not
+        // fall through to the global name while the email stays
+        // local.
+        let (_lock, home, _guard) = empty_home_guard();
+        set_global_identity(&home, "Global Person", "global@example.com");
+        let dir = TempDirGuard::new("git-identity-mixed-name");
+        git(&dir.path, "init", &["--quiet"], &[]).unwrap();
+        set_local_identity(&dir.path, "geectl", "jane@example.com");
+        assert_eq!(
+            git_identity(&dir.path).unwrap(),
+            Some(Identity {
+                name: "geectl".to_string(),
+                email: "jane@example.com".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn git_identity_local_placeholder_email_uses_local_pair() {
+        // The mirror case: a placeholder local email with a real
+        // local name is the configured local pair, not a mix of
+        // the local name with the global email.
+        let (_lock, home, _guard) = empty_home_guard();
+        set_global_identity(&home, "Global Person", "global@example.com");
+        let dir = TempDirGuard::new("git-identity-mixed-email");
+        git(&dir.path, "init", &["--quiet"], &[]).unwrap();
+        set_local_identity(&dir.path, "Jane Packager", "geectl@localhost");
+        assert_eq!(
+            git_identity(&dir.path).unwrap(),
+            Some(Identity {
+                name: "Jane Packager".to_string(),
+                email: "geectl@localhost".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn git_identity_global_identity_outside_a_repo() {
+        // A plain package directory is not a work tree, but the
+        // global identity still applies.
+        let (_lock, home, _guard) = empty_home_guard();
+        set_global_identity(&home, "Jane Packager", "jane@example.com");
+        let dir = TempDirGuard::new("git-identity-plain-dir");
+        assert_eq!(
+            git_identity(&dir.path).unwrap(),
+            Some(Identity {
+                name: "Jane Packager".to_string(),
+                email: "jane@example.com".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn git_identity_unset_is_none() {
+        let (_lock, _home, _guard) = empty_home_guard();
+        let dir = TempDirGuard::new("git-identity-unset");
+        assert_eq!(git_identity(&dir.path).unwrap(), None);
+    }
+
+    #[test]
+    fn git_identity_partial_is_none() {
+        // A name with no email anywhere identifies nobody.
+        let (_lock, _home, _guard) = empty_home_guard();
+        let dir = TempDirGuard::new("git-identity-partial");
+        git(&dir.path, "init", &["--quiet"], &[]).unwrap();
+        git(
+            &dir.path,
+            "config",
+            &["--local", "user.name", "Jane Packager"],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(git_identity(&dir.path).unwrap(), None);
+    }
+
+    #[test]
+    fn git_identity_missing_dir_is_none() {
+        let (_lock, _home, _guard) = empty_home_guard();
+        assert_eq!(
+            git_identity(Path::new("/definitely/not/a/real/dir")).unwrap(),
+            None
+        );
     }
 
     /// A recorded OBS-native checkout: a root commit with the base

@@ -4,8 +4,10 @@
 //! The config file lives at `$XDG_CONFIG_HOME/geectl/config.toml`
 //! (default `~/.config/geectl/config.toml`). It holds only the two
 //! endpoint URLs (`obs_url`, `gitea_url`), the output-format
-//! default (`format`, `json` or `text`), and the named-instance
-//! table (`[instances]`, alias → URL — see [`Config::instances`]).
+//! default (`format`, `json` or `text`), the named-instance
+//! table (`[instances]`, alias → URL — see [`Config::instances`]),
+//! and the changelog identity (`[identity]`, `name` / `email` —
+//! see [`Identity`]).
 //! Credentials are never
 //! stored here: a key that looks like a credential is a refusal to
 //! run, naming the key, the file, and the environment variable to use
@@ -44,6 +46,12 @@ pub const OBS_URL_VAR: &str = "GEECTL_OBS_URL";
 pub const GITEA_URL_VAR: &str = "GEECTL_GITEA_URL";
 /// Environment variable overriding the output-format default.
 pub const FORMAT_VAR: &str = "GEECTL_FORMAT";
+/// Environment variable carrying the changelog identity's real
+/// name (see [`Identity`]): the name a `.changes` header carries
+/// when the config file sets no `[identity]`.
+pub const VC_REALNAME_VAR: &str = "VC_REALNAME";
+/// Environment variable carrying the changelog identity's email.
+pub const VC_MAILADDR_VAR: &str = "VC_MAILADDR";
 
 /// The built-in OBS endpoint (the OBS API, not the web UI).
 pub const DEFAULT_OBS_URL: &str = "https://api.opensuse.org";
@@ -51,8 +59,9 @@ pub const DEFAULT_OBS_URL: &str = "https://api.opensuse.org";
 /// the same host).
 pub const DEFAULT_GITEA_URL: &str = "https://src.opensuse.org";
 
-/// The effective (non-secret) configuration: endpoint URLs and
-/// the output-format default. A field is `None` when neither the
+/// The effective (non-secret) configuration: endpoint URLs, the
+/// output-format default, and the changelog identity. A field is
+/// `None` when neither the
 /// config file nor the environment set it; [`effective_config`]
 /// fills in the built-in defaults. The `[build]` table carries
 /// the local-build vertical's tunables; both are `None` when the
@@ -62,6 +71,12 @@ pub struct Config {
     pub obs_url: Option<String>,
     pub gitea_url: Option<String>,
     pub format: Option<String>,
+    /// The changelog identity from the config file's `[identity]`
+    /// section (`name` / `email`): the author a generated
+    /// `.changes` entry header carries, unless `--author` says
+    /// otherwise. `None` when the section is absent; see
+    /// [`Identity`].
+    pub identity: Option<Identity>,
     /// Named instances from the config file's `[instances]`
     /// table, sorted by alias: `(alias, url)` pairs, e.g.
     /// `example = "https://api.opensuse.org"`. The alias
@@ -85,6 +100,84 @@ pub struct Config {
     /// The local-build cache cap in GiB (20 by default). Zero is
     /// refused: a zero cap would evict everything at every build.
     pub build_cache_cap_gib: Option<u64>,
+}
+
+/// The changelog identity: the name and email a `.changes` entry
+/// header carries. It lives in the config file's `[identity]`
+/// section (`name` / `email`), or comes from the `VC_REALNAME` /
+/// `VC_MAILADDR` environment, the OBS account, or git — in that
+/// order (see [`crate::cli_changelog::resolve_changelog_identity`]).
+/// A source yields an identity only whole: a name without an
+/// email (or the reverse) is a misconfiguration, never a
+/// half-identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Identity {
+    /// The real name, e.g. `Jane Packager`.
+    pub name: String,
+    /// The email address, e.g. `jane@example.com`.
+    pub email: String,
+}
+
+impl Identity {
+    /// The `Name <email>` author line for a `.changes` header.
+    pub fn format(&self) -> String {
+        format!("{} <{}>", self.name, self.email)
+    }
+}
+
+/// Whether `name` / `email` form a usable identity: a non-empty
+/// name, and an email address (an `@`, no whitespace) — the same
+/// form `validate` V11 demands of a header author.
+pub(crate) fn identity_shape_ok(name: &str, email: &str) -> bool {
+    !name.trim().is_empty()
+        && !email.is_empty()
+        && email.contains('@')
+        && !email.contains(char::is_whitespace)
+}
+
+/// Build an identity from parts, refusing a misshapen one. The
+/// error names the source, never the value.
+fn check_identity_shape(name: &str, email: &str, source: &str) -> Result<(), GeectlError> {
+    if !identity_shape_ok(name, email) {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("{source}: identity needs a non-empty name and an email address"),
+        ));
+    }
+    Ok(())
+}
+
+/// The changelog identity from the environment: `VC_REALNAME` /
+/// `VC_MAILADDR`, both or neither. One without the other is a
+/// misconfiguration, not a half-identity: refuse, naming the
+/// missing variable. `env` is a snapshot (see [`snapshot_env`]);
+/// values are trimmed, and an empty value counts as unset.
+pub(crate) fn identity_from_env_map(
+    env: &HashMap<String, String>,
+) -> Result<Option<Identity>, GeectlError> {
+    let name = env
+        .get(VC_REALNAME_VAR)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let email = env
+        .get(VC_MAILADDR_VAR)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match (name, email) {
+        (Some(name), Some(email)) => {
+            check_identity_shape(&name, &email, "VC_REALNAME/VC_MAILADDR")?;
+            Ok(Some(Identity { name, email }))
+        }
+        (Some(_), None) => Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("{VC_REALNAME_VAR} is set but {VC_MAILADDR_VAR} is not"),
+        )),
+        (None, Some(_)) => Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("{VC_MAILADDR_VAR} is set but {VC_REALNAME_VAR} is not"),
+        )),
+        (None, None) => Ok(None),
+    }
 }
 
 /// The effective endpoints and output format, plus where each
@@ -219,6 +312,7 @@ pub fn effective_config(config: &Config) -> Result<EffectiveConfig, GeectlError>
             gitea_url: Some(gitea_url),
             format: Some(format),
             instances: config.instances.clone(),
+            identity: config.identity.clone(),
             build_cache_dir: None,
             build_cache_cap_gib: None,
         },
@@ -459,7 +553,8 @@ fn toml_position(text: &str, offset: usize) -> String {
 }
 
 /// Parse config TOML. Only `obs_url` / `gitea_url` / `format` /
-/// `instances` are recognised; anything else is an error (a typo
+/// `instances` / `identity` / `build` are recognised; anything
+/// else is an error (a typo
 /// must not silently do nothing), and a credential-shaped key
 /// anywhere in the file is a refusal to run. URL values must be
 /// `https://` with a host — validated here, at load time, not at
@@ -486,6 +581,7 @@ pub fn parse_config(text: &str, path: &Path) -> Result<Config, GeectlError> {
             && key != "gitea_url"
             && key != "format"
             && key != "instances"
+            && key != "identity"
             && key != "build"
         {
             return Err(GeectlError::new(
@@ -506,6 +602,55 @@ pub fn parse_config(text: &str, path: &Path) -> Result<Config, GeectlError> {
     }
     if let Some(value) = table.get("instances") {
         config.instances = as_instances_table(value, path)?;
+    }
+    if let Some(value) = table.get("identity") {
+        let identity = value.as_table().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ConfigError,
+                format!("{}: 'identity' must be a table", path.display()),
+            )
+        })?;
+        for key in identity.keys() {
+            if key != "name" && key != "email" {
+                return Err(GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!("{}: unknown config key 'identity.{key}'", path.display()),
+                ));
+            }
+        }
+        let name = match identity.get("name") {
+            Some(value) => Some(as_identity_string(value, "identity.name", path)?),
+            None => None,
+        };
+        let email = match identity.get("email") {
+            Some(value) => Some(as_identity_string(value, "identity.email", path)?),
+            None => None,
+        };
+        match (name, email) {
+            (Some(name), Some(email)) => {
+                check_identity_shape(&name, &email, &format!("{}: '[identity]'", path.display()))?;
+                config.identity = Some(Identity { name, email });
+            }
+            (Some(_), None) => {
+                return Err(GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!(
+                        "{}: '[identity]' needs both 'name' and 'email' (missing 'email')",
+                        path.display()
+                    ),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!(
+                        "{}: '[identity]' needs both 'name' and 'email' (missing 'name')",
+                        path.display()
+                    ),
+                ));
+            }
+            (None, None) => {}
+        }
     }
     if let Some(value) = table.get("build") {
         let build = value.as_table().ok_or_else(|| {
@@ -573,6 +718,25 @@ fn as_format_string(value: &toml::Value, key: &str, path: &Path) -> Result<Strin
         )
     })?;
     validate_format(text, &format!("{}: '{key}'", path.display()))
+}
+
+/// An identity value must be a non-empty string (trimmed): a
+/// blank name or email is a misconfiguration, not an absent one.
+fn as_identity_string(value: &toml::Value, key: &str, path: &Path) -> Result<String, GeectlError> {
+    let text = value.as_str().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("{}: '{key}' must be a string", path.display()),
+        )
+    })?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("{}: '{key}' must not be empty", path.display()),
+        ));
+    }
+    Ok(text.to_string())
 }
 
 /// A URL value must be a string and a usable `https://` endpoint
@@ -871,7 +1035,7 @@ fn credential_env_hint(key: &str) -> String {
 /// The template `config init` writes: endpoints, the output-format
 /// default, and named instances, with the credential rule spelled
 /// out in a comment.
-pub const CONFIG_TEMPLATE: &str = r#"# geectl configuration — endpoint URLs, the output-format default, and named instances.
+pub const CONFIG_TEMPLATE: &str = r#"# geectl configuration — endpoint URLs, the output-format default, named instances, and the changelog identity.
 #
 # Credentials are NEVER stored here. Pass them via the environment
 # (or mounted secret files):
@@ -893,6 +1057,13 @@ gitea_url = "https://src.opensuse.org"
 # The output format default: "json" (default) or "text". The
 # --format flag wins over it, and GEECTL_FORMAT wins over this key.
 # format = "json"
+#
+# The changelog identity: the name and email `.changes` entries
+# carry in their header. Without it, `changelog generate` falls
+# back to VC_REALNAME/VC_MAILADDR, the OBS account, then git.
+# [identity]
+# name = "Jane Packager"
+# email = "jane@example.com"
 #
 # Local builds (one podman vertical) keep their cache under
 # $XDG_CACHE_HOME/geectl/ by default, capped at 20 GiB. Uncomment
@@ -1984,6 +2155,124 @@ mod tests {
     }
 
     #[test]
+    fn identity_section_parses() {
+        let config = parse_config(
+            "[identity]\nname = \"Jane Packager\"\nemail = \"jane@example.com\"\n",
+            &config_path(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.identity,
+            Some(Identity {
+                name: "Jane Packager".to_string(),
+                email: "jane@example.com".to_string(),
+            })
+        );
+        assert_eq!(
+            config.identity.as_ref().unwrap().format(),
+            "Jane Packager <jane@example.com>"
+        );
+    }
+
+    #[test]
+    fn identity_section_needs_both_name_and_email() {
+        for bad in [
+            "[identity]\nname = \"Jane Packager\"\n",
+            "[identity]\nemail = \"jane@example.com\"\n",
+        ] {
+            let err = parse_config(bad, &config_path()).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ConfigError, "config {bad:?}");
+            assert!(err.context.contains("[identity]"), "{}", err.context);
+            assert!(err.context.contains("both"), "{}", err.context);
+        }
+    }
+
+    #[test]
+    fn identity_section_rejects_unknown_key() {
+        let err = parse_config(
+            "[identity]\nname = \"Jane Packager\"\nemail = \"jane@example.com\"\nnickname = \"jane\"\n",
+            &config_path(),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("identity.nickname"), "{}", err.context);
+    }
+
+    #[test]
+    fn identity_section_rejects_misshapen_values() {
+        for bad in [
+            "[identity]\nname = \"\"\nemail = \"jane@example.com\"\n",
+            "[identity]\nname = \"Jane Packager\"\nemail = \"not-an-email\"\n",
+            "[identity]\nname = \"Jane Packager\"\nemail = \"jane @example.com\"\n",
+            "[identity]\nname = 42\nemail = \"jane@example.com\"\n",
+        ] {
+            let err = parse_config(bad, &config_path()).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ConfigError, "config {bad:?}");
+        }
+    }
+
+    #[test]
+    fn identity_section_must_be_a_table() {
+        let err = parse_config("identity = \"Jane Packager\"\n", &config_path()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains("'identity' must be a table"),
+            "{}",
+            err.context
+        );
+    }
+
+    #[test]
+    fn identity_env_both_present() {
+        let mut env = HashMap::new();
+        env.insert(VC_REALNAME_VAR.to_string(), "Jane Packager".to_string());
+        env.insert(VC_MAILADDR_VAR.to_string(), "jane@example.com".to_string());
+        assert_eq!(
+            identity_from_env_map(&env).unwrap(),
+            Some(Identity {
+                name: "Jane Packager".to_string(),
+                email: "jane@example.com".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn identity_env_partial_is_an_error() {
+        let mut only_name = HashMap::new();
+        only_name.insert(VC_REALNAME_VAR.to_string(), "Jane Packager".to_string());
+        let err = identity_from_env_map(&only_name).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains(VC_MAILADDR_VAR), "{}", err.context);
+        let mut only_email = HashMap::new();
+        only_email.insert(VC_MAILADDR_VAR.to_string(), "jane@example.com".to_string());
+        let err = identity_from_env_map(&only_email).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains(VC_REALNAME_VAR), "{}", err.context);
+    }
+
+    #[test]
+    fn identity_env_absent_is_none() {
+        assert_eq!(identity_from_env_map(&HashMap::new()).unwrap(), None);
+    }
+
+    #[test]
+    fn effective_config_carries_identity() {
+        let config = parse_config(
+            "[identity]\nname = \"Jane Packager\"\nemail = \"jane@example.com\"\n",
+            &config_path(),
+        )
+        .unwrap();
+        let effective = effective_config(&config).unwrap();
+        assert_eq!(
+            effective.config.identity,
+            Some(Identity {
+                name: "Jane Packager".to_string(),
+                email: "jane@example.com".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn endpoint_url_is_trimmed() {
         // Leading/trailing whitespace is stored trimmed, not passed
         // on to fail confusingly at request time.
@@ -2010,6 +2299,7 @@ mod tests {
             gitea_url: None,
             format: None,
             instances: vec![],
+            identity: None,
             build_cache_dir: None,
             build_cache_cap_gib: None,
         };
@@ -2022,6 +2312,7 @@ mod tests {
             gitea_url: None,
             format: None,
             instances: vec![],
+            identity: None,
             build_cache_dir: None,
             build_cache_cap_gib: None,
         };
@@ -2141,6 +2432,7 @@ mod tests {
             gitea_url: None,
             format: Some("text".to_string()),
             instances: vec![],
+            identity: None,
             build_cache_dir: None,
             build_cache_cap_gib: None,
         };
@@ -2158,6 +2450,7 @@ mod tests {
             gitea_url: None,
             format: Some("yaml".to_string()),
             instances: vec![],
+            identity: None,
             build_cache_dir: None,
             build_cache_cap_gib: None,
         };
@@ -2399,6 +2692,7 @@ mod tests {
             obs_url: Some("https://api.opensuse.org".to_string()),
             gitea_url: None,
             format: None,
+            identity: None,
             instances: vec![
                 ("example".to_string(), "https://api.example.org".to_string()),
                 ("other".to_string(), "https://other.example.org".to_string()),
