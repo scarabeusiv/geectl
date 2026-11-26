@@ -39,7 +39,6 @@
 //! with one header line echoing the query coordinates (`project: …`);
 //! findings follow as `repository/project:line: kind: message` lines.
 
-use crate::auth::EnvObsAuth;
 use crate::config;
 use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
@@ -47,7 +46,6 @@ use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{
     format_prjconf_report, prjconf_finding_line, prjconf_skipped_line, DryRun, ObsClient,
     PrjconfCleanResult, PrjconfFinding, PrjconfSeverity, PrjconfSkipped, PrjconfValidation,
-    OBS_API_BASE,
 };
 use clap::Subcommand;
 use serde_json::{json, Value};
@@ -104,9 +102,10 @@ pub fn run_prjconf(
     command: PrjconfCommand,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = obs_client(&http, debug)?;
+    let client = obs_client(&http, debug, instance)?;
     match command {
         PrjconfCommand::Show { project } => {
             let config = client.project_config(&project)?;
@@ -174,14 +173,15 @@ fn run_validate(
 /// reporting on the debug channel. Credentials resolve to `None`
 /// when unconfigured; the operations fail closed themselves when
 /// they need them.
-fn obs_client<'a>(http: &'a dyn HttpClient, debug: &Debug) -> Result<ObsClient<'a>, GeectlError> {
+fn obs_client<'a>(
+    http: &'a dyn HttpClient,
+    debug: &Debug,
+    instance: Option<&str>,
+) -> Result<ObsClient<'a>, GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
-    // Defensive default: effective_config always yields Some(obs_url).
-    let obs_url = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
-    let credentials = EnvObsAuth::credentials_for_url(obs_url, obs_url, &file_config.instances)?;
-    ObsClient::with_base_and_credentials(http, obs_url, credentials)
+    let (obs_url, credentials) = config::obs_endpoint(instance, &file_config)?;
+    ObsClient::with_base_and_credentials(http, &obs_url, credentials)
         .map(|client| client.with_debug(debug.clone()))
 }
 

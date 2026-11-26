@@ -227,9 +227,10 @@ pub fn run_gitea(
     command: GiteaCommand,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = gitea_client(&http, debug)?;
+    let client = gitea_client(&http, debug, instance)?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     match command {
         GiteaCommand::RepoGet { owner, repo } => {
@@ -437,7 +438,7 @@ pub fn run_gitea(
             Ok(maintainers_result(&owner, &repo, &maintainership))
         }
         GiteaCommand::CleanupForks { user } => {
-            let result = crate::cli_request::with_client(debug, live, |obs| {
+            let result = crate::cli_request::with_client(debug, live, instance, |obs| {
                 client.cleanup_forks(obs, user.as_deref(), &dry_run)
             })?;
             let mut payload = cleanup_forks_json(&result, &dry_run);
@@ -601,6 +602,8 @@ fn cleanup_fork_entry_line(entry: &CleanupForkEntry, dry_run: &DryRun) -> String
 /// env / default) with the Bearer token resolved for that URL — the
 /// matching alias's variables when the URL is named in `[instances]`,
 /// the plain variables otherwise — reporting on the debug channel.
+/// With `--instance`, strictly the flagged alias's variables (see
+/// `resolve_gitea_for_instance`); the host stays the configured URL.
 /// Construction fails closed without a token — even in dry-run, even
 /// for reads (see the `gitea` group's module docs). The one
 /// construction for the `gitea` group, the `pull-request` group's
@@ -609,6 +612,7 @@ fn cleanup_fork_entry_line(entry: &CleanupForkEntry, dry_run: &DryRun) -> String
 pub(crate) fn gitea_client<'a>(
     http: &'a dyn HttpClient,
     debug: &Debug,
+    instance: Option<&str>,
 ) -> Result<GiteaClient<'a>, GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
@@ -627,12 +631,20 @@ pub(crate) fn gitea_client<'a>(
     // here as its own default — resolve it with this `base` as
     // `default_url` instead, or the default's token would be
     // forwarded to that host.
-    let credentials = require_credentials_for_url(
-        EnvGiteaAuth::credentials_for_url(base, base, &file_config.instances)?,
-        base,
-        base,
-        &file_config.instances,
-    )?;
+    // With `--instance` the flag selects the account: strictly the
+    // alias's own token variables, failing closed on an unknown
+    // alias or a missing token — the plain variables never apply
+    // here. Without it, the per-URL resolution: the matching
+    // alias's variables when one matches, else the plain variables.
+    let credentials = match instance {
+        Some(alias) => EnvGiteaAuth::credentials_for_instance(alias, &file_config.instances)?,
+        None => require_credentials_for_url(
+            EnvGiteaAuth::credentials_for_url(base, base, &file_config.instances)?,
+            base,
+            base,
+            &file_config.instances,
+        )?,
+    };
     GiteaClient::with_base(http, base, credentials).map(|client| client.with_debug(debug.clone()))
 }
 

@@ -31,25 +31,31 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 /// The resolved endpoints: the OBS base URL, the config file's
-/// instances, and the effective config (for the commit service
-/// gate).
+/// instances, the flagged instance when `--instance` names one,
+/// and the effective config (for the commit service gate).
 struct Endpoints {
     obs_base: String,
     instances: Vec<(String, String)>,
+    instance: Option<String>,
     config: config::Config,
 }
 
-fn endpoints() -> Result<Endpoints, GeectlError> {
+fn endpoints(instance: Option<&str>) -> Result<Endpoints, GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
     let effective = config::effective_config(&file_config)?;
-    Ok(Endpoints {
-        obs_base: effective
+    let obs_base = match instance {
+        Some(alias) => config::obs_base_url(Some(alias), &file_config)?,
+        None => effective
             .config
             .obs_url
             .clone()
             .unwrap_or_else(|| OBS_API_BASE.to_string()),
+    };
+    Ok(Endpoints {
+        obs_base,
         instances: file_config.instances,
+        instance: instance.map(str::to_string),
         config: effective.config,
     })
 }
@@ -84,11 +90,16 @@ fn obs_client<'a>(
     debug: &Debug,
 ) -> Result<ObsClient<'a>, GeectlError> {
     let credentials = if needs_obs_credentials(leaf) && (live || leaf == "pull") {
-        EnvObsAuth::credentials_for_url(
-            &endpoints.obs_base,
-            &endpoints.obs_base,
-            &endpoints.instances,
-        )?
+        // With `--instance` the flagged instance's credentials
+        // resolve strictly from the alias's own variables.
+        match &endpoints.instance {
+            Some(alias) => EnvObsAuth::credentials_for_instance(alias, &endpoints.instances)?,
+            None => EnvObsAuth::credentials_for_url(
+                &endpoints.obs_base,
+                &endpoints.obs_base,
+                &endpoints.instances,
+            )?,
+        }
     } else {
         Credentials::None
     };
@@ -227,9 +238,10 @@ pub fn checkout(
     rev: Option<&str>,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let endpoints = endpoints()?;
+    let endpoints = endpoints(instance)?;
     let client = obs_client(&http, &endpoints, "checkout", live, debug)?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     // A dry-run checkout clones nothing: resolving the Gitea
@@ -308,9 +320,10 @@ pub fn update(
     rev: Option<&str>,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let endpoints = endpoints()?;
+    let endpoints = endpoints(instance)?;
     let client = obs_client(&http, &endpoints, "update", live, debug)?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     // A dry-run update fetches nothing: resolving the Gitea
@@ -424,7 +437,7 @@ fn status_result(wc: &WorkingCopy, entries: &[working_copy::StatusEntry]) -> (Va
 /// A content command: the text IS the diff. A failed link-target
 /// read degrades: the plain halves print and the failure is a
 /// stderr note, not an error.
-pub fn diff(debug: &Debug) -> Result<(Value, String), GeectlError> {
+pub fn diff(debug: &Debug, instance: Option<&str>) -> Result<(Value, String), GeectlError> {
     let _ = debug;
     let wc = open_working_copy(false, None)?;
     // The link read runs only on a linked checkout: an unlinked
@@ -434,7 +447,7 @@ pub fn diff(debug: &Debug) -> Result<(Value, String), GeectlError> {
     // public downloads.
     let (diff, note) = if working_copy::is_linked(&wc)? {
         let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-        let endpoints = endpoints()?;
+        let endpoints = endpoints(instance)?;
         let client = obs_client(&http, &endpoints, "diff", false, debug)?;
         working_copy::diff(&wc, Some(&client))?
     } else {
@@ -578,6 +591,7 @@ pub fn commit(
     noservice: bool,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     // Refused before anything is resolved: an empty message
     // aborts the git commit and sends an empty comment on the
@@ -589,7 +603,7 @@ pub fn commit(
         ));
     }
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let endpoints = endpoints()?;
+    let endpoints = endpoints(instance)?;
     let client = obs_client(&http, &endpoints, "commit", live, debug)?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     // A dry-run commit pushes nothing: resolving the Gitea
@@ -664,9 +678,13 @@ fn commit_result(
 }
 
 /// Pull a linked package to the link target's latest revision.
-pub fn pull(debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
+pub fn pull(
+    debug: &Debug,
+    live: bool,
+    instance: Option<&str>,
+) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let endpoints = endpoints()?;
+    let endpoints = endpoints(instance)?;
     // `pull` resolves credentials even in dry-run (see
     // `obs_client`): its plan reads the authed expanded routes,
     // and the plan is read-only.
@@ -793,6 +811,7 @@ fn resolve_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::obs::test_support::FakeHttp;
     use crate::working_copy::StatusEntry;
 
     fn wc() -> WorkingCopy {
@@ -972,6 +991,30 @@ mod tests {
     }
 
     #[test]
+    fn obs_client_with_flagged_instance_uses_the_alias_base() {
+        // The flag selects the client base: a working copy recorded
+        // from another instance refuses this client at open (pinned
+        // by `open_for_refuses_another_instance` in working_copy),
+        // so the flagged base is what the guard compares against.
+        let http = FakeHttp::new();
+        let endpoints = Endpoints {
+            obs_base: "https://api.example.org".to_string(),
+            instances: vec![("example".to_string(), "https://api.example.org".to_string())],
+            instance: Some("example".to_string()),
+            config: config::Config {
+                obs_url: None,
+                gitea_url: None,
+                format: None,
+                instances: vec![],
+                build_cache_dir: None,
+                build_cache_cap_gib: None,
+            },
+        };
+        let client = obs_client(&http, &endpoints, "diff", false, &Debug::disabled()).unwrap();
+        assert_eq!(client.base, "https://api.example.org");
+    }
+
+    #[test]
     fn leaf_credential_wiring_pins_which_leaves_need_credentials() {
         // `pull` reads the authed expanded routes and `commit`
         // mutates: without credentials both 401. `checkout`,
@@ -1005,9 +1048,9 @@ mod tests {
 
     #[test]
     fn commit_rejects_an_empty_message_before_any_resolution() {
-        let err = commit("", false, &Debug::disabled(), false).unwrap_err();
+        let err = commit("", false, &Debug::disabled(), false, None).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        let err = commit("   ", false, &Debug::disabled(), false).unwrap_err();
+        let err = commit("   ", false, &Debug::disabled(), false, None).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 

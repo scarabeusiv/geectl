@@ -36,7 +36,7 @@ use crate::debug::{strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{GiteaClient, GiteaUser};
 use crate::http::{HttpClient, Timeout, UreqClient};
-use crate::obs::{ObsClient, ProjectMatch, OBS_API_BASE};
+use crate::obs::{ObsClient, ProjectMatch};
 use crate::person::{PersonBackend, PersonClient, PersonSearch, PersonSearchResult};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
@@ -68,6 +68,7 @@ pub fn run_person(
     command: PersonCommand,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     // A read, always live: `--live` is ignored.
     let _ = live;
@@ -86,14 +87,14 @@ pub fn run_person(
             };
             query.validate()?;
             match query.backend {
-                Some(PersonBackend::Obs) => with_obs(debug, |obs| {
+                Some(PersonBackend::Obs) => with_obs(debug, instance, |obs| {
                     search_with(&PersonClient::new(Some(obs), None), &query)
                 }),
-                Some(PersonBackend::Gitea) => with_gitea(debug, |gitea| {
+                Some(PersonBackend::Gitea) => with_gitea(debug, instance, |gitea| {
                     search_with(&PersonClient::new(None, Some(gitea)), &query)
                 }),
-                None => with_obs(debug, |obs| {
-                    with_gitea(debug, |gitea| {
+                None => with_obs(debug, instance, |obs| {
+                    with_gitea(debug, instance, |gitea| {
                         search_with(&PersonClient::new(Some(obs), Some(gitea)), &query)
                     })
                 }),
@@ -130,30 +131,36 @@ fn search_with(
 /// resolution error.
 fn with_obs<T>(
     debug: &Debug,
+    instance: Option<&str>,
     f: impl FnOnce(&ObsClient) -> Result<T, GeectlError>,
 ) -> Result<T, GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
-    let base = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
-    let credentials = EnvObsAuth::credentials_for_url(base, base, &file_config.instances)?;
+    let base = config::obs_base_url(instance, &file_config)?;
+    let credentials = match instance {
+        Some(alias) => EnvObsAuth::credentials_for_instance(alias, &file_config.instances)?,
+        None => EnvObsAuth::credentials_for_url(&base, &base, &file_config.instances)?,
+    };
     let client =
-        ObsClient::with_base_and_credentials(&http, base, credentials)?.with_debug(debug.clone());
+        ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
     f(&client)
 }
 
 /// A `GiteaClient` for the configured Gitea instance (config file /
-/// env / default) with the environment Bearer <redacted>, resolved for
+/// env / default) with the environment Bearer token, resolved for
 /// the configured URL from its instance alias like the OBS arm
 /// (`EnvGiteaAuth::credentials_for_url`, the same per-URL shape
-/// as the OBS arm), reporting on the debug channel. Construction
-/// fails closed without a token.
+/// as the OBS arm), reporting on the debug channel. With
+/// `--instance`, strictly the flagged alias's variables; the host
+/// stays the configured URL. Construction fails closed without a
+/// token.
 /// The same construction as the `gitea` group's, except the
 /// alias-aware resolution.
 fn gitea_client<'a>(
     http: &'a dyn HttpClient,
     debug: &Debug,
+    instance: Option<&str>,
 ) -> Result<GiteaClient<'a>, GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
@@ -166,7 +173,10 @@ fn gitea_client<'a>(
         .gitea_url
         .as_deref()
         .unwrap_or(DEFAULT_GITEA_URL);
-    let credentials = EnvGiteaAuth::credentials_for_url(base, base, &file_config.instances)?;
+    let credentials = match instance {
+        Some(alias) => EnvGiteaAuth::credentials_for_instance(alias, &file_config.instances)?,
+        None => EnvGiteaAuth::credentials_for_url(base, base, &file_config.instances)?,
+    };
     GiteaClient::with_base(http, base, credentials).map(|client| client.with_debug(debug.clone()))
 }
 
@@ -175,10 +185,11 @@ fn gitea_client<'a>(
 /// the caller runs inside it.
 fn with_gitea<T>(
     debug: &Debug,
+    instance: Option<&str>,
     f: impl FnOnce(&GiteaClient) -> Result<T, GeectlError>,
 ) -> Result<T, GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = gitea_client(&http, debug)?;
+    let client = gitea_client(&http, debug, instance)?;
     f(&client)
 }
 

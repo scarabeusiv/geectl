@@ -52,7 +52,7 @@ use crate::obs::{
     parse_build_log_url, results_across_instances, valid_obs_filename, valid_obs_name, BinaryFile,
     BuildHistoryEntry, BuildInfo, BuildLogQuery, BuildResults, DryRun, ExtDependency, FileInfo,
     InstanceBuildResults, JobHistoryEntry, JobStatus, ObsClient, PackageDeps, ProvidedBy,
-    Repository, ResultsQuery, WipeBinariesOptions, WipeCode, OBS_API_BASE,
+    Repository, ResultsQuery, WipeBinariesOptions, WipeCode,
 };
 use clap::{Args, Subcommand};
 use fs2::FileExt;
@@ -531,12 +531,13 @@ pub fn run_build(
     debug: &Debug,
     command: BuildCommand,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     // Credentials resolve lazily for `list-repositories`: the read is
     // public and never touches them, so a half-set credential env
     // (username without password) must not break it.
-    let (base, instances) = obs_endpoint()?;
+    let (base, instances) = obs_endpoint(instance)?;
     // The build-log coordinates resolve before credentials: a pasted
     // URL or a half-given coordinate set fails with its own typed
     // error instead of a credentials error, and the header below
@@ -577,7 +578,10 @@ pub fn run_build(
         {
             Credentials::None
         }
-        _ => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
+        _ => match instance {
+            Some(alias) => EnvObsAuth::credentials_for_instance(alias, &instances)?,
+            None => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
+        },
     };
     let client =
         ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
@@ -603,7 +607,9 @@ pub fn run_build(
         } => {
             let query = query.into_query(oldstate);
             if all_instances {
-                results_all_instances(&http, debug, &base, &instances, &project, &query, &header)
+                results_all_instances(
+                    &http, debug, &base, &instances, &project, &query, &header, instance,
+                )
             } else {
                 let results = client.results(&project, &query)?;
                 Ok((
@@ -1780,15 +1786,13 @@ fn write_downloaded(output: &PathBuf, bytes: &[u8]) -> Result<(), GeectlError> {
 /// The configured OBS base URL and the config file's `[instances]`
 /// table, for credential resolution (see
 /// [`auth::resolve_obs_for_url`]).
-pub(crate) fn obs_endpoint() -> Result<(String, Vec<(String, String)>), GeectlError> {
+pub(crate) fn obs_endpoint(
+    instance: Option<&str>,
+) -> Result<(String, Vec<(String, String)>), GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
     Ok((
-        effective
-            .config
-            .obs_url
-            .unwrap_or_else(|| OBS_API_BASE.to_string()),
+        config::obs_base_url(instance, &file_config)?,
         file_config.instances,
     ))
 }
@@ -1990,6 +1994,7 @@ pub(crate) fn read_results_across_instances(
     instances: &[(String, String)],
     project: &str,
     query: &ResultsQuery,
+    instance: Option<&str>,
 ) -> Result<Vec<InstanceBuildResults>, GeectlError> {
     let endpoints = merged_endpoints(base, instances)?;
     let refs: Vec<(&str, &str)> = endpoints
@@ -1997,7 +2002,16 @@ pub(crate) fn read_results_across_instances(
         .map(|(alias, url)| (alias.as_str(), url.as_str()))
         .collect();
     let outcomes = results_across_instances(&refs, project, query, |url, project, query| {
-        let credentials = EnvObsAuth::credentials_for_url(url, base, instances)?;
+        // The flagged endpoint resolves strictly from the alias's
+        // own variables: the plain variables must not apply to it
+        // just because it is the call's base. The other endpoints
+        // resolve per URL as before.
+        let credentials = match instance {
+            Some(alias) if same_api_url(url, base).unwrap_or(false) => {
+                EnvObsAuth::credentials_for_instance(alias, instances)?
+            }
+            _ => EnvObsAuth::credentials_for_url(url, base, instances)?,
+        };
         let client =
             ObsClient::with_base_and_credentials(http, url, credentials)?.with_debug(debug.clone());
         client.results(project, query)
@@ -2037,6 +2051,7 @@ pub(crate) fn read_results_across_instances(
 /// shape (one `instance:` section in text, one entry in the
 /// payload's `instances` array), so the flag changes the view even
 /// then; only the failure is identical to the plain read.
+#[allow(clippy::too_many_arguments)]
 fn results_all_instances(
     http: &UreqClient,
     debug: &Debug,
@@ -2045,8 +2060,10 @@ fn results_all_instances(
     project: &str,
     query: &ResultsQuery,
     header: &str,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
-    let outcomes = read_results_across_instances(http, debug, base, instances, project, query)?;
+    let outcomes =
+        read_results_across_instances(http, debug, base, instances, project, query, instance)?;
     Ok((
         merged_results_payload(project, &outcomes),
         with_header(header, render_merged_results_text(&outcomes)),

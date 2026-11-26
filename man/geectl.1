@@ -4,7 +4,7 @@
 .SH NAME
 geectl \- Geeko Controller — a CLI for openSUSE packaging workflows
 .SH SYNOPSIS
-\fBgeectl\fR [\fB\-\-format\fR] [\fB\-\-debug\fR] [\fB\-\-debug\-body\fR] [\fB\-\-live\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIsubcommands\fR]
+\fBgeectl\fR [\fB\-\-format\fR] [\fB\-\-debug\fR] [\fB\-\-debug\-body\fR] [\fB\-\-live\fR] [\fB\-\-instance\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIsubcommands\fR]
 .SH DESCRIPTION
 Geeko Controller — a CLI for openSUSE packaging workflows
 .SH OPTIONS
@@ -30,6 +30,9 @@ Also print request and response bodies on the debug channel (capped at 2048 byte
 .TP
 \fB\-\-live\fR
 Actually perform mutations. Without it, only the plan is printed: dry\-run is the default for mutations
+.TP
+\fB\-\-instance\fR \fI<ALIAS>\fR
+Select the OBS instance for this call, by its alias in the config file\*(Aqs `[instances]` table. The flag is authoritative: it beats the `GEECTL_OBS_URL` environment variable, the configured URL, and any working\-copy state. Credentials resolve only from the flagged instance\*(Aqs own variables (`GEECTL_OBS_USERNAME_<ALIAS>` / `GEECTL_OBS_PASSWORD[_FILE]_<ALIAS>` / `GEECTL_OBS_APIKEY[_FILE]_<ALIAS>`); another instance\*(Aqs variables are never borrowed, and a missing credential for the flagged instance fails the call. The Gitea instance is unaffected
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help

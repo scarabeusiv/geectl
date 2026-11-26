@@ -651,6 +651,31 @@ pub fn alias_for_url<'a>(
     Ok(None)
 }
 
+/// The URL for one instance alias: the alias as written in the
+/// config's `[instances]` table. An unknown alias is a `ConfigError`
+/// naming the alias and the known aliases — an alias is not a
+/// secret, and the user needs the spelling to fix it.
+pub fn url_for_alias<'a>(
+    instances: &'a [(String, String)],
+    alias: &str,
+) -> Result<&'a str, GeectlError> {
+    for (known, url) in instances {
+        if known == alias {
+            return Ok(url.as_str());
+        }
+    }
+    let known: Vec<&str> = instances.iter().map(|(alias, _)| alias.as_str()).collect();
+    let hint = if known.is_empty() {
+        "no instances are configured in [instances]".to_string()
+    } else {
+        format!("known instances: {}", known.join(", "))
+    };
+    Err(GeectlError::new(
+        ErrorKind::ConfigError,
+        format!("unknown instance {alias:?}; {hint}"),
+    ))
+}
+
 /// The credential variable names for one instance alias: the alias
 /// as written in the config, uppercased (env vars are conventionally
 /// uppercase). Basic first, then the API-key pair.
@@ -794,6 +819,46 @@ fn resolve_obs_plain(
         vars,
         read_file,
     )
+}
+
+/// Resolve OBS credentials strictly for one named instance —
+/// the `--instance` path. Only the alias's own variables resolve
+/// (`GEECTL_OBS_APIKEY[_FILE]_<ALIAS>` /
+/// `GEECTL_OBS_USERNAME_<ALIAS>` /
+/// `GEECTL_OBS_PASSWORD[_FILE]_<ALIAS>`); the plain variables
+/// never apply here, and another instance's variables are never
+/// borrowed. A missing credential for the named instance is a
+/// `ConfigError` naming the variables to set — it fails closed
+/// even when nothing is configured anywhere, unlike
+/// [`resolve_obs_for_url`], which returns [`Credentials::None`]
+/// in that case.
+pub fn resolve_obs_for_instance(
+    alias: &str,
+    instances: &[(String, String)],
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Credentials, GeectlError> {
+    let _ = url_for_alias(instances, alias)?;
+    let (username_var, password_var, password_file_var, apikey_var, apikey_file_var) =
+        obs_alias_vars(alias);
+    let scoped = resolve_obs_scope(
+        &apikey_var,
+        &apikey_file_var,
+        &username_var,
+        &password_var,
+        &password_file_var,
+        vars,
+        read_file,
+    )?;
+    match scoped {
+        Credentials::None => Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!(
+                "no credentials configured for instance {alias:?}; set {apikey_var} or {username_var} and {password_var}"
+            ),
+        )),
+        creds => Ok(creds),
+    }
 }
 
 /// Resolve OBS credentials — an API token (Bearer) or a
@@ -1574,6 +1639,35 @@ impl EnvObsAuth {
         resolve_obs_for_url(
             url,
             default_url,
+            instances,
+            &|name| env.get(name).cloned(),
+            &read_secret_file_production,
+        )
+    }
+
+    /// OBS credentials strictly for one named instance from the
+    /// process environment — the `--instance` path. See
+    /// [`resolve_obs_for_instance`]: only the alias's own variables
+    /// resolve, and a missing credential fails closed. The alias
+    /// variables are snapshotted so resolution sees one consistent
+    /// view of the environment.
+    pub fn credentials_for_instance(
+        alias: &str,
+        instances: &[(String, String)],
+    ) -> Result<Credentials, GeectlError> {
+        let (username_var, password_var, password_file_var, apikey_var, apikey_file_var) =
+            obs_alias_vars(alias);
+        let names = [
+            username_var,
+            password_var,
+            password_file_var,
+            apikey_var,
+            apikey_file_var,
+        ];
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let env = snapshot_env(&refs)?;
+        resolve_obs_for_instance(
+            alias,
             instances,
             &|name| env.get(name).cloned(),
             &read_secret_file_production,
@@ -3358,5 +3452,89 @@ mod tests {
         // No GEECTL_* key: neither the loose mode nor the malformed
         // line matters — the file is not a geectl file.
         assert!(load_dotenv_at(&path).unwrap().is_none());
+    }
+
+    // --- `--instance` resolution (issue #407) ---
+
+    #[test]
+    fn instance_flag_resolves_the_alias_token() {
+        let map = vars(&[("GEECTL_OBS_APIKEY_EXAMPLE", "alias-token")]);
+        let creds = resolve_obs_for_instance(
+            "example",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(matches!(creds, Credentials::Bearer { ref token } if token == "alias-token"));
+    }
+
+    #[test]
+    fn instance_flag_never_borrows_another_instances_keys() {
+        // Plain credentials are set, and a different alias's
+        // variables are set; neither may serve the flagged instance.
+        let map = vars(&[
+            (OBS_USERNAME_VAR, "plain-user"),
+            (OBS_PASSWORD_VAR, "plain-secret"),
+            ("GEECTL_OBS_USERNAME_OTHER", "other-user"),
+            ("GEECTL_OBS_PASSWORD_OTHER", "other-secret"),
+        ]);
+        let err = resolve_obs_for_instance(
+            "example",
+            &instances(&[
+                ("example", "https://api.example.org"),
+                ("other", "https://other.example.org"),
+            ]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("example"));
+        assert!(err.context.contains("GEECTL_OBS_USERNAME_EXAMPLE"));
+        assert!(!err.context.contains("plain-user"));
+        assert!(!err.context.contains("other-user"));
+        assert!(!err.context.contains("plain-secret"));
+        assert!(!err.context.contains("other-secret"));
+    }
+
+    #[test]
+    fn instance_flag_with_nothing_configured_fails_closed() {
+        let map = vars(&[]);
+        let err = resolve_obs_for_instance(
+            "example",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("example"));
+        assert!(err.context.contains("GEECTL_OBS_USERNAME_EXAMPLE"));
+    }
+
+    #[test]
+    fn instance_flag_unknown_alias_names_the_known_aliases() {
+        let map = vars(&[]);
+        let err = resolve_obs_for_instance(
+            "missing",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("missing"));
+        assert!(err.context.contains("example"));
+    }
+
+    #[test]
+    fn url_for_alias_matches_the_alias_as_written() {
+        let table = instances(&[("example", "https://api.example.org")]);
+        assert_eq!(
+            url_for_alias(&table, "example").unwrap(),
+            "https://api.example.org"
+        );
+        assert!(url_for_alias(&table, "EXAMPLE").is_err());
     }
 }

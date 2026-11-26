@@ -94,7 +94,7 @@ use crate::obs::{
     Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person, ProjectMatch,
     ProjectMeta, ReleaseOptions, Repository, RevisionPatch, RevisionRange, RevisionSpec, RoleGrant,
     ScmsyncProjectList, SourceFile, StagedRequest, StagingProject, StagingReadOptions,
-    TokenOperation, FACTORY_PROJECT, OBS_API_BASE,
+    TokenOperation, FACTORY_PROJECT,
 };
 use clap::Subcommand;
 use serde_json::{json, Value};
@@ -865,9 +865,10 @@ pub fn run_remote(
     command: RemoteCommand,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let (base, instances) = obs_endpoint()?;
+    let (base, instances) = obs_endpoint(instance)?;
     // Credentials resolve per command (see `docs/cli.md`).
     let credentials = match &command {
         RemoteCommand::Cat { .. }
@@ -908,7 +909,10 @@ pub fn run_remote(
         RemoteCommand::Unlock { .. } if !live => Credentials::None,
         RemoteCommand::AddChannels { .. } if !live => Credentials::None,
         RemoteCommand::AddContainers { .. } if !live => Credentials::None,
-        _ => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
+        _ => match instance {
+            Some(alias) => EnvObsAuth::credentials_for_instance(alias, &instances)?,
+            None => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
+        },
     };
     let client =
         ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
@@ -2025,15 +2029,13 @@ pub fn run_remote(
 /// Here the dry-run mutations need none either, but the library proves
 /// it (its dry-run guard runs before the credentials check), so nothing
 /// is swallowed.
-pub(crate) fn obs_endpoint() -> Result<(String, Vec<(String, String)>), GeectlError> {
+pub(crate) fn obs_endpoint(
+    instance: Option<&str>,
+) -> Result<(String, Vec<(String, String)>), GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
     Ok((
-        effective
-            .config
-            .obs_url
-            .unwrap_or_else(|| OBS_API_BASE.to_string()),
+        config::obs_base_url(instance, &file_config)?,
         file_config.instances,
     ))
 }
@@ -4677,8 +4679,26 @@ mod tests {
         ));
     }
 
+    // The CLI parse in an unoptimized build needs ~1.5 MiB of stack
+    // (the production binary runs on a 32 MiB thread for the same
+    // reason, see main); the Windows test thread carries 2 MiB, and
+    // this test's deepest parse paths exceed it once another global
+    // flag is added. Run the body on a thread with an explicit stack
+    // instead; a panic resumes on the test thread so the failure
+    // still reports at its own site.
     #[test]
     fn list_commands_parse_positionals() {
+        let child = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(list_commands_parse_positionals_inner)
+            .unwrap();
+        match child.join() {
+            Ok(()) => (),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn list_commands_parse_positionals_inner() {
         assert!(matches!(
             parse(&["geectl", "remote", "list-files", "P", "K"]),
             RemoteCommand::ListFiles { .. }

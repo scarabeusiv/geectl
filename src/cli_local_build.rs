@@ -48,7 +48,7 @@ use crate::local_build::{
     LocalBuild, PrecommitRecord, ServiceRunMode, ServiceRunRecord, ServiceRunRequest,
     SpecCleanerResult, WipeOutcome,
 };
-use crate::obs::{DryRun, ObsClient, OBS_API_BASE};
+use crate::obs::{DryRun, ObsClient};
 use crate::periodic::{self, PeriodicOs, PeriodicOutcome, PeriodicStatus};
 use clap::Subcommand;
 use serde_json::{json, Value};
@@ -306,28 +306,28 @@ pub fn run_local_build(
     debug: &Debug,
     command: LocalBuildCommand,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
     let effective = config::effective_config(&file_config)?;
-    // Unreachable by construction — effective_config always yields
-    // Some(obs_url) — but kept as a defensive default rather than an
-    // unwrap: a config change must not turn into a panic here.
-    let obs_url = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
+    let obs_url = config::obs_base_url(instance, &file_config)?;
     // Credentials resolve per command: the service leaves make no
     // server calls, so none resolve there — a half-set credential
     // env must not break a local run. The build leaf fetches
     // buildinfo/buildconfig on a live run, so it resolves the
     // endpoint's credentials; its dry run touches nothing and
-    // resolves none.
+    // resolves none. With `--instance` the build leaf resolves
+    // strictly from the alias's own variables.
     let credentials = match &command {
-        LocalBuildCommand::Build { .. } if live => {
-            EnvObsAuth::credentials_for_url(obs_url, obs_url, &file_config.instances)?
-        }
+        LocalBuildCommand::Build { .. } if live => match instance {
+            Some(alias) => EnvObsAuth::credentials_for_instance(alias, &file_config.instances)?,
+            None => EnvObsAuth::credentials_for_url(&obs_url, &obs_url, &file_config.instances)?,
+        },
         _ => Credentials::None,
     };
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = ObsClient::with_base_and_credentials(&http, obs_url, credentials)?
+    let client = ObsClient::with_base_and_credentials(&http, &obs_url, credentials)?
         .with_debug(debug.clone());
     let vertical = LocalBuild::from_config(&client, &effective.config)?.with_debug(debug.clone());
     match command {

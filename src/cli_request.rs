@@ -67,7 +67,7 @@ use crate::obs::{
     DeletePayload, DeleteTarget, DryRun, FiledRequest, ForwardActionResult, ForwardResult,
     MaintenanceIncidentPayload, ObsClient, Request, RequestAction, RequestComment, RequestHistory,
     RequestReview, RequestSearch, RequestState, RequestStateInfo, ReviewState, ReviewTarget,
-    SrFiling, SrPayload, OBS_API_BASE,
+    SrFiling, SrPayload,
 };
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
@@ -508,13 +508,14 @@ pub fn run(
     command: RequestCommand,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     match command {
-        RequestCommand::Show { id } => with_client(debug, true, |client| {
+        RequestCommand::Show { id } => with_client(debug, true, instance, |client| {
             let request = client.show_request(&id)?;
             Ok((request_json(&request), render_request_text(&request)))
         }),
-        RequestCommand::Log { id } => with_client(debug, true, |client| {
+        RequestCommand::Log { id } => with_client(debug, true, instance, |client| {
             let history = client.request_log(&id)?;
             let payload = json!({
                 "id": request_id_json(&id),
@@ -587,7 +588,7 @@ pub fn run(
                 limit,
             )?;
             search.match_expr()?;
-            with_client(debug, true, |client| {
+            with_client(debug, true, instance, |client| {
                 let requests = client.search_requests(&search)?;
                 let payload = json!({
                     "requests": requests.iter().map(request_json).collect::<Vec<_>>(),
@@ -637,7 +638,7 @@ pub fn run(
                 limit,
             )?;
             search.match_expr()?;
-            with_client(debug, true, |client| {
+            with_client(debug, true, instance, |client| {
                 let requests = client.search_requests(&search)?;
                 let payload = json!({
                     "requests": requests.iter().map(request_json).collect::<Vec<_>>(),
@@ -646,7 +647,7 @@ pub fn run(
                 Ok((payload, render_list_text(&coordinates, &requests)))
             })
         }
-        RequestCommand::Diff { id, xml } => with_client(debug, true, |client| {
+        RequestCommand::Diff { id, xml } => with_client(debug, true, instance, |client| {
             let diff = client.request_diff(&id, xml)?;
             // A content command: the payload is the diff, and the
             // text rendering is the diff verbatim. Content commands
@@ -658,7 +659,7 @@ pub fn run(
             let payload = json!({ "id": request_id_json(&id), "diff": diff, "xml": xml });
             Ok((payload, render_diff_text(&id, &diff)))
         }),
-        RequestCommand::ListComments { id } => with_client(debug, true, |client| {
+        RequestCommand::ListComments { id } => with_client(debug, true, instance, |client| {
             let comments = client.list_comments(&id)?;
             let payload = json!({
                 "id": request_id_json(&id),
@@ -680,6 +681,7 @@ pub fn run(
             no_forward,
             forward_message.as_deref(),
             live,
+            instance,
         ),
         RequestCommand::Decline { id, comment } => act(
             debug,
@@ -688,6 +690,7 @@ pub fn run(
             &comment,
             false,
             live,
+            instance,
             "declined",
         ),
         RequestCommand::Revoke { id, comment } => act(
@@ -697,6 +700,7 @@ pub fn run(
             &comment,
             false,
             live,
+            instance,
             "revoked",
         ),
         RequestCommand::ChangeState {
@@ -707,7 +711,7 @@ pub fn run(
         } => {
             let state = parse_state(&state)?;
             let verb = state.as_str();
-            act(debug, &id, state, &comment, force, live, verb)
+            act(debug, &id, state, &comment, force, live, instance, verb)
         }
         RequestCommand::TryChangeState {
             id,
@@ -717,7 +721,7 @@ pub fn run(
         } => {
             let state = parse_state(&state)?;
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
-            with_client(debug, live, |client| {
+            with_client(debug, live, instance, |client| {
                 let changed = client.try_change_state(&id, state, &comment, force, &dry_run)?;
                 // `changed` is the library's would-change answer: in
                 // a dry run it is true by design (the change is only
@@ -762,7 +766,7 @@ pub fn run(
                 package.as_deref(),
             )?;
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
-            with_client(debug, live, |client| {
+            with_client(debug, live, instance, |client| {
                 client.add_review(&id, &target, &comment, &dry_run)?;
                 let mut payload = json!({
                     "id": request_id_json(&id),
@@ -819,7 +823,7 @@ pub fn run(
                 package.as_deref(),
             )?;
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
-            with_client(debug, live, |client| {
+            with_client(debug, live, instance, |client| {
                 client.change_review_state(&id, state, &target, &comment, &dry_run)?;
                 let mut payload = json!({
                     "id": request_id_json(&id),
@@ -855,7 +859,7 @@ pub fn run(
         }
         RequestCommand::AddComment { id, body, parent } => {
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
-            with_client(debug, live, |client| {
+            with_client(debug, live, instance, |client| {
                 client.add_comment(&id, &body, parent.as_deref(), &dry_run)?;
                 let mut payload = json!({
                     "id": request_id_json(&id),
@@ -871,17 +875,17 @@ pub fn run(
                 Ok((payload, text))
             })
         }
-        RequestCommand::File { file } => file_request(debug, live, &file, None),
+        RequestCommand::File { file } => file_request(debug, live, instance, &file, None),
         RequestCommand::Refile { file, supersede } => {
-            file_request(debug, live, &file, Some(&supersede))
+            file_request(debug, live, instance, &file, Some(&supersede))
         }
         RequestCommand::FileMaintenanceIncident { incident } => {
-            file_maintenance_incident(debug, live, &incident, None)
+            file_maintenance_incident(debug, live, instance, &incident, None)
         }
         RequestCommand::RefileMaintenanceIncident {
             incident,
             supersede,
-        } => file_maintenance_incident(debug, live, &incident, Some(&supersede)),
+        } => file_maintenance_incident(debug, live, instance, &incident, Some(&supersede)),
         RequestCommand::Supersede { old_id, new_id } => {
             if !live {
                 return Err(GeectlError::new(
@@ -889,7 +893,7 @@ pub fn run(
                     "request supersede has no dry-run: pass --live to perform it, or use `request refile --supersede` for the dry-runnable supersede flow",
                 ));
             }
-            with_client(debug, true, |client| {
+            with_client(debug, true, instance, |client| {
                 client.supersede_request(&old_id, &new_id)?;
                 let payload = json!({
                     "old_id": request_id_json(&old_id),
@@ -917,7 +921,7 @@ pub fn run(
                 &description,
             )?;
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
-            with_client(debug, live, |client| {
+            with_client(debug, live, instance, |client| {
                 let filing = SrFiling::new(client, &dry_run).with_debug(debug.clone());
                 let id = filing.file_change_devel(&payload)?;
                 let filed = filed_payload(&id, &dry_run, |id| {
@@ -969,7 +973,7 @@ pub fn run(
             }
             let grantees = grantees.join(" and ");
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
-            with_client(debug, live, |client| {
+            with_client(debug, live, instance, |client| {
                 let filing = SrFiling::new(client, &dry_run).with_debug(debug.clone());
                 let id = filing.file_add_role(&payload)?;
                 let filed = filed_payload(&id, &dry_run, |id| {
@@ -1035,7 +1039,7 @@ pub fn run(
                 payload = payload.with_accept_at_in_hours(hours)?;
             }
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
-            with_client(debug, live, |client| {
+            with_client(debug, live, instance, |client| {
                 let filing = SrFiling::new(client, &dry_run).with_debug(debug.clone());
                 let id = filing.file_delete_request(&payload)?;
                 let filed = filed_payload(&id, &dry_run, |id| {
@@ -1206,6 +1210,7 @@ fn build_search(
 fn file_request(
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
     file: &FileArgs,
     supersede: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
@@ -1238,7 +1243,7 @@ fn file_request(
     } else {
         None
     };
-    with_client(debug, live, |client| {
+    with_client(debug, live, instance, |client| {
         let filing = SrFiling::new(client, &dry_run)
             .with_debug(debug.clone())
             .with_gitea_http(gitea_http);
@@ -1357,6 +1362,7 @@ fn file_request_text(
 fn file_maintenance_incident(
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
     incident: &MaintenanceIncidentArgs,
     supersede: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
@@ -1374,7 +1380,7 @@ fn file_maintenance_incident(
         payload = payload.with_cleanup()?;
     }
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    with_client(debug, live, |client| {
+    with_client(debug, live, instance, |client| {
         let filing = SrFiling::new(client, &dry_run).with_debug(debug.clone());
         let id = match supersede {
             Some(old_id) => filing.refile_maintenance_incident(&payload, old_id)?,
@@ -1465,6 +1471,7 @@ fn filed_payload(
 
 /// One state-change act (`accept`, `decline`, `revoke`,
 /// `change-state`): change the state, or record the plan in dry-run.
+#[allow(clippy::too_many_arguments)]
 fn act(
     debug: &Debug,
     id: &str,
@@ -1472,10 +1479,11 @@ fn act(
     comment: &str,
     force: bool,
     live: bool,
+    instance: Option<&str>,
     verb: &str,
 ) -> Result<(Value, String), GeectlError> {
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    with_client(debug, live, |client| {
+    with_client(debug, live, instance, |client| {
         client.change_state(id, state, comment, force, &dry_run)?;
         let mut payload = json!({
             "id": request_id_json(id),
@@ -1507,6 +1515,7 @@ fn act(
 /// `-m` / `--forward-message`. In dry-run nothing is accepted, so
 /// nothing is forwarded either — the plan notes the forward that
 /// would follow the accept.
+#[allow(clippy::too_many_arguments)]
 fn accept(
     debug: &Debug,
     id: &str,
@@ -1515,6 +1524,7 @@ fn accept(
     no_forward: bool,
     forward_message: Option<&str>,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let (mut payload, mut text) = act(
         debug,
@@ -1523,12 +1533,13 @@ fn accept(
         comment,
         force,
         live,
+        instance,
         "accepted",
     )?;
     // The accept landed (or, in dry-run, is planned): clean up the
     // branch home packages it merged, through the shared helper.
     // A cleanup that cannot run is reported, never an error here.
-    let (cleanup_payload, cleanup_text) = accept_cleanup(debug, id, live);
+    let (cleanup_payload, cleanup_text) = accept_cleanup(debug, id, live, instance);
     if let Value::Object(map) = &mut payload {
         map.insert("cleanup".to_string(), cleanup_payload);
     }
@@ -1554,8 +1565,8 @@ fn accept(
         return Ok((payload, text));
     }
     // Live: the accept landed; forward the now-accepted request.
-    let (forward_payload, forward_text) =
-        forward(debug, id, forward_message, live).map_err(|err| {
+    let (forward_payload, forward_text) = forward(debug, id, forward_message, live, instance)
+        .map_err(|err| {
             GeectlError::new(
                 err.kind(),
                 format!("accepted request {id}, but the forward failed: {err}"),
@@ -1573,9 +1584,14 @@ fn accept(
 /// that cannot run at all (the request cannot be read, no
 /// credentials in dry-run) is reported as a payload with an `error`
 /// and a one-line text, never an error from this call.
-pub(crate) fn accept_cleanup(debug: &Debug, id: &str, live: bool) -> (Value, String) {
+pub(crate) fn accept_cleanup(
+    debug: &Debug,
+    id: &str,
+    live: bool,
+    instance: Option<&str>,
+) -> (Value, String) {
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    match with_client(debug, live, |client| {
+    match with_client(debug, live, instance, |client| {
         client.cleanup_accepted_request(id, &dry_run)
     }) {
         Ok(cleanup) => (
@@ -1728,9 +1744,10 @@ pub(crate) fn forward(
     id: &str,
     message: Option<&str>,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    with_client(debug, live, |client| {
+    with_client(debug, live, instance, |client| {
         let result = client.forward_request(id, message, &dry_run)?;
         Ok((
             forward_json(&result, &dry_run),
@@ -1894,16 +1911,23 @@ pub(crate) fn forward_action_text(action: &ForwardActionResult, dry_run: &DryRun
 pub(crate) fn with_client<T>(
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
     f: impl FnOnce(&ObsClient) -> Result<T, GeectlError>,
 ) -> Result<T, GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
-    let base = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
-    let credentials = match EnvObsAuth::credentials_for_url(base, base, &file_config.instances) {
+    let base = config::obs_base_url(instance, &file_config)?;
+    // With `--instance` the error propagates even in dry-run: the
+    // flagged instance's credentials are strict, and a dry run
+    // must not silently plan against an instance it cannot use.
+    let resolve = match instance {
+        Some(alias) => EnvObsAuth::credentials_for_instance(alias, &file_config.instances),
+        None => EnvObsAuth::credentials_for_url(&base, &base, &file_config.instances),
+    };
+    let credentials = match resolve {
         Ok(credentials) => credentials,
-        Err(err) if !live => {
+        Err(err) if !live && instance.is_none() => {
             // The dry run prints the plan without credentials, but
             // the failure must not be silent: the same credentials
             // would fail a `--live` run, so the error goes on the
@@ -1917,7 +1941,7 @@ pub(crate) fn with_client<T>(
         Err(err) => return Err(err),
     };
     let client =
-        ObsClient::with_base_and_credentials(&http, base, credentials)?.with_debug(debug.clone());
+        ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
     f(&client)
 }
 

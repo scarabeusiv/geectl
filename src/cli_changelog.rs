@@ -109,6 +109,7 @@ pub fn run_changelog(
     command: ChangelogCommand,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     // `changelog` performs no OBS mutation: `--live` is ignored, like
     // `cat`. `--write` is the explicit local-write flag.
@@ -119,7 +120,14 @@ pub fn run_changelog(
             target_project,
             target_package,
             entries,
-        } => run_validate(&dir, target_project, target_package, entries, debug),
+        } => run_validate(
+            &dir,
+            target_project,
+            target_package,
+            entries,
+            debug,
+            instance,
+        ),
         ChangelogCommand::Generate {
             dir,
             target_project,
@@ -135,6 +143,7 @@ pub fn run_changelog(
             message,
             write,
             debug,
+            instance,
         ),
     }
 }
@@ -180,9 +189,10 @@ fn fetch_target(
     debug: &Debug,
     project: &str,
     package: &str,
+    instance: Option<&str>,
 ) -> Result<Option<PackageSnapshot>, GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let (base, _instances) = crate::cli_remote::obs_endpoint()?;
+    let (base, _instances) = crate::cli_remote::obs_endpoint(instance)?;
     let client =
         ObsClient::with_base_and_credentials(&http, &base, crate::auth::Credentials::None)?
             .with_debug(debug.clone());
@@ -240,11 +250,12 @@ fn run_validate(
     target_package: Option<String>,
     entries: usize,
     debug: &Debug,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let target = resolve_target(target_project, target_package)?;
     let local = load_local(dir)?;
     let target_snapshot = match &target {
-        Some((project, package)) => fetch_target(debug, project, package)?,
+        Some((project, package)) => fetch_target(debug, project, package, instance)?,
         None => None,
     };
     let (news, news_error, tarball_present) = lookup_news(dir, &local);
@@ -473,6 +484,7 @@ fn refuse_symlink_destination(path: &Path) -> Result<(), GeectlError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_generate(
     dir: &Path,
     target_project: Option<String>,
@@ -481,6 +493,7 @@ fn run_generate(
     message: Vec<String>,
     write: bool,
     debug: &Debug,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let author = match author {
         Some(author) => parse_author(&author)?,
@@ -514,7 +527,7 @@ fn run_generate(
     let target = resolve_target(target_project, target_package)?;
     let local = load_local(dir)?;
     let target_snapshot = match &target {
-        Some((project, package)) => fetch_target(debug, project, package)?,
+        Some((project, package)) => fetch_target(debug, project, package, instance)?,
         None => None,
     };
     // NEWS is only looked up for a new version: when the version

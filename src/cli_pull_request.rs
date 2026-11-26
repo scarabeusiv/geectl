@@ -57,7 +57,7 @@ use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::local_build::LocalBuild;
 use crate::obs::{
     package_show_url, AcceptCleanupOutcome, CveId, DryRun, ForwardActionResult, ObsClient,
-    RequestAction, RequestState, ResultsQuery, ReviewTarget, SrPayload, OBS_API_BASE,
+    RequestAction, RequestState, ResultsQuery, ReviewTarget, SrPayload,
 };
 use crate::pull_request::{
     build_comment_body, PullRequest, PullRequestBackend, PullRequestClient, PullRequestEndpoint,
@@ -397,6 +397,7 @@ pub fn run_pull_request(
     command: PullRequestCommand,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     match command {
         PullRequestCommand::Show { reference } => {
@@ -407,10 +408,10 @@ pub fn run_pull_request(
             // its filters this way).
             let reference: PullRequestRef = reference.parse()?;
             match &reference {
-                PullRequestRef::Obs(_) => with_obs(debug, true, |obs| {
+                PullRequestRef::Obs(_) => with_obs(debug, true, instance, |obs| {
                     show_with(&PullRequestClient::new(Some(obs), None), &reference)
                 }),
-                PullRequestRef::Gitea { .. } => with_gitea(debug, |gitea| {
+                PullRequestRef::Gitea { .. } => with_gitea(debug, instance, |gitea| {
                     show_with(&PullRequestClient::new(None, Some(gitea)), &reference)
                 }),
             }
@@ -431,10 +432,10 @@ pub fn run_pull_request(
                 }
             }
             match &reference {
-                PullRequestRef::Obs(_) => with_obs(debug, true, |obs| {
+                PullRequestRef::Obs(_) => with_obs(debug, true, instance, |obs| {
                     diff_with(&PullRequestClient::new(Some(obs), None), &reference, xml)
                 }),
-                PullRequestRef::Gitea { .. } => with_gitea(debug, |gitea| {
+                PullRequestRef::Gitea { .. } => with_gitea(debug, instance, |gitea| {
                     diff_with(&PullRequestClient::new(None, Some(gitea)), &reference, xml)
                 }),
             }
@@ -443,6 +444,7 @@ pub fn run_pull_request(
             args,
             debug,
             live,
+            instance,
             "approve",
             "approved",
             |client, reference, target, message, commit, dry_run| {
@@ -453,6 +455,7 @@ pub fn run_pull_request(
             args,
             debug,
             live,
+            instance,
             "request changes on",
             "requested changes on",
             |client, reference, target, message, commit, dry_run| {
@@ -463,7 +466,7 @@ pub fn run_pull_request(
             let reference: PullRequestRef = args.reference.parse()?;
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
             match &reference {
-                PullRequestRef::Obs(_) => with_obs(debug, live, |obs| {
+                PullRequestRef::Obs(_) => with_obs(debug, live, instance, |obs| {
                     let client = PullRequestClient::new(Some(obs), None);
                     let comment =
                         client.comment(&reference, &args.body, args.parent.as_deref(), &dry_run)?;
@@ -472,7 +475,7 @@ pub fn run_pull_request(
                         comment_text(&reference, &comment, &args.body, &dry_run),
                     ))
                 }),
-                PullRequestRef::Gitea { .. } => with_gitea(debug, |gitea| {
+                PullRequestRef::Gitea { .. } => with_gitea(debug, instance, |gitea| {
                     let client = PullRequestClient::new(None, Some(gitea));
                     let comment =
                         client.comment(&reference, &args.body, args.parent.as_deref(), &dry_run)?;
@@ -499,7 +502,7 @@ pub fn run_pull_request(
             }
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
             let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-            let (base, instances) = crate::cli_build::obs_endpoint()?;
+            let (base, instances) = crate::cli_build::obs_endpoint(instance)?;
             // The link forms before the results read: a
             // non-production host fails before any network.
             let link = package_show_url(&args.project, &args.package, &base)?;
@@ -514,9 +517,10 @@ pub fn run_pull_request(
                 &instances,
                 &args.project,
                 &query,
+                instance,
             )?;
             let body = build_comment_body(&args.project, &args.package, &link, &outcomes);
-            with_gitea(debug, |gitea| {
+            with_gitea(debug, instance, |gitea| {
                 let client = PullRequestClient::new(None, Some(gitea));
                 let comment = client.build_comment(
                     &reference,
@@ -549,7 +553,7 @@ pub fn run_pull_request(
         PullRequestCommand::Comments { reference } => {
             let reference: PullRequestRef = reference.parse()?;
             match &reference {
-                PullRequestRef::Obs(_) => with_obs(debug, true, |obs| {
+                PullRequestRef::Obs(_) => with_obs(debug, true, instance, |obs| {
                     let client = PullRequestClient::new(Some(obs), None);
                     let comments = client.comments(&reference)?;
                     Ok((
@@ -557,7 +561,7 @@ pub fn run_pull_request(
                         comments_text(&reference, &comments),
                     ))
                 }),
-                PullRequestRef::Gitea { .. } => with_gitea(debug, |gitea| {
+                PullRequestRef::Gitea { .. } => with_gitea(debug, instance, |gitea| {
                     let client = PullRequestClient::new(None, Some(gitea));
                     let comments = client.comments(&reference)?;
                     Ok((
@@ -571,7 +575,7 @@ pub fn run_pull_request(
             let reference: PullRequestRef = args.reference.parse()?;
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
             match &reference {
-                PullRequestRef::Obs(_) => with_obs(debug, live, |obs| {
+                PullRequestRef::Obs(_) => with_obs(debug, live, instance, |obs| {
                     let client = PullRequestClient::new(Some(obs), None);
                     let cancelled = client.cancel_review_request(
                         &reference,
@@ -585,7 +589,7 @@ pub fn run_pull_request(
                         cancel_text(&reference, &args.reviewer, args.all, &cancelled, &dry_run),
                     ))
                 }),
-                PullRequestRef::Gitea { .. } => with_gitea(debug, |gitea| {
+                PullRequestRef::Gitea { .. } => with_gitea(debug, instance, |gitea| {
                     let client = PullRequestClient::new(None, Some(gitea));
                     let cancelled = client.cancel_review_request(
                         &reference,
@@ -655,6 +659,7 @@ pub fn run_pull_request(
                     args.force,
                     forward_message,
                     live,
+                    instance,
                 ),
                 PullRequestRef::Gitea { .. } => merge_gitea(
                     debug,
@@ -664,6 +669,7 @@ pub fn run_pull_request(
                     args.no_forward,
                     forward_message,
                     live,
+                    instance,
                 ),
             }
         }
@@ -673,6 +679,7 @@ pub fn run_pull_request(
                 args.reference,
                 debug,
                 live,
+                instance,
                 "decline",
                 "declined",
                 message,
@@ -685,6 +692,7 @@ pub fn run_pull_request(
                 args.reference,
                 debug,
                 live,
+                instance,
                 "withdraw",
                 "withdrew",
                 message,
@@ -695,13 +703,14 @@ pub fn run_pull_request(
             reference,
             debug,
             live,
+            instance,
             "reopen",
             "reopened",
             None,
             |client, reference, dry_run| client.reopen(reference, dry_run),
         ),
-        PullRequestCommand::Submit(args) => submit(args, debug, live),
-        PullRequestCommand::Cleanup => cleanup(debug, live),
+        PullRequestCommand::Submit(args) => submit(args, debug, live, instance),
+        PullRequestCommand::Cleanup => cleanup(debug, live, instance),
         PullRequestCommand::Search(args) => {
             // The filters are parsed and validated before any
             // credential resolution, like the handle above.
@@ -737,22 +746,22 @@ pub fn run_pull_request(
                 ("repo", &repo_values),
             ]);
             match query.backend {
-                Some(PullRequestBackend::Obs) => with_obs(debug, true, |obs| {
+                Some(PullRequestBackend::Obs) => with_obs(debug, true, instance, |obs| {
                     search_with(
                         &PullRequestClient::new(Some(obs), None),
                         &query,
                         &coordinates,
                     )
                 }),
-                Some(PullRequestBackend::Gitea) => with_gitea(debug, |gitea| {
+                Some(PullRequestBackend::Gitea) => with_gitea(debug, instance, |gitea| {
                     search_with(
                         &PullRequestClient::new(None, Some(gitea)),
                         &query,
                         &coordinates,
                     )
                 }),
-                None => with_obs(debug, true, |obs| {
-                    with_gitea(debug, |gitea| {
+                None => with_obs(debug, true, instance, |obs| {
+                    with_gitea(debug, instance, |gitea| {
                         search_with(
                             &PullRequestClient::new(Some(obs), Some(gitea)),
                             &query,
@@ -778,16 +787,23 @@ pub fn run_pull_request(
 fn with_obs<T>(
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
     f: impl FnOnce(&ObsClient) -> Result<T, GeectlError>,
 ) -> Result<T, GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
-    let base = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
-    let credentials = match EnvObsAuth::credentials_for_url(base, base, &file_config.instances) {
+    let base = config::obs_base_url(instance, &file_config)?;
+    // With `--instance` the error propagates even in dry-run: the
+    // flagged instance's credentials are strict, and a dry run
+    // must not silently plan against an instance it cannot use.
+    let resolve = match instance {
+        Some(alias) => EnvObsAuth::credentials_for_instance(alias, &file_config.instances),
+        None => EnvObsAuth::credentials_for_url(&base, &base, &file_config.instances),
+    };
+    let credentials = match resolve {
         Ok(credentials) => credentials,
-        Err(err) if !live => {
+        Err(err) if !live && instance.is_none() => {
             // The dry run prints the plan without credentials, but
             // the failure must not be silent: the same credentials
             // would fail a `--live` run, so the error goes on the
@@ -801,7 +817,7 @@ fn with_obs<T>(
         Err(err) => return Err(err),
     };
     let client =
-        ObsClient::with_base_and_credentials(&http, base, credentials)?.with_debug(debug.clone());
+        ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
     f(&client)
 }
 
@@ -810,10 +826,11 @@ fn with_obs<T>(
 /// the caller runs inside it.
 fn with_gitea<T>(
     debug: &Debug,
+    instance: Option<&str>,
     f: impl FnOnce(&GiteaClient) -> Result<T, GeectlError>,
 ) -> Result<T, GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = crate::cli_gitea::gitea_client(&http, debug)?;
+    let client = crate::cli_gitea::gitea_client(&http, debug, instance)?;
     f(&client)
 }
 
@@ -823,7 +840,12 @@ fn with_gitea<T>(
 /// are validated before any credential resolution — like the other
 /// arms validate their handles and targets first. Each arm then
 /// refuses a checkout that is not submittable before filing.
-fn submit(args: SubmitArgs, debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
+fn submit(
+    args: SubmitArgs,
+    debug: &Debug,
+    live: bool,
+    instance: Option<&str>,
+) -> Result<(Value, String), GeectlError> {
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     let wc = if live {
         working_copy::open(&current_dir()?)
@@ -846,7 +868,7 @@ fn submit(args: SubmitArgs, debug: &Debug, live: bool) -> Result<(Value, String)
             } else {
                 None
             };
-            with_obs(debug, live, |obs| {
+            with_obs(debug, live, instance, |obs| {
                 working_copy::refuse_not_submittable_obs(&wc, obs)?;
                 let client = PullRequestClient::new(Some(obs), None)
                     .with_debug(debug.clone())
@@ -1347,6 +1369,7 @@ fn review_act_with(
     args: ReviewActArgs,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
     present: &str,
     past: &str,
     act: impl FnOnce(
@@ -1367,7 +1390,7 @@ fn review_act_with(
     )?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     match &reference {
-        PullRequestRef::Obs(_) => with_obs(debug, live, |obs| {
+        PullRequestRef::Obs(_) => with_obs(debug, live, instance, |obs| {
             let client = PullRequestClient::new(Some(obs), None);
             let opinion = act(
                 &client,
@@ -1390,7 +1413,7 @@ fn review_act_with(
                 ),
             ))
         }),
-        PullRequestRef::Gitea { .. } => with_gitea(debug, |gitea| {
+        PullRequestRef::Gitea { .. } => with_gitea(debug, instance, |gitea| {
             let client = PullRequestClient::new(None, Some(gitea));
             let opinion = act(
                 &client,
@@ -1482,11 +1505,13 @@ fn merge_obs(
     force: bool,
     forward_message: Option<&str>,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let (mut payload, mut text) = level_act_with(
         format!("obs:{id}"),
         debug,
         live,
+        instance,
         "merge",
         "merged",
         message,
@@ -1495,7 +1520,8 @@ fn merge_obs(
     // The merge landed (or, in dry-run, is planned): clean up the
     // branch home packages it merged, through the shared helper.
     // A cleanup that cannot run is reported, never an error here.
-    let (cleanup_payload, cleanup_text) = crate::cli_request::accept_cleanup(debug, id, live);
+    let (cleanup_payload, cleanup_text) =
+        crate::cli_request::accept_cleanup(debug, id, live, instance);
     if let Value::Object(map) = &mut payload {
         map.insert("cleanup".to_string(), cleanup_payload);
     }
@@ -1519,7 +1545,7 @@ fn merge_obs(
     }
     // Live: the merge landed; forward the now-merged request.
     let (forward_payload, forward_text) =
-        crate::cli_request::forward(debug, id, forward_message, live).map_err(|err| {
+        crate::cli_request::forward(debug, id, forward_message, live, instance).map_err(|err| {
             GeectlError::new(
                 err.kind(),
                 format!("merged request {id}, but the forward failed: {err}"),
@@ -1555,6 +1581,7 @@ fn merge_obs(
 /// nothing is forwarded either — the plan notes the forward that
 /// would follow the merge, like the OBS arm; the preflight runs
 /// in dry-run too, when OBS credentials are available.
+#[allow(clippy::too_many_arguments)]
 fn merge_gitea(
     debug: &Debug,
     reference: &str,
@@ -1563,6 +1590,7 @@ fn merge_gitea(
     no_forward: bool,
     forward_message: Option<&str>,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     // Both arms are resolved and validated before the merge
     // lands: a missing OBS credential, an ambiguous or
@@ -1578,12 +1606,14 @@ fn merge_gitea(
             reference,
             forward_message,
             live,
+            instance,
         )?)
     };
     let (mut payload, mut text) = level_act_with(
         reference.to_string(),
         debug,
         live,
+        instance,
         "merge",
         "merged",
         message,
@@ -1592,7 +1622,7 @@ fn merge_gitea(
     // The merge landed (or, in dry-run, is planned): clean up the
     // branch home it merged, through the shared helper. A cleanup
     // that cannot run is reported, never an error here.
-    let (cleanup_payload, cleanup_text) = merge_gitea_cleanup(debug, reference, live);
+    let (cleanup_payload, cleanup_text) = merge_gitea_cleanup(debug, reference, live, instance);
     if let Value::Object(map) = &mut payload {
         map.insert("cleanup".to_string(), cleanup_payload);
     }
@@ -1623,8 +1653,8 @@ fn merge_gitea(
         return Ok((payload, text));
     }
     // Live: the merge landed; forward the merged pull request.
-    let (forward_payload, forward_text) = forward_gitea(debug, reference, forward_message)
-        .map_err(|err| {
+    let (forward_payload, forward_text) =
+        forward_gitea(debug, reference, forward_message, instance).map_err(|err| {
             GeectlError::new(
                 err.kind(),
                 format!("merged {reference}, but the forward failed: {err}"),
@@ -1648,7 +1678,12 @@ fn merge_gitea(
 /// request whose head syncs no OBS package (not a geectl branch)
 /// has nothing to clean up: empty outcomes, silent in text, the
 /// payload records the empty result.
-fn merge_gitea_cleanup(debug: &Debug, reference: &str, live: bool) -> (Value, String) {
+fn merge_gitea_cleanup(
+    debug: &Debug,
+    reference: &str,
+    live: bool,
+    instance: Option<&str>,
+) -> (Value, String) {
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     let not_run = |err: GeectlError| -> (Value, String) {
         (
@@ -1666,7 +1701,7 @@ fn merge_gitea_cleanup(debug: &Debug, reference: &str, live: bool) -> (Value, St
     // credential-less dry-run prints the plan without a server.
     // Live, the merge already landed, so missing credentials report
     // instead of failing: the merge stands either way.
-    let obs_ready = match with_obs(debug, live, |obs| {
+    let obs_ready = match with_obs(debug, live, instance, |obs| {
         Ok(matches!(
             obs.credentials(),
             Credentials::Basic { .. } | Credentials::Bearer { .. }
@@ -1682,7 +1717,7 @@ fn merge_gitea_cleanup(debug: &Debug, reference: &str, live: bool) -> (Value, St
             "cannot clean up the branch home without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
         ));
     }
-    let head = match gitea_merge_head_inputs(debug, reference) {
+    let head = match gitea_merge_head_inputs(debug, reference, instance) {
         Ok(Some(head)) => head,
         Ok(None) => {
             debug.emit("decision: skipping the merge-time branch cleanup: the merged pull request's head repo is gone, so no branch home can be resolved");
@@ -1693,7 +1728,7 @@ fn merge_gitea_cleanup(debug: &Debug, reference: &str, live: bool) -> (Value, St
         }
         Err(err) => return not_run(err),
     };
-    let outcome = match with_obs(debug, live, |obs| {
+    let outcome = match with_obs(debug, live, instance, |obs| {
         let package = resolve_forward_package(
             obs,
             &head.repo_url,
@@ -1746,6 +1781,7 @@ struct GiteaMergeHeadInputs {
 fn gitea_merge_head_inputs(
     debug: &Debug,
     reference: &str,
+    instance: Option<&str>,
 ) -> Result<Option<GiteaMergeHeadInputs>, GeectlError> {
     let reference: PullRequestRef = reference.parse()?;
     let (owner, repo, number) = match &reference {
@@ -1761,7 +1797,7 @@ fn gitea_merge_head_inputs(
             ));
         }
     };
-    let (pr, head) = with_gitea(debug, |gitea| {
+    let (pr, head) = with_gitea(debug, instance, |gitea| {
         let pr = gitea.pr_get(&owner, &repo, number)?;
         let head = match pr.head.repo.as_ref() {
             Some(head) => {
@@ -1871,6 +1907,7 @@ fn gitea_forward_inputs(
     debug: &Debug,
     reference: &str,
     forward_message: Option<&str>,
+    instance: Option<&str>,
 ) -> Result<GiteaForwardInputs, GeectlError> {
     let reference: PullRequestRef = reference.parse()?;
     let (owner, repo, number) = match &reference {
@@ -1886,7 +1923,7 @@ fn gitea_forward_inputs(
             ));
         }
     };
-    let (pr, default_branch, clone_url) = with_gitea(debug, |gitea| {
+    let (pr, default_branch, clone_url) = with_gitea(debug, instance, |gitea| {
         let pr = gitea.pr_get(&owner, &repo, number)?;
         let repo = gitea.repo_get(&owner, &repo)?;
         Ok((pr, repo.default_branch, repo.clone_url))
@@ -1991,13 +2028,14 @@ fn preflight_gitea_forward(
     reference: &str,
     forward_message: Option<&str>,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<ForwardPreflight, GeectlError> {
     // OBS credentials first: without them there is nothing to
     // verify against, and the Gitea reads must not run either — a
     // credential-less dry-run prints the plan without a server.
     // Live, the resolution fails fast on missing credentials, so
     // a live merge never reaches the skip below.
-    let obs_ready = with_obs(debug, live, |obs| {
+    let obs_ready = with_obs(debug, live, instance, |obs| {
         Ok(matches!(
             obs.credentials(),
             Credentials::Basic { .. } | Credentials::Bearer { .. }
@@ -2013,9 +2051,9 @@ fn preflight_gitea_forward(
         debug.emit("decision: skipping the forward preflight: no OBS credentials in dry-run, so the forward is planned unverified");
         return Ok(ForwardPreflight::SkippedNoObsCredentials);
     }
-    let inputs = gitea_forward_inputs(debug, reference, forward_message)?;
+    let inputs = gitea_forward_inputs(debug, reference, forward_message, instance)?;
     let dry_run = DryRun::new(true).with_debug(debug.clone());
-    with_obs(debug, live, |obs| {
+    with_obs(debug, live, instance, |obs| {
         let package = resolve_forward_package(
             obs,
             &inputs.repo_url,
@@ -2049,10 +2087,11 @@ fn forward_gitea(
     debug: &Debug,
     reference: &str,
     forward_message: Option<&str>,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
-    let inputs = gitea_forward_inputs(debug, reference, forward_message)?;
+    let inputs = gitea_forward_inputs(debug, reference, forward_message, instance)?;
     let dry_run = DryRun::new(false).with_debug(debug.clone());
-    let action = with_obs(debug, true, |obs| {
+    let action = with_obs(debug, true, instance, |obs| {
         let package = resolve_forward_package(
             obs,
             &inputs.repo_url,
@@ -2177,10 +2216,12 @@ fn scmsync_branch_matches(parsed: &ScmsyncUrl, branch: &str, default_branch: &st
 /// One pull-request-level act (`merge` / `decline` /
 /// `withdraw` / `reopen`) through the uniform client: the handle
 /// is validated before any credential resolution, like `show`.
+#[allow(clippy::too_many_arguments)]
 fn level_act_with(
     reference: String,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
     present: &str,
     past: &str,
     message: Option<&str>,
@@ -2193,7 +2234,7 @@ fn level_act_with(
     let reference: PullRequestRef = reference.parse()?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     match &reference {
-        PullRequestRef::Obs(_) => with_obs(debug, live, |obs| {
+        PullRequestRef::Obs(_) => with_obs(debug, live, instance, |obs| {
             let client = PullRequestClient::new(Some(obs), None);
             let status = act(&client, &reference, &dry_run)?;
             Ok((
@@ -2201,7 +2242,7 @@ fn level_act_with(
                 level_act_text(present, past, &reference, &status, message, &dry_run),
             ))
         }),
-        PullRequestRef::Gitea { .. } => with_gitea(debug, |gitea| {
+        PullRequestRef::Gitea { .. } => with_gitea(debug, instance, |gitea| {
             let client = PullRequestClient::new(None, Some(gitea));
             let status = act(&client, &reference, &dry_run)?;
             Ok((
@@ -2387,7 +2428,11 @@ struct CleanupRootOutcome {
 /// accepted. The checkout opens first (a local read, no
 /// credentials); the request state is read once, live only — a dry
 /// run plans from the local record alone, with no server read.
-fn cleanup(debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
+fn cleanup(
+    debug: &Debug,
+    live: bool,
+    instance: Option<&str>,
+) -> Result<(Value, String), GeectlError> {
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     let wc = if live {
         working_copy::open(&current_dir()?)
@@ -2397,7 +2442,7 @@ fn cleanup(debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
     let Some(id) = working_copy::submitted_request(&wc.root)? else {
         return cleanup_result(&wc.project, &wc.package, None, None, &[], false, &dry_run);
     };
-    with_obs(debug, live, |obs| {
+    with_obs(debug, live, instance, |obs| {
         let path = config::config_path()?;
         let file_config = config::load_config_at(&path)?;
         let effective = config::effective_config(&file_config)?;

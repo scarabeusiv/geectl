@@ -23,14 +23,12 @@
 //! when they need credentials. How the other groups handle a
 //! half-configured pair is stated in `docs/cli.md`.
 
-use crate::auth::EnvObsAuth;
 use crate::config;
 use crate::debug::Debug;
 use crate::error::GeectlError;
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{
     DryRun, MaintainedInstance, MaintenanceBranchOptions, MaintenanceBranchResult, ObsClient,
-    OBS_API_BASE,
 };
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
@@ -94,10 +92,15 @@ pub fn run(
     command: MaintenanceCommand,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     match command {
-        MaintenanceCommand::MaintainedInstances(args) => maintained_instances(args, debug),
-        MaintenanceCommand::MaintenanceBranch(args) => maintenance_branch(args, debug, live),
+        MaintenanceCommand::MaintainedInstances(args) => {
+            maintained_instances(args, debug, instance)
+        }
+        MaintenanceCommand::MaintenanceBranch(args) => {
+            maintenance_branch(args, debug, live, instance)
+        }
     }
 }
 
@@ -135,22 +138,22 @@ fn dry_run_for(live: bool, debug: &Debug) -> DryRun {
 /// when unconfigured; the operations fail closed themselves when
 /// they need them. A half-configured pair fails fast here, even in
 /// dry-run (see the module docs).
-fn obs_client<'a>(http: &'a dyn HttpClient, debug: &Debug) -> Result<ObsClient<'a>, GeectlError> {
+fn obs_client<'a>(
+    http: &'a dyn HttpClient,
+    debug: &Debug,
+    instance: Option<&str>,
+) -> Result<ObsClient<'a>, GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
-    // Unreachable by construction — effective_config always yields
-    // Some(obs_url) — but kept as a defensive default rather than an
-    // unwrap: a config change must not turn into a panic here.
-    let obs_url = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
-    let credentials = EnvObsAuth::credentials_for_url(obs_url, obs_url, &file_config.instances)?;
-    ObsClient::with_base_and_credentials(http, obs_url, credentials)
+    let (obs_url, credentials) = config::obs_endpoint(instance, &file_config)?;
+    ObsClient::with_base_and_credentials(http, &obs_url, credentials)
         .map(|client| client.with_debug(debug.clone()))
 }
 
 fn maintained_instances(
     args: InstancesArgs,
     debug: &Debug,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let options = branch_options(
         args.attribute.as_deref(),
@@ -158,7 +161,7 @@ fn maintained_instances(
         None,
     )?;
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = obs_client(&http, debug)?;
+    let client = obs_client(&http, debug, instance)?;
     let instances = client.maintained_instances(&args.package, &options)?;
     let payload = json!({
         "package": args.package,
@@ -253,6 +256,7 @@ fn maintenance_branch(
     args: BranchArgs,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let options = branch_options(
         args.attribute.as_deref(),
@@ -261,7 +265,7 @@ fn maintenance_branch(
     )?;
     let dry_run = dry_run_for(live, debug);
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = obs_client(&http, debug)?;
+    let client = obs_client(&http, debug, instance)?;
     match client.maintenance_branch(&args.package, &options, &dry_run)? {
         // Dry-run: the guard returned None and recorded the plan —
         // the plan is the payload.

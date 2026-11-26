@@ -196,7 +196,7 @@ impl WorkingCopy {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
                 format!(
-                    "the working copy at {} was checked out from {}, but the client is using {}: check it out again from the right instance, or fix the configured OBS URL",
+                    "the working copy at {} was checked out from {}, but the client is using {}: check it out again from the right instance, pass --instance <alias> for that instance, or fix the configured OBS URL",
                     self.root.display(),
                     self.apiurl,
                     apiurl

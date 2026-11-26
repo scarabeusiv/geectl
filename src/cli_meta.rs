@@ -46,7 +46,7 @@ use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{parse_gitea_repo, GiteaClient};
 use crate::http::{Timeout, UreqClient};
 use crate::meta::{MetaClient, MetaFields, MetaTarget, SetMeta};
-use crate::obs::{DryRun, ObsClient, OBS_API_BASE};
+use crate::obs::{DryRun, ObsClient};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
@@ -93,6 +93,7 @@ pub fn run_meta(
     command: MetaCommand,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     match command {
         MetaCommand::Set(args) => {
@@ -111,12 +112,12 @@ pub fn run_meta(
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
             let set = match &target {
                 MetaTarget::ObsProject { .. } | MetaTarget::ObsPackage { .. } => {
-                    with_obs(debug, live, |obs| {
+                    with_obs(debug, live, instance, |obs| {
                         let client = MetaClient::new(Some(obs), None);
                         client.set_meta(&target, &fields, &dry_run)
                     })?
                 }
-                MetaTarget::GiteaRepo { .. } => with_gitea(debug, |gitea| {
+                MetaTarget::GiteaRepo { .. } => with_gitea(debug, instance, |gitea| {
                     let client = MetaClient::new(None, Some(gitea));
                     client.set_meta(&target, &fields, &dry_run)
                 })?,
@@ -169,16 +170,23 @@ fn set_meta_target(args: &SetMetaArgs) -> Result<MetaTarget, GeectlError> {
 fn with_obs<T>(
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
     f: impl FnOnce(&ObsClient) -> Result<T, GeectlError>,
 ) -> Result<T, GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
-    let base = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
-    let credentials = match EnvObsAuth::credentials_for_url(base, base, &file_config.instances) {
+    let base = config::obs_base_url(instance, &file_config)?;
+    // With `--instance` the error propagates even in dry-run: the
+    // flagged instance's credentials are strict, and a dry run
+    // must not silently plan against an instance it cannot use.
+    let resolve = match instance {
+        Some(alias) => EnvObsAuth::credentials_for_instance(alias, &file_config.instances),
+        None => EnvObsAuth::credentials_for_url(&base, &base, &file_config.instances),
+    };
+    let credentials = match resolve {
         Ok(credentials) => credentials,
-        Err(err) if !live => {
+        Err(err) if !live && instance.is_none() => {
             // The dry run prints the plan without credentials, but
             // the failure must not be silent: the same credentials
             // would fail a `--live` run, so the error goes on the
@@ -192,7 +200,7 @@ fn with_obs<T>(
         Err(err) => return Err(err),
     };
     let client =
-        ObsClient::with_base_and_credentials(&http, base, credentials)?.with_debug(debug.clone());
+        ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
     f(&client)
 }
 
@@ -201,10 +209,11 @@ fn with_obs<T>(
 /// the caller runs inside it.
 fn with_gitea<T>(
     debug: &Debug,
+    instance: Option<&str>,
     f: impl FnOnce(&GiteaClient) -> Result<T, GeectlError>,
 ) -> Result<T, GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = crate::cli_gitea::gitea_client(&http, debug)?;
+    let client = crate::cli_gitea::gitea_client(&http, debug, instance)?;
     f(&client)
 }
 

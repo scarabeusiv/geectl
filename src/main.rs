@@ -28,6 +28,7 @@ fn run(
     format: Format,
     format_source: &'static str,
 ) -> Result<String, GeectlError> {
+    let instance = cli.instance.as_deref();
     let (payload, text) = match cli.command {
         Some(Command::Version) | None => {
             let payload = json!({
@@ -37,14 +38,18 @@ fn run(
             let text = format!("geectl {}", env!("CARGO_PKG_VERSION"));
             (payload, text)
         }
-        Some(Command::Request { command }) => geectl::cli_request::run(*command, debug, cli.live)?,
-        Some(Command::Build { command }) => geectl::cli_build::run_build(debug, command, cli.live)?,
+        Some(Command::Request { command }) => {
+            geectl::cli_request::run(*command, debug, cli.live, instance)?
+        }
+        Some(Command::Build { command }) => {
+            geectl::cli_build::run_build(debug, command, cli.live, instance)?
+        }
         Some(Command::LocalBuild { command }) => {
-            geectl::cli_local_build::run_local_build(debug, command, cli.live)?
+            geectl::cli_local_build::run_local_build(debug, command, cli.live, instance)?
         }
         Some(Command::Config { command }) => match command {
             ConfigCommand::Show => {
-                let payload = config_show_payload(format, format_source)?;
+                let payload = config_show_payload(format, format_source, instance)?;
                 let text = render_config_show_text(&payload);
                 (payload, text)
             }
@@ -71,51 +76,60 @@ fn run(
             }
         },
         Some(Command::Remote { command }) => {
-            geectl::cli_remote::run_remote(command, debug, cli.live)?
+            geectl::cli_remote::run_remote(command, debug, cli.live, instance)?
         }
         Some(Command::Branch { command }) => {
-            geectl::cli_branch::run_branch(*command, debug, cli.live)?
+            geectl::cli_branch::run_branch(*command, debug, cli.live, instance)?
         }
         Some(Command::Maintenance { command }) => {
-            let (payload, text) = geectl::maintenance::run(command, debug, cli.live)?;
+            let (payload, text) = geectl::maintenance::run(command, debug, cli.live, instance)?;
             (payload, text)
         }
         Some(Command::Service { command }) => {
-            geectl::cli_service::run_service(command, debug, cli.live)?
+            geectl::cli_service::run_service(command, debug, cli.live, instance)?
         }
-        Some(Command::Gitea { command }) => geectl::cli_gitea::run_gitea(command, debug, cli.live)?,
+        Some(Command::Gitea { command }) => {
+            geectl::cli_gitea::run_gitea(command, debug, cli.live, instance)?
+        }
         Some(Command::PullRequest { command }) => {
-            geectl::cli_pull_request::run_pull_request(command, debug, cli.live)?
+            geectl::cli_pull_request::run_pull_request(command, debug, cli.live, instance)?
         }
         Some(Command::Person { command }) => {
-            geectl::cli_person::run_person(command, debug, cli.live)?
+            geectl::cli_person::run_person(command, debug, cli.live, instance)?
         }
-        Some(Command::Meta { command }) => geectl::cli_meta::run_meta(command, debug, cli.live)?,
+        Some(Command::Meta { command }) => {
+            geectl::cli_meta::run_meta(command, debug, cli.live, instance)?
+        }
         Some(Command::Changelog { command }) => {
-            geectl::cli_changelog::run_changelog(command, debug, cli.live)?
+            geectl::cli_changelog::run_changelog(command, debug, cli.live, instance)?
         }
         Some(Command::Checkout {
             project,
             package,
             rev,
-        }) => {
-            geectl::cli_working_copy::checkout(&project, &package, rev.as_deref(), debug, cli.live)?
-        }
+        }) => geectl::cli_working_copy::checkout(
+            &project,
+            &package,
+            rev.as_deref(),
+            debug,
+            cli.live,
+            instance,
+        )?,
         Some(Command::Update { rev }) => {
-            geectl::cli_working_copy::update(rev.as_deref(), debug, cli.live)?
+            geectl::cli_working_copy::update(rev.as_deref(), debug, cli.live, instance)?
         }
         Some(Command::Status) => geectl::cli_working_copy::status(debug)?,
-        Some(Command::Diff) => geectl::cli_working_copy::diff(debug)?,
+        Some(Command::Diff) => geectl::cli_working_copy::diff(debug, instance)?,
         Some(Command::Add { files }) => geectl::cli_working_copy::add(&files, debug, cli.live)?,
         Some(Command::Rm { files }) => geectl::cli_working_copy::rm(&files, debug, cli.live)?,
         Some(Command::Addremove) => geectl::cli_working_copy::addremove(debug, cli.live)?,
         Some(Command::Commit { message, noservice }) => {
-            geectl::cli_working_copy::commit(&message, noservice, debug, cli.live)?
+            geectl::cli_working_copy::commit(&message, noservice, debug, cli.live, instance)?
         }
-        Some(Command::Pull) => geectl::cli_working_copy::pull(debug, cli.live)?,
+        Some(Command::Pull) => geectl::cli_working_copy::pull(debug, cli.live, instance)?,
         Some(Command::Resolve) => geectl::cli_working_copy::resolve(debug, cli.live)?,
         Some(Command::Prjconf { command }) => {
-            geectl::cli_prjconf::run_prjconf(command, debug, cli.live)?
+            geectl::cli_prjconf::run_prjconf(command, debug, cli.live, instance)?
         }
     };
     Ok(match format {
@@ -221,26 +235,28 @@ fn gitea_auth_kind(gitea_url: &str, instances: &[(String, String)]) -> &'static 
 /// Gitea base hosts with their auth kinds. None on any config-load
 /// failure, so a debug run never fails for want of a config line —
 /// including `version`, which does not otherwise touch config.
-fn debug_config_line() -> Option<String> {
+fn debug_config_line(instance: Option<&str>) -> Option<String> {
     let path = config::config_path().ok()?;
     let file_config = config::load_config_at(&path).ok()?;
     let effective = config::effective_config(&file_config).ok()?;
     // effective_config resolves env > file > default, so both URLs
     // are present by construction; the fallback is only for the
-    // type, never expected to fire.
-    let obs_url = effective.config.obs_url.as_deref().unwrap_or("");
+    // type, never expected to fire. The OBS URL honours
+    // `--instance`: the flagged alias's URL, else the effective one.
+    let obs_url = config::obs_base_url(instance, &file_config).ok()?;
     let gitea_url = effective.config.gitea_url.as_deref().unwrap_or("");
     Some(format!(
         "config: obs {} (auth: {}), gitea {} (auth: {})",
-        geectl::debug::url_host(obs_url),
-        obs_auth_kind(obs_url, &file_config.instances),
+        geectl::debug::url_host(&obs_url),
+        obs_auth_kind(&obs_url, &file_config.instances),
         geectl::debug::url_host(gitea_url),
         gitea_auth_kind(gitea_url, &file_config.instances)
     ))
 }
 
 /// The `config show` payload: the effective endpoint URLs with the
-/// source of each value (environment / config / default), the
+/// source of each value (environment / config / default / flag),
+/// the
 /// effective output format with its source (flag / environment /
 /// config / default), the named-instance table, and the credential
 /// status for each provider. The `[build]` tunables ride along too,
@@ -252,6 +268,7 @@ fn debug_config_line() -> Option<String> {
 fn config_show_payload(
     format: Format,
     format_source: &'static str,
+    instance: Option<&str>,
 ) -> Result<serde_json::Value, GeectlError> {
     // The config path is resolved once and passed to the load: a
     // second `config_path()` call here could diverge from the one
@@ -292,7 +309,21 @@ fn config_show_payload(
         Some(cap) => (cap, "config"),
         None => (geectl::local_build::DEFAULT_CACHE_CAP_GIB, "default"),
     };
-    let obs_url = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
+    // `--instance` names the OBS URL and its source: the
+    // flagged alias's URL with source `flag`, else the effective
+    // URL with its own source.
+    let (obs_url, obs_url_source) = match instance {
+        Some(alias) => (config::obs_base_url(Some(alias), &file_config)?, "flag"),
+        None => (
+            effective
+                .config
+                .obs_url
+                .as_deref()
+                .unwrap_or(OBS_API_BASE)
+                .to_string(),
+            effective.obs_url_source,
+        ),
+    };
     // The effective Gitea URL is the configured default for the
     // single configured URL, so `gitea_auth` reports the
     // credentials that URL would actually use — the matching
@@ -312,8 +343,8 @@ fn config_show_payload(
     }
     Ok(json!({
         "config_file": path.to_string_lossy(),
-        "obs_url": effective.config.obs_url,
-        "obs_url_source": effective.obs_url_source,
+        "obs_url": json!(obs_url),
+        "obs_url_source": obs_url_source,
         "gitea_url": effective.config.gitea_url,
         "gitea_url_source": effective.gitea_url_source,
         "format": format.as_str(),
@@ -323,7 +354,7 @@ fn config_show_payload(
         "build_cache_cap_gib": build_cache_cap_gib,
         "build_cache_cap_gib_source": build_cache_cap_gib_source,
         "instances": instances_json,
-        "obs_auth": obs_auth_status(obs_url, &effective.config.instances),
+        "obs_auth": obs_auth_status(&obs_url, &effective.config.instances),
         "gitea_auth": gitea_auth,
         "gitea_ssh_key": auth_status(&GiteaSshKey),
     }))
@@ -813,7 +844,7 @@ fn real_main() -> ExitCode {
             // The file name only, never a key or a value.
             debug.emit("loaded .env");
         }
-        if let Some(line) = debug_config_line() {
+        if let Some(line) = debug_config_line(cli.instance.as_deref()) {
             debug.emit(&line);
         }
     }
@@ -876,7 +907,7 @@ mod tests {
 
     #[test]
     fn config_show_payload_reports_format_and_source() {
-        let payload = config_show_payload(Format::Text, "config").unwrap();
+        let payload = config_show_payload(Format::Text, "config", None).unwrap();
         assert_eq!(payload["format"], "text");
         assert_eq!(payload["format_source"], "config");
         let text = render_config_show_text(&payload);

@@ -38,7 +38,7 @@ use crate::gitea::{FirstBuild, ForkOptions, ForkResult};
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{
     BranchOptions, BranchResult, CopyOptions, CopyProjectOptions, DryRun, LinkOptions,
-    LinkRevision, ObsClient, RevisionSpec, OBS_API_BASE,
+    LinkRevision, ObsClient, RevisionSpec,
 };
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
@@ -392,19 +392,20 @@ pub fn run_branch(
     command: BranchCommand,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     match command {
-        BranchCommand::Create(args) => branch(args, debug, live),
-        BranchCommand::BranchPackage(args) => branch_package(args, debug, live),
-        BranchCommand::CopyPackage(args) => copy_package(args, debug, live),
-        BranchCommand::CopyProject(args) => copy_project(args, debug, live),
-        BranchCommand::SetDevelProject(args) => set_devel_project(args, debug, live),
-        BranchCommand::LinkPackage(args) => link_package(args, debug, live),
-        BranchCommand::RepairLink(args) => repair_link(args, debug, live),
-        BranchCommand::SetLinkRev(args) => set_link_rev(args, debug, live),
-        BranchCommand::SetLinkRevProject(args) => set_link_rev_project(args, debug, live),
-        BranchCommand::LinkToBranch(args) => link_to_branch(args, debug, live),
-        BranchCommand::DetachBranch(args) => detach_branch(args, debug, live),
+        BranchCommand::Create(args) => branch(args, debug, live, instance),
+        BranchCommand::BranchPackage(args) => branch_package(args, debug, live, instance),
+        BranchCommand::CopyPackage(args) => copy_package(args, debug, live, instance),
+        BranchCommand::CopyProject(args) => copy_project(args, debug, live, instance),
+        BranchCommand::SetDevelProject(args) => set_devel_project(args, debug, live, instance),
+        BranchCommand::LinkPackage(args) => link_package(args, debug, live, instance),
+        BranchCommand::RepairLink(args) => repair_link(args, debug, live, instance),
+        BranchCommand::SetLinkRev(args) => set_link_rev(args, debug, live, instance),
+        BranchCommand::SetLinkRevProject(args) => set_link_rev_project(args, debug, live, instance),
+        BranchCommand::LinkToBranch(args) => link_to_branch(args, debug, live, instance),
+        BranchCommand::DetachBranch(args) => detach_branch(args, debug, live, instance),
     }
 }
 
@@ -416,22 +417,23 @@ fn dry_run_for(live: bool, debug: &Debug) -> DryRun {
     DryRun::new(!live).with_debug(debug.clone())
 }
 
-/// An `ObsClient` for the effective OBS base (config file / env /
-/// default) with the environment OBS credentials for that URL,
-/// reporting on the debug channel. Credentials resolve to `None`
-/// when unconfigured; the operations fail closed themselves when
-/// they need them. A half-configured pair fails fast here, even in
-/// dry-run (see the module docs).
-fn obs_client<'a>(http: &'a dyn HttpClient, debug: &Debug) -> Result<ObsClient<'a>, GeectlError> {
+/// An `ObsClient` for the call's OBS base (`--instance` when
+/// flagged, else config file / env / default) with the environment
+/// OBS credentials for that URL, reporting on the debug channel.
+/// Credentials resolve to `None` when unconfigured; the operations
+/// fail closed themselves when they need them. A half-configured
+/// pair fails fast here, even in dry-run (see the module docs) —
+/// and with `--instance`, a missing credential for the flagged
+/// instance fails fast here too.
+fn obs_client<'a>(
+    http: &'a dyn HttpClient,
+    debug: &Debug,
+    instance: Option<&str>,
+) -> Result<ObsClient<'a>, GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
-    // Unreachable by construction — effective_config always yields
-    // Some(obs_url) — but kept as a defensive default rather than an
-    // unwrap: a config change must not turn into a panic here.
-    let obs_url = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
-    let credentials = EnvObsAuth::credentials_for_url(obs_url, obs_url, &file_config.instances)?;
-    ObsClient::with_base_and_credentials(http, obs_url, credentials)
+    let (obs_url, credentials) = config::obs_endpoint(instance, &file_config)?;
+    ObsClient::with_base_and_credentials(http, &obs_url, credentials)
         .map(|client| client.with_debug(debug.clone()))
 }
 
@@ -446,17 +448,20 @@ fn target_client<'a>(
     http: &'a dyn HttpClient,
     debug: &Debug,
     api_url: &str,
+    instance: Option<&str>,
 ) -> Result<ObsClient<'a>, GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
-    let default_url = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
+    // The source instance is the flagged one when `--instance` is
+    // set: the refusal compares `--to-apiurl` against it, and the
+    // target resolves against it as the default.
+    let default_url = config::obs_base_url(instance, &file_config)?;
     // `--to-apiurl` means another instance: pointing it at the
     // configured instance would silently take the degraded
     // client-side copy (no server copy, `--keep-link`/`--comment`
     // refused) instead of the same-instance server copy. Refuse it
     // with the fix — in dry-run too, before any read.
-    if same_api_url(api_url, default_url)? {
+    if same_api_url(api_url, &default_url)? {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
             format!(
@@ -465,7 +470,7 @@ fn target_client<'a>(
         ));
     }
     let credentials =
-        EnvObsAuth::credentials_for_url(api_url, default_url, &file_config.instances)?;
+        EnvObsAuth::credentials_for_url(api_url, &default_url, &file_config.instances)?;
     ObsClient::with_base_and_credentials(http, api_url, credentials)
         .map(|client| client.with_debug(debug.clone()))
 }
@@ -597,7 +602,12 @@ fn render_row<const N: usize>(cells: &[String; N], widths: &[usize; N]) -> Strin
     joined.trim_end().to_string()
 }
 
-fn branch(args: BranchArgs, debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
+fn branch(
+    args: BranchArgs,
+    debug: &Debug,
+    live: bool,
+    instance: Option<&str>,
+) -> Result<(Value, String), GeectlError> {
     let options = ForkOptions {
         new_repo_name: args.new_repo_name.clone(),
         organization: args.organization.clone(),
@@ -609,8 +619,8 @@ fn branch(args: BranchArgs, debug: &Debug, live: bool) -> Result<(Value, String)
     };
     let dry_run = dry_run_for(live, debug);
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let obs = obs_client(&http, debug)?;
-    let gitea = gitea_client(&http, debug)?;
+    let obs = obs_client(&http, debug, instance)?;
+    let gitea = gitea_client(&http, debug, instance)?;
     match gitea.branch(&obs, &args.project, &args.package, &options, &dry_run)? {
         // Dry-run: the guard returned None and recorded the plan.
         // The target is the requested one when the flags named it,
@@ -720,6 +730,7 @@ fn branch_package(
     args: BranchPackageArgs,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let options = BranchOptions {
         target_project: args.target_project.clone(),
@@ -739,7 +750,7 @@ fn branch_package(
     };
     let dry_run = dry_run_for(live, debug);
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = obs_client(&http, debug)?;
+    let client = obs_client(&http, debug, instance)?;
     match client.branch_package(&args.project, &args.package, &options, &dry_run)? {
         // Dry-run: the guard returned None and recorded the plan.
         // The target is the requested one when the flags named it,
@@ -802,6 +813,7 @@ fn copy_package(
     args: CopyPackageArgs,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let options = CopyOptions {
         revision: args.revision.clone(),
@@ -814,7 +826,7 @@ fn copy_package(
     };
     let dry_run = dry_run_for(live, debug);
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = obs_client(&http, debug)?;
+    let client = obs_client(&http, debug, instance)?;
     let target_package = &args.target_package;
     let payload = json!({
         "source_project": args.source_project,
@@ -857,7 +869,7 @@ fn copy_package(
             }
         },
         Some(api_url) => {
-            let target = target_client(&http, debug, api_url)?;
+            let target = target_client(&http, debug, api_url, instance)?;
             let result = client.copy_package_to_instance(
                 &target,
                 &args.source_project,
@@ -898,6 +910,7 @@ fn copy_project(
     args: CopyProjectArgs,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let options = CopyProjectOptions {
         with_binaries: args.with_binaries,
@@ -911,7 +924,7 @@ fn copy_project(
     };
     let dry_run = dry_run_for(live, debug);
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = obs_client(&http, debug)?;
+    let client = obs_client(&http, debug, instance)?;
     client.copy_project(
         &args.source_project,
         &args.target_project,
@@ -941,10 +954,11 @@ fn set_devel_project(
     args: SetDevelProjectArgs,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let dry_run = dry_run_for(live, debug);
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = obs_client(&http, debug)?;
+    let client = obs_client(&http, debug, instance)?;
     client.set_devel_project(
         &args.project,
         &args.package,
@@ -978,6 +992,7 @@ fn link_package(
     args: LinkPackageArgs,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let options = LinkOptions {
         force: args.force,
@@ -990,7 +1005,7 @@ fn link_package(
     };
     let dry_run = dry_run_for(live, debug);
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = obs_client(&http, debug)?;
+    let client = obs_client(&http, debug, instance)?;
     let target_package = &args.target_package;
     client.link_package(
         &args.source_project,
@@ -1025,10 +1040,11 @@ fn repair_link(
     args: RepairLinkArgs,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let dry_run = dry_run_for(live, debug);
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = obs_client(&http, debug)?;
+    let client = obs_client(&http, debug, instance)?;
     client.repair_link(&args.project, &args.package, &dry_run)?;
     let payload = json!({
         "project": args.project,
@@ -1053,11 +1069,12 @@ fn set_link_rev(
     args: SetLinkRevArgs,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let revision = parse_link_revision(&args.revision)?;
     let dry_run = dry_run_for(live, debug);
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = obs_client(&http, debug)?;
+    let client = obs_client(&http, debug, instance)?;
     let set = client.set_link_rev(&args.project, &args.package, &revision, &dry_run)?;
     // None is dry-run (the guard) or live-unset (the link follows
     // its target again): the handler tells them apart by `live`.
@@ -1087,11 +1104,12 @@ fn set_link_rev_project(
     args: SetLinkRevProjectArgs,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let revision = parse_link_revision(&args.revision)?;
     let dry_run = dry_run_for(live, debug);
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = obs_client(&http, debug)?;
+    let client = obs_client(&http, debug, instance)?;
     let set = client.set_link_rev_project(&args.project, &revision, &dry_run)?;
     if live {
         let payload = json!({
@@ -1145,10 +1163,11 @@ fn link_to_branch(
     args: LinkToBranchArgs,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let dry_run = dry_run_for(live, debug);
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = obs_client(&http, debug)?;
+    let client = obs_client(&http, debug, instance)?;
     client.link_to_branch(&args.project, &args.package, &dry_run)?;
     let payload = json!({
         "project": args.project,
@@ -1173,10 +1192,11 @@ fn detach_branch(
     args: DetachBranchArgs,
     debug: &Debug,
     live: bool,
+    instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
     let dry_run = dry_run_for(live, debug);
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = obs_client(&http, debug)?;
+    let client = obs_client(&http, debug, instance)?;
     let detached = client.detach_branch(&args.project, &args.package, &dry_run)?;
     // None is dry-run (the guard) or a live detach that dropped the
     // link instead of copying: the handler tells them apart by `live`.

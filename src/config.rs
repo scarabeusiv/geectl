@@ -29,8 +29,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::os::unix::fs::OpenOptionsExt;
 
 use crate::auth::{
-    open_file_nonblocking, same_api_url, snapshot_env, GITEA_SSH_KEY_VAR, GITEA_TOKEN_FILE_VAR,
-    GITEA_TOKEN_VAR, OBS_PASSWORD_FILE_VAR, OBS_PASSWORD_VAR, OBS_USERNAME_VAR,
+    open_file_nonblocking, same_api_url, snapshot_env, url_for_alias, Credentials, EnvObsAuth,
+    GITEA_SSH_KEY_VAR, GITEA_TOKEN_FILE_VAR, GITEA_TOKEN_VAR, OBS_PASSWORD_FILE_VAR,
+    OBS_PASSWORD_VAR, OBS_USERNAME_VAR,
 };
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::is_loopback_url;
@@ -225,6 +226,42 @@ pub fn effective_config(config: &Config) -> Result<EffectiveConfig, GeectlError>
         gitea_url_source,
         format_source,
     })
+}
+
+/// The OBS base URL for one call, honouring `--instance`: the
+/// alias's URL when the flag names one (an unknown alias is a
+/// `ConfigError` naming the known aliases), else the effective
+/// OBS URL — environment, then config file, then the built-in
+/// default.
+pub fn obs_base_url(instance: Option<&str>, file_config: &Config) -> Result<String, GeectlError> {
+    match instance {
+        Some(alias) => Ok(url_for_alias(&file_config.instances, alias)?.to_string()),
+        None => {
+            let effective = effective_config(file_config)?;
+            Ok(effective
+                .config
+                .obs_url
+                .unwrap_or_else(|| DEFAULT_OBS_URL.to_string()))
+        }
+    }
+}
+
+/// The OBS base URL and credentials for one call, honouring
+/// `--instance`: with the flag, the alias's URL and strictly the
+/// alias's own credential variables (see
+/// [`crate::auth::resolve_obs_for_instance`]); without it, the
+/// effective URL and the per-URL resolution (see
+/// [`crate::auth::resolve_obs_for_url`]).
+pub fn obs_endpoint(
+    instance: Option<&str>,
+    file_config: &Config,
+) -> Result<(String, Credentials), GeectlError> {
+    let base = obs_base_url(instance, file_config)?;
+    let credentials = match instance {
+        Some(alias) => EnvObsAuth::credentials_for_instance(alias, &file_config.instances)?,
+        None => EnvObsAuth::credentials_for_url(&base, &base, &file_config.instances)?,
+    };
+    Ok((base, credentials))
 }
 
 /// Validate an output-format value (from the config file or the
@@ -2353,5 +2390,50 @@ mod tests {
             out,
             "[instances]\napi_opensuse_org = \"https://api.opensuse.org\"\n"
         );
+    }
+
+    // --- `--instance` base URL (issue #407) ---
+
+    fn instances_config() -> Config {
+        Config {
+            obs_url: Some("https://api.opensuse.org".to_string()),
+            gitea_url: None,
+            format: None,
+            instances: vec![
+                ("example".to_string(), "https://api.example.org".to_string()),
+                ("other".to_string(), "https://other.example.org".to_string()),
+            ],
+            build_cache_dir: None,
+            build_cache_cap_gib: None,
+        }
+    }
+
+    #[test]
+    fn obs_base_url_flag_returns_the_alias_url() {
+        let config = instances_config();
+        assert_eq!(
+            obs_base_url(Some("other"), &config).unwrap(),
+            "https://other.example.org"
+        );
+    }
+
+    #[test]
+    fn obs_base_url_flag_unknown_alias_is_a_config_error() {
+        let config = instances_config();
+        let err = obs_base_url(Some("missing"), &config).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("missing"));
+        assert!(err.context.contains("example"));
+        assert!(err.context.contains("other"));
+    }
+
+    #[test]
+    fn obs_endpoint_flag_unknown_alias_is_a_config_error() {
+        // The alias lookup runs before any credential resolution:
+        // an unknown alias fails without touching the environment.
+        let config = instances_config();
+        let err = obs_endpoint(Some("missing"), &config).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("missing"));
     }
 }
