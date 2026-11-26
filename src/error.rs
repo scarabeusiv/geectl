@@ -238,7 +238,7 @@ impl ErrorKind {
                 "pass one flavor; one invocation builds one flavor"
             }
             ErrorKind::UnsupportedArch => {
-                "build locally only for the host architecture; other architectures go to the server"
+                "build it on the server with the build leaves; the submit is not blocked on the build result — the result is visible on the submission and checked at the accepting step"
             }
             ErrorKind::UnsupportedOs => {
                 "the periodic schedule ships only on Linux, macOS and Windows"

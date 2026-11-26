@@ -1042,7 +1042,7 @@ pub fn validate_build_request(req: &BuildRequest) -> Result<(), GeectlError> {
         return Err(GeectlError::new(
             ErrorKind::UnsupportedArch,
             format!(
-                "local build for {} on a {} host; other architectures go to the server (OBS-ONLY)",
+                "local build for {} on a {} host; other architectures build on the server with geectl build: rebuild-package, wait-for-results, build-log, build-status, results, download-binary, list-binaries, build-history",
                 req.arch,
                 std::env::consts::ARCH
             ),
@@ -10562,6 +10562,29 @@ fi
             let req = BuildRequest::new(source, "testproject", "standard", other_arch());
             let err = vertical.build(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::UnsupportedArch);
+            for leaf in [
+                "rebuild-package",
+                "wait-for-results",
+                "build-log",
+                "build-status",
+                "results",
+                "download-binary",
+                "list-binaries",
+                "build-history",
+            ] {
+                assert!(
+                    err.context.contains(leaf),
+                    "UnsupportedArch names the server route: {leaf} missing from {:?}",
+                    err.context
+                );
+            }
+            assert!(
+                err.kind()
+                    .remediation()
+                    .contains("not blocked on the build result"),
+                "UnsupportedArch remediation states the submit is not blocked: {:?}",
+                err.kind().remediation()
+            );
             assert!(setup.http.get_calls().is_empty());
         }
 
