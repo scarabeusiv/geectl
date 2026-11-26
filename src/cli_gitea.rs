@@ -11,8 +11,8 @@
 //! `GEECTL_GITEA_TOKEN_FILE`), so a dry-run preview cannot be built
 //! without one. That is the library's rule, not a CLI shortcut.
 //! Per-instance Gitea credentials (one token per configured Gitea
-//! instance, on the alias model) are not part of this group: it
-//! takes the single configured instance.
+//! instance, on the alias model): the host stays configured and
+//! `--instance` selects the alias token.
 //!
 //! The `branch` composite (Gitea fork + OBS `cmd=fork`, library
 //! `GiteaClient::branch`) is exposed as `branch create`: the
