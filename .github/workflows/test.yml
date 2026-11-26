@@ -76,6 +76,11 @@ jobs:
           # the live tests quietly.
           GEECTL_GITEA_EXPECTED: "1"
         run: cargo test --locked
+      # The scmsync harness is a standalone Python script: its unit
+      # tests need no live instance and run here, with the system
+      # python3, so a validation regression fails the PR.
+      - name: Run the scmsync harness unit tests
+        run: python3 -m unittest discover -s tests/live -p "test_*.py" -v
       # The generator binary is feature-gated, so the default test
       # run never builds it: its tests run here, with the feature on.
       - name: Run the generator tests

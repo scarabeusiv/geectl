@@ -39,6 +39,12 @@
 #   bash tests/gitea/provision.sh
 #   (defaults: port 3001, user `geectl`, container `docker`)
 #   GITEA_PORT=3002 CONTAINER=podman bash tests/gitea/provision.sh
+#   GITEA_NETWORK=geectl-scmsync_default bash tests/gitea/provision.sh
+#   (attaches the container to an existing container network as well
+#   as publishing its port on loopback, so another stack on that
+#   network reaches Gitea by container name — the scmsync harness's
+#   OBS backend uses this. Unset by default: the live Gitea tests
+#   use the loopback URL only.)
 #
 # Exit code is non-zero if any step fails. The instance is left running
 # on failure for inspection; `tests/gitea/teardown.sh` removes it.
@@ -100,7 +106,21 @@ for attempt in 1 2 3; do
     fi
     sleep 10
 done
+# Attach to an existing container network when asked: the scmsync
+# harness's OBS backend reaches Gitea by container name on the OBS
+# compose network, which needs the shared network. Unset by default.
+# A network name is one token ([A-Za-z0-9_.-]): anything else would
+# split the `--network` argument below.
+if [ -n "${GITEA_NETWORK:-}" ]; then
+    case "$GITEA_NETWORK" in
+        *[!A-Za-z0-9_.-]*)
+            echo "GITEA_NETWORK must match ^[A-Za-z0-9_.-]+\$: got '$GITEA_NETWORK'" >&2
+            exit 1
+            ;;
+    esac
+fi
 $CONTAINER run -d --name "$CONTAINER_NAME" --rm \
+    ${GITEA_NETWORK:+--network} ${GITEA_NETWORK:+$GITEA_NETWORK} \
     -p "127.0.0.1:${GITEA_PORT}:3000" \
     -e USER_UID=1000 -e USER_GID=1000 \
     -e GITEA__security__INSTALL_LOCK=true \

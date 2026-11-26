@@ -34,6 +34,12 @@ Gitea is a single container, so compose adds nothing — and `podman
 compose` on the Mac is only a wrapper around an external provider
 binary (`docker-compose`, installed via Homebrew).
 
+`GITEA_NETWORK` attaches the container to an existing container
+network as well as publishing its port on loopback, so another stack
+on that network reaches Gitea by container name — the scmsync harness
+(`tests/live/scmsync-harness.py`) uses this so the OBS backend can
+fetch the repo. Unset by default.
+
 `provision.sh` creates the test user (`geectl`, admin) and an API token
 with the minimal scopes the tests need
 (`read:user,read:repository,write:repository,write:user,write:organization` — repo creation

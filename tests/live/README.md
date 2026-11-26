@@ -101,3 +101,37 @@ second instance's server state — same files, same md5s, byte-identical
 reads, carried-over title and description — then copies again (nothing
 to copy: the md5 skip) and copies a link package (expanded, no `_link`
 file on the target).
+
+## The scmsync harness
+
+`tests/live/scmsync-harness.py` is the concept check for the Gitea
+<-> OBS scmsync bridge: it creates a throwaway Gitea repo and a
+scmsync home test project/package, pushes git changes, and asserts
+the OBS side follows (or, for the `_link` case, refuses to). It runs
+weekly (`.github/workflows/scmsync-live.yml`, Mondays 06:00 UTC) and
+on demand, as its own job with its own context.
+
+Local instances only: the loopback OBS instance from this directory
+plus the disposable Gitea container from `tests/gitea/`. The OBS
+backend fetches the repo over the shared compose network, so the
+Gitea container joins this stack's network (`GITEA_NETWORK`) and the
+scmsync clone URL names the container; geectl and git on the host use
+the loopback URLs. The harness only accepts loopback OBS and Gitea
+URLs, and takes every endpoint from the environment — see its header
+for the table.
+
+Run it locally (after provisioning both instances):
+
+```sh
+COMPOSE_PROJECT_NAME=geectl-scmsync bash tests/live/provision.sh
+GITEA_NETWORK=geectl-scmsync_default CONTAINER=podman bash tests/gitea/provision.sh
+cargo build --locked
+GEECTL_BIN=$PWD/target/debug/geectl GEECTL_OBS_URL=http://127.0.0.1:3000 \
+  GEECTL_OBS_USERNAME=Admin GEECTL_OBS_PASSWORD=opensuse \
+  GEECTL_GITEA_URL=http://127.0.0.1:3001 \
+  GEECTL_GITEA_TOKEN_FILE=tests/gitea/.gitea-token \
+  SCMSYNC_GITEA_URL=http://geectl-gitea-live:3000 \
+  python3 tests/live/scmsync-harness.py
+bash tests/gitea/teardown.sh
+COMPOSE_PROJECT_NAME=geectl-scmsync bash tests/live/teardown.sh
+```
