@@ -958,8 +958,7 @@ mod tests {
             &ValidateOptions {
                 entries: 1,
                 news_section: None,
-                tarball_present: false,
-                news_lookup_failed: false,
+                ..Default::default()
             },
         );
         assert!(report.passed(), "findings: {:?}", report.findings);

@@ -161,24 +161,25 @@ pub struct ValidateOptions<'a> {
     /// one entry per SR.
     pub entries: usize,
     /// The extracted upstream NEWS section for the new version, when
-    /// the tarball has one. `None` means no news was found — V9 does
-    /// not flag that case (upstream may maintain no changelog at
-    /// all); the report records the skip instead.
+    /// the tarball has one. `None` means no news was found — the V9
+    /// finding then says nothing about upstream news, only that the
+    /// entry carries no summary of the changes. Whether NEWS exists
+    /// only changes the message, never whether the rule fires: the
+    /// author, not NEWS, decides there is nothing to say.
     pub news_section: Option<&'a str>,
-    /// Whether a source tarball was found on disk at all. V9
-    /// distinguishes the two no-news cases: a tarball with no NEWS
-    /// section is a plain skip, while no tarball means the bare
-    /// update line was never checked against upstream NEWS.
-    /// Default false: unknown, treated as absent.
+    /// Ignored: the V9 rule reads `news_section` only. Kept so code
+    /// constructing this struct with the field keeps compiling.
+    #[deprecated = "ignored; the V9 rule reads `news_section` only"]
     pub tarball_present: bool,
-    /// Whether the upstream NEWS lookup failed. The caller reports
-    /// that failure itself, so V9 adds no second skip for it.
-    /// Default false.
+    /// Ignored: the V9 rule reads `news_section` only. Kept so code
+    /// constructing this struct with the field keeps compiling.
+    #[deprecated = "ignored; the V9 rule reads `news_section` only"]
     pub news_lookup_failed: bool,
 }
 
 impl Default for ValidateOptions<'_> {
     fn default() -> Self {
+        #[allow(deprecated)]
         ValidateOptions {
             entries: 1,
             news_section: None,
@@ -1227,14 +1228,12 @@ fn is_unfilled_slot(line: &str) -> bool {
     line.contains("reason: TODO") || line.contains("TODO:")
 }
 
-/// V9: a version update carries more than a bare version line when
-/// upstream news exists for the new version. The upstream-news
-/// condition is load-bearing: when no NEWS section was found, the
-/// rule does not flag (upstream may maintain no changelog at all).
-/// When no tarball was on disk at all, the skip says so instead:
-/// the line was never checked, not merely unflaggable. A failed
-/// lookup is reported once by the caller; V9 stays silent rather
-/// than adding a second skip.
+/// V9: a version update carries more than a bare version line. The
+/// author, not NEWS, decides there is nothing to say: a bare update
+/// with no substantive line and no no-visible-changes statement is
+/// a finding whether or not an upstream NEWS section exists for the
+/// new version. NEWS only changes the message — when a section was
+/// found, the finding names it as the material to distill.
 /// A draft marker left by `generate` (`TODO` slots) is also a
 /// needs-detail finding: the human step has not run yet.
 fn check_bare_update(
@@ -1288,44 +1287,27 @@ fn check_bare_update(
         return;
     }
     if other.is_empty() && !states_no_change {
-        match options.news_section {
+        // NEWS only changes the message, never whether the rule
+        // fires: with a section the author has material to distill,
+        // without one the entry still needs its own summary.
+        let message = match options.news_section {
             Some(section) if !section.trim().is_empty() => {
-                report.findings.push(Finding {
-                    rule: Rule::V9,
-                    file: changes_name.to_string(),
-                    line: entry.bullets().first().map(|(n, _, _)| *n).unwrap_or(entry.header_line),
-                    message: "bare 'Update to <version>' with no summary of the upstream changes — upstream news exists for the new version; add substantive bullets, or state '* No user-visible changes'"
-                        .to_string(),
-                });
+                "bare 'Update to <version>' with no summary of the upstream changes — upstream news exists for the new version; add substantive bullets, or state '* No user-visible changes'"
             }
             _ => {
-                // A failed lookup is reported once by the caller;
-                // V9 adds no second, contradictory skip for it.
-                if !options.news_lookup_failed {
-                    let version = spec.and_then(|s| s.version.clone()).unwrap_or_default();
-                    // No NEWS section: the advisory differs by
-                    // whether a tarball was there to check at all.
-                    // A spec with no version never had a tarball to
-                    // look for, whatever another spec's lookup found.
-                    let reason = if version.is_empty() {
-                        "the spec carries no version, so the bare update line was not checked against upstream NEWS"
-                            .to_string()
-                    } else if options.tarball_present {
-                        format!(
-                            "no upstream NEWS section found for version {version} — nothing to distill, so the bare update line is not flagged"
-                        )
-                    } else {
-                        format!(
-                            "no source tarball on disk for version {version} — the bare update line was not checked against upstream NEWS"
-                        )
-                    };
-                    report.skipped.push(Skipped {
-                        rule: Rule::V9,
-                        reason,
-                    });
-                }
+                "bare 'Update to <version>' with no summary of the changes — add substantive bullets, or state '* No user-visible changes'"
             }
-        }
+        };
+        report.findings.push(Finding {
+            rule: Rule::V9,
+            file: changes_name.to_string(),
+            line: entry
+                .bullets()
+                .first()
+                .map(|(n, _, _)| *n)
+                .unwrap_or(entry.header_line),
+            message: message.to_string(),
+        });
     }
 }
 
@@ -1884,7 +1866,7 @@ mod tests {
         // only move the refusal to the Factory submission.
         let sep = "-".repeat(67);
         let text = format!(
-            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nSat Apr 14 2007 Tobias Blomberg <t@example.com>\n\n- Initial package\n\n"
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n  * Fix a crash\n\n{sep}\nSat Apr 14 2007 Tobias Blomberg <t@example.com>\n\n- Initial package\n\n"
         );
         let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &text)]);
         let report = validate(&local, None, &ValidateOptions::default());
@@ -1895,7 +1877,7 @@ mod tests {
             .collect();
         assert_eq!(v5.len(), 1, "findings: {:?}", report.findings);
         assert_eq!(v5[0].file, "foo.changes");
-        assert_eq!(v5[0].line, 7);
+        assert_eq!(v5[0].line, 8);
         assert!(v5[0].message.contains("Sat Apr 14 2007 Tobias Blomberg"));
         // The refusal names the remedy: repair the header, do not
         // delete the entry.
@@ -1920,7 +1902,7 @@ mod tests {
         // parse, and the whole file passes.
         let sep = "-".repeat(67);
         let text = format!(
-            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nSat Apr 14 10:00:00 UTC 2007 - Tobias Blomberg <t@example.com>\n\n- Initial package\n\n"
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n  * Fix a crash\n\n{sep}\nSat Apr 14 10:00:00 UTC 2007 - Tobias Blomberg <t@example.com>\n\n- Initial package\n\n"
         );
         let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &text)]);
         let report = validate(&local, None, &ValidateOptions::default());
@@ -1935,7 +1917,7 @@ mod tests {
         // with the separator clears it.
         let sep = "-".repeat(67);
         let unrepaired = format!(
-            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nSat Apr 14 2007 - Tobias Blomberg <t@example.com>\n\n- Initial package\n\n"
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n  * Fix a crash\n\n{sep}\nSat Apr 14 2007 - Tobias Blomberg <t@example.com>\n\n- Initial package\n\n"
         );
         let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &unrepaired)]);
         let report = validate(&local, None, &ValidateOptions::default());
@@ -2080,8 +2062,7 @@ mod tests {
         let options = ValidateOptions {
             entries: 1,
             news_section: Some("## 2.0\n\n- Fix a crash\n"),
-            tarball_present: true,
-            news_lookup_failed: false,
+            ..Default::default()
         };
         let report = validate(&local, None, &options);
         assert!(report
@@ -2091,7 +2072,10 @@ mod tests {
     }
 
     #[test]
-    fn v9_does_not_flag_when_no_news_exists() {
+    fn v9_flags_a_bare_update_when_no_news_exists() {
+        // No NEWS section: the author, not NEWS, decides there is
+        // nothing to say — the bare update is still a finding, with
+        // a message that does not claim upstream news exists.
         let local = snapshot(&[
             ("foo.spec", SPEC),
             (
@@ -2100,8 +2084,44 @@ mod tests {
             ),
         ]);
         let report = validate(&local, None, &ValidateOptions::default());
-        assert!(!report.findings.iter().any(|f| f.rule == Rule::V9));
-        assert!(report.skipped.iter().any(|s| s.rule == Rule::V9));
+        assert!(report.findings.iter().any(|f| f.rule == Rule::V9
+            && f.message.contains("bare 'Update")
+            && !f.message.contains("upstream news exists")));
+        assert!(!report.skipped.iter().any(|s| s.rule == Rule::V9));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_option_fields_are_ignored() {
+        // The 0.2.2 fields keep compiling for existing struct
+        // literals; they change nothing — V9 reads `news_section`
+        // alone, so the same input yields the same report whether
+        // the fields are set or not.
+        let local = snapshot(&[
+            ("foo.spec", SPEC),
+            (
+                "foo.changes",
+                &changes_file("- Update to 2.0", "- Initial package"),
+            ),
+        ]);
+        let baseline = validate(&local, None, &ValidateOptions::default());
+        let with_fields = validate(
+            &local,
+            None,
+            &ValidateOptions {
+                entries: 1,
+                news_section: None,
+                tarball_present: true,
+                news_lookup_failed: true,
+            },
+        );
+        for report in [baseline, with_fields] {
+            assert!(report
+                .findings
+                .iter()
+                .any(|f| f.rule == Rule::V9 && f.message.contains("bare 'Update")));
+            assert!(!report.skipped.iter().any(|s| s.rule == Rule::V9));
+        }
     }
 
     #[test]
@@ -2119,8 +2139,7 @@ mod tests {
         let options = ValidateOptions {
             entries: 1,
             news_section: Some("## 2.0\n\n- Fix a crash\n"),
-            tarball_present: true,
-            news_lookup_failed: false,
+            ..Default::default()
         };
         let report = validate(&local, None, &options);
         assert!(!report.findings.iter().any(|f| f.rule == Rule::V9));
@@ -2428,8 +2447,7 @@ mod tests {
         let options = ValidateOptions {
             entries: 1,
             news_section: Some("## 2.0\n\n- Fix a crash\n"),
-            tarball_present: true,
-            news_lookup_failed: false,
+            ..Default::default()
         };
         let report = validate(&local, None, &options);
         assert!(report
@@ -2450,8 +2468,7 @@ mod tests {
         let options = ValidateOptions {
             entries: 1,
             news_section: Some("## 2.0\n\n- Fix a crash\n"),
-            tarball_present: true,
-            news_lookup_failed: false,
+            ..Default::default()
         };
         let report = validate(&local, None, &options);
         assert!(report
@@ -2819,94 +2836,5 @@ mod tests {
         ]);
         let report = validate(&local, Some(&target), &ValidateOptions::default());
         assert!(!report.findings.iter().any(|f| f.rule == Rule::V4));
-    }
-
-    #[test]
-    fn v9_skip_says_when_no_tarball_was_on_disk() {
-        // A bare update with no tarball at all: the rule is skipped,
-        // and the skip says the line was never checked.
-        let local = snapshot(&[
-            ("foo.spec", SPEC),
-            (
-                "foo.changes",
-                &changes_file("- Update to 2.0", "- Initial package"),
-            ),
-        ]);
-        let options = ValidateOptions {
-            entries: 1,
-            news_section: None,
-            tarball_present: false,
-            news_lookup_failed: false,
-        };
-        let report = validate(&local, None, &options);
-        assert!(report
-            .skipped
-            .iter()
-            .any(|s| s.rule == Rule::V9 && s.reason.contains("no source tarball on disk")));
-        assert!(!report.findings.iter().any(|f| f.rule == Rule::V9));
-        // A tarball on disk with no NEWS section keeps the old skip.
-        let options = ValidateOptions {
-            entries: 1,
-            news_section: None,
-            tarball_present: true,
-            news_lookup_failed: false,
-        };
-        let report = validate(&local, None, &options);
-        assert!(report
-            .skipped
-            .iter()
-            .any(|s| s.rule == Rule::V9 && s.reason.contains("no upstream NEWS section found")));
-    }
-
-    #[test]
-    fn v9_stays_silent_when_the_news_lookup_failed() {
-        // A failed NEWS lookup is reported once by the caller; V9
-        // adds no second, contradictory skip for it.
-        let local = snapshot(&[
-            ("foo.spec", SPEC),
-            (
-                "foo.changes",
-                &changes_file("- Update to 2.0", "- Initial package"),
-            ),
-        ]);
-        let options = ValidateOptions {
-            entries: 1,
-            news_section: None,
-            tarball_present: true,
-            news_lookup_failed: true,
-        };
-        let report = validate(&local, None, &options);
-        assert!(!report.skipped.iter().any(|s| s.rule == Rule::V9));
-        assert!(!report.findings.iter().any(|f| f.rule == Rule::V9));
-    }
-
-    #[test]
-    fn v9_skip_does_not_claim_a_missing_tarball_without_a_version() {
-        // A spec with no Version: never had a tarball to look for;
-        // the skip says the version was unknown, not that no
-        // tarball was on disk.
-        let spec = SPEC.replace("Version:        2.0\n", "");
-        let local = snapshot(&[
-            ("foo.spec", &spec),
-            (
-                "foo.changes",
-                &changes_file("- Update to 2.0", "- Initial package"),
-            ),
-        ]);
-        let options = ValidateOptions {
-            entries: 1,
-            news_section: None,
-            tarball_present: false,
-            news_lookup_failed: false,
-        };
-        let report = validate(&local, None, &options);
-        assert!(report
-            .skipped
-            .iter()
-            .any(|s| s.rule == Rule::V9 && s.reason.contains("carries no version")));
-        assert!(!report
-            .skipped
-            .iter()
-            .any(|s| s.rule == Rule::V9 && s.reason.contains("no source tarball")));
     }
 }

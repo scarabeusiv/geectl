@@ -213,24 +213,25 @@ fn fetch_target(
 /// The upstream NEWS section for the local version, when the
 /// tarball is on disk and carries one. The second return value is
 /// the lookup failure, when the lookup failed (as opposed to finding
-/// no section); the third is whether a tarball was found at all
-/// (V9 tells the two no-news cases apart).
-fn lookup_news(dir: &Path, local: &PackageSnapshot) -> (Option<NewsSection>, Option<String>, bool) {
+/// no section) — the generate path reports it in its payload. V9 no
+/// longer distinguishes the no-news cases: the finding message only
+/// says whether news was found.
+fn lookup_news(dir: &Path, local: &PackageSnapshot) -> (Option<NewsSection>, Option<String>) {
     let spec_names = local.spec_names();
     let Some(spec_name) = spec_names.first() else {
-        return (None, None, false);
+        return (None, None);
     };
     let spec = parse_spec(&local.files[*spec_name]);
     let Some(version) = spec.version else {
-        return (None, None, false);
+        return (None, None);
     };
     let source0 = spec.sources.first().map(String::as_str);
     let Some(tarball) = find_tarball(dir, &version, source0) else {
-        return (None, None, false);
+        return (None, None);
     };
     match extract_news_section(&tarball, &version) {
-        Ok(section) => (section, None, true),
-        Err(err) => (None, Some(err.to_string()), true),
+        Ok(section) => (section, None),
+        Err(err) => (None, Some(err.to_string())),
     }
 }
 
@@ -247,21 +248,22 @@ fn run_validate(
         Some((project, package)) => fetch_target(debug, project, package)?,
         None => None,
     };
-    let (news, news_error, tarball_present) = lookup_news(dir, &local);
+    let (news, news_error) = lookup_news(dir, &local);
+    // The lookup failure is not a V9 skip: V9 runs whether or not
+    // news was found. Name it on the debug channel so a corrupt or
+    // undecodable tarball is visible instead of silent.
+    if let Some(reason) = news_error {
+        debug.emit(&format!(
+            "changelog: upstream NEWS lookup failed ({reason})"
+        ));
+    }
     let options = ValidateOptions {
         entries,
         news_section: news.as_ref().map(|section| section.text.as_str()),
-        tarball_present,
-        news_lookup_failed: news_error.is_some(),
+        ..Default::default()
     };
     let report = validate(&local, target_snapshot.as_ref(), &options);
-    let mut skipped = report.skipped.clone();
-    if let Some(reason) = news_error {
-        skipped.push(crate::changelog::Skipped {
-            rule: crate::changelog::Rule::V9,
-            reason: format!("upstream NEWS lookup failed ({reason}) — V9 did not run"),
-        });
-    }
+    let skipped = report.skipped.clone();
     let target_text = target
         .as_ref()
         .map(|(project, package)| format!(" target: {project}/{package}"))
@@ -521,10 +523,10 @@ fn run_generate(
     // is unchanged, the upstream section for it was already
     // distilled when the version landed, so there is nothing to
     // extract.
-    let (news, news_error, _) = if version_is_new(&local, target_snapshot.as_ref()) {
+    let (news, news_error) = if version_is_new(&local, target_snapshot.as_ref()) {
         lookup_news(dir, &local)
     } else {
-        (None, None, false)
+        (None, None)
     };
     let generation = generate(
         &local,
@@ -719,5 +721,34 @@ mod tests {
             .expect_err("undecodable bytes are refused");
         assert!(err.context.contains("no known encoding decodes"));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn run_validate_logs_a_failed_news_lookup_on_the_debug_channel() {
+        // A corrupt tarball reads as a plain V9 finding; the lookup
+        // failure itself is named on the debug channel, not silent.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("foo.spec"),
+            "Name:           foo\nVersion:        2.0\nLicense:        GPL-3.0-only\nSource0:        foo-2.0.tar.gz\n%changelog\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("foo.changes"),
+            "-------------------------------------------------------------------\nMon Nov 23 00:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n-------------------------------------------------------------------\nMon Nov 16 00:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Initial package\n\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("foo-2.0.tar.gz"), b"not a tarball at all").unwrap();
+        let (debug, lines) = Debug::captured(true, false);
+        let err = run_validate(dir.path(), None, None, 1, &debug)
+            .expect_err("a bare update is a V9 finding");
+        assert!(err.context.contains("finding(s)"), "{}", err.context);
+        let lines = lines.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("upstream NEWS lookup failed")),
+            "debug lines: {lines:?}"
+        );
     }
 }

@@ -49,11 +49,11 @@ skipped. Any other fetch failure is a hard error.
   `.spec`/`.changes` files and `_`-prefixed files are excluded.
 - V8 — `Version:` is present and a single token.
 - V9 — a bare `Update to <version>` entry with no other substantive
-  line is a finding, but only when the upstream NEWS section for the
-  new version exists. A line that only names a file, dependency, or
-  license operation counts as non-substantive. No news found → the rule is
-  skipped; when no source tarball was on disk at all,
-  the skip says so — the check skipped the line. A leftover `TODO`
+  line is a finding, whether or not the upstream NEWS section for
+  the new version exists. A line that only names a file, dependency,
+  or license operation counts as non-substantive. When a NEWS section
+  was found, the finding names it as the material to distill; without
+  one, the finding asks for a summary anyway. A leftover `TODO`
   slot is also a V9 finding.
 - V10 — the license tokens in the newest entry match the spec
   `License:` (normalised: `GPLv3` → `GPL-3.0`, `-only`/`-or-later`
@@ -72,8 +72,7 @@ skipped. Any other fetch failure is a hard error.
   security claim with no full id, and a CVE named as not fixed /
   not affected with no fix statement elsewhere in the entry.
 
-Rules skipped for lack of a target (or of a NEWS section) are listed
-in the report with the reason. `validate` exits 0 with verdict
+Rules skipped for lack of a target are listed in the report with the reason. `validate` exits 0 with verdict
 `pass`, or 24 (`validation_failed`) with one
 `file:line: V#: message` line per finding in the error context.
 
@@ -121,4 +120,4 @@ an error value.
 
 ## Scope
 
-This layer validates and generates `.changes` entries; filing, OBS mutation, and commit wiring live in their own layers. V1–V8 and V10–V12 are exact; V9 is a deterministic heuristic gated on the NEWS section existing. Old entries change through the whole-file normalization: `--write` normalizes the whole file (trailing whitespace, CRLF→LF, legacy encodings to UTF-8, BOM stripped) and V11 compares older entries after that normalization, so a difference normalization alone explains counts as no finding.
+This layer validates and generates `.changes` entries; filing, OBS mutation, and commit wiring live in their own layers. V1–V8 and V10–V12 are exact; V9 is a deterministic heuristic — the NEWS section only changes its message, never whether it fires. Old entries change through the whole-file normalization: `--write` normalizes the whole file (trailing whitespace, CRLF→LF, legacy encodings to UTF-8, BOM stripped) and V11 compares older entries after that normalization, so a difference normalization alone explains counts as no finding.
