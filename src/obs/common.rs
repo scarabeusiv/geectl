@@ -12,6 +12,7 @@ use crate::url::encode_query_value;
 use crate::url::UrlBuilder;
 use crate::xml::find_tag_end;
 use crate::xml::xml_attr_blank;
+use crate::xml::xml_descendant_spans;
 use crate::xml::xml_unescape;
 
 /// The OBS API base (production).
@@ -1002,8 +1003,12 @@ pub(crate) fn single_element_text(
 
 /// Each `<tag ...>...</tag>` (or self-closing `<tag .../>`) element
 /// in `block`, as `(opening-tag text, inner text)`. The tag name must
-/// stand on its own. An unterminated element is an error, never a
-/// skipped element.
+/// stand on its own. Only an unterminated element of the searched
+/// tag itself is an error; other malformed content is skipped, the
+/// failed `<` reading as text. The search reads through the shared
+/// child walk, so an element hidden in a comment or a CDATA section
+/// is never found, and nested elements of the same name read as one
+/// whole element.
 pub(crate) fn elements(block: &str, tag: &str) -> Result<Vec<(String, String)>, GeectlError> {
     let malformed = || {
         GeectlError::new(
@@ -1011,34 +1016,23 @@ pub(crate) fn elements(block: &str, tag: &str) -> Result<Vec<(String, String)>, 
             format!("unexpected OBS response: malformed <{tag}> element"),
         )
     };
-    let open = format!("<{tag}");
+    let spans = xml_descendant_spans(block, tag).map_err(|_| malformed())?;
     let mut out = Vec::new();
-    let mut rest = block;
-    while let Some(pos) = rest.find(&open) {
-        let after_tag = &rest[pos + open.len()..];
-        let Some(first) = after_tag.chars().next() else {
-            return Err(malformed());
-        };
-        if !(first.is_whitespace() || first == '/' || first == '>') {
-            rest = after_tag;
+    for &(start, tag_end, elem_end, self_closing) in &spans {
+        // The opening-tag text starts past `<tag`, as before: the
+        // callers read attributes out of it.
+        let open = &block[start + 1 + tag.len()..tag_end - 1];
+        if self_closing {
+            out.push((open.to_string(), String::new()));
             continue;
         }
-        let Some(end) = find_tag_end(after_tag) else {
-            return Err(malformed());
-        };
-        let element = &after_tag[..end];
-        if element.trim_end().ends_with('/') {
-            out.push((element.to_string(), String::new()));
-            rest = &after_tag[end + 1..];
-        } else {
-            let inner = &after_tag[end + 1..];
-            let close = format!("</{tag}>");
-            let Some(close_pos) = inner.find(&close) else {
-                return Err(malformed());
-            };
-            out.push((element.to_string(), inner[..close_pos].to_string()));
-            rest = &inner[close_pos + close.len()..];
-        }
+        // The inner text runs to the element's own close tag: the
+        // last `<` in the span, since nothing follows the close.
+        let close_start = block[start..elem_end]
+            .rfind('<')
+            .map(|rel| start + rel)
+            .unwrap_or(elem_end);
+        out.push((open.to_string(), block[tag_end..close_start].to_string()));
     }
     Ok(out)
 }
@@ -1909,5 +1903,37 @@ mod tests {
             Some("abcdef1234567890abcdef1234567890abcdef12".to_string())
         );
         assert_eq!(parse_obsinfo_commit("mtime: 1\n"), None);
+    }
+
+    #[test]
+    fn elements_ignores_elements_hidden_in_comments_and_cdata() {
+        // The descendant extraction reads through the shared child
+        // walk: a `<person>` inside a comment or a CDATA section is
+        // opaque text, never an element.
+        let block = "<!-- <person userid=\"hidden\" role=\"maintainer\"/> --><person userid=\"alice\" role=\"maintainer\"/>";
+        let found = elements(block, "person").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, " userid=\"alice\" role=\"maintainer\"/");
+        assert_eq!(found[0].1, "");
+        let block = "<![CDATA[<person userid=\"hidden\" role=\"maintainer\"/>]]><person userid=\"alice\" role=\"maintainer\"/>";
+        let found = elements(block, "person").unwrap();
+        assert_eq!(found.len(), 1);
+        // A match nested in another element is still found, with its
+        // inner text intact.
+        let block = "<wrapper><person userid=\"bob\" role=\"reviewer\">note</person></wrapper>";
+        let found = elements(block, "person").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, "note");
+    }
+
+    #[test]
+    fn elements_reads_nested_same_name_elements_whole() {
+        // The shared walk counts nesting, so a match nested in a
+        // match reads as one whole element instead of truncating at
+        // the first close tag.
+        let block = "<devel project=\"a\"><devel project=\"b\"/></devel>";
+        let found = elements(block, "devel").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, "<devel project=\"b\"/>");
     }
 }

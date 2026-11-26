@@ -829,52 +829,27 @@ pub(crate) fn skip_xml_prolog(body: &str) -> Result<&str, ()> {
 /// Each occurrence of element `name` in `body`, as its full text
 /// including the tags. The tag name must end at whitespace, `/`, or
 /// `>` (so `<resultlist>` never matches a search for `<result`).
-/// An unterminated element is a server error: the scan fails instead
+/// The search reads through the shared child walk, so an element
+/// hidden in a comment or a CDATA section is never found, and
+/// nested elements of the same name read as one whole element. An
+/// unterminated element is a server error: the scan fails instead
 /// of returning the partial list, so a truncated document never reads
 /// as a smaller matrix.
 pub(crate) fn xml_elements<'a>(body: &'a str, name: &str) -> Result<Vec<&'a str>, GeectlError> {
-    let unterminated = || {
-        GeectlError::new(
+    let spans = xml_descendant_spans(body, name).map_err(|err| match err {
+        XmlScanError::Unterminated { .. } => GeectlError::new(
             ErrorKind::ServerError,
             format!("unexpected OBS response: unterminated <{name}> element"),
-        )
-    };
-    let mut out = Vec::new();
-    let mut offset = 0;
-    let open_marker = format!("<{name}");
-    let close_marker = format!("</{name}>");
-    while offset < body.len() {
-        let rest = &body[offset..];
-        let Some(pos) = rest.find(&open_marker) else {
-            break;
-        };
-        let after_tag = &rest[pos + open_marker.len()..];
-        let Some(first) = after_tag.chars().next() else {
-            return Err(unterminated());
-        };
-        if !(first.is_whitespace() || first == '/' || first == '>') {
-            offset += pos + open_marker.len();
-            continue;
-        }
-        let Some(end) = find_tag_end(after_tag) else {
-            return Err(unterminated());
-        };
-        let tag = &after_tag[..end];
-        let elem_start = offset + pos;
-        if tag.trim_end().ends_with('/') {
-            // Self-closing: the element is just the tag.
-            out.push(&body[elem_start..elem_start + open_marker.len() + end + 1]);
-            offset = elem_start + open_marker.len() + end + 1;
-            continue;
-        }
-        let Some(close) = after_tag[end + 1..].find(&close_marker) else {
-            return Err(unterminated());
-        };
-        let full_end = end + 1 + close + close_marker.len();
-        out.push(&body[elem_start..elem_start + open_marker.len() + full_end]);
-        offset = elem_start + open_marker.len() + full_end;
-    }
-    Ok(out)
+        ),
+        XmlScanError::EmptyName { .. } => GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS response: empty tag name in element content",
+        ),
+    })?;
+    Ok(spans
+        .iter()
+        .map(|&(start, _, elem_end, _)| &body[start..elem_end])
+        .collect())
 }
 
 /// The index just past the element starting at `start` (the `<` of
@@ -1008,15 +983,15 @@ enum XmlConstruct<'a> {
 /// Why `xml_next_construct` could not scan the construct at a `<`:
 /// the construct never terminates, or the tag has no name. `child`
 /// names the element whose end was missing, when the scan got that far.
-enum XmlScanError<'a> {
+pub(crate) enum XmlScanError<'a> {
     Unterminated { at: usize, child: Option<&'a str> },
     EmptyName { at: usize },
 }
 
 /// Scan the construct starting at `tag_start` (the `<` of its opening
 /// tag) in `inner`: classify it and return the offset just past it.
-/// The caller renders the error: the two callers name the fault
-/// differently, so the scan reports the fact and the offset, not the
+/// The shared child walk yields the fact; each policy renders it in
+/// its own terms, so the scan reports the fact and the offset, not the
 /// message.
 fn xml_next_construct(
     inner: &str,
@@ -1071,7 +1046,17 @@ fn xml_next_construct(
         .unwrap_or(after_lt.len());
     let tag_name = &after_lt[..name_end];
     let Some(gt) = find_tag_end(after_lt) else {
-        return Err(unterminated(None));
+        // The tag never terminates, but its name is readable: name
+        // the element that failed, so a caller looking for it can
+        // tell its own unterminated element from other content. A
+        // `<` that does not start a name (bare `<` in text, a
+        // comment, a processing instruction) stays anonymous.
+        let child = tag_name
+            .chars()
+            .next()
+            .filter(|c| is_name_start_char(*c))
+            .map(|_| tag_name);
+        return Err(unterminated(child));
     };
     if tag_name.is_empty() {
         return Err(XmlScanError::EmptyName { at: tag_start });
@@ -1102,6 +1087,232 @@ fn xml_next_construct(
     ))
 }
 
+/// One direct child of element content, as the shared child walk
+/// scans it: the text between constructs, or one construct starting
+/// at a `<`. The collect path, the reject path, and the descendant
+/// extraction all read through this walk, so the CDATA-aware
+/// scanning has a single implementation: a comment or CDATA section
+/// is one item here, never a place a `<name` search can mistake for
+/// an element.
+pub(crate) enum XmlChild<'a> {
+    /// Character data between constructs, with its byte offset in
+    /// the scanned content.
+    Text { start: usize, text: &'a str },
+    /// A comment, as its full text including `<!--` and `-->`.
+    Comment { start: usize, text: &'a str },
+    /// A processing instruction, as its full text including `<?`
+    /// and `?>`.
+    Pi { start: usize, text: &'a str },
+    /// A CDATA section, with its byte offset in the scanned
+    /// content. Its text is never read: every policy rejects a
+    /// CDATA section where it appears, or skips it as opaque.
+    Cdata { start: usize },
+    /// Other markup (`<!...>` that is neither a comment nor CDATA),
+    /// as its full text.
+    Markup { start: usize, text: &'a str },
+    /// A closing tag at this level, with its byte offset in the
+    /// scanned content.
+    CloseTag { start: usize },
+    /// A child element: its tag name, its byte offset, the offset
+    /// just past its opening tag, the offset just past the whole
+    /// element, and whether the opening tag is self-closing.
+    Element {
+        start: usize,
+        name: &'a str,
+        tag_end: usize,
+        elem_end: usize,
+        self_closing: bool,
+    },
+}
+
+/// The shared child walk over element content: each direct child in
+/// document order. Malformed content is yielded once as the scan
+/// fact (what failed, at which offset), and the walk then resumes
+/// past the `<` that failed: a caller that treats the fact as
+/// fatal ends there, while the descendant search skips past
+/// content that is not the element it looks for. Each policy
+/// renders the fact in its own terms, like [`xml_next_construct`]
+/// before it.
+pub(crate) struct XmlChildren<'a> {
+    inner: &'a str,
+    offset: usize,
+}
+
+impl<'a> XmlChildren<'a> {
+    /// Walk the direct children of `inner`, the content between an
+    /// element's open and close tags.
+    pub(crate) fn new(inner: &'a str) -> Self {
+        XmlChildren { inner, offset: 0 }
+    }
+}
+
+impl<'a> Iterator for XmlChildren<'a> {
+    type Item = Result<XmlChild<'a>, XmlScanError<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.inner.len() {
+            return None;
+        }
+        let start = self.offset;
+        let rest = &self.inner[start..];
+        let Some(lt) = rest.find('<') else {
+            self.offset = self.inner.len();
+            return Some(Ok(XmlChild::Text { start, text: rest }));
+        };
+        if lt > 0 {
+            self.offset = start + lt;
+            return Some(Ok(XmlChild::Text {
+                start,
+                text: &rest[..lt],
+            }));
+        }
+        match xml_next_construct(self.inner, start) {
+            Ok((construct, next)) => {
+                self.offset = next;
+                Some(Ok(match construct {
+                    XmlConstruct::CloseTag => {
+                        // The scan stops just past the `<` for a
+                        // closing tag; the walk needs the whole tag,
+                        // so the end is found here. No `>` means the
+                        // tag runs to the end of the content: the
+                        // caller rejects the stray close either way.
+                        let end = find_tag_end(&self.inner[start + 1..])
+                            .map(|gt| start + 1 + gt + 1)
+                            .unwrap_or(self.inner.len());
+                        self.offset = end;
+                        XmlChild::CloseTag { start }
+                    }
+                    XmlConstruct::Comment => XmlChild::Comment {
+                        start,
+                        text: &self.inner[start..next],
+                    },
+                    XmlConstruct::Pi => XmlChild::Pi {
+                        start,
+                        text: &self.inner[start..next],
+                    },
+                    XmlConstruct::Cdata => XmlChild::Cdata { start },
+                    XmlConstruct::Markup => XmlChild::Markup {
+                        start,
+                        text: &self.inner[start..next],
+                    },
+                    XmlConstruct::Child {
+                        name,
+                        tag_end,
+                        elem_end,
+                        self_closing,
+                    } => XmlChild::Element {
+                        start,
+                        name,
+                        tag_end,
+                        elem_end,
+                        self_closing,
+                    },
+                }))
+            }
+            Err(err) => {
+                // Report the fact once, then resume past the
+                // `<` that failed: the next item scans the text
+                // after it. The offset always advances, so a
+                // caller that skips the fact can never loop.
+                let at = match err {
+                    XmlScanError::Unterminated { at, .. } => at,
+                    XmlScanError::EmptyName { at } => at,
+                };
+                self.offset = at + 1;
+                Some(Err(err))
+            }
+        }
+    }
+}
+
+/// The descendant elements named `name` in `inner`, each as its byte
+/// offset, the offset just past its opening tag, the offset just past
+/// the whole element, and whether the opening tag is self-closing.
+/// A match is never descended into; any other element is, so a match
+/// hidden in a comment or a CDATA section is never found and a match
+/// nested in another element is. Malformed content that is not the
+/// searched element is skipped — the failed `<` reads as text, as
+/// the marker search before it never parsed that content at all —
+/// while an unterminated searched element ends the scan with the
+/// fact, never a partial list.
+pub(crate) fn xml_descendant_spans<'a>(
+    inner: &'a str,
+    name: &str,
+) -> Result<Vec<(usize, usize, usize, bool)>, XmlScanError<'a>> {
+    let mut out = Vec::new();
+    xml_descendant_spans_into(inner, name, 0, &mut out)?;
+    Ok(out)
+}
+
+/// The descendant search over `inner`, with `base` the offset of
+/// `inner` in the document the spans are reported against.
+fn xml_descendant_spans_into<'a>(
+    inner: &'a str,
+    name: &str,
+    base: usize,
+    out: &mut Vec<(usize, usize, usize, bool)>,
+) -> Result<(), XmlScanError<'a>> {
+    // An explicit stack of child walks, not recursion: the walk used
+    // to recurse per nesting level, so a hostile deeply-nested
+    // document exhausted the call stack while the sibling
+    // `xml_element_end` stays iterative. A frame is the walk over
+    // one element's inner, that inner, and its offset in the
+    // document; matches still land in document order, as the top
+    // frame's walk only resumes once the frame pushed above it is
+    // done.
+    let mut stack: Vec<(XmlChildren<'a>, &'a str, usize)> =
+        vec![(XmlChildren::new(inner), inner, base)];
+    while let Some(frame) = stack.last_mut() {
+        let Some(child) = frame.0.next() else {
+            stack.pop();
+            continue;
+        };
+        let frame_inner = frame.1;
+        let frame_base = frame.2;
+        let child = match child {
+            Ok(child) => child,
+            // The searched element itself, unterminated, is a
+            // failure. Anything else malformed is skipped: the
+            // walk already resumed past its `<`.
+            Err(XmlScanError::Unterminated {
+                at,
+                child: Some(failed),
+            }) if failed == name => {
+                return Err(XmlScanError::Unterminated {
+                    at,
+                    child: Some(failed),
+                });
+            }
+            Err(_) => continue,
+        };
+        let XmlChild::Element {
+            start,
+            name: tag_name,
+            tag_end,
+            elem_end,
+            self_closing,
+        } = child
+        else {
+            continue;
+        };
+        if tag_name == name {
+            out.push((
+                frame_base + start,
+                frame_base + tag_end,
+                frame_base + elem_end,
+                self_closing,
+            ));
+        } else if !self_closing {
+            stack.push((
+                XmlChildren::new(&frame_inner[tag_end..elem_end]),
+                &frame_inner[tag_end..elem_end],
+                frame_base + tag_end,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The direct child elements named `name` in `inner` (the content
 /// between an element's open and close tags), as their full text
 /// including the tags. Unlike [`xml_elements`], this does not descend:
@@ -1128,15 +1339,16 @@ pub(crate) fn xml_child_elements<'a>(
         )
     };
     let mut out = Vec::new();
-    let mut offset = 0;
-    while offset < inner.len() {
-        let rest = &inner[offset..];
-        let Some(lt) = rest.find('<') else {
-            break;
-        };
-        let tag_start = offset + lt;
-        let (construct, next) = match xml_next_construct(inner, tag_start) {
-            Ok(found) => found,
+    for child in XmlChildren::new(inner) {
+        match child {
+            Ok(XmlChild::Element {
+                start,
+                name: tag_name,
+                elem_end,
+                ..
+            }) if tag_name == name => out.push(&inner[start..elem_end]),
+            Ok(XmlChild::CloseTag { .. }) => return Err(stray_close()),
+            Ok(_) => {}
             Err(XmlScanError::Unterminated { .. }) => return Err(unterminated()),
             Err(XmlScanError::EmptyName { .. }) => {
                 return Err(GeectlError::new(
@@ -1144,17 +1356,7 @@ pub(crate) fn xml_child_elements<'a>(
                     "unexpected OBS response: empty tag name in element content",
                 ));
             }
-        };
-        match construct {
-            XmlConstruct::Child {
-                name: tag_name,
-                elem_end,
-                ..
-            } if tag_name == name => out.push(&inner[tag_start..elem_end]),
-            XmlConstruct::CloseTag => return Err(stray_close()),
-            _ => {}
         }
-        offset = next;
     }
     Ok(out)
 }
@@ -1266,21 +1468,9 @@ pub(crate) fn xml_reject_stray_text(inner: &str, element: &str) -> Result<(), Ge
         text.find(|c: char| !matches!(c, ' ' | '\t' | '\r' | '\n'))
             .unwrap_or(text.len())
     };
-    let mut offset = 0;
-    while offset < inner.len() {
-        let rest = &inner[offset..];
-        let Some(lt) = rest.find('<') else {
-            if !xml_content_blank(rest) {
-                return Err(stray_text(offset + first_content(rest)));
-            }
-            return Ok(());
-        };
-        if !xml_content_blank(&rest[..lt]) {
-            return Err(stray_text(offset + first_content(&rest[..lt])));
-        }
-        let tag_start = offset + lt;
-        let (construct, next) = match xml_next_construct(inner, tag_start) {
-            Ok(found) => found,
+    for child in XmlChildren::new(inner) {
+        let child = match child {
+            Ok(child) => child,
             Err(XmlScanError::Unterminated { at, child }) => {
                 return Err(match child {
                     Some(child) => unterminated_child(child, at),
@@ -1296,21 +1486,31 @@ pub(crate) fn xml_reject_stray_text(inner: &str, element: &str) -> Result<(), Ge
                 ));
             }
         };
-        match construct {
-            XmlConstruct::Cdata => return Err(cdata(tag_start)),
-            XmlConstruct::Comment | XmlConstruct::Pi | XmlConstruct::Markup => {
-                if let Some((tag, rel)) = hidden_tag(&inner[tag_start..next]) {
-                    return Err(hidden_modeled_tag(tag, tag_start + rel));
+        match child {
+            XmlChild::Text { start, text } => {
+                if !xml_content_blank(text) {
+                    return Err(stray_text(start + first_content(text)));
                 }
             }
-            XmlConstruct::CloseTag => {
+            XmlChild::Cdata { start, .. } => return Err(cdata(start)),
+            XmlChild::Comment { start, text }
+            | XmlChild::Pi { start, text }
+            | XmlChild::Markup { start, text } => {
+                if let Some((tag, rel)) = hidden_tag(text) {
+                    return Err(hidden_modeled_tag(tag, start + rel));
+                }
+            }
+            XmlChild::CloseTag { start, .. } => {
                 // The parent's close was stripped by the caller, so nothing may close here.
                 return Err(GeectlError::new(
                     ErrorKind::ServerError,
-                    format!("unexpected OBS response: stray closing tag in <{element}> at offset {tag_start}"),
+                    format!(
+                        "unexpected {subject}: stray closing tag in <{element}> at offset {start}"
+                    ),
                 ));
             }
-            XmlConstruct::Child {
+            XmlChild::Element {
+                start,
                 name: tag_name,
                 tag_end,
                 elem_end,
@@ -1319,7 +1519,7 @@ pub(crate) fn xml_reject_stray_text(inner: &str, element: &str) -> Result<(), Ge
                 if self_closing {
                     // Self-closing child: skip it whole, past its own tag
                     // name so the name itself is not read as hidden.
-                    let after_name = tag_start + 1 + tag_name.len();
+                    let after_name = start + 1 + tag_name.len();
                     if let Some((tag, rel)) = hidden_tag(&inner[after_name..tag_end]) {
                         return Err(hidden_modeled_tag(tag, after_name + rel));
                     }
@@ -1348,14 +1548,13 @@ pub(crate) fn xml_reject_stray_text(inner: &str, element: &str) -> Result<(), Ge
                         return Err(markup_in_child(tag_name, at));
                     }
                 } else {
-                    let after_name = tag_start + 1 + tag_name.len();
+                    let after_name = start + 1 + tag_name.len();
                     if let Some((tag, rel)) = hidden_tag(&inner[after_name..elem_end]) {
                         return Err(hidden_modeled_tag(tag, after_name + rel));
                     }
                 }
             }
         }
-        offset = next;
     }
     Ok(())
 }
@@ -2017,6 +2216,33 @@ mod tests {
     }
 
     #[test]
+    fn xml_descendant_spans_survives_deep_nesting() {
+        // The descendant search walks an explicit stack, not the
+        // call stack: a hostile deeply-nested document must not
+        // abort the process. Verified against the old recursion:
+        // 2,500 levels passed, 3,000 aborted the test thread with
+        // a stack overflow. Each level gets its own tag name, so
+        // finding an element's end stays cheap per level instead
+        // of re-scanning the whole subtree for a repeated name.
+        let depth = 3_000;
+        let mut body = String::new();
+        for level in 0..depth {
+            body.push_str(&format!("<n{level}>"));
+        }
+        body.push_str("<target/>");
+        for level in (0..depth).rev() {
+            body.push_str(&format!("</n{level}>"));
+        }
+        // `XmlScanError` carries no `Debug`, so no `unwrap` here.
+        let spans = match xml_descendant_spans(&body, "target") {
+            Ok(spans) => spans,
+            Err(_) => panic!("deep nesting must parse"),
+        };
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].3);
+    }
+
+    #[test]
     fn xml_element_end_skips_a_nested_tag_whole() {
         // A `<!--` inside a nested tag's quoted attribute value
         // is not a comment opener: the tag is skipped whole and
@@ -2391,5 +2617,37 @@ mod tests {
         assert!(skip_xml_prolog("<?xmlfoo version=\"1.0\"?><a/>").is_err());
         // Leading whitespace is the caller's job: the input is expected trimmed.
         assert_eq!(skip_xml_prolog("  <a/>").unwrap(), "  <a/>");
+    }
+
+    #[test]
+    fn xml_elements_ignores_elements_hidden_in_comments_and_cdata() {
+        // The descendant extraction reads through the shared child
+        // walk: a `<result>` inside a comment or a CDATA section is
+        // opaque text, never an element.
+        let body = "<!-- <result project=\"a\"/> --><result project=\"b\"/>";
+        let found = xml_elements(body, "result").unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("project=\"b\""));
+        let body = "<![CDATA[<result project=\"a\"/>]]><result project=\"b\"/>";
+        let found = xml_elements(body, "result").unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("project=\"b\""));
+        // A match nested in another element is still found: the walk
+        // descends through non-matching elements.
+        let body = "<wrapper><result project=\"c\"/></wrapper>";
+        let found = xml_elements(body, "result").unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("project=\"c\""));
+    }
+
+    #[test]
+    fn xml_elements_reads_nested_same_name_elements_whole() {
+        // The shared walk counts nesting, so a match nested in a
+        // match reads as one whole element instead of truncating at
+        // the first close tag.
+        let body = "<result><result>x</result></result>";
+        let found = xml_elements(body, "result").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0], "<result><result>x</result></result>");
     }
 }
