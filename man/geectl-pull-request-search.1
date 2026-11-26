@@ -48,8 +48,8 @@ deleted
 \fB\-\-creator\fR \fI<CREATOR>\fR
 Only pull requests by this author
 .TP
-\fB\-\-repo\fR \fI<REPO>\fR
-Only pull requests in this Gitea repo (`owner/repo`). Requires `\-\-backend gitea`
+\fB\-\-reviewer\fR \fI<REVIEWER>\fR
+Only pull requests with review requested of this login. Requires `\-\-backend gitea`. Only the token owner\*(Aqs login: the server filters review requests for the authenticated user only
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help

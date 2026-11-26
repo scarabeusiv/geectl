@@ -715,9 +715,15 @@ impl PullRequestSummary {
 /// backend both arms run, OBS first then Gitea. The states are
 /// the unified states; with none given each arm applies its own
 /// default (new/review/declined on OBS, open on Gitea). The
-/// creator filters by author. The repo scopes the Gitea arm to
-/// one repo (`owner`/`repo`); a repo-scoped search needs the
-/// Gitea backend — the OBS arm has no repo to scope to.
+/// creator filters by author. The reviewer filters by review
+/// requested of that login; it needs the Gitea backend — the
+/// OBS arm has no reviewer filter. Only the token owner's login
+/// is accepted: the server filters review requests for the
+/// authenticated user only, and the search answer carries no
+/// requested-reviewer info, so the filter is server-side only.
+/// The repo scopes the Gitea arm to one repo
+/// (`owner`/`repo`); a repo-scoped search needs the Gitea
+/// backend — the OBS arm has no repo to scope to.
 #[derive(Debug, Clone, Default)]
 pub struct PullRequestSearch {
     /// Only this backend, or both when unset.
@@ -726,6 +732,11 @@ pub struct PullRequestSearch {
     pub states: Vec<PullRequestStatus>,
     /// Only pull requests by this author, when set.
     pub creator: Option<String>,
+    /// Only pull requests with review requested of this login,
+    /// when set; needs the Gitea backend. Only the token owner's
+    /// login: the server filters review requests for the
+    /// authenticated user only.
+    pub reviewer: Option<String>,
     /// Only this Gitea repo, when set; needs the Gitea backend.
     pub repo: Option<(String, String)>,
 }
@@ -739,6 +750,12 @@ impl PullRequestSearch {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
                 "a repo-scoped search needs backend gitea: the OBS arm has no repo to scope to",
+            ));
+        }
+        if self.reviewer.is_some() && self.backend != Some(PullRequestBackend::Gitea) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "a reviewer-scoped search needs backend gitea: the OBS arm has no reviewer filter",
             ));
         }
         Ok(())
@@ -894,13 +911,19 @@ impl<'a> PullRequestClient<'a> {
     /// Search pull requests as the list shape. With no backend
     /// both arms run, OBS first then Gitea; a backend scopes the
     /// search to that arm. Both arms filter server-side (the
-    /// state mapping and the creator); the Gitea arm filters
-    /// client-side to the exact states and creator as a backstop,
-    /// since the repo-scoped list has no author filter and the
-    /// wire states do not map one-to-one to the unified states.
-    /// A repo-scoped search needs the Gitea backend; without it
-    /// the search fails as invalid input instead of returning
-    /// unscoped OBS hits.
+    /// state mapping and the creator); the reviewer filters
+    /// server-side on the Gitea arm only (`review_requested`,
+    /// token owner only) and needs the Gitea backend. A
+    /// reviewer-scoped search runs the global search even with
+    /// a repo given, since the repo-scoped list has no reviewer
+    /// filter. The Gitea arm filters client-side to the exact
+    /// states, creator, and repo as a backstop, since the
+    /// repo-scoped list has no author filter, the search
+    /// endpoint has no repo scope, and the wire states do not
+    /// map one-to-one to the unified states. A repo-scoped
+    /// search needs the Gitea backend; without it the search
+    /// fails as invalid input instead of returning unscoped OBS
+    /// hits.
     pub fn search(
         &self,
         query: &PullRequestSearch,
@@ -923,14 +946,17 @@ impl<'a> PullRequestClient<'a> {
         if query.backend.is_none() || query.backend == Some(PullRequestBackend::Gitea) {
             let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
             let wire = gitea_state_for(&query.states);
-            let mut items = match &query.repo {
-                Some((owner, repo)) => gitea
+            // The repo-scoped list has no reviewer filter, so a
+            // reviewer-scoped search runs the global search even
+            // with a repo given; the retain below scopes it.
+            let mut items = match (&query.repo, &query.reviewer) {
+                (Some((owner, repo)), None) => gitea
                     .pr_list(owner, repo, wire)?
                     .iter()
                     .map(|pr| PullRequestSummary::from_gitea(owner, repo, pr))
                     .collect::<Result<Vec<_>, _>>()?,
-                None => gitea
-                    .pr_search(wire, query.creator.as_deref())?
+                _ => gitea
+                    .pr_search_scoped(wire, query.creator.as_deref(), query.reviewer.as_deref())?
                     .iter()
                     .map(PullRequestSummary::from_gitea_issue)
                     .collect::<Result<Vec<_>, _>>()?,
@@ -1817,15 +1843,28 @@ fn gitea_state_for(states: &[PullRequestStatus]) -> GiteaPullRequestState {
     }
 }
 
-/// Whether a Gitea summary matches the search's exact states and
-/// creator. The OBS arm needs no such filter: it filters
-/// server-side.
+/// Whether a Gitea summary matches the search's exact states,
+/// creator, and repo. The OBS arm needs no such filter: it
+/// filters server-side.
 fn matches_query(summary: &PullRequestSummary, query: &PullRequestSearch) -> bool {
     if !query.states.is_empty() && !query.states.contains(&summary.status) {
         return false;
     }
     if let Some(creator) = &query.creator {
         if summary.author != *creator {
+            return false;
+        }
+    }
+    if let Some((owner, repo)) = &query.repo {
+        let in_repo = match &summary.reference {
+            PullRequestRef::Gitea {
+                owner: summary_owner,
+                repo: summary_repo,
+                ..
+            } => summary_owner == owner && summary_repo == repo,
+            _ => false,
+        };
+        if !in_repo {
             return false;
         }
     }
@@ -2230,8 +2269,13 @@ mod tests {
 
     /// An issue-search item, shaped like Gitea 1.24.7 answers.
     fn issue_json(number: u64, state: &str, merged: bool, author: &str) -> String {
+        issue_json_in(number, state, merged, author, "openSUSE/geectl")
+    }
+
+    /// An issue-search item in the named repo.
+    fn issue_json_in(number: u64, state: &str, merged: bool, author: &str, repo: &str) -> String {
         format!(
-            r#"{{"number": {number}, "user": {{"login": "{author}"}}, "title": "change_review_state", "body": "A test PR body.", "labels": [], "state": "{state}", "pull_request": {{"merged": {merged}, "draft": false}}, "repository": {{"full_name": "openSUSE/geectl"}}}}"#
+            r#"{{"number": {number}, "user": {{"login": "{author}"}}, "title": "change_review_state", "body": "A test PR body.", "labels": [], "state": "{state}", "pull_request": {{"merged": {merged}, "draft": false}}, "repository": {{"full_name": "{repo}"}}}}"#
         )
     }
 
@@ -2635,6 +2679,14 @@ mod tests {
         let summaries = client.search(&query).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].author, "plusky");
+        assert_eq!(
+            summaries[0].reference,
+            PullRequestRef::Gitea {
+                owner: "openSUSE".to_string(),
+                repo: "geectl".to_string(),
+                number: 123,
+            }
+        );
     }
 
     #[test]
@@ -2762,6 +2814,153 @@ mod tests {
                 .expect_err("a repo-scoped search without the Gitea backend must fail");
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
         }
+    }
+
+    #[test]
+    fn search_gitea_scopes_reviewer_server_side() {
+        // The reviewer reaches the server as `review_requested`
+        // once the login matches the token owner: the mock URLs
+        // pin both the owner read and the parameter, so a search
+        // that sent the wrong parameter would answer nothing. The
+        // answer carries pull requests whose review was requested
+        // of the token owner, whatever their author.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/user",
+                "{\"login\": \"scarabeus_iv\", \"full_name\": \"Tomáš Chvátal\", \"email\": \"tomas.chvatal@gmail.com\"}",
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&review_requested=true&page=1&limit=50",
+                &format!("[{}]", issue_json(122, "open", false, "plusky")),
+            );
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Gitea),
+            reviewer: Some("scarabeus_iv".to_string()),
+            ..Default::default()
+        };
+        let summaries = client.search(&query).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].author, "plusky");
+    }
+
+    #[test]
+    fn search_gitea_scopes_creator_and_reviewer_server_side() {
+        // Creator and reviewer combine: both reach the server
+        // (`created_by` and `review_requested`), so the answer
+        // carries the creator's pull requests with review
+        // requested of the token owner.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/user",
+                "{\"login\": \"scarabeus_iv\", \"full_name\": \"Tomáš Chvátal\", \"email\": \"tomas.chvatal@gmail.com\"}",
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&created_by=plusky&review_requested=true&page=1&limit=50",
+                &format!("[{}]", issue_json(123, "open", false, "plusky")),
+            );
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Gitea),
+            creator: Some("plusky".to_string()),
+            reviewer: Some("scarabeus_iv".to_string()),
+            ..Default::default()
+        };
+        let summaries = client.search(&query).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].author, "plusky");
+    }
+
+    #[test]
+    fn search_reviewer_other_than_token_owner_fails() {
+        // The server filters review requests for the
+        // authenticated user only, so a reviewer naming anyone
+        // else fails as invalid input instead of searching
+        // unfiltered: no search call runs, so the fake needs no
+        // canned search response.
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/user",
+            "{\"login\": \"scarabeus_iv\", \"full_name\": \"Tomáš Chvátal\", \"email\": \"tomas.chvatal@gmail.com\"}",
+        );
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Gitea),
+            reviewer: Some("plusky".to_string()),
+            ..Default::default()
+        };
+        let err = client
+            .search(&query)
+            .expect_err("a reviewer other than the token owner must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn search_reviewer_scoped_search_needs_the_gitea_backend() {
+        // A reviewer scopes the Gitea arm only: with no backend,
+        // or with the OBS backend, the reviewer filter would be
+        // silently ignored on the OBS arm, so the search fails as
+        // invalid input instead. No HTTP call runs: the fake has
+        // no canned responses, so any arm running would fail with
+        // a network error, not the invalid-input error asserted
+        // here.
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(Some(&obs), Some(&gitea));
+        for backend in [None, Some(PullRequestBackend::Obs)] {
+            let query = PullRequestSearch {
+                backend,
+                reviewer: Some("scarabeus_iv".to_string()),
+                ..Default::default()
+            };
+            let err = client
+                .search(&query)
+                .expect_err("a reviewer-scoped search without the Gitea backend must fail");
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn search_reviewer_and_repo_scopes_to_both() {
+        // A reviewer-scoped repo search runs the global search
+        // (the repo-scoped list has no reviewer filter) and the
+        // retain scopes it to the repo: the answer carries a
+        // pull request from another repo too, and only the
+        // scoped repo survives.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/user",
+                "{\"login\": \"scarabeus_iv\", \"full_name\": \"Tomáš Chvátal\", \"email\": \"tomas.chvatal@gmail.com\"}",
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&review_requested=true&page=1&limit=50",
+                &format!(
+                    "[{}, {}]",
+                    issue_json(122, "open", false, "plusky"),
+                    issue_json_in(123, "open", false, "plusky", "openSUSE/other"),
+                ),
+            );
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Gitea),
+            repo: Some(("openSUSE".to_string(), "geectl".to_string())),
+            reviewer: Some("scarabeus_iv".to_string()),
+            ..Default::default()
+        };
+        let summaries = client.search(&query).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].reference,
+            PullRequestRef::Gitea {
+                owner: "openSUSE".to_string(),
+                repo: "geectl".to_string(),
+                number: 122,
+            }
+        );
     }
 
     #[test]

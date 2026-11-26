@@ -2853,17 +2853,44 @@ impl<'a> GiteaClient<'a> {
     /// merged flag but no head/base endpoints. A creator scopes
     /// the search server-side (`created_by`); without one the
     /// search answers every pull request and the caller filters.
+    /// A reviewer scopes the search server-side too, but only to
+    /// the token owner: the server filters review requests for
+    /// the authenticated user only (`review_requested`), so a
+    /// reviewer naming anyone else fails as invalid input.
     /// Paginates internally and is bounded like `repo_list`. The
     /// token needs the `read:issue` scope: the server gates the
     /// issues search on it (403 without it).
-    pub fn pr_search(
+    /// Search pull requests across the instance, unscoped: the
+    /// 0.2.2 shape, kept so library callers keep compiling — it
+    /// searches without a creator or reviewer filter.
+    pub fn pr_search(&self, state: GiteaPullRequestState) -> Result<Vec<GiteaIssue>, GeectlError> {
+        self.pr_search_scoped(state, None, None)
+    }
+
+    pub fn pr_search_scoped(
         &self,
         state: GiteaPullRequestState,
         creator: Option<&str>,
+        reviewer: Option<&str>,
     ) -> Result<Vec<GiteaIssue>, GeectlError> {
         let mut params: Vec<(&str, &str)> = vec![("type", "pulls"), ("state", state.as_str())];
         if let Some(creator) = creator {
             params.push(("created_by", creator));
+        }
+        if let Some(reviewer) = reviewer {
+            // The server filters review requests for the
+            // authenticated user only: a reviewer naming anyone
+            // else is refused instead of searching unfiltered.
+            let owner = self.current_user_login()?;
+            if !owner.eq_ignore_ascii_case(reviewer) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "reviewer {reviewer:?} is not the token owner ({owner}): the server filters review requests for the authenticated user only"
+                    ),
+                ));
+            }
+            params.push(("review_requested", "true"));
         }
         self.list_paged::<GiteaIssue>(
             &["api", "v1", "repos", "issues", "search"],
@@ -6795,7 +6822,7 @@ mod tests {
             &format!("[{}]", issue_json(122, "open", false)),
         );
         let items = client(&http)
-            .pr_search(GiteaPullRequestState::Open, None)
+            .pr_search_scoped(GiteaPullRequestState::Open, None, None)
             .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].number, 122);
@@ -6810,13 +6837,46 @@ mod tests {
     }
 
     #[test]
+    fn pr_search_without_filters_searches_unscoped() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&page=1&limit=50",
+            &format!("[{}]", issue_json(122, "open", false)),
+        );
+        let items = client(&http)
+            .pr_search(GiteaPullRequestState::Open)
+            .unwrap();
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn pr_search_reviewer_scopes_to_the_token_owner() {
+        // The reviewer reaches the server as `review_requested`
+        // once the login matches the token owner: the mock URLs
+        // pin both the owner read and the parameter, so a search
+        // that sent the wrong parameter would answer nothing.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/user",
+                &user_json("scarabeus_iv", "Tomáš Chvátal", "tomas.chvatal@gmail.com"),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&review_requested=true&page=1&limit=50",
+                &format!("[{}]", issue_json(122, "open", false)),
+            );
+        let items = client(&http)
+            .pr_search_scoped(GiteaPullRequestState::Open, None, Some("scarabeus_iv"))
+            .unwrap();
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
     fn pr_search_null_page_is_an_empty_list() {
         let http = FakeHttp::new().with_get(
             "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=closed&page=1&limit=50",
             "null",
         );
         let items = client(&http)
-            .pr_search(GiteaPullRequestState::Closed, None)
+            .pr_search_scoped(GiteaPullRequestState::Closed, None, None)
             .unwrap();
         assert!(items.is_empty());
     }

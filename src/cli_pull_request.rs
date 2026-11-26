@@ -381,6 +381,12 @@ pub struct SearchArgs {
     /// Only pull requests by this author.
     #[arg(long)]
     creator: Option<String>,
+    /// Only pull requests with review requested of this login.
+    /// Requires `--backend gitea`. Only the token owner's login:
+    /// the server filters review requests for the authenticated
+    /// user only.
+    #[arg(long)]
+    reviewer: Option<String>,
     /// Only pull requests in this Gitea repo (`owner/repo`).
     /// Requires `--backend gitea`.
     #[arg(long)]
@@ -715,16 +721,19 @@ pub fn run_pull_request(
                 backend,
                 states,
                 creator: args.creator.clone(),
+                reviewer: args.reviewer.clone(),
                 repo,
             };
             query.validate()?;
             let backend_values: Vec<String> = args.backend.clone().into_iter().collect();
             let creator_values: Vec<String> = args.creator.clone().into_iter().collect();
+            let reviewer_values: Vec<String> = args.reviewer.clone().into_iter().collect();
             let repo_values: Vec<String> = args.repo.clone().into_iter().collect();
             let coordinates = search_coordinates(&[
                 ("backend", &backend_values),
                 ("state", &args.state),
                 ("creator", &creator_values),
+                ("reviewer", &reviewer_values),
                 ("repo", &repo_values),
             ]);
             match query.backend {
@@ -3378,8 +3387,9 @@ mod tests {
                 ("backend", &["gitea".to_string()]),
                 ("state", &["open".to_string(), "merged".to_string()]),
                 ("creator", &[]),
+                ("reviewer", &["scarabeus_iv".to_string()]),
             ]),
-            " backend=gitea state=open,merged"
+            " backend=gitea state=open,merged reviewer=scarabeus_iv"
         );
         assert_eq!(search_header("", 0), "search (0 pull requests)");
         assert_eq!(

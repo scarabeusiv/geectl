@@ -38,7 +38,7 @@ carries a comment's own text.
 | Subcommand | Agent use |
 |---|---|
 | `pull-request show <REF>` | Read one pull request: state, source and target, reviews, labels |
-| `pull-request search [--backend obs\|gitea] [--state …] [--creator …] [--repo …]` | Triage: what is open, by state or author, on either backend or both |
+| `pull-request search [--backend obs\|gitea] [--state …] [--creator …] [--reviewer …] [--repo …]` | Triage: what is open, by state, author, or requested review, on either backend or both |
 | `pull-request approve <REF> [--comment …] [--user\|--group\|--project\|--package …]` | Approve the review |
 | `pull-request request-changes <REF> [--comment …] [--user\|--group\|--project\|--package …]` | Ask for changes on the review |
 | `pull-request comment <REF> --body … [--parent …]` | Comment on the pull request; `--parent` threads the reply on OBS |
@@ -54,9 +54,11 @@ carries a comment's own text.
 Gitea, and returns both sets under the one list shape. Each arm applies
 its own default state: new, review, and declined on OBS; open
 on Gitea. `--state` takes `PullRequestStatus` names. `--creator` filters by
-author; on the Gitea arm the filter runs client-side on the returned pull
-requests. `--repo` scopes the Gitea arm to one repo; otherwise the Gitea
-arm uses the global search.
+author; on the Gitea arm the filter runs server-side (`created_by`), with
+a client-side retain as a backstop. `--reviewer` filters by review
+requested of the token owner's login, server-side (`review_requested`).
+`--repo` scopes the Gitea arm to one repo; otherwise the Gitea arm uses
+the global search.
 
 The `request` group carries the OBS backend spelling of read and act; the
 `gitea` group carries the Gitea backend spelling of repo and branch. The
@@ -94,6 +96,7 @@ bare SHA.
 | `gitea branch-get <OWNER/REPO> <BRANCH>` | Read one branch |
 | `gitea branch-head <OWNER/REPO> <BRANCH>` | The head commit SHA of a branch |
 | `gitea maintainers <OWNER/REPO>` | The maintainers recorded in the repo's `_maintainership.json` |
+| `gitea whoami` | Show the token owner: login, full name, email |
 
 `repo-list` text carries identifiers; the clone URLs and the fork parent
 are in the JSON payload. `branch-list` text carries the full head SHA; the

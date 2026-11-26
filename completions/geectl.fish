@@ -1606,6 +1606,7 @@ closed\t''
 superseded\t''
 deleted\t''"
 complete -c geectl -n "__fish_geectl_using_subcommand pull-request; and __fish_seen_subcommand_from search" -l creator -d 'Only pull requests by this author' -r
+complete -c geectl -n "__fish_geectl_using_subcommand pull-request; and __fish_seen_subcommand_from search" -l reviewer -d 'Only pull requests with review requested of this login. Requires `--backend gitea`. Only the token owner\'s login: the server filters review requests for the authenticated user only' -r
 complete -c geectl -n "__fish_geectl_using_subcommand pull-request; and __fish_seen_subcommand_from search" -l repo -d 'Only pull requests in this Gitea repo (`owner/repo`). Requires `--backend gitea`' -r
 complete -c geectl -n "__fish_geectl_using_subcommand pull-request; and __fish_seen_subcommand_from search" -l format -d 'Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json`' -r -f -a "json\t''
 text\t''"

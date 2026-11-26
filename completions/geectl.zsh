@@ -2890,6 +2890,7 @@ _arguments "${_arguments_options[@]}" : \
 '--backend=[Only this backend (\`obs\` or \`gitea\`). With no backend both arms run, OBS first then Gitea]:BACKEND:(obs gitea)' \
 '*--state=[Only pull requests in these unified states. With none given each arm applies its own default (new/review/declined on OBS, open on Gitea). OBS has no closed state\: \`--state closed\` reads OBS declined requests, which report as \`declined\`]:STATE:(open merged declined withdrawn closed superseded deleted)' \
 '--creator=[Only pull requests by this author]:CREATOR:_default' \
+'--reviewer=[Only pull requests with review requested of this login. Requires \`--backend gitea\`. Only the token owner'\''s login\: the server filters review requests for the authenticated user only]:REVIEWER:_default' \
 '--repo=[Only pull requests in this Gitea repo (\`owner/repo\`). Requires \`--backend gitea\`]:REPO:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
