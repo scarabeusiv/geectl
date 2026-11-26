@@ -2063,8 +2063,9 @@ fn pull_request_merge_obs_live_merges_when_the_forward_is_refused() {
 }
 
 /// A routing stub OBS server for a live merge whose target package
-/// has no link parent: the merge lands and the forward reports
-/// the hop skipped, filing nothing.
+/// has no link parent and whose Factory package records no devel:
+/// the merge lands and the forward reports the hop skipped,
+/// filing nothing.
 fn serve_merge_no_link_parent() -> (
     std::net::SocketAddr,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -2076,7 +2077,7 @@ fn serve_merge_no_link_parent() -> (
     let seen_in_thread = std::sync::Arc::clone(&seen);
     let request_xml = "<request id=\"42\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"accepted\" who=\"alice\" when=\"2026-11-24T00:00:00Z\" /><description>Update foo to 2.0</description></request>";
     let directory_xml = "<directory></directory>";
-    let meta_xml = "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>";
+    let meta_xml = "<package name=\"foo\" project=\"openSUSE:Factory\"></package>";
     let empty_collection = "<collection matches=\"0\"></collection>";
     let ok = "<status code=\"ok\" />";
     std::thread::spawn(move || {
@@ -2128,8 +2129,9 @@ fn serve_merge_no_link_parent() -> (
 
 #[test]
 fn pull_request_merge_obs_live_no_link_parent_forwards_nothing() {
-    // No link parent means no hop: the merge lands, the forward
-    // reports the action skipped, and nothing is filed.
+    // No link parent and no recorded Factory devel mean no hop:
+    // the merge lands, the forward reports the action skipped,
+    // and nothing is filed.
     let (addr, seen) = serve_merge_no_link_parent();
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
@@ -2152,7 +2154,7 @@ fn pull_request_merge_obs_live_no_link_parent_forwards_nothing() {
     assert_eq!(value["forward"]["actions"][0]["outcome"], "skipped");
     assert_eq!(
         value["forward"]["actions"][0]["reason"],
-        "the package has no link parent"
+        "openSUSE:Factory/foo records no devel for devel:languages:python/foo"
     );
     {
         let seen = seen.lock().unwrap();
@@ -2163,7 +2165,7 @@ fn pull_request_merge_obs_live_no_link_parent_forwards_nothing() {
         );
         assert!(
             !seen.iter().any(|r| r.contains("cmd=create")),
-            "a forward was filed with no link parent: {seen:?}"
+            "a forward was filed with no hop: {seen:?}"
         );
     }
     let out = geectl_isolated(&dir)
@@ -2183,7 +2185,7 @@ fn pull_request_merge_obs_live_no_link_parent_forwards_nothing() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "merged obs:42 (now merged); request 42: nothing forwarded\nskipped devel:languages:python/foo: the package has no link parent"
+        "merged obs:42 (now merged); request 42: nothing forwarded\nskipped devel:languages:python/foo: openSUSE:Factory/foo records no devel for devel:languages:python/foo"
     );
 }
 
