@@ -173,6 +173,13 @@ pub enum LocalBuildCommand {
         /// is always selectable.
         #[arg(long)]
         preinstall_image: bool,
+        /// Run the build container privileged (the engine's own
+        /// privileged podman mode, like upstream's
+        /// `VM_TYPE_PRIVILEGED` opt-in): the default is rootless,
+        /// with a cap list only and the build root inside the
+        /// disposable container.
+        #[arg(long)]
+        privileged: bool,
         /// Save the built RPMs into this directory (created when
         /// missing) on a green build.
         #[arg(long, short = 'k')]
@@ -427,6 +434,7 @@ pub fn run_local_build(
             root,
             noinit,
             preinstall_image,
+            privileged,
             keep_rpms,
             prefer_packages,
             timeout_secs,
@@ -455,6 +463,7 @@ pub fn run_local_build(
             build_req.root = root.clone();
             build_req.noinit = noinit;
             build_req.preinstall_image = preinstall_image;
+            build_req.privileged = privileged;
             build_req.keep_rpms = keep_rpms.clone();
             build_req.prefer_packages = prefer_packages.clone();
             build_req.timeout_secs = timeout_secs;
@@ -525,6 +534,7 @@ pub fn run_local_build(
                 "flavor": flavor,
                 "alternative_project": alternative_project,
                 "noinit": noinit,
+                "privileged": privileged,
                 "keep_rpms": keep_rpms,
                 "prefer_packages": prefer_packages,
                 "dry_run": !live,
@@ -844,6 +854,9 @@ fn render_build(record: &BuildRecord) -> String {
                 if plan.trust_all_projects {
                     lines.push("trust-all-projects: true".to_string());
                 }
+                if plan.privileged {
+                    lines.push("privileged: true".to_string());
+                }
                 if let Some(keep) = &plan.keep_rpms {
                     lines.push(format!("keep-rpms: {}", keep.display()));
                 }
@@ -893,6 +906,14 @@ fn render_build(record: &BuildRecord) -> String {
         } else {
             lines.push(format!("root: {}", record.root_path.display()));
         }
+        lines.push(format!(
+            "container: {}",
+            if record.privileged {
+                "privileged"
+            } else {
+                "rootless"
+            }
+        ));
         let mut cache = format!(
             "cache: pkg {} hits, {} misses",
             record.cache.pkg_hits, record.cache.pkg_misses
@@ -2139,6 +2160,7 @@ mod tests {
             engine_version: Some("20261016".to_string()),
             root_path: PathBuf::from("/tmp/root"),
             root_reused: true,
+            privileged: false,
             cache: CacheStats {
                 pkg_hits: 3,
                 pkg_misses: 0,
@@ -2166,6 +2188,7 @@ mod tests {
             engine_version: Some("20261016".to_string()),
             root_path: PathBuf::from("/tmp/root"),
             root_reused: false,
+            privileged: false,
             cache: CacheStats::default(),
             eviction: EvictionReport::default(),
             preinstall_image: None,
@@ -2179,6 +2202,7 @@ mod tests {
                 flavor: None,
                 alternative_project: None,
                 trust_all_projects: false,
+                privileged: false,
                 keep_rpms: None,
                 prefer_packages: None,
                 argv: vec![
@@ -2204,9 +2228,11 @@ mod tests {
         plan.keep_rpms = Some(PathBuf::from("/tmp/keep"));
         plan.prefer_packages = Some(PathBuf::from("/tmp/prefer"));
         plan.trust_all_projects = true;
+        plan.privileged = true;
         let text = render_build(&flagged);
         assert!(text.contains("alternative-project: openSUSE:Factory"));
         assert!(text.contains("trust-all-projects: true"));
+        assert!(text.contains("privileged: true"));
         assert!(text.contains("keep-rpms: /tmp/keep"));
         assert!(text.contains("prefer-packages: /tmp/prefer"));
         let mut record = dry_run_build_record();

@@ -4,7 +4,7 @@
 .SH NAME
 geectl\-local\-build\-build \- Build the package in the container: the run\-mode service run, the precommit gate, then the engine build
 .SH SYNOPSIS
-\fBgeectl local\-build build\fR [\fB\-\-arch\fR] [\fB\-\-flavor\fR] [\fB\-\-clean\fR] [\fB\-\-release\fR] [\fB\-\-trust\-all\-projects\fR] [\fB\-\-refresh\-image\fR] [\fB\-\-alternative\-project\fR] [\fB\-\-root\fR] [\fB\-\-noinit\fR] [\fB\-\-preinstall\-image\fR] [\fB\-k\fR|\fB\-\-keep\-rpms\fR] [\fB\-p\fR|\fB\-\-prefer\-packages\fR] [\fB\-\-timeout\-secs\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-repo\fR> <\fIDIRECTORY\fR> 
+\fBgeectl local\-build build\fR [\fB\-\-arch\fR] [\fB\-\-flavor\fR] [\fB\-\-clean\fR] [\fB\-\-release\fR] [\fB\-\-trust\-all\-projects\fR] [\fB\-\-refresh\-image\fR] [\fB\-\-alternative\-project\fR] [\fB\-\-root\fR] [\fB\-\-noinit\fR] [\fB\-\-preinstall\-image\fR] [\fB\-\-privileged\fR] [\fB\-k\fR|\fB\-\-keep\-rpms\fR] [\fB\-p\fR|\fB\-\-prefer\-packages\fR] [\fB\-\-timeout\-secs\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-repo\fR> <\fIDIRECTORY\fR> 
 .SH DESCRIPTION
 Build the package in the container: the run\-mode service run, the precommit gate, then the engine build.
 .PP
@@ -46,6 +46,9 @@ Skip the root initialization: start the build immediately in the existing root. 
 .TP
 \fB\-\-preinstall\-image\fR
 Use the preinstall image when the buildinfo offers one. Off by default: the engine extracts the image with bsdtar `\-\-chroot` plus device nodes, which need root. The engine always runs as container root, so the image is always selectable
+.TP
+\fB\-\-privileged\fR
+Run the build container privileged (the engine\*(Aqs own privileged podman mode, like upstream\*(Aqs `VM_TYPE_PRIVILEGED` opt\-in): the default is rootless, with a cap list only and the build root inside the disposable container
 .TP
 \fB\-k\fR, \fB\-\-keep\-rpms\fR \fI<KEEP_RPMS>\fR
 Save the built RPMs into this directory (created when missing) on a green build

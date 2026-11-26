@@ -6918,7 +6918,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__local__subcmd__build__subcmd__build)
-            opts="-k -p -h --project --repo --arch --flavor --clean --release --trust-all-projects --refresh-image --alternative-project --root --noinit --preinstall-image --keep-rpms --prefer-packages --timeout-secs --format --debug --debug-body --live --instance --help"
+            opts="-k -p -h --project --repo --arch --flavor --clean --release --trust-all-projects --refresh-image --alternative-project --root --noinit --preinstall-image --privileged --keep-rpms --prefer-packages --timeout-secs --format --debug --debug-body --live --instance --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

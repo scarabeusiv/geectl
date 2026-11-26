@@ -209,6 +209,12 @@ pub struct BuildRequest {
     /// need root. The engine always runs as container root, so
     /// the image is always selectable.
     pub preinstall_image: bool,
+    /// Run the build container privileged (the engine's own
+    /// privileged podman mode, like upstream's `VM_TYPE_PRIVILEGED`
+    /// opt-in): `--privileged`. Off by default: the container runs
+    /// rootless, with a cap list only, and the build root lives
+    /// inside the disposable container.
+    pub privileged: bool,
     /// Copy the built RPMs into this directory on a green build;
     /// the directory is created when missing.
     pub keep_rpms: Option<PathBuf>,
@@ -244,6 +250,7 @@ impl BuildRequest {
             root: None,
             noinit: false,
             preinstall_image: false,
+            privileged: false,
             keep_rpms: None,
             prefer_packages: None,
             timeout_secs: DEFAULT_BUILD_TIMEOUT_SECS,
@@ -401,6 +408,10 @@ pub struct EnginePlan {
     /// still refuses foreign `home:` deps without it.
     #[serde(default)]
     pub trust_all_projects: bool,
+    /// Whether `--privileged` was passed: the plan records the
+    /// container shape, like the trust flag.
+    #[serde(default)]
+    pub privileged: bool,
     /// The directory built RPMs are copied to on a green build,
     /// when `--keep-rpms` was passed.
     pub keep_rpms: Option<PathBuf>,
@@ -436,6 +447,12 @@ pub struct BuildRecord {
     pub root_path: PathBuf,
     /// True when the build reused an existing root.
     pub root_reused: bool,
+    /// True when the build ran in a privileged container
+    /// (`--privileged`): the default rootless container discards
+    /// its root with the container, so the host root holds only
+    /// the synced-out log and RPMs.
+    #[serde(default)]
+    pub privileged: bool,
     pub cache: CacheStats,
     pub eviction: EvictionReport,
     /// The preinstall image filename the build seeded the root
@@ -1068,6 +1085,25 @@ pub fn validate_build_request(req: &BuildRequest) -> Result<(), GeectlError> {
             "--noinit and --preinstall-image conflict: no deps are installed without initialization",
         ));
     }
+    // `--noinit` builds in the existing root: the default rootless
+    // container discards its root with the container, so there is
+    // no existing root to build in — pass `--privileged` to build
+    // in a preserved root.
+    if req.noinit && !req.privileged {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--noinit needs a preserved root: the default rootless container discards its root — pass --privileged to build in a preserved root",
+        ));
+    }
+    // `--privileged` is refused on macOS: the privileged shape
+    // mounts the build root from the host, and macOS file sharing
+    // breaks dependency installation — use the rootless shape.
+    if req.privileged && std::env::consts::OS == "macos" {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--privileged is refused on macOS: the privileged shape mounts the build root from the host and macOS file sharing breaks dependency installation — use the rootless shape",
+        ));
+    }
     // A custom root is a user directory, not a cache dir: `--clean`
     // wipes it, so it must be a geectl root (marker) or empty — the
     // same rule `build-wipe` enforces. A path naming a file is not
@@ -1225,6 +1261,12 @@ impl<'a> LocalBuild<'a> {
         };
         let log_path = root.join(BUILD_LOG);
         let root_existed = root.join(ROOT_MARKER).exists();
+        // The engine root is the in-container root in the default
+        // rootless shape: computed once per build and reused for
+        // the plan, the engine argv, and the sync — a fresh
+        // in-container root is minted on each call, so the value
+        // must not be recomputed.
+        let engine_root = BuildContainer::engine_root(req.privileged, &root);
         // The dry run stops here: the plan is data, and nothing
         // below it (no fetch, no root, no eviction) is touched.
         if req.dry_run {
@@ -1253,12 +1295,12 @@ impl<'a> LocalBuild<'a> {
                 None => None,
             };
             let argv = self.engine_argv(
-                &root,
+                &engine_root,
                 &spec,
                 req,
-                &root.join(RPMLIST),
-                &root.join(BUILDCONFIG),
-                &self.sccache_uri_for_req(req, &package, &root),
+                &engine_root.join(RPMLIST),
+                &engine_root.join(BUILDCONFIG),
+                &self.sccache_uri_for_req(req, &package, &engine_root),
             );
             self.debug.emit(&format!(
                 "local-build dry-run: {} {} {}",
@@ -1278,6 +1320,7 @@ impl<'a> LocalBuild<'a> {
                 engine_version: None,
                 root_path: root.clone(),
                 root_reused: root_existed,
+                privileged: req.privileged,
                 cache: CacheStats::default(),
                 eviction: EvictionReport {
                     cap_bytes: self.cache_cap_bytes,
@@ -1289,12 +1332,13 @@ impl<'a> LocalBuild<'a> {
                 dry_run: true,
                 plan: Some(EnginePlan {
                     image: DEFAULT_IMAGE.to_string(),
-                    root: root.clone(),
+                    root: engine_root.clone(),
                     repo: req.repo.clone(),
                     arch: req.arch.clone(),
                     flavor: req.flavor.clone(),
                     alternative_project: req.alternative_project.clone(),
                     trust_all_projects: req.trust_all_projects,
+                    privileged: req.privileged,
                     keep_rpms,
                     prefer_packages,
                     argv,
@@ -1391,16 +1435,24 @@ impl<'a> LocalBuild<'a> {
         // The build container carries the engine: it starts here,
         // installs the `build` package, and reports its version
         // for the marker and the record. It lives for the whole
-        // build and stops on drop, on every path out.
-        let container = BuildContainer::start(self, &source_dir, &root, deadline)?;
+        // build and stops on drop, on every path out. The rootless
+        // shape patches the installed engine scripts in place for
+        // the mounts bind-fallback, so the engine mounts inside a
+        // rootless container.
+        let container = BuildContainer::start(self, &source_dir, &root, req.privileged, deadline)?;
         container.install_engine(deadline)?;
+        if !req.privileged {
+            container.patch_engine(&engine_root, deadline)?;
+        }
         let engine_version = container.engine_version(deadline);
         if engine_version.is_none() {
             self.debug
                 .emit("local-build: engine reported no version; recording unknown");
         }
         self.ensure_marker(&root, req, &package, &image, &engine_version)?;
-        let root_reused = root_existed && !req.clean;
+        // The rootless root is always fresh (a new container per
+        // build): only the privileged shape reuses a root.
+        let root_reused = root_existed && !req.clean && req.privileged;
 
         // Eviction runs at build start, after the buildinfo fetch
         // (the current dep set is known) and before any download.
@@ -1475,18 +1527,60 @@ impl<'a> LocalBuild<'a> {
                 format!("cannot create sccache store {}: {e}", sccache_dir.display()),
             )
         })?;
-        let sccache_uri = self.sccache_uri_for_req(req, &package, &root);
+        let sccache_uri = self.sccache_uri_for_req(req, &package, &engine_root);
+        // The rootless container reads its inputs from the
+        // in-container root: the rpmlist and buildconfig the host
+        // just wrote are copied in. The privileged container reads
+        // the host root through its bind, so there is nothing to
+        // copy. The sccache store lives under the engine root for
+        // a custom root, so the rootless container needs its
+        // directory created inside the container too (the
+        // cache-dir store is bind-mounted and already exists).
+        if !req.privileged {
+            container.copy_into(&rpmlist_path, &engine_root.join(RPMLIST), deadline)?;
+            container.copy_into(&buildconfig_path, &engine_root.join(BUILDCONFIG), deadline)?;
+            let engine_sccache_dir = self.sccache_dir_for_req(req, &package, &engine_root);
+            let output = container.exec(
+                &[
+                    "mkdir".to_string(),
+                    "-p".to_string(),
+                    engine_sccache_dir.to_string_lossy().to_string(),
+                ],
+                deadline,
+            )?;
+            if !output.status.success() {
+                return Err(GeectlError::new(
+                    ErrorKind::ImageUnavailable,
+                    format!(
+                        "cannot create the in-container sccache store {}: {}",
+                        engine_sccache_dir.display(),
+                        last_lines(&String::from_utf8_lossy(&output.stderr), 20).join("\n")
+                    ),
+                ));
+            }
+        }
         let argv = self.engine_argv(
-            &root,
+            &engine_root,
             &spec,
             req,
-            &rpmlist_path,
-            &buildconfig_path,
+            &engine_root.join(RPMLIST),
+            &engine_root.join(BUILDCONFIG),
             &sccache_uri,
         );
         self.debug
             .emit(&format!("local-build engine: {}", argv.join(" ")));
         let (outcome, _, _) = run_engine_in_container(&container, &argv, deadline)?;
+        // The rootless container's results live in the in-container
+        // root: the log and the built RPMs are copied out to the
+        // host root before the record is read. The privileged
+        // container wrote them to the host root through its bind.
+        // A timed-out engine is not synced out: the timeout kills
+        // the container, so there is nothing left to copy, and the
+        // budget is already spent — the sync would only mask the
+        // timeout with a budget-exhausted error.
+        if !req.privileged && !outcome.timed_out {
+            container.sync_out(&engine_root, &root, outcome.exit_code, deadline)?;
+        }
         let record = self.finish_build(
             req,
             &package,
@@ -4002,6 +4096,7 @@ impl<'a> LocalBuild<'a> {
             engine_version: engine_version.clone(),
             root_path: root.to_path_buf(),
             root_reused,
+            privileged: req.privileged,
             cache,
             eviction,
             preinstall_image,
@@ -4148,18 +4243,23 @@ struct EngineOutcome {
 /// steps run as `podman exec` calls in the same container, stopped
 /// on drop. The container runs as root (the podman default): the
 /// engine mounts filesystems inside the build root and chroots
-/// into it, which the invoking user cannot do. The container runs
-/// privileged with `SYS_ADMIN` and `MKNOD`: the engine mounts
-/// dev, proc, and sys inside the build root, and the default cap
-/// set denies those mounts (verified live on the Mac podman
-/// machine, where caps alone mount /dev and /proc but not /sys).
-/// That is the flag set the engine's own privileged podman mode
-/// uses. The network stays open — the engine package is installed
-/// from the image's repositories at container start. A timed-out
-/// `exec` kills the container: the exec'd process ends with it
-/// instead of running on to the sleep budget. Unlike the engine's
-/// own podman mode, geectl owns this container by name, so a
-/// timeout kill stops the container instead of leaving it running.
+/// into it, which the invoking user cannot do. Both shapes add
+/// `SYS_ADMIN` and `MKNOD`: the engine mounts dev, proc, and sys
+/// inside the build root, and the default cap set denies those
+/// mounts. The default shape is rootless: the build root lives
+/// inside the disposable container (see `CONTAINER_BUILD_ROOT`),
+/// the container runs on the cap list alone, and the installed
+/// engine scripts are patched in place for the mounts
+/// bind-fallback. `--privileged` selects the privileged shape:
+/// the container runs privileged (the flag set the engine's own
+/// privileged podman mode uses) and the build root is the host
+/// root, bind-mounted, so it persists. The network stays open —
+/// the engine package is installed from the image's repositories
+/// at container start. A timed-out `exec` kills the container:
+/// the exec'd process ends with it instead of running on to the
+/// sleep budget. Unlike the engine's own podman mode, geectl owns
+/// this container by name, so a timeout kill stops the container
+/// instead of leaving it running.
 struct BuildContainer {
     podman: PathBuf,
     name: String,
@@ -4182,22 +4282,125 @@ fn build_engine_install_argv() -> Vec<String> {
     ]
 }
 
+/// The build root inside the rootless container: container-local
+/// native fs (the container's overlay), never a host bind and
+/// never a podman volume. A virtiofs host bind breaks both the
+/// engine's fresh mounts and rpm's `0200` placeholder files, so
+/// the rootless root lives here and is discarded with the
+/// container. The host root stays the record root: the rpmlist and
+/// buildconfig are copied in before the engine runs, the log and
+/// the built RPMs are copied out after it. Each build mints a
+/// fresh root below this prefix (pid + counter), so parallel
+/// builds never share one.
+const CONTAINER_BUILD_ROOT: &str = "/tmp/geectl-build-root";
+
+/// The in-container root counter: each rootless build mints a
+/// fresh in-container root, so parallel builds never share one.
+static CONTAINER_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// One patch-in-place hunk for the installed engine scripts: the
+/// anchor line the installed text must carry exactly once, and the
+/// lines inserted after it. The hunks are the upstream mounts
+/// bind-fallback patch (plus the devpts fallback it lacks), in the
+/// shape they will later go upstream: try the fresh mount, bind
+/// the container's own mount on failure, no new modes.
+struct EnginePatch {
+    /// The installed script, absolute in the container.
+    file: &'static str,
+    /// The anchor line, exact text including the leading tab.
+    anchor: &'static str,
+    /// The lines inserted after the anchor.
+    insertion: &'static str,
+}
+
+/// The patch-in-place hunks for the installed engine scripts.
+const ENGINE_PATCHES: &[EnginePatch] = &[
+    EnginePatch {
+        file: "/usr/lib/build/build",
+        anchor: "\tmount -n -tproc none $BUILD_ROOT/proc",
+        insertion: "\t# A fresh proc or sysfs mount fails in a rootless container:\n\t# sysfs cannot be mounted from a user namespace. Bind the\n\t# container's own mounts instead, like the /dev binds.\n\ttest -e $BUILD_ROOT/proc/self || mount -n --bind /proc $BUILD_ROOT/proc",
+    },
+    EnginePatch {
+        file: "/usr/lib/build/build",
+        anchor: "\tmount -n -tsysfs none $BUILD_ROOT/sys",
+        insertion: "\ttest -e $BUILD_ROOT/sys/kernel || mount -n --bind /sys $BUILD_ROOT/sys",
+    },
+    EnginePatch {
+        file: "/usr/lib/build/build",
+        anchor: "\tmount -n -tdevpts -omode=0620,ptmxmode=0666,gid=5 none $BUILD_ROOT/dev/pts",
+        insertion: "\ttest -e $BUILD_ROOT/dev/pts/ptmx || mount -n --bind /dev/pts $BUILD_ROOT/dev/pts",
+    },
+    EnginePatch {
+        file: "/usr/lib/build/init_buildsystem",
+        anchor: "\tmount -n -tproc none \"$BUILD_ROOT/proc\"",
+        insertion: "\t# A fresh proc mount fails in a rootless container: bind the\n\t# container's own /proc instead, like the /dev binds.\n\ttest -e \"$BUILD_ROOT/proc/self\" || mount -n --bind /proc \"$BUILD_ROOT/proc\"",
+    },
+    EnginePatch {
+        file: "/usr/lib/build/init_buildsystem",
+        anchor: "\tmount -n -tdevpts -omode=0620,ptmxmode=0666,gid=5 none \"$BUILD_ROOT/dev/pts\"",
+        insertion: "\ttest -e \"$BUILD_ROOT/dev/pts/ptmx\" || mount -n --bind /dev/pts \"$BUILD_ROOT/dev/pts\"",
+    },
+];
+
+/// Insert `insertion` after the single occurrence of `anchor` in
+/// `text`. Fails closed when the anchor is absent or appears more
+/// than once: the installed engine's text drifted from the patch,
+/// and a blind edit would corrupt the script.
+fn apply_engine_patch(
+    file: &str,
+    text: &str,
+    anchor: &str,
+    insertion: &str,
+) -> Result<String, GeectlError> {
+    let count = text.matches(anchor).count();
+    if count != 1 {
+        return Err(GeectlError::new(
+            ErrorKind::InternalError,
+            format!(
+                "cannot patch the installed engine script {file}: anchor {anchor:?} occurs {count} times, expected exactly once"
+            ),
+        ));
+    }
+    Ok(text.replacen(anchor, &format!("{anchor}\n{insertion}"), 1))
+}
+
 impl BuildContainer {
+    /// The root the engine builds in: the host root for the
+    /// privileged shape (the container bind-mounts it), a fresh
+    /// in-container root for the rootless shape (see
+    /// `CONTAINER_BUILD_ROOT`). A fresh root is minted on each
+    /// call for the rootless shape: call once per build and reuse
+    /// the value — the plan, the engine argv, and the sync must
+    /// all name the same root.
+    fn engine_root(privileged: bool, host_root: &Path) -> PathBuf {
+        if privileged {
+            host_root.to_path_buf()
+        } else {
+            let n = CONTAINER_ROOT_COUNTER.fetch_add(1, Ordering::SeqCst);
+            PathBuf::from(format!("{CONTAINER_BUILD_ROOT}-{}-{n}", std::process::id()))
+        }
+    }
+
     fn start(
         vertical: &LocalBuild<'_>,
         workdir: &Path,
         root: &Path,
+        privileged: bool,
         deadline: std::time::Instant,
     ) -> Result<Self, GeectlError> {
         // The mounts carry the cache dir (the root, the pkg cache,
-        // the sccache store), the workdir (the source dir for a
-        // build, the root itself for a shell), and the root when it
-        // sits outside the cache dir (a custom `--root`), all at
-        // their host paths, so every argv path the engine takes
-        // resolves inside the container exactly as on the host.
+        // the sccache store) and the workdir (the source dir for a
+        // build, the root itself for a shell), all at their host
+        // paths, so every argv path the engine takes resolves
+        // inside the container exactly as on the host. The
+        // privileged shape also mounts the root when it sits
+        // outside the cache dir (a custom `--root`): the engine
+        // builds in the host root, which persists. The rootless
+        // shape mounts no root: the engine builds in the
+        // in-container root (see `engine_root`), and the results
+        // are copied out to the host root.
         check_mount_source(&vertical.cache_dir)?;
         check_mount_source(workdir)?;
-        check_mount_source(root)?;
         let podman = which(&vertical.podman).ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ImageUnavailable,
@@ -4225,31 +4428,30 @@ impl BuildContainer {
                 workdir.display()
             ),
         ];
-        if !root.starts_with(&vertical.cache_dir) && root != workdir {
-            mounts.push(format!(
-                "type=bind,src={},target={}",
-                root.display(),
-                root.display()
-            ));
+        if privileged {
+            check_mount_source(root)?;
+            if !root.starts_with(&vertical.cache_dir) && root != workdir {
+                mounts.push(format!(
+                    "type=bind,src={},target={}",
+                    root.display(),
+                    root.display()
+                ));
+            }
         }
+        // The engine mounts dev, proc, and sys inside the build
+        // root, and the default cap set denies those mounts, so
+        // both shapes add SYS_ADMIN and MKNOD. The privileged
+        // shape adds --privileged on top: the flag set the
+        // engine's own privileged podman mode uses. The rootless
+        // shape runs on the cap list alone.
+        let mut run_args: Vec<&str> = vec!["-d", "--rm", "--name", &name];
+        if privileged {
+            run_args.push("--privileged");
+        }
+        run_args.extend(["--cap-add", "SYS_ADMIN", "--cap-add", "MKNOD"]);
         let mut cmd = Command::new(&podman);
         cmd.arg("run");
-        cmd.args([
-            "-d",
-            "--rm",
-            "--name",
-            &name,
-            // Privileged, with the mount caps: the engine mounts
-            // dev, proc, and sys inside the build root (see the
-            // struct doc). The service container stays locked
-            // down; the build container cannot be — mounting is
-            // the engine's job.
-            "--privileged",
-            "--cap-add",
-            "SYS_ADMIN",
-            "--cap-add",
-            "MKNOD",
-        ]);
+        cmd.args(run_args);
         for mount in &mounts {
             cmd.args(["--mount", mount]);
         }
@@ -4334,6 +4536,38 @@ impl BuildContainer {
         }
     }
 
+    /// Run a `podman` command built by the caller, bounded by the
+    /// deadline. A timeout kills the container, like `exec`: the
+    /// command's process ends with it instead of running on.
+    fn run_podman(
+        &self,
+        cmd: &mut Command,
+        deadline: std::time::Instant,
+        what: &str,
+    ) -> Result<std::process::Output, GeectlError> {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(GeectlError::new(
+                ErrorKind::BuildTimeout,
+                "build container budget exhausted before the command started",
+            ));
+        }
+        run_with_timeout(cmd, remaining).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                self.kill();
+                GeectlError::new(
+                    ErrorKind::BuildTimeout,
+                    format!("build container command timed out: {what}"),
+                )
+            } else {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot run a command in the build container: {e}"),
+                )
+            }
+        })
+    }
+
     /// Run `argv` in the container, bounded by the deadline. The
     /// argv form carries no shell. Every call sets the working
     /// directory explicitly instead of relying on the create-time
@@ -4343,36 +4577,223 @@ impl BuildContainer {
         argv: &[String],
         deadline: std::time::Instant,
     ) -> Result<std::process::Output, GeectlError> {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(GeectlError::new(
-                ErrorKind::BuildTimeout,
-                "build container budget exhausted before the command started",
-            ));
-        }
         let mut cmd = Command::new(&self.podman);
         cmd.arg("exec")
             .arg("-w")
             .arg(&self.workdir)
             .arg(&self.name)
             .args(argv);
-        run_with_timeout(&mut cmd, remaining).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::TimedOut {
-                self.kill();
-                GeectlError::new(
-                    ErrorKind::BuildTimeout,
-                    format!(
-                        "build container command timed out: {}",
-                        argv.first().map(String::as_str).unwrap_or("")
-                    ),
-                )
-            } else {
+        let what = argv.first().map(String::as_str).unwrap_or("");
+        self.run_podman(&mut cmd, deadline, what)
+    }
+
+    /// Copy a host path into the container (`podman cp`), bounded
+    /// by the deadline. A timeout kills the container, like `exec`.
+    fn copy_into(
+        &self,
+        host_path: &Path,
+        container_path: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<(), GeectlError> {
+        let mut cmd = Command::new(&self.podman);
+        cmd.arg("cp")
+            .arg(host_path)
+            .arg(format!("{}:{}", self.name, container_path.display()));
+        let output = self.run_podman(&mut cmd, deadline, "cp")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(GeectlError::new(
+            ErrorKind::ImageUnavailable,
+            format!(
+                "cannot copy {} into the build container: {}",
+                host_path.display(),
+                last_lines(&String::from_utf8_lossy(&output.stderr), 20).join("\n")
+            ),
+        ))
+    }
+
+    /// Copy a container path out to the host (`podman cp`), bounded
+    /// by the deadline. A timeout kills the container, like `exec`.
+    /// The source must exist: a missing source fails, so callers
+    /// check existence first when the file is optional.
+    fn copy_out(
+        &self,
+        container_path: &Path,
+        host_path: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<(), GeectlError> {
+        let mut cmd = Command::new(&self.podman);
+        cmd.arg("cp")
+            .arg(format!("{}:{}", self.name, container_path.display()))
+            .arg(host_path);
+        let output = self.run_podman(&mut cmd, deadline, "cp")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(GeectlError::new(
+            ErrorKind::ImageUnavailable,
+            format!(
+                "cannot copy {} out of the build container: {}",
+                container_path.display(),
+                last_lines(&String::from_utf8_lossy(&output.stderr), 20).join("\n")
+            ),
+        ))
+    }
+
+    /// Patch the installed engine scripts in place for the rootless
+    /// shape: the mounts bind-fallback patch (see `ENGINE_PATCHES`),
+    /// applied to the `build` package the container just installed.
+    /// Each script is copied out, patched on the host with exact
+    /// anchors, and copied back with its mode kept executable; the
+    /// patched scripts must still parse, checked before the build
+    /// starts. The in-container root is created here too: the
+    /// sync-in step copies the rpmlist and buildconfig into it.
+    fn patch_engine(
+        &self,
+        engine_root: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<(), GeectlError> {
+        let output = self.exec(
+            &[
+                "mkdir".to_string(),
+                "-p".to_string(),
+                engine_root.to_string_lossy().to_string(),
+            ],
+            deadline,
+        )?;
+        if !output.status.success() {
+            return Err(GeectlError::new(
+                ErrorKind::ImageUnavailable,
+                format!(
+                    "cannot create the in-container build root {}: {}",
+                    engine_root.display(),
+                    last_lines(&String::from_utf8_lossy(&output.stderr), 20).join("\n")
+                ),
+            ));
+        }
+        for file in ["/usr/lib/build/build", "/usr/lib/build/init_buildsystem"] {
+            // The container name is unique per container:
+            // parallel builds share a process id, so a pid-keyed
+            // stage would collide and one build could delete the
+            // other's file mid-patch.
+            let staged = std::env::temp_dir().join(format!(
+                "geectl-engine-patch-{}-{}",
+                self.name,
+                file.replace('/', "_")
+            ));
+            self.copy_out(Path::new(file), &staged, deadline)?;
+            let text = fs::read_to_string(&staged).map_err(|e| {
                 GeectlError::new(
                     ErrorKind::InternalError,
-                    format!("cannot run a command in the build container: {e}"),
+                    format!(
+                        "cannot read the staged engine script {}: {e}",
+                        staged.display()
+                    ),
                 )
+            })?;
+            let mut patched = text;
+            for patch in ENGINE_PATCHES.iter().filter(|p| p.file == file) {
+                patched = apply_engine_patch(file, &patched, patch.anchor, patch.insertion)?;
             }
-        })
+            fs::write(&staged, patched.as_bytes()).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!(
+                        "cannot write the staged engine script {}: {e}",
+                        staged.display()
+                    ),
+                )
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&staged, fs::Permissions::from_mode(0o755));
+            }
+            let copy_result = self.copy_into(&staged, Path::new(file), deadline);
+            let _ = fs::remove_file(&staged);
+            copy_result?;
+        }
+        // A botched edit would fail the engine run with a confusing
+        // syntax error in the log: check the patched scripts parse
+        // before the build starts.
+        for file in ["/usr/lib/build/build", "/usr/lib/build/init_buildsystem"] {
+            let output = self.exec(
+                &["sh".to_string(), "-n".to_string(), file.to_string()],
+                deadline,
+            )?;
+            if !output.status.success() {
+                return Err(GeectlError::new(
+                    ErrorKind::ImageUnavailable,
+                    format!(
+                        "patched engine script {file} does not parse: {}",
+                        last_lines(&String::from_utf8_lossy(&output.stderr), 20).join("\n")
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy the rootless build's results out of the container into
+    /// the host root: the build log, and the built RPMs the engine
+    /// wrote under the in-container root's `.mount/.build.packages`.
+    /// The log copy is required: without it the record would read a
+    /// stale log from a reused host root. The RPMs are copied only
+    /// on a zero engine exit (a failed build writes none), and only
+    /// the files the engine actually wrote — found through the
+    /// `.build.packages` link, so the topdir layout stays the
+    /// engine's business. A missing packages dir means no RPMs:
+    /// the record judges the build failed from the log, not from
+    /// the sync.
+    fn sync_out(
+        &self,
+        engine_root: &Path,
+        host_root: &Path,
+        exit_code: i32,
+        deadline: std::time::Instant,
+    ) -> Result<(), GeectlError> {
+        self.copy_out(
+            &engine_root.join(BUILD_LOG),
+            &host_root.join(BUILD_LOG),
+            deadline,
+        )?;
+        if exit_code != 0 {
+            return Ok(());
+        }
+        let packages = engine_root.join(".mount").join(".build.packages");
+        let output = self.exec(
+            &[
+                "find".to_string(),
+                packages.to_string_lossy().to_string(),
+                "-name".to_string(),
+                "*.rpm".to_string(),
+                "-type".to_string(),
+                "f".to_string(),
+            ],
+            deadline,
+        )?;
+        if !output.status.success() {
+            return Ok(());
+        }
+        let out_dir = host_root.join(".mount").join(".build.packages");
+        fs::create_dir_all(&out_dir).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!(
+                    "cannot create the synced-out packages dir {}: {e}",
+                    out_dir.display()
+                ),
+            )
+        })?;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            self.copy_out(Path::new(line), &out_dir, deadline)?;
+        }
+        Ok(())
     }
 
     fn stop(&self) {
@@ -6462,9 +6883,12 @@ impl<'a> LocalBuild<'a> {
         // The shell runs in a build container, like the engine:
         // the container starts here, installs the engine, and
         // stops on drop. The shell works on the preserved root,
-        // so the container's workdir is the root itself.
+        // so the container's workdir is the root itself — and so
+        // the shell always uses the privileged shape: the rootless
+        // shape discards its root with the container, and there
+        // is no preserved root to enter.
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-        let container = BuildContainer::start(self, &root, &root, deadline)?;
+        let container = BuildContainer::start(self, &root, &root, true, deadline)?;
         container.install_engine(deadline)?;
         let (outcome, stdout, stderr) = run_engine_in_container(&container, &argv, deadline)?;
         if outcome.timed_out {
@@ -9608,6 +10032,33 @@ if [ "$1" = "rmi" ]; then exit 0; fi
 if [ "$1" = "run" ]; then echo "fake-container-id"; exit 0; fi
 if [ "$1" = "stop" ]; then exit 0; fi
 if [ "$1" = "kill" ]; then exit 0; fi
+if [ "$1" = "cp" ]; then
+  src="$2"; dst="$3"
+  case "$src" in *:* ) src="${{src#*:}}" ;; esac
+  case "$dst" in *:* ) dst="${{dst#*:}}" ;; esac
+  if [ "$src" = "/usr/lib/build/build" ]; then
+    printf '#!/bin/sh
+	mount -n -tproc none $BUILD_ROOT/proc
+	mount -n -tsysfs none $BUILD_ROOT/sys
+	mount -n -tdevpts -omode=0620,ptmxmode=0666,gid=5 none $BUILD_ROOT/dev/pts
+	mount -n -ttmpfs none $BUILD_ROOT/dev/shm
+' > "$dst"
+    exit 0
+  fi
+  if [ "$src" = "/usr/lib/build/init_buildsystem" ]; then
+    printf '#!/bin/sh
+	mount -n -tproc none "$BUILD_ROOT/proc"
+	mount -n -tdevpts -omode=0620,ptmxmode=0666,gid=5 none "$BUILD_ROOT/dev/pts"
+' > "$dst"
+    exit 0
+  fi
+  case "$dst" in
+    /usr/lib/build/build|/usr/lib/build/init_buildsystem) exit 0 ;;
+  esac
+  mkdir -p "$(dirname "$dst")"
+  cp "$src" "$dst"
+  exit $?
+fi
 if [ "$1" = "exec" ]; then
   shift 1
   if [ "$1" = "-w" ]; then shift 2; fi
@@ -9643,6 +10094,8 @@ if [ "$1" = "exec" ]; then
     fi
     exit 0
   fi
+  if [ "$1" = "mkdir" ]; then shift 1; mkdir "$@"; exit $?; fi
+  if [ "$1" = "find" ]; then shift 1; find "$@"; exit $?; fi
   exit 0
 fi
 exit 0
@@ -10037,6 +10490,107 @@ exit 0
         }
 
         #[test]
+        fn validate_build_request_rejects_rootless_noinit() {
+            let dir = TempDir::new();
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.noinit = true;
+            let err = validate_build_request(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("--noinit needs a preserved root"));
+        }
+
+        #[test]
+        #[cfg(not(target_os = "macos"))]
+        fn validate_build_request_accepts_privileged_noinit() {
+            let dir = TempDir::new();
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.noinit = true;
+            req.privileged = true;
+            validate_build_request(&req).unwrap();
+        }
+
+        #[test]
+        #[cfg(target_os = "macos")]
+        fn validate_build_request_refuses_privileged_on_macos() {
+            let dir = TempDir::new();
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.privileged = true;
+            let err = validate_build_request(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("--privileged is refused on macOS"));
+        }
+
+        #[test]
+        fn engine_root_is_the_host_root_when_privileged() {
+            assert_eq!(
+                BuildContainer::engine_root(true, Path::new("/tmp/root")),
+                PathBuf::from("/tmp/root")
+            );
+        }
+
+        #[test]
+        fn engine_root_mints_a_fresh_in_container_root_when_rootless() {
+            let first = BuildContainer::engine_root(false, Path::new("/tmp/root"));
+            let second = BuildContainer::engine_root(false, Path::new("/tmp/root"));
+            for root in [&first, &second] {
+                assert_eq!(root.parent(), Some(Path::new("/tmp")));
+                assert!(
+                    root.file_name().is_some_and(|name| name
+                        .to_string_lossy()
+                        .starts_with("geectl-build-root-")),
+                    "engine root: {}",
+                    root.display()
+                );
+            }
+            assert_ne!(first, second);
+        }
+
+        #[test]
+        fn apply_engine_patch_inserts_after_the_single_anchor() {
+            let text = "line one\n\tmount -n -tproc none $BUILD_ROOT/proc\nline three\n";
+            let patched = apply_engine_patch(
+                "/usr/lib/build/build",
+                text,
+                "\tmount -n -tproc none $BUILD_ROOT/proc",
+                "\ttest -e $BUILD_ROOT/proc/self || mount -n --bind /proc $BUILD_ROOT/proc",
+            )
+            .unwrap();
+            assert_eq!(
+                patched,
+                "line one\n\tmount -n -tproc none $BUILD_ROOT/proc\n\ttest -e $BUILD_ROOT/proc/self || mount -n --bind /proc $BUILD_ROOT/proc\nline three\n"
+            );
+        }
+
+        #[test]
+        fn apply_engine_patch_refuses_a_missing_anchor() {
+            let err = apply_engine_patch(
+                "/usr/lib/build/build",
+                "line one\nline two\n",
+                "\tmount -n -tproc none $BUILD_ROOT/proc",
+                "\ttest -e $BUILD_ROOT/proc/self || mount -n --bind /proc $BUILD_ROOT/proc",
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InternalError);
+        }
+
+        #[test]
+        fn apply_engine_patch_refuses_a_repeated_anchor() {
+            let text =
+                "\tmount -n -tproc none $BUILD_ROOT/proc\n\tmount -n -tproc none $BUILD_ROOT/proc\n";
+            let err = apply_engine_patch(
+                "/usr/lib/build/build",
+                text,
+                "\tmount -n -tproc none $BUILD_ROOT/proc",
+                "\ttest -e $BUILD_ROOT/proc/self || mount -n --bind /proc $BUILD_ROOT/proc",
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InternalError);
+        }
+
+        #[test]
         fn validate_build_request_rejects_a_missing_prefer_dir() {
             let dir = TempDir::new();
             let source = write_source(dir.path(), "foo.spec");
@@ -10142,6 +10696,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn dry_run_plan_carries_the_new_flags() {
             let dir = TempDir::new();
             let (podman, _, _) = stub_podman(dir.path(), true);
@@ -10159,6 +10714,10 @@ exit 0
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.dry_run = true;
             req.trust_all_projects = true;
+            // The plan's root is the host root only in the
+            // privileged shape: the default rootless shape plans
+            // the in-container root.
+            req.privileged = true;
             req.alternative_project = Some("openSUSE:Factory".to_string());
             req.root = Some(root.clone());
             req.keep_rpms = Some(keep.clone());
@@ -10170,6 +10729,7 @@ exit 0
                 Some("openSUSE:Factory")
             );
             assert!(plan.trust_all_projects);
+            assert!(plan.privileged);
             assert_eq!(plan.root, root);
             assert_eq!(plan.keep_rpms, Some(keep));
             assert_eq!(plan.prefer_packages, Some(prefer));
@@ -10192,6 +10752,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn dry_run_plan_carries_noinit() {
             // --noinit takes no --prefer-packages, so its argv pin
             // lives in its own test with an initialized root.
@@ -10209,6 +10770,9 @@ exit 0
             req.dry_run = true;
             req.root = Some(root.clone());
             req.noinit = true;
+            // --noinit needs a preserved root, so the dry-run plan
+            // uses the privileged shape.
+            req.privileged = true;
             let record = vertical.build(&req).unwrap();
             let plan = record.plan.unwrap();
             assert!(plan.argv.iter().any(|a| a == "--noinit"));
@@ -10222,6 +10786,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn dry_run_noinit_on_a_fresh_root_prints_the_plan() {
             // The plan is data and needs neither rpmlist nor
             // buildconfig, so a dry run prints it without consulting
@@ -10236,6 +10801,9 @@ exit 0
             req.dry_run = true;
             req.root = Some(dir.path().join("fresh-root"));
             req.noinit = true;
+            // --noinit needs a preserved root, so the dry-run plan
+            // uses the privileged shape.
+            req.privileged = true;
             let record = vertical.build(&req).unwrap();
             assert_eq!(record.verdict, "dry-run");
             assert!(record.dry_run);
@@ -10245,6 +10813,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn noinit_build_on_a_fresh_root_is_refused() {
             let dir = TempDir::new();
             let (podman, _, _) = stub_podman(dir.path(), true);
@@ -10256,6 +10825,7 @@ exit 0
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.root = Some(root.clone());
             req.noinit = true;
+            req.privileged = true;
             let err = vertical.build(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(err
@@ -10650,6 +11220,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn noinit_build_after_a_normal_build_is_green() {
             let dir = TempDir::new();
             let (podman, _, argv_log) = stub_podman(dir.path(), true);
@@ -10657,7 +11228,10 @@ exit 0
             let client = setup.client();
             let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
-            let req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
+            let mut req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
+            // Both builds use the preserved root: --noinit builds
+            // in the root the first build initialized.
+            req.privileged = true;
             let first = vertical.build(&req).unwrap();
             assert_eq!(first.verdict, "green");
             // Dep prep must not run again: the rpmlist/buildconfig
@@ -10670,6 +11244,7 @@ exit 0
             let downloads_before = setup.http.get_bytes_calls().len();
             let mut second = BuildRequest::new(source, "testproject", "standard", host_arch());
             second.noinit = true;
+            second.privileged = true;
             let record = vertical.build(&second).unwrap();
             assert_eq!(record.verdict, "green");
             assert_eq!(fs::read_to_string(&rpmlist).unwrap(), "sentinel rpmlist");
@@ -11197,6 +11772,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn stub_build_end_to_end_and_second_run_reuses_the_root() {
             let dir = TempDir::new();
             let (podman, podman_log, argv_log) = stub_podman(dir.path(), true);
@@ -11204,7 +11780,11 @@ exit 0
             let client = setup.client();
             let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
-            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            // Root reuse is a privileged-shape behavior: the
+            // default rootless shape builds in a fresh
+            // in-container root every run.
+            req.privileged = true;
 
             let record = vertical.build(&req).unwrap();
             assert_eq!(record.verdict, "green");
@@ -11272,6 +11852,41 @@ exit 0
                 1,
                 "podman calls:\n{podman_calls}"
             );
+        }
+
+        #[test]
+        fn stub_build_rootless_end_to_end_and_second_run_is_fresh() {
+            let dir = TempDir::new();
+            let (podman, _, argv_log) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert!(!record.privileged);
+            assert!(!record.root_reused);
+            assert!(!record.rpms.is_empty());
+            assert!(record.log_path.exists());
+            // The synced-out log carries the engine's finished line.
+            let log = fs::read_to_string(&record.log_path).unwrap();
+            assert!(log.contains("finished"));
+            // The engine ran in an in-container root, not the host root.
+            let argv = fs::read_to_string(&argv_log).unwrap();
+            assert!(
+                argv.contains("--root=/tmp/geectl-build-root-"),
+                "engine argv: {argv}"
+            );
+            // The second run is green in a fresh root: the same
+            // host root, not reused, and the cache hits.
+            let record2 = vertical.build(&req).unwrap();
+            assert_eq!(record2.verdict, "green");
+            assert_eq!(record2.root_path, record.root_path);
+            assert!(!record2.root_reused);
+            assert_eq!(record2.cache.pkg_hits, 4);
+            assert_eq!(record2.cache.pkg_misses, 0);
         }
 
         #[test]
@@ -12915,6 +13530,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn stub_build_second_run_reuses_the_root_and_drops_the_image() {
             let dir = TempDir::new();
             let (podman, _, _) = stub_podman(dir.path(), true);
@@ -12924,6 +13540,8 @@ exit 0
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.preinstall_image = true;
+            // The second run reuses the root: the privileged shape.
+            req.privileged = true;
 
             let first = vertical.build(&req).unwrap();
             assert_eq!(
@@ -13470,7 +14088,7 @@ exit 0
             let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
-            req.timeout_secs = 1;
+            req.timeout_secs = 5;
             let err = vertical.build(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::BuildTimeout);
             // The timeout kills the build container by name, so
@@ -13479,6 +14097,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn build_pull_and_engine_share_one_timeout_budget() {
             // The timeout is one budget for the whole op: a pull
             // that takes 2 s of a 3 s budget leaves the engine 1 s,
@@ -13500,6 +14119,10 @@ exit 0
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.timeout_secs = 3;
             req.refresh_image = true;
+            // The privileged shape: the hand-written slow-pull
+            // stub plays no `cp`, so the rootless patch-in-place
+            // has nothing to copy from.
+            req.privileged = true;
             let started = std::time::Instant::now();
             let err = vertical.build(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::BuildTimeout);
@@ -13554,6 +14177,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn build_leaf_phases_share_one_timeout_budget() {
             // One budget for the whole `build` leaf: the run-mode
             // service run, the precommit gate, and the engine build
@@ -13578,6 +14202,10 @@ exit 0
             let mut build_req =
                 BuildRequest::new(src.clone(), "testproject", "standard", host_arch());
             build_req.timeout_secs = 10;
+            // The privileged shape: the slow-service stub plays no
+            // `cp`, so the rootless patch-in-place has nothing to
+            // copy from.
+            build_req.privileged = true;
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let started = std::time::Instant::now();
             let err = (|| -> Result<BuildRecord, GeectlError> {
@@ -13591,6 +14219,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn build_leaf_precommit_shares_the_timeout_budget() {
             // The precommit gate shares the leaf's deadline too:
             // its work here takes 10 s against a 10 s budget with
@@ -13615,6 +14244,10 @@ exit 0
             let mut build_req =
                 BuildRequest::new(src.clone(), "testproject", "standard", host_arch());
             build_req.timeout_secs = 10;
+            // The privileged shape: the slow-service stub plays no
+            // `cp`, so the rootless patch-in-place has nothing to
+            // copy from.
+            build_req.privileged = true;
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let started = std::time::Instant::now();
             let err = (|| -> Result<BuildRecord, GeectlError> {
