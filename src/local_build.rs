@@ -453,6 +453,14 @@ pub struct BuildRecord {
     /// the synced-out log and RPMs.
     #[serde(default)]
     pub privileged: bool,
+    /// Whether sccache was resolved in the target repo and the
+    /// engine ran with `--sccache-uri`: `Some(true)` when resolved,
+    /// `Some(false)` when the repo carries no sccache package (the
+    /// build runs without it), `None` on a dry run (unresolved —
+    /// the plan carries the invocation, and sccache is resolved at
+    /// build time).
+    #[serde(default)]
+    pub sccache: Option<bool>,
     pub cache: CacheStats,
     pub eviction: EvictionReport,
     /// The preinstall image filename the build seeded the root
@@ -1294,13 +1302,15 @@ impl<'a> LocalBuild<'a> {
                 })?),
                 None => None,
             };
+            // A dry run resolves no sccache: the plan carries the
+            // invocation, and sccache is resolved at build time.
             let argv = self.engine_argv(
                 &engine_root,
                 &spec,
                 req,
                 &engine_root.join(RPMLIST),
                 &engine_root.join(BUILDCONFIG),
-                &self.sccache_uri_for_req(req, &package, &engine_root),
+                None,
             );
             self.debug.emit(&format!(
                 "local-build dry-run: {} {} {}",
@@ -1321,6 +1331,7 @@ impl<'a> LocalBuild<'a> {
                 root_path: root.clone(),
                 root_reused: root_existed,
                 privileged: req.privileged,
+                sccache: None,
                 cache: CacheStats::default(),
                 eviction: EvictionReport {
                     cap_bytes: self.cache_cap_bytes,
@@ -1475,8 +1486,12 @@ impl<'a> LocalBuild<'a> {
                 current_dep_files.push(PREINSTALL_INFO_FILENAME.to_string());
             }
         }
-        let current_dep_names: Vec<String> =
+        let mut current_dep_names: Vec<String> =
             info.bdeps.iter().map(|dep| dep.name.clone()).collect();
+        // sccache is resolved later (prepare_deps) and is not a
+        // bdep: protect its cached RPM by name prefix, like a dep
+        // whose file name is not known yet.
+        current_dep_names.push("sccache".to_string());
         let eviction = self.evict(
             &current_dep_files,
             &current_dep_names,
@@ -1489,10 +1504,20 @@ impl<'a> LocalBuild<'a> {
         // `--noinit` skips that: the engine installs nothing, so
         // the root's existing rpmlist and buildconfig (checked
         // above) are reused as-is and nothing is downloaded.
-        let (cache, used_preinstall) = if req.noinit {
-            (CacheStats::default(), None)
+        // sccache is resolved in prepare_deps (normal path) or read
+        // from the reused rpmlist (`--noinit`, where the engine
+        // installs nothing and sccache is used only when the root
+        // already carries it).
+        let (cache, used_preinstall, sccache) = if req.noinit {
+            let rpmlist = fs::read_to_string(root.join(RPMLIST)).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot read rpmlist {}: {e}", root.join(RPMLIST).display()),
+                )
+            })?;
+            (CacheStats::default(), None, rpmlist_has_sccache(&rpmlist))
         } else {
-            let (cache, rpmlist, used_preinstall) =
+            let (cache, rpmlist, used_preinstall, sccache) =
                 self.prepare_deps(req, &info, &root, &package)?;
             let rpmlist_path = root.join(RPMLIST);
             write_atomic(&rpmlist_path, rpmlist.as_bytes()).map_err(|e| {
@@ -1511,7 +1536,7 @@ impl<'a> LocalBuild<'a> {
                     ),
                 )
             })?;
-            (cache, used_preinstall)
+            (cache, used_preinstall, sccache)
         };
         let rpmlist_path = root.join(RPMLIST);
         let buildconfig_path = root.join(BUILDCONFIG);
@@ -1565,7 +1590,7 @@ impl<'a> LocalBuild<'a> {
             req,
             &engine_root.join(RPMLIST),
             &engine_root.join(BUILDCONFIG),
-            &sccache_uri,
+            sccache.then_some(sccache_uri.as_path()),
         );
         self.debug
             .emit(&format!("local-build engine: {}", argv.join(" ")));
@@ -1592,6 +1617,7 @@ impl<'a> LocalBuild<'a> {
             cache,
             eviction,
             used_preinstall,
+            sccache,
             trusted_foreign_projects,
             outcome,
         )?;
@@ -1813,12 +1839,12 @@ impl<'a> LocalBuild<'a> {
 
     /// The engine argv for a build, in the shape the engine takes
     /// inside the container: root, rpmlist, dist, arch, the build
-    /// flags, the sccache URI, and the spec last. No VM options:
-    /// the engine already runs inside the container, so there is
-    /// no VM to start.
+    /// flags, the sccache URI (only when sccache was resolved), and
+    /// the spec last. No VM options: the engine already runs inside
+    /// the container, so there is no VM to start.
     // Six arguments: the engine invocation's inputs — root, spec,
-    // request, rpmlist, buildconfig, sccache URI. Grouping them
-    // would hide the argv shape.
+    // request, rpmlist, buildconfig, sccache URI (when resolved).
+    // Grouping them would hide the argv shape.
     #[allow(clippy::too_many_arguments)]
     fn engine_argv(
         &self,
@@ -1827,7 +1853,7 @@ impl<'a> LocalBuild<'a> {
         req: &BuildRequest,
         rpmlist: &Path,
         buildconfig: &Path,
-        sccache_uri: &Path,
+        sccache_uri: Option<&Path>,
     ) -> Vec<String> {
         let mut argv = vec![
             "build".to_string(),
@@ -1856,7 +1882,12 @@ impl<'a> LocalBuild<'a> {
             argv.push("--release".to_string());
             argv.push(release.clone());
         }
-        argv.push(format!("--sccache-uri={}", sccache_uri.display()));
+        // `--sccache-uri` only when sccache was resolved: without
+        // it the engine wraps `CC` with a sccache that was never
+        // installed, and the build fails at configure.
+        if let Some(sccache_uri) = sccache_uri {
+            argv.push(format!("--sccache-uri={}", sccache_uri.display()));
+        }
         argv.push(spec.to_string_lossy().to_string());
         argv
     }
@@ -2467,6 +2498,17 @@ struct DepWork<'d> {
     filename: Result<String, GeectlError>,
 }
 
+/// A resolved sccache binary: the stored file name, its hdrmd5,
+/// and the (project, repository) it resolved from — the download
+/// fetches it from that repo, not the target repo.
+#[derive(Debug, Clone)]
+struct ResolvedSccache {
+    filename: String,
+    hdrmd5: Option<String>,
+    project: String,
+    repository: String,
+}
+
 /// Image resolution and dep preparation.
 impl<'a> LocalBuild<'a> {
     /// Resolve the build image: the local digest when present, a
@@ -3005,10 +3047,94 @@ impl<'a> LocalBuild<'a> {
         }
     }
 
+    /// Resolve `sccache` for a build: the binary-versions view
+    /// reports the stored binary name and its hdrmd5 (or `not
+    /// available` when the repo carries no sccache package).
+    /// Returns `None` when sccache is not available — the build
+    /// runs without it. A lookup failure degrades the same way:
+    /// sccache is an optimization, never a reason to fail a build.
+    /// A whole-repo listing is not used: on a
+    /// download-on-demand repo it names only fetched binaries,
+    /// so an unfetched sccache would look absent.
+    /// The lookup runs against the repositories the build's deps
+    /// resolve from (the buildinfo dep views, in first-appearance
+    /// order), with the build's own repo last when no dep resolves
+    /// from it — never against the target project repo alone: its
+    /// binary-versions view is download-on-demand-backed and lists
+    /// only already-fetched binaries, so a package that exists but
+    /// was never fetched looks absent (proven: hello, gcc and vim
+    /// all report `not available` on openSUSE:Tumbleweed/standard,
+    /// while the dep view openSUSE:Tumbleweed/dod lists them). The
+    /// resolved (project, repository) travels with the result: the
+    /// download fetches sccache from the repo it resolved from.
+    fn resolve_sccache(
+        &self,
+        req: &BuildRequest,
+        info: &crate::obs::BuildInfo,
+    ) -> Option<ResolvedSccache> {
+        let mut candidates: Vec<(&str, &str)> = Vec::new();
+        for dep in &info.bdeps {
+            let project = dep.project.as_deref().unwrap_or(req.fetch_project());
+            let pair = (project, Self::dep_repo(dep, req));
+            if !candidates.contains(&pair) {
+                candidates.push(pair);
+            }
+        }
+        let own = (req.fetch_project(), req.repo.as_str());
+        if !candidates.contains(&own) {
+            candidates.push(own);
+        }
+        for (project, repository) in candidates {
+            let versions = match self
+                .obs
+                .binary_versions(project, repository, &req.arch, "sccache")
+            {
+                Ok(versions) => versions,
+                Err(e) => {
+                    self.debug.emit(&format!(
+                        "local-build: sccache lookup in {project}/{repository} failed ({e}); trying the next repo"
+                    ));
+                    continue;
+                }
+            };
+            let mut available: Vec<_> = versions.iter().filter(|v| v.error.is_none()).collect();
+            available.sort_by(|a, b| a.name.cmp(&b.name));
+            available.dedup_by(|a, b| a.name == b.name);
+            match available.len() {
+                1 => {
+                    let version = available[0];
+                    return Some(ResolvedSccache {
+                        filename: version.name.clone(),
+                        hdrmd5: version.hdrmd5.clone(),
+                        project: project.to_string(),
+                        repository: repository.to_string(),
+                    });
+                }
+                0 => {
+                    self.debug.emit(&format!(
+                        "local-build: sccache is not available in {project}/{repository}; trying the next repo"
+                    ));
+                }
+                _ => {
+                    let names: Vec<&str> = available.iter().map(|v| v.name.as_str()).collect();
+                    self.debug.emit(&format!(
+                        "local-build: ambiguous sccache resolution in {project}/{repository} ({}); trying the next repo",
+                        names.join(", ")
+                    ));
+                }
+            }
+        }
+        self.debug.emit(
+            "local-build: sccache is not available in any repo the build resolves from; building without sccache",
+        );
+        None
+    }
+
     /// Prepare the resolved deps: each one lands in the pkg cache
     /// (hdrmd5-verified on every use) and the rpmlist names it for
     /// the engine. Returns the cache statistics, the rpmlist text,
-    /// and the preinstall image filename the build used, if any.
+    /// the preinstall image filename the build used, if any, and
+    /// whether sccache was resolved for the build.
     /// A dep the server resolved without a binary name is resolved
     /// from the binary list of its package; a dep with no installable
     /// file refuses (fail closed, naming the dep). Every dep is
@@ -3029,7 +3155,7 @@ impl<'a> LocalBuild<'a> {
         info: &crate::obs::BuildInfo,
         root: &Path,
         package: &str,
-    ) -> Result<(CacheStats, String, Option<String>), GeectlError> {
+    ) -> Result<(CacheStats, String, Option<String>, bool), GeectlError> {
         let mut stats = CacheStats::default();
         let preinstall_image =
             self.prepare_preinstall_image(req, info, root, package, &mut stats)?;
@@ -3037,6 +3163,20 @@ impl<'a> LocalBuild<'a> {
             .as_ref()
             .map(|image| image.binaries.iter().map(String::as_str).collect())
             .unwrap_or_default();
+        // sccache is resolved from the repositories the build's
+        // deps resolve from (the buildinfo dep views), not from the
+        // target repo alone: the engine adds it to its additional
+        // packages when `--sccache-uri` is passed, but
+        // `init_buildsystem` uses the rpmlist as-is, so the package
+        // is never installed unless the rpmlist names it. The image
+        // covers it the same way it covers a dep: no download, no
+        // `<name> <file>` line — the image lines carry it.
+        let mut sccache = covered.contains("sccache");
+        let sccache_file: Option<ResolvedSccache> = if sccache {
+            None
+        } else {
+            self.resolve_sccache(req, info)
+        };
         let mut lines: Vec<String> = Vec::new();
         let mut preinstall: Vec<String> = Vec::new();
         let mut vminstall: Vec<String> = Vec::new();
@@ -3101,6 +3241,50 @@ impl<'a> LocalBuild<'a> {
                 lines.push(format!("{} {}", item.dep.name, path.display()));
             }
         }
+        // sccache downloads best-effort, after the dep batch: a
+        // failed lookup or download degrades to a build without
+        // sccache (recorded below), never fails the build — the
+        // package is an optimization, not a dependency.
+        if let Some(resolved) = sccache_file {
+            let dep = BuildDep {
+                name: "sccache".to_string(),
+                project: Some(resolved.project),
+                repository: Some(resolved.repository),
+                package: None,
+                binary: Some(resolved.filename.clone()),
+                version: None,
+                release: None,
+                arch: Some(req.arch.clone()),
+                epoch: None,
+                hdrmd5: resolved.hdrmd5,
+                preinstall: false,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let dead_mirrors = Mutex::new(std::collections::HashSet::new());
+            match self.ensure_cached(
+                req,
+                info,
+                &dep,
+                &resolved.filename,
+                &mut stats,
+                &dead_mirrors,
+            ) {
+                Ok(path) => {
+                    lines.push(format!("sccache {}", path.display()));
+                    sccache = true;
+                }
+                Err(e) => {
+                    self.debug.emit(&format!(
+                        "local-build: sccache download failed ({e}); building without sccache"
+                    ));
+                }
+            }
+        }
         // The rpmlist shape: one `<name> <file>` line per dep, the
         // preinstall image lines when an image was selected, then
         // the install lists.
@@ -3127,7 +3311,7 @@ impl<'a> LocalBuild<'a> {
         if !installonly.is_empty() {
             lines.push(format!("installonly: {}", installonly.join(" ")));
         }
-        Ok((stats, lines.join("\n") + "\n", used_image))
+        Ok((stats, lines.join("\n") + "\n", used_image, sccache))
     }
 
     /// Resolve a dep's binary file name. The scheduler's buildinfo
@@ -4072,7 +4256,7 @@ impl<'a> LocalBuild<'a> {
     /// record. A non-zero engine exit is `BuildFailed` (exit code +
     /// log path + tail); a zero exit with no `finished` line or no
     /// RPMs is a record with verdict `failed`.
-    // Twelve arguments: the build record's fields, assembled here
+    // Thirteen arguments: the build record's fields, assembled here
     // from the build's inputs — there is no earlier record to pass.
     #[allow(clippy::too_many_arguments)]
     fn finish_build(
@@ -4087,6 +4271,7 @@ impl<'a> LocalBuild<'a> {
         cache: CacheStats,
         eviction: EvictionReport,
         preinstall_image: Option<String>,
+        sccache: bool,
         trusted_foreign_projects: Vec<String>,
         outcome: EngineOutcome,
     ) -> Result<BuildRecord, GeectlError> {
@@ -4129,6 +4314,7 @@ impl<'a> LocalBuild<'a> {
             root_path: root.to_path_buf(),
             root_reused,
             privileged: req.privileged,
+            sccache: Some(sccache),
             cache,
             eviction,
             preinstall_image,
@@ -5553,6 +5739,16 @@ fn rpm_package_name(filename: &str) -> Option<String> {
         return None;
     }
     Some(name.to_string())
+}
+
+/// Whether an rpmlist names sccache for the engine: a line
+/// starting with `sccache ` (the package name, a space, and the
+/// cached file path). An image-covered sccache leaves no such
+/// line (the image lines carry it), so a `--noinit` re-run in
+/// that case builds without sccache — correct, just uncached.
+/// Only the rpmlist's own entry is reported.
+fn rpmlist_has_sccache(rpmlist: &str) -> bool {
+    rpmlist.lines().any(|line| line.starts_with("sccache "))
 }
 
 /// The RPMs a build produced: `*.rpm` files under the root's
@@ -9656,11 +9852,11 @@ mod tests {
 
     #[test]
     fn prepare_deps_downloads_in_parallel_keeping_dep_order() {
-        // Six deps, four workers: the downloads overlap (the fake
-        // records more than one `get_bytes` in flight at once) while
-        // the rpmlist keeps dep order and the statistics add up.
-        // A second run finds everything cached: six hits, no
-        // further download.
+        // Six deps plus sccache, four workers: the downloads
+        // overlap (the fake records more than one `get_bytes` in
+        // flight at once) while the rpmlist keeps dep order and
+        // the statistics add up. A second run finds everything
+        // cached: seven hits, no further download.
         let dir = TempDir::new();
         let arch = host_arch();
         let mut http = FakeHttp::new().with_get_bytes_delay(std::time::Duration::from_millis(50));
@@ -9679,18 +9875,36 @@ mod tests {
             info.bdeps
                 .push(api_dep(&format!("dep{index}"), &binary, hdrmd5));
         }
+        // sccache resolves from the target repo and downloads like
+        // a dep: the binary-versions view names the stored binary
+        // and its digest, and the RPM downloads from the
+        // repository. The digest is real, so this also exercises
+        // the hdrmd5-verified download path.
+        let sccache_rpm = make_rpm(b"sccache payload");
+        let sccache_hdrmd5 = format!("{:x}", md5::compute(&sccache_rpm[112..]));
+        http = http
+            .with_get(
+                &format!(
+                    "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=sccache"
+                ),
+                &format!(
+                    "<binaryversionlist><binary name=\"sccache.rpm\" hdrmd5=\"{sccache_hdrmd5}\" sizek=\"3328\"/></binaryversionlist>"
+                ),
+            )
+            .with_get_bytes(&api_url(arch, "sccache.rpm"), &sccache_rpm);
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let vertical = LocalBuild::new(&client, dir.path().join("cache"));
         let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
-        let (stats, rpmlist, image) = vertical
+        let (stats, rpmlist, image, sccache) = vertical
             .prepare_deps(&req, &info, dir.path(), "foo")
             .unwrap();
         assert!(image.is_none());
-        assert_eq!(stats.pkg_misses, 6);
+        assert!(sccache);
+        assert_eq!(stats.pkg_misses, 7);
         assert_eq!(stats.pkg_hits, 0);
         assert!(http.max_concurrent_get_bytes() >= 2);
         let lines: Vec<&str> = rpmlist.lines().collect();
-        assert_eq!(lines.len(), 9);
+        assert_eq!(lines.len(), 10);
         for (index, line) in lines.iter().enumerate().take(6) {
             let binary = format!("dep{index}-1.0-1.{arch}.rpm");
             assert!(line.starts_with(&format!("dep{index} ")), "{line}");
@@ -9705,13 +9919,79 @@ mod tests {
             );
             assert!(std::path::Path::new(path).exists(), "{path}");
         }
-        assert_eq!(http.get_bytes_calls().len(), 6);
-        let (stats, _, _) = vertical
+        assert_eq!(http.get_bytes_calls().len(), 7);
+        let (stats, _, _, sccache) = vertical
             .prepare_deps(&req, &info, dir.path(), "foo")
             .unwrap();
+        assert!(sccache);
         assert_eq!(stats.pkg_misses, 0);
-        assert_eq!(stats.pkg_hits, 6);
-        assert_eq!(http.get_bytes_calls().len(), 6);
+        assert_eq!(stats.pkg_hits, 7);
+        assert_eq!(http.get_bytes_calls().len(), 7);
+    }
+
+    #[test]
+    fn prepare_deps_resolves_sccache_from_the_dep_repos_not_the_target_repo() {
+        // The target repo's binary-versions view is
+        // download-on-demand-backed and lists only fetched
+        // binaries, so sccache looks absent there even though it
+        // exists; the deps resolve from a foreign repo whose view
+        // lists it. sccache resolves from the dep view and
+        // downloads from that repo, not the target repo.
+        let dir = TempDir::new();
+        let arch = host_arch();
+        let mut info = crate::obs::BuildInfo {
+            error: None,
+            bdeps: Vec::new(),
+            preinstall_image: None,
+            urls: std::collections::HashMap::new(),
+            skipped_paths: 0,
+        };
+        let dep_rpm = make_rpm(b"dep payload");
+        let dep_hdrmd5 = format!("{:x}", md5::compute(&dep_rpm[112..]));
+        let dep_binary = format!("dep-1.0-1.{arch}.rpm");
+        let mut dep = api_dep("dep", &dep_binary, dep_hdrmd5);
+        dep.project = Some("baseproject".to_string());
+        dep.repository = Some("dod".to_string());
+        info.bdeps.push(dep);
+        let sccache_rpm = make_rpm(b"sccache payload");
+        let sccache_hdrmd5 = format!("{:x}", md5::compute(&sccache_rpm[112..]));
+        let http = FakeHttp::new()
+            .with_get_bytes(
+                &format!(
+                    "https://api.opensuse.org/build/baseproject/dod/{arch}/_repository/{dep_binary}"
+                ),
+                &dep_rpm,
+            )
+            .with_get(
+                &format!(
+                    "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=sccache"
+                ),
+                "<binaryversionlist/>",
+            )
+            .with_get(
+                &format!(
+                    "https://api.opensuse.org/build/baseproject/dod/{arch}/_repository?view=binaryversions&binary=sccache"
+                ),
+                &format!(
+                    "<binaryversionlist><binary name=\"sccache.rpm\" hdrmd5=\"{sccache_hdrmd5}\" sizek=\"3328\"/></binaryversionlist>"
+                ),
+            )
+            .with_get_bytes(
+                &format!(
+                    "https://api.opensuse.org/build/baseproject/dod/{arch}/_repository/sccache.rpm"
+                ),
+                &sccache_rpm,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+        let (stats, rpmlist, image, sccache) = vertical
+            .prepare_deps(&req, &info, dir.path(), "foo")
+            .unwrap();
+        assert!(image.is_none());
+        assert!(sccache);
+        assert!(rpmlist.contains("sccache "));
+        assert_eq!(stats.pkg_misses, 2);
     }
 
     #[test]
@@ -9918,9 +10198,12 @@ mod tests {
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let vertical = LocalBuild::new(&client, dir.path().join("cache"));
         let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
-        let (stats, _, _) = vertical
+        let (stats, _, _, sccache) = vertical
             .prepare_deps(&req, &info, dir.path(), "foo")
             .unwrap();
+        // No binary-versions stub: the lookup fails and the build
+        // goes on without sccache.
+        assert!(!sccache);
         assert_eq!(stats.pkg_misses, 8);
         assert!(
             (1..=4).contains(&http.mirror_calls().len()),
@@ -9953,9 +10236,12 @@ mod tests {
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let vertical = LocalBuild::new(&client, dir.path().join("cache"));
         let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
-        let (stats, rpmlist, _) = vertical
+        let (stats, rpmlist, _, sccache) = vertical
             .prepare_deps(&req, &info, dir.path(), "foo")
             .unwrap();
+        // No binary-versions stub: the lookup fails and the build
+        // goes on without sccache.
+        assert!(!sccache);
         assert_eq!(stats.pkg_misses, 1);
         assert_eq!(stats.pkg_hits, 1);
         assert_eq!(http.get_bytes_calls().len(), 1);
@@ -10347,6 +10633,24 @@ exit 0
                             "https://api.opensuse.org/build/testproject/standard/{arch}/helper/helper-1.0-1.{arch}.rpm"
                         ),
                         b"fake helper rpm",
+                    )
+                    // sccache is resolved from the target repo, not
+                    // the buildinfo: the binary-versions view names
+                    // the stored binary (no hdrmd5 here, so the
+                    // download verifies as ok like the other fake
+                    // RPMs), and the RPM downloads from the
+                    // repository like a dep with no source package.
+                    .with_get(
+                        &format!(
+                            "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=sccache"
+                        ),
+                        "<binaryversionlist><binary name=\"sccache.rpm\" sizek=\"3328\"/></binaryversionlist>",
+                    )
+                    .with_get_bytes(
+                        &format!(
+                            "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/sccache.rpm"
+                        ),
+                        b"fake sccache rpm",
                     );
                 Setup { http }
             }
@@ -10477,7 +10781,10 @@ exit 0
             let plan = record.plan.unwrap();
             assert_eq!(plan.argv.first().unwrap(), "build");
             assert!(!plan.argv.iter().any(|a| a.starts_with("--vm-")));
-            assert!(plan.argv.iter().any(|a| a.starts_with("--sccache-uri=")));
+            // A dry run resolves no sccache: the plan carries
+            // no `--sccache-uri`, and the record says so.
+            assert!(!plan.argv.iter().any(|a| a.starts_with("--sccache-uri=")));
+            assert!(record.sccache.is_none());
             assert!(plan.argv.last().unwrap().ends_with("foo.spec"));
             // Nothing was created: no root, no cache, no server call.
             assert!(!dir.path().join("cache").join("build-roots").exists());
@@ -10773,6 +11080,7 @@ exit 0
             req.keep_rpms = Some(keep.clone());
             req.prefer_packages = Some(prefer.clone());
             let record = vertical.build(&req).unwrap();
+            assert!(record.sccache.is_none());
             let plan = record.plan.unwrap();
             assert_eq!(
                 plan.alternative_project.as_deref(),
@@ -10791,8 +11099,11 @@ exit 0
                 "argv: {:?}",
                 plan.argv
             );
+            // A dry run resolves no sccache, so the plan
+            // carries no `--sccache-uri` even with a custom root.
             assert!(
-                plan.argv
+                !plan
+                    .argv
                     .iter()
                     .any(|a| a == &format!("--sccache-uri={}/sccache/sccache.tar", root.display())),
                 "argv: {:?}",
@@ -11846,8 +12157,9 @@ exit 0
                 Some("sha256:fake-digest-1234")
             );
             assert_eq!(record.engine_version.as_deref(), Some("build-1.0-1"));
-            assert_eq!(record.cache.pkg_misses, 4);
+            assert_eq!(record.cache.pkg_misses, 5);
             assert_eq!(record.cache.pkg_hits, 0);
+            assert_eq!(record.sccache, Some(true));
             assert!(record.log_path.exists());
             // The root carries the marker, the record, the rpmlist
             // (with the preinstall line) and the buildconfig.
@@ -11892,8 +12204,9 @@ exit 0
             let record2 = vertical.build(&req).unwrap();
             assert_eq!(record2.verdict, "green");
             assert!(record2.root_reused);
-            assert_eq!(record2.cache.pkg_hits, 4);
+            assert_eq!(record2.cache.pkg_hits, 5);
             assert_eq!(record2.cache.pkg_misses, 0);
+            assert_eq!(record2.sccache, Some(true));
             // The image was not pulled again: the sidecar records
             // the refresh, so the second build reuses the digest.
             let podman_calls = fs::read_to_string(&podman_log).unwrap();
@@ -11918,6 +12231,7 @@ exit 0
             assert_eq!(record.verdict, "green");
             assert!(!record.privileged);
             assert!(!record.root_reused);
+            assert_eq!(record.sccache, Some(true));
             assert!(!record.rpms.is_empty());
             assert!(record.log_path.exists());
             // The synced-out log carries the engine's finished line.
@@ -11935,8 +12249,9 @@ exit 0
             assert_eq!(record2.verdict, "green");
             assert_eq!(record2.root_path, record.root_path);
             assert!(!record2.root_reused);
-            assert_eq!(record2.cache.pkg_hits, 4);
+            assert_eq!(record2.cache.pkg_hits, 5);
             assert_eq!(record2.cache.pkg_misses, 0);
+            assert_eq!(record2.sccache, Some(true));
         }
 
         #[test]
@@ -12045,6 +12360,9 @@ exit 0
             let record = vertical.build(&req).unwrap();
             assert_eq!(record.verdict, "green");
             assert_eq!(record.cache.pkg_misses, 4);
+            // No binary-versions stub: sccache is not resolved and
+            // the build runs without it.
+            assert_eq!(record.sccache, Some(false));
             let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
             // The noinstall dep is downloaded and listed like any
             // dep: the rpmlist references the file, so it must exist.
@@ -13568,8 +13886,11 @@ exit 0
             // glibc and pre are covered: never downloaded, listed as
             // image-supplied; ownpkg and helper still download, plus
             // the image itself.
-            assert_eq!(record.cache.pkg_misses, 3);
+            // glibc and pre are covered; ownpkg, helper, and
+            // sccache download (the image does not carry sccache).
+            assert_eq!(record.cache.pkg_misses, 4);
             assert_eq!(record.cache.pkg_hits, 0);
+            assert_eq!(record.sccache, Some(true));
             let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
             assert!(rpmlist.contains("glibc preinstallimage"));
             assert!(rpmlist.contains("pre preinstallimage"));
@@ -13577,6 +13898,7 @@ exit 0
             assert!(!rpmlist.contains("pre-1.0"));
             assert!(rpmlist.contains("ownpkg-1.0-1."));
             assert!(rpmlist.contains("helper-1.0-1."));
+            assert!(rpmlist.contains("sccache.rpm"));
             assert!(rpmlist.contains("preinstallimage: "));
             assert!(rpmlist.contains("_preinstallimage.abc123"));
             assert!(rpmlist
@@ -13623,14 +13945,16 @@ exit 0
                 first.preinstall_image.as_deref(),
                 Some("_preinstallimage.abc123")
             );
+            assert_eq!(first.sccache, Some(true));
             let second = vertical.build(&req).unwrap();
             assert!(second.root_reused);
             assert_eq!(second.preinstall_image, None);
+            assert_eq!(second.sccache, Some(true));
             // glibc and pre were never downloaded in the first run:
-            // they are the two misses now; ownpkg and helper hit
-            // the cache.
+            // they are the two misses now; ownpkg, helper, and
+            // sccache hit the cache.
             assert_eq!(second.cache.pkg_misses, 2);
-            assert_eq!(second.cache.pkg_hits, 2);
+            assert_eq!(second.cache.pkg_hits, 3);
             let rpmlist = fs::read_to_string(second.root_path.join(RPMLIST)).unwrap();
             assert!(!rpmlist.contains("preinstallimage: "));
             assert!(!rpmlist.contains(" preinstallimage"));
@@ -13651,7 +13975,8 @@ exit 0
             let record = vertical.build(&req).unwrap();
             assert_eq!(record.verdict, "green");
             assert_eq!(record.preinstall_image, None);
-            assert_eq!(record.cache.pkg_misses, 4);
+            assert_eq!(record.cache.pkg_misses, 5);
+            assert_eq!(record.sccache, Some(true));
             let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
             assert!(!rpmlist.contains("preinstallimage: "));
             assert!(!rpmlist.contains(" preinstallimage"));
@@ -13779,9 +14104,11 @@ exit 0
             let record = vertical.build(&req).unwrap();
             assert_eq!(record.verdict, "green");
             assert_eq!(record.preinstall_image, None);
-            // 4 deps plus the failed image fetch: the image lookup
-            // missed, even though the download did not land.
-            assert_eq!(record.cache.pkg_misses, 5);
+            // 4 deps plus the failed image fetch plus sccache:
+            // the image lookup missed, even though the download
+            // did not land.
+            assert_eq!(record.cache.pkg_misses, 6);
+            assert_eq!(record.sccache, Some(true));
             let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
             assert!(!rpmlist.contains("preinstallimage"));
             assert!(rpmlist.contains("glibc-2.38-1."));
@@ -14645,6 +14972,9 @@ exit 0
             let record = vertical.build(&req).unwrap();
             assert_eq!(record.verdict, "green");
             assert_eq!(record.cache.pkg_misses, 1);
+            // No binary-versions stub: sccache is not resolved and
+            // the build runs without it.
+            assert_eq!(record.sccache, Some(false));
             assert!(dir
                 .path()
                 .join("cache")

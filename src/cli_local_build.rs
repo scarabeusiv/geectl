@@ -914,6 +914,14 @@ fn render_build(record: &BuildRecord) -> String {
                 "rootless"
             }
         ));
+        lines.push(format!(
+            "sccache: {}",
+            match record.sccache {
+                Some(true) => "used",
+                Some(false) => "unavailable",
+                None => "unresolved",
+            }
+        ));
         let mut cache = format!(
             "cache: pkg {} hits, {} misses",
             record.cache.pkg_hits, record.cache.pkg_misses
@@ -2161,6 +2169,7 @@ mod tests {
             root_path: PathBuf::from("/tmp/root"),
             root_reused: true,
             privileged: false,
+            sccache: Some(true),
             cache: CacheStats {
                 pkg_hits: 3,
                 pkg_misses: 0,
@@ -2189,6 +2198,7 @@ mod tests {
             root_path: PathBuf::from("/tmp/root"),
             root_reused: false,
             privileged: false,
+            sccache: None,
             cache: CacheStats::default(),
             eviction: EvictionReport::default(),
             preinstall_image: None,
@@ -2240,6 +2250,10 @@ mod tests {
         assert_eq!(render_build(&record), "no plan");
         let text = render_build(&build_record());
         assert!(text.contains("verdict: green"));
+        assert!(text.contains("sccache: used"));
+        let mut unavailable = build_record();
+        unavailable.sccache = Some(false);
+        assert!(render_build(&unavailable).contains("sccache: unavailable"));
         assert!(text.contains("kept-rpm: /tmp/keep/foo-1.0-1.x86_64.rpm"));
         assert!(text.contains("cache: pkg 3 hits, 0 misses, 1 preferred, sccache 5 hits"));
         assert!(text.contains("exit: 0"));
@@ -2301,7 +2315,10 @@ mod tests {
         assert!(text.contains("root: /tmp/root"));
         assert!(!text.contains("(reused)"));
         assert!(text.contains("cache: pkg 3 hits, 0 misses"));
-        assert!(!text.contains("sccache"));
+        // No sccache hits: the cache line carries no sccache
+        // part, but the build still records sccache as used.
+        assert!(!text.contains(", sccache "));
+        assert!(text.contains("sccache: used"));
     }
 
     /// The agreement test: every identifying field the JSON payload
