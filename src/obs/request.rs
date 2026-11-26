@@ -728,6 +728,13 @@ pub enum CleanupStep {
 /// and nothing to report in text. The payload still records it.
 pub const NO_BRANCH_MARKER_REASON: &str = "no geectl branch marker in the test project description";
 
+/// The reason a project fork is skipped by branch cleanup: a project
+/// fork (`_project`) has no single home package to delete. Shared by
+/// the accept-path skip and the `cleanup-forks` payload, like
+/// [`NO_BRANCH_MARKER_REASON`], so the wording lives in one place.
+pub const PROJECT_FORK_NO_HOME_PACKAGE_REASON: &str =
+    "project fork: no single home package to delete";
+
 impl CleanupStep {
     /// Whether this step is reported in text: a delete, an
     /// already-gone, a failure, or a skip with a reason to act on.
@@ -3569,8 +3576,7 @@ impl<'a> ObsClient<'a> {
                     } else if package == "_project" {
                         (
                             CleanupStep::Skipped {
-                                reason: "project fork: no single home package to delete"
-                                    .to_string(),
+                                reason: PROJECT_FORK_NO_HOME_PACKAGE_REASON.to_string(),
                             },
                             not_deleted(),
                         )

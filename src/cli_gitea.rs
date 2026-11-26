@@ -49,6 +49,7 @@ use crate::gitea::{
     Maintainership, RepoCreateOptions,
 };
 use crate::http::{HttpClient, Timeout, UreqClient};
+use crate::obs::request::PROJECT_FORK_NO_HOME_PACKAGE_REASON;
 use crate::obs::DryRun;
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
@@ -478,7 +479,7 @@ fn cleanup_fork_entry_json(entry: &CleanupForkEntry) -> Value {
         } => (
             "project_fork",
             Some(fork.as_str()),
-            None,
+            Some(PROJECT_FORK_NO_HOME_PACKAGE_REASON),
             Some(*fork_obsolete),
             None,
             None,
@@ -1274,6 +1275,27 @@ mod tests {
                 user: Some(user)
             } if user == "fbui"
         ));
+    }
+
+    #[test]
+    fn cleanup_fork_entry_json_carries_the_shared_project_fork_reason() {
+        // The project-fork skip reason lives in one place
+        // (obs/request.rs): the accept-path skip and the
+        // cleanup-forks payload read the same string.
+        let entry = CleanupForkEntry {
+            project: "home:scarabeus_iv:branches:games".to_string(),
+            package: Some("_project".to_string()),
+            outcome: CleanupForkOutcome::ProjectFork {
+                fork: "fbui/_ObsPrj#master".to_string(),
+                fork_obsolete: true,
+            },
+        };
+        let payload = cleanup_fork_entry_json(&entry);
+        assert_eq!(payload["outcome"].as_str(), Some("project_fork"));
+        assert_eq!(
+            payload["reason"].as_str(),
+            Some(PROJECT_FORK_NO_HOME_PACKAGE_REASON)
+        );
     }
 
     fn sample_repository() -> GiteaRepository {
