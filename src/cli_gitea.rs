@@ -45,8 +45,8 @@ use crate::debug::{strip_terminal_controls_marked, Debug};
 use crate::error::GeectlError;
 use crate::gitea::{
     require_credentials_for_url, CleanupForkEntry, CleanupForkOutcome, CleanupForksResult,
-    ForkRepoOptions, GiteaBranch, GiteaClient, GiteaCommitStatus, GiteaRepository, MaintainerInfo,
-    Maintainership, RepoCreateOptions,
+    ForkRepoOptions, GiteaBranch, GiteaClient, GiteaCommitStatus, GiteaRepository, GiteaUser,
+    MaintainerInfo, Maintainership, RepoCreateOptions,
 };
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::request::PROJECT_FORK_NO_HOME_PACKAGE_REASON;
@@ -78,6 +78,9 @@ pub enum GiteaCommand {
         /// The search keyword.
         query: String,
     },
+    /// Show the token owner: the login, full name, and email the
+    /// configured Gitea token belongs to.
+    Whoami,
     /// Create a repository under the token owner's account. A
     /// mutation: dry-run is the default (only the plan is printed);
     /// `--live` performs the creation.
@@ -256,6 +259,15 @@ pub fn run_gitea(
                 payload,
                 with_header(&repo_search_header(&query), render_repositories(&repos)),
             ))
+        }
+        GiteaCommand::Whoami => {
+            let user = client.whoami()?;
+            let payload = json!({
+                "login": user.login,
+                "full_name": user.full_name,
+                "email": user.email,
+            });
+            Ok((payload, render_whoami(&user)))
         }
         GiteaCommand::RepoCreate(args) => {
             let options = RepoCreateOptions {
@@ -774,6 +786,25 @@ fn render_repository(repository: &GiteaRepository) -> String {
     lines.join("\n")
 }
 
+/// The token owner as `key: value` lines: the login first,
+/// then the full name and email only when present.
+fn render_whoami(user: &GiteaUser) -> String {
+    // Login, full name and email are server-authored free text:
+    // strip terminal controls (visibly marked, like the other
+    // renders), then flatten newlines — the strip keeps newlines
+    // by design, and the render needs one line per field, so a
+    // newline in a field must not inject a new line.
+    let one_line = |value: &str| strip_terminal_controls_marked(value).replace('\n', " ");
+    let mut lines = vec![format!("login: {}", one_line(&user.login))];
+    if !user.full_name.is_empty() {
+        lines.push(format!("full_name: {}", one_line(&user.full_name)));
+    }
+    if !user.email.is_empty() {
+        lines.push(format!("email: {}", one_line(&user.email)));
+    }
+    lines.join("\n")
+}
+
 fn render_repositories(repositories: &[GiteaRepository]) -> String {
     if repositories.is_empty() {
         return "no repositories".to_string();
@@ -1177,6 +1208,38 @@ mod tests {
     }
 
     #[test]
+    fn render_whoami_shows_only_the_present_fields() {
+        let user = GiteaUser {
+            login: "scarabeus_iv".to_string(),
+            full_name: "Tomáš Chvátal".to_string(),
+            email: "tomas.chvatal@gmail.com".to_string(),
+        };
+        assert_eq!(
+            render_whoami(&user),
+            "login: scarabeus_iv\nfull_name: Tomáš Chvátal\nemail: tomas.chvatal@gmail.com"
+        );
+        let user = GiteaUser {
+            login: "scarabeus_iv".to_string(),
+            full_name: String::new(),
+            email: String::new(),
+        };
+        assert_eq!(render_whoami(&user), "login: scarabeus_iv");
+    }
+
+    #[test]
+    fn render_whoami_flattens_newlines() {
+        let user = GiteaUser {
+            login: "scarabeus_iv\nemail: forged@example.com".to_string(),
+            full_name: "Tomáš\nChvátal".to_string(),
+            email: "tomas.chvatal@gmail.com\nlogin: forged".to_string(),
+        };
+        assert_eq!(
+            render_whoami(&user),
+            "login: scarabeus_iv email: forged@example.com\nfull_name: Tomáš Chvátal\nemail: tomas.chvatal@gmail.com login: forged"
+        );
+    }
+
+    #[test]
     fn gitea_commands_parse() {
         assert!(matches!(
             parse(&["geectl", "gitea", "repo-get", "pool", "systemd"]),
@@ -1201,6 +1264,10 @@ mod tests {
         assert!(matches!(
             parse(&["geectl", "gitea", "repo-search", "geectl"]),
             GiteaCommand::RepoSearch { query } if query == "geectl"
+        ));
+        assert!(matches!(
+            parse(&["geectl", "gitea", "whoami"]),
+            GiteaCommand::Whoami
         ));
         let parsed = parse(&[
             "geectl",

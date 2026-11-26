@@ -2639,6 +2639,16 @@ _arguments "${_arguments_options[@]}" : \
 ':query -- The search keyword:_default' \
 && ret=0
 ;;
+(whoami)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (repo-create)
 _arguments "${_arguments_options[@]}" : \
 '--description=[A short description]:DESCRIPTION:_default' \
@@ -2789,6 +2799,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (repo-search)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(whoami)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -4198,6 +4212,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(whoami)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (repo-create)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -5034,6 +5052,7 @@ _geectl__subcmd__gitea_commands() {
 'repo-get:Show a repository\: owner, default branch, privacy, clone URLs, and the token owner'\''s permissions' \
 'repo-list:List repositories\: the token owner'\''s own repos, one user'\''s repos with \`--owner\`, one organization'\''s with \`--org\`, or both (the user'\''s first, then the organization'\''s)' \
 'repo-search:Search repositories across the instance by keyword\: the keyword matches the name and the description. The Gitea counterpart of \`remote search-packages\` / \`remote search-projects\`' \
+'whoami:Show the token owner\: the login, full name, and email the configured Gitea token belongs to' \
 'repo-create:Create a repository under the token owner'\''s account. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation' \
 'repo-delete:Delete a repository. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. The library refuses without \`--force\`, even live' \
 'repo-fork:Fork a repository into the token owner'\''s account (or an organization with \`--organization\`). A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the fork' \
@@ -5079,6 +5098,7 @@ _geectl__subcmd__gitea__subcmd__help_commands() {
 'repo-get:Show a repository\: owner, default branch, privacy, clone URLs, and the token owner'\''s permissions' \
 'repo-list:List repositories\: the token owner'\''s own repos, one user'\''s repos with \`--owner\`, one organization'\''s with \`--org\`, or both (the user'\''s first, then the organization'\''s)' \
 'repo-search:Search repositories across the instance by keyword\: the keyword matches the name and the description. The Gitea counterpart of \`remote search-packages\` / \`remote search-projects\`' \
+'whoami:Show the token owner\: the login, full name, and email the configured Gitea token belongs to' \
 'repo-create:Create a repository under the token owner'\''s account. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation' \
 'repo-delete:Delete a repository. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. The library refuses without \`--force\`, even live' \
 'repo-fork:Fork a repository into the token owner'\''s account (or an organization with \`--organization\`). A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the fork' \
@@ -5163,6 +5183,11 @@ _geectl__subcmd__gitea__subcmd__help__subcmd__repo-search_commands() {
     local commands; commands=()
     _describe -t commands 'geectl gitea help repo-search commands' commands "$@"
 }
+(( $+functions[_geectl__subcmd__gitea__subcmd__help__subcmd__whoami_commands] )) ||
+_geectl__subcmd__gitea__subcmd__help__subcmd__whoami_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl gitea help whoami commands' commands "$@"
+}
 (( $+functions[_geectl__subcmd__gitea__subcmd__maintainers_commands] )) ||
 _geectl__subcmd__gitea__subcmd__maintainers_commands() {
     local commands; commands=()
@@ -5202,6 +5227,11 @@ _geectl__subcmd__gitea__subcmd__repo-list_commands() {
 _geectl__subcmd__gitea__subcmd__repo-search_commands() {
     local commands; commands=()
     _describe -t commands 'geectl gitea repo-search commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__gitea__subcmd__whoami_commands] )) ||
+_geectl__subcmd__gitea__subcmd__whoami_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl gitea whoami commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help_commands] )) ||
 _geectl__subcmd__help_commands() {
@@ -5506,6 +5536,7 @@ _geectl__subcmd__help__subcmd__gitea_commands() {
 'repo-get:Show a repository\: owner, default branch, privacy, clone URLs, and the token owner'\''s permissions' \
 'repo-list:List repositories\: the token owner'\''s own repos, one user'\''s repos with \`--owner\`, one organization'\''s with \`--org\`, or both (the user'\''s first, then the organization'\''s)' \
 'repo-search:Search repositories across the instance by keyword\: the keyword matches the name and the description. The Gitea counterpart of \`remote search-packages\` / \`remote search-projects\`' \
+'whoami:Show the token owner\: the login, full name, and email the configured Gitea token belongs to' \
 'repo-create:Create a repository under the token owner'\''s account. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation' \
 'repo-delete:Delete a repository. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. The library refuses without \`--force\`, even live' \
 'repo-fork:Fork a repository into the token owner'\''s account (or an organization with \`--organization\`). A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the fork' \
@@ -5583,6 +5614,11 @@ _geectl__subcmd__help__subcmd__gitea__subcmd__repo-list_commands() {
 _geectl__subcmd__help__subcmd__gitea__subcmd__repo-search_commands() {
     local commands; commands=()
     _describe -t commands 'geectl help gitea repo-search commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__help__subcmd__gitea__subcmd__whoami_commands] )) ||
+_geectl__subcmd__help__subcmd__gitea__subcmd__whoami_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help gitea whoami commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help__subcmd__help_commands] )) ||
 _geectl__subcmd__help__subcmd__help_commands() {

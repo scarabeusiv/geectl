@@ -1456,18 +1456,31 @@ impl<'a> GiteaClient<'a> {
         parse_repository(&body, owner, repo)
     }
 
-    /// Read the token owner's login (`GET /api/v1/user`). A private
-    /// helper: the fork target owner defaults to this login.
-    fn current_user_login(&self) -> Result<String, GeectlError> {
+    /// Read the token owner (`GET /api/v1/user`): the login,
+    /// full name, and email the token belongs to. Terminal
+    /// control characters are stripped from all three before
+    /// any reaches a render: the full name and email are
+    /// account-holder free text, and the login is rendered raw
+    /// by `whoami`.
+    pub fn whoami(&self) -> Result<GiteaUser, GeectlError> {
         let url = build_url(&self.base, &["api", "v1", "user"], &[]);
         let body = self.http.get_with(&url, &self.credentials)?;
-        let user: GiteaUser = serde_json::from_str(&body).map_err(|err| {
+        let mut user: GiteaUser = serde_json::from_str(&body).map_err(|err| {
             GeectlError::new(
                 ErrorKind::ServerError,
                 format!("unexpected Gitea user response: {err}"),
             )
         })?;
-        Ok(user.login)
+        user.login = strip_terminal_controls(&user.login);
+        user.full_name = strip_terminal_controls(&user.full_name);
+        user.email = strip_terminal_controls(&user.email);
+        Ok(user)
+    }
+
+    /// Read the token owner's login (`GET /api/v1/user`). A private
+    /// helper: the fork target owner defaults to this login.
+    fn current_user_login(&self) -> Result<String, GeectlError> {
+        Ok(self.whoami()?.login)
     }
 
     /// Fork a repository (`POST
@@ -6893,6 +6906,30 @@ mod tests {
 
     fn user_search_json(users: &[String]) -> String {
         format!(r#"{{"ok": true, "data": [{}]}}"#, users.join(","))
+    }
+
+    #[test]
+    fn whoami_reads_the_token_owner() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/user",
+            &user_json("scarabeus_iv", "Tomáš Chvátal", "tomas.chvatal@gmail.com"),
+        );
+        let user = client(&http).whoami().unwrap();
+        assert_eq!(user.login, "scarabeus_iv");
+        assert_eq!(user.full_name, "Tomáš Chvátal");
+        assert_eq!(user.email, "tomas.chvatal@gmail.com");
+    }
+
+    #[test]
+    fn whoami_strips_terminal_controls_from_free_text() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/user",
+            "{\"login\": \"scarabeus\\u0001_iv\", \"full_name\": \"Tom\\u0001áš\", \"email\": \"a\\u0007b@example.com\"}",
+        );
+        let user = client(&http).whoami().unwrap();
+        assert_eq!(user.login, "scarabeus_iv");
+        assert_eq!(user.full_name, "Tomáš");
+        assert_eq!(user.email, "ab@example.com");
     }
 
     /// Fifty users, named `user-00` … — the full page the

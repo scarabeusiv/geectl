@@ -297,6 +297,7 @@ without evaluating trust.
 - `geectl gitea repo-get <OWNER> <REPO>` — Show a repository: owner, default branch, privacy, clone URLs, and the token owner's permissions.
 - `geectl gitea repo-list` — List repositories: the token owner's own repos, one user's repos with `--owner`, one organization's with `--org`, or both (the user's first, then the organization's); key flags: --owner <OWNER>, --org <ORG>
 - `geectl gitea repo-search <QUERY>` — Search repositories across the instance by keyword: the keyword matches the name and the description. The Gitea counterpart of `remote search-packages` / `remote search-projects`.
+- `geectl gitea whoami` — Show the token owner: the login, full name, and email the configured Gitea token belongs to.
 - `geectl gitea repo-create <NAME>` — Create a repository under the token owner's account; key flags: --private, --description <DESCRIPTION>, --default-branch <DEFAULT_BRANCH>
 - `geectl gitea repo-delete <OWNER> <REPO>` — Delete a repository; key flags: --force
 - `geectl gitea repo-fork <OWNER> <REPO>` — Fork a repository into the token owner's account (or an organization with `--organization`); key flags: --new-name <NEW_NAME>, --organization <ORGANIZATION>
