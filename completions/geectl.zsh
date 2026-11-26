@@ -1984,7 +1984,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--output=[Where to write the downloaded bytes\: the file path (it must not already exist), or the directory every built file goes into with \`--all\`]:OUTPUT:_files' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
-'()--all[Download every built file into the \`--output\` directory; a file already there refuses the run. The downloads are sequential, not atomic\: if one fails, the files already downloaded stay]' \
+'()--all[Download every built file into the \`--output\` directory; a file already there is skipped and reported, never re-downloaded and never deleted. The downloads are sequential, not atomic\: if one fails, the files already downloaded stay]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
 '--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \

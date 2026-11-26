@@ -322,7 +322,8 @@ pub enum BuildCommand {
         #[arg(long)]
         output: PathBuf,
         /// Download every built file into the `--output` directory;
-        /// a file already there refuses the run. The downloads are
+        /// a file already there is skipped and reported, never
+        /// re-downloaded and never deleted. The downloads are
         /// sequential, not atomic: if one fails, the files already
         /// downloaded stay.
         #[arg(long, conflicts_with = "filename")]
@@ -904,26 +905,29 @@ pub fn run_build(
         } => {
             if all {
                 // One list call plus one streaming download per
-                // file: the streamed download has no 10 MiB cap,
-                // and each file is created exclusively — a second
-                // run into the same directory refuses the files
-                // already there. The names are validated up front,
+                // file: the streamed download has no 10 MiB cap.
+                // A file already in the output directory is
+                // skipped and reported, never re-downloaded and
+                // never deleted — a second run into the same
+                // directory downloads only what is missing, so a
+                // retry is not refused by the files the earlier
+                // run left. A skipped file deleted after the
+                // partition is downloaded in a second pass, not
+                // reported as present (see `recheck_skipped`). The names
+                // are validated up front,
                 // before anything downloads, so a bad server name
-                // fails the run with nothing downloaded; the total
-                // size is checked against the output filesystem
-                // before the first download, so a disk that cannot
-                // hold the run fails fast instead of mid-run. A
-                // failure aborts the run; the files already
-                // downloaded stay, and the failed file's partial
-                // download is removed only when this run created
-                // it — a file that pre-existed (refused by
-                // exclusive create) or was never created (a
-                // failure before the first byte) is never
-                // deleted — so a retry is not refused by the
-                // partial.
+                // fails the run with nothing downloaded; the size
+                // of what this run downloads is checked against
+                // the output filesystem before the first
+                // download, so a disk that cannot hold the run
+                // fails fast instead of mid-run. A failure aborts
+                // the run; the files already downloaded stay, and
+                // the failed file's partial download is removed
+                // only when this run created it — a file that
+                // pre-existed or was never created (a failure
+                // before the first byte) is never deleted.
                 let files = client.list_binaries(&project, Some(&package), &repository, &arch)?;
                 validate_download_names(&files)?;
-                let total_size = total_download_size(&files)?;
                 std::fs::create_dir_all(&output).map_err(|e| {
                     GeectlError::new(
                         ErrorKind::InternalError,
@@ -936,24 +940,52 @@ pub fn run_build(
                         format!("cannot resolve output directory {}: {e}", output.display()),
                     )
                 })?;
-                check_disk_space(&output, total_size)?;
+                let (to_download, mut skipped) =
+                    partition_downloads(&files, &output, &output_canonical)?;
+                let pending: Vec<BinaryFile> =
+                    to_download.iter().map(|(file, _)| file.clone()).collect();
+                check_disk_space(&output, total_download_size(&pending)?)?;
                 let mut downloaded: Vec<(String, u64, PathBuf)> = Vec::new();
-                for file in &files {
-                    let dest = contained_dest(&output, &output_canonical, &file.name)?;
-                    let size = download_one_file(
-                        |dest| {
-                            client.download_binary_to_file(
-                                &project,
-                                &package,
-                                &repository,
-                                &arch,
-                                &file.name,
-                                dest,
-                            )
-                        },
-                        &dest,
-                    )?;
-                    downloaded.push((file.name.clone(), size, dest));
+                // At most two passes: what was missing at partition,
+                // then anything a skipped entry lost since (see
+                // `recheck_skipped`) — a file deleted mid-run is
+                // downloaded, not reported as present.
+                let mut pending = to_download;
+                let mut rechecked = false;
+                loop {
+                    for (file, dest) in pending {
+                        match download_one_file(
+                            |dest| {
+                                client.download_binary_to_file(
+                                    &project,
+                                    &package,
+                                    &repository,
+                                    &arch,
+                                    &file.name,
+                                    dest,
+                                )
+                            },
+                            &dest,
+                        ) {
+                            Ok(size) => downloaded.push((file.name.clone(), size, dest)),
+                            // A file that appeared between the
+                            // partition and the download is a skip, not
+                            // a failure: the run still proceeds for the
+                            // remaining files.
+                            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                                skipped.push((file.name.clone(), dest));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    if rechecked {
+                        break;
+                    }
+                    rechecked = true;
+                    pending = recheck_skipped(&files, &mut skipped);
+                    if pending.is_empty() {
+                        break;
+                    }
                 }
                 let payload = json!({
                     "project": project,
@@ -971,8 +1003,17 @@ pub fn run_build(
                             })
                         })
                         .collect::<Vec<_>>(),
+                    "skipped": skipped
+                        .iter()
+                        .map(|(filename, dest)| {
+                            json!({
+                                "filename": filename,
+                                "path": dest.to_string_lossy(),
+                            })
+                        })
+                        .collect::<Vec<_>>(),
                 });
-                let text = download_all_text(&downloaded);
+                let text = download_all_text(&downloaded, &skipped);
                 Ok((payload, with_header(&header, text)))
             } else {
                 let filename = match filename {
@@ -1484,6 +1525,59 @@ fn total_download_size(files: &[BinaryFile]) -> Result<u64, GeectlError> {
     Ok(total)
 }
 
+/// What a `--all` run downloads, and what it skips as already
+/// present: the files to download (with their destinations), and
+/// the files already in the output directory (with their paths).
+type DownloadPlan = (Vec<(BinaryFile, PathBuf)>, Vec<(String, PathBuf)>);
+
+/// Split a `--all` file list into the files to download and the
+/// files already in the output directory: a destination that
+/// exists (file, directory, or symlink) is skipped, never
+/// re-downloaded and never deleted. The split happens before the
+/// disk-space check, so the probe covers only what this run
+/// downloads.
+fn partition_downloads(
+    files: &[BinaryFile],
+    output: &Path,
+    output_canonical: &Path,
+) -> Result<DownloadPlan, GeectlError> {
+    let mut to_download = Vec::new();
+    let mut skipped = Vec::new();
+    for file in files {
+        let dest = contained_dest(output, output_canonical, &file.name)?;
+        if dest.symlink_metadata().is_ok() {
+            skipped.push((file.name.clone(), dest));
+        } else {
+            to_download.push((file.clone(), dest));
+        }
+    }
+    Ok((to_download, skipped))
+}
+
+/// Re-check the skipped entries after the download loop: a file
+/// present at partition may have been deleted since, and reporting
+/// it as skipped would claim a file that no longer exists. Entries
+/// that still exist stay skipped; the vanished ones come back, with
+/// their server entries, for one download pass instead of a false
+/// skip line.
+fn recheck_skipped(
+    files: &[BinaryFile],
+    skipped: &mut Vec<(String, PathBuf)>,
+) -> Vec<(BinaryFile, PathBuf)> {
+    let mut missing = Vec::new();
+    skipped.retain(|(name, dest)| {
+        if dest.symlink_metadata().is_ok() {
+            true
+        } else {
+            if let Some(file) = files.iter().find(|f| &f.name == name) {
+                missing.push((file.clone(), dest.clone()));
+            }
+            false
+        }
+    });
+    missing
+}
+
 /// Join a validated binary name onto the output directory, confined
 /// to it: the name is one path component (see
 /// [`is_safe_download_name`]), so joining it onto the canonical
@@ -1519,10 +1613,14 @@ fn contained_dest(
 /// failure before the first byte) is never removed. An existence
 /// check that itself errors assumes the file existed: fail closed,
 /// never delete. The check does not follow links, so a dangling
-/// symlink counts as pre-existing and is never removed. The error
-/// kind cannot say this: a connect failure reports `NetworkError`
-/// before anything is created, and a mid-stream write failure reports
-/// `InternalError` after this run created the file.
+/// symlink counts as pre-existing and is never removed. The
+/// existence check races a concurrent run: a file that appeared
+/// after the check is refused by the exclusive create with
+/// `AlreadyExists`, and that failure never removes either — this
+/// run created nothing, and the file is the other run's. A connect
+/// failure reports `NetworkError` before anything is created, and a
+/// mid-stream write failure reports `InternalError` after this run
+/// created the file.
 fn download_one_file(
     download: impl FnOnce(&Path) -> Result<u64, GeectlError>,
     dest: &Path,
@@ -1535,7 +1633,7 @@ fn download_one_file(
     match download(dest) {
         Ok(size) => Ok(size),
         Err(e) => {
-            if !existed_before {
+            if !existed_before && e.kind() != ErrorKind::AlreadyExists {
                 let _ = std::fs::remove_file(dest);
             }
             Err(e)
@@ -1595,31 +1693,54 @@ fn check_disk_space(dir: &Path, total_bytes: u64) -> Result<(), GeectlError> {
 
 /// The `download-binary` confirmation line: the file, its size, and
 /// where the bytes were written. The bytes themselves never ride the
-/// text rendering.
+/// text rendering. The name is server-provided, so it is stripped of
+/// terminal controls before printing.
 fn download_text(filename: &str, size: u64, output: &Path) -> String {
     format!(
-        "downloaded {filename} ({size} bytes) to {}",
+        "downloaded {} ({size} bytes) to {}",
+        strip_terminal_controls(filename),
         output.display()
     )
 }
 
-/// The `--all` download as text: one confirmation line per file,
-/// or that there is nothing to download.
-fn download_all_text(downloaded: &[(String, u64, PathBuf)]) -> String {
-    if downloaded.is_empty() {
+/// The `--all` download as text: one confirmation line per
+/// downloaded file, then one line per file skipped as already
+/// present, or that there is nothing to download.
+fn download_all_text(
+    downloaded: &[(String, u64, PathBuf)],
+    skipped: &[(String, PathBuf)],
+) -> String {
+    let mut lines: Vec<String> = downloaded
+        .iter()
+        .map(|(filename, size, dest)| download_text(filename, *size, dest))
+        .collect();
+    lines.extend(
+        skipped
+            .iter()
+            .map(|(filename, dest)| skipped_text(filename, dest)),
+    );
+    if lines.is_empty() {
         "no binaries".to_string()
     } else {
-        downloaded
-            .iter()
-            .map(|(filename, size, dest)| download_text(filename, *size, dest))
-            .collect::<Vec<_>>()
-            .join("\n")
+        lines.join("\n")
     }
+}
+
+/// The `--all` skip line: the file, and where the existing copy
+/// sits. The existing file is never read or written. The name is
+/// server-provided, so it is stripped of terminal controls before
+/// printing.
+fn skipped_text(filename: &str, output: &Path) -> String {
+    format!(
+        "skipped {} (already exists) to {}",
+        strip_terminal_controls(filename),
+        output.display()
+    )
 }
 
 /// Write downloaded bytes to the `--output` path. The file is created
 /// exclusively: an existing destination is refused instead of silently
-/// overwritten, like `remote download` and like `--all`. A write
+/// overwritten, like `remote download`. A write
 /// failure is an internal error naming the path (the download itself
 /// already succeeded, so the failure is on our side, not the
 /// server's). A failed write removes the partial file, so a retry
@@ -3292,15 +3413,53 @@ mod tests {
 
     #[test]
     fn download_all_text_names_each_file_or_nothing() {
-        assert_eq!(download_all_text(&[]), "no binaries");
+        assert_eq!(download_all_text(&[], &[]), "no binaries");
         assert_eq!(
-            download_all_text(&[
-                ("a.rpm".to_string(), 10, PathBuf::from("/tmp/d/a.rpm")),
-                ("b.rpm".to_string(), 20, PathBuf::from("/tmp/d/b.rpm")),
-            ]),
+            download_all_text(
+                &[
+                    ("a.rpm".to_string(), 10, PathBuf::from("/tmp/d/a.rpm")),
+                    ("b.rpm".to_string(), 20, PathBuf::from("/tmp/d/b.rpm")),
+                ],
+                &[]
+            ),
             "downloaded a.rpm (10 bytes) to /tmp/d/a.rpm\n".to_string()
                 + "downloaded b.rpm (20 bytes) to /tmp/d/b.rpm"
         );
+        assert_eq!(
+            download_all_text(
+                &[],
+                &[
+                    ("a.rpm".to_string(), PathBuf::from("/tmp/d/a.rpm")),
+                    ("b.rpm".to_string(), PathBuf::from("/tmp/d/b.rpm")),
+                ]
+            ),
+            "skipped a.rpm (already exists) to /tmp/d/a.rpm\n".to_string()
+                + "skipped b.rpm (already exists) to /tmp/d/b.rpm"
+        );
+        assert_eq!(
+            download_all_text(
+                &[("a.rpm".to_string(), 10, PathBuf::from("/tmp/d/a.rpm"))],
+                &[("b.rpm".to_string(), PathBuf::from("/tmp/d/b.rpm"))]
+            ),
+            "downloaded a.rpm (10 bytes) to /tmp/d/a.rpm\n".to_string()
+                + "skipped b.rpm (already exists) to /tmp/d/b.rpm"
+        );
+    }
+
+    #[test]
+    fn download_texts_strip_terminal_controls_from_server_names() {
+        let text = download_all_text(
+            &[(
+                "a\u{202e}rpm".to_string(),
+                10,
+                PathBuf::from("/tmp/d/a.rpm"),
+            )],
+            &[("b\x1b[31mrpm".to_string(), PathBuf::from("/tmp/d/b.rpm"))],
+        );
+        assert!(!text.contains('\u{202e}'));
+        assert!(!text.contains('\x1b'));
+        assert!(text.contains("downloaded arpm (10 bytes)"));
+        assert!(text.contains("skipped b[31mrpm (already exists)"));
     }
 
     #[test]
@@ -3391,6 +3550,91 @@ mod tests {
     }
 
     #[test]
+    fn partition_downloads_skips_what_exists_and_keeps_the_rest() {
+        let dir = std::env::temp_dir().join(format!(
+            "geectl-cli-build-test-{}-partition",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        std::fs::write(dir.join("_buildenv"), b"planted").unwrap();
+        let files = vec![
+            BinaryFile {
+                name: "_buildenv".to_string(),
+                size: Some(9),
+                mtime: None,
+            },
+            BinaryFile {
+                name: "a-1.0-1.x86_64.rpm".to_string(),
+                size: Some(10),
+                mtime: None,
+            },
+        ];
+        let (to_download, skipped) = partition_downloads(&files, &dir, &canonical).unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].0, "_buildenv");
+        assert_eq!(to_download.len(), 1);
+        assert_eq!(to_download[0].0.name, "a-1.0-1.x86_64.rpm");
+        // A dangling symlink counts as existing: it is skipped,
+        // never followed and never deleted.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/nonexistent-target-xyz", dir.join("link.rpm")).unwrap();
+            let files = vec![BinaryFile {
+                name: "link.rpm".to_string(),
+                size: Some(10),
+                mtime: None,
+            }];
+            let (to_download, skipped) = partition_downloads(&files, &dir, &canonical).unwrap();
+            assert!(to_download.is_empty());
+            assert_eq!(skipped.len(), 1);
+            assert_eq!(skipped[0].0, "link.rpm");
+        }
+        // An unsafe name fails the partition with nothing split.
+        let bad = vec![BinaryFile {
+            name: "../bad.rpm".to_string(),
+            size: Some(10),
+            mtime: None,
+        }];
+        assert!(partition_downloads(&bad, &dir, &canonical).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn recheck_skipped_returns_what_vanished_since_partition() {
+        let dir = std::env::temp_dir().join(format!(
+            "geectl-cli-build-test-{}-recheck",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        std::fs::write(dir.join("kept.rpm"), b"kept").unwrap();
+        std::fs::write(dir.join("gone.rpm"), b"gone").unwrap();
+        let files = vec![
+            BinaryFile {
+                name: "kept.rpm".to_string(),
+                size: Some(4),
+                mtime: None,
+            },
+            BinaryFile {
+                name: "gone.rpm".to_string(),
+                size: Some(4),
+                mtime: None,
+            },
+        ];
+        let (_, mut skipped) = partition_downloads(&files, &dir, &canonical).unwrap();
+        assert_eq!(skipped.len(), 2);
+        std::fs::remove_file(dir.join("gone.rpm")).unwrap();
+        let missing = recheck_skipped(&files, &mut skipped);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].0, "kept.rpm");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0.name, "gone.rpm");
+        assert_eq!(missing[0].1, dir.join("gone.rpm"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn download_one_file_removes_only_what_this_run_created() {
         let dir = std::env::temp_dir().join(format!(
             "geectl-cli-build-test-{}-one-file",
@@ -3452,17 +3696,36 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::NetworkError);
             assert!(dest.symlink_metadata().is_ok());
         }
+        // An AlreadyExists failure never removes: the exclusive
+        // create refused, so this run created nothing — a file a
+        // concurrent run created after the existence check is the
+        // other run's, and deleting it would turn its win into a
+        // false skip.
+        let dest = dir.join("winner.rpm");
+        let err = download_one_file(
+            |d| {
+                std::fs::write(d, b"winner").unwrap();
+                Err(GeectlError::new(ErrorKind::AlreadyExists, "exists"))
+            },
+            &dest,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"winner");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn download_all_text_keeps_u64_sizes() {
         assert_eq!(
-            download_all_text(&[(
-                "big.rpm".to_string(),
-                5_000_000_000,
-                PathBuf::from("/tmp/d/big.rpm")
-            )]),
+            download_all_text(
+                &[(
+                    "big.rpm".to_string(),
+                    5_000_000_000,
+                    PathBuf::from("/tmp/d/big.rpm")
+                )],
+                &[]
+            ),
             "downloaded big.rpm (5000000000 bytes) to /tmp/d/big.rpm"
         );
     }

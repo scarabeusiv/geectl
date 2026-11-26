@@ -13,7 +13,7 @@ Download one built file by name. With `\-\-all`, every built file
 Where to write the downloaded bytes: the file path (it must not already exist), or the directory every built file goes into with `\-\-all`
 .TP
 \fB\-\-all\fR
-Download every built file into the `\-\-output` directory; a file already there refuses the run. The downloads are sequential, not atomic: if one fails, the files already downloaded stay
+Download every built file into the `\-\-output` directory; a file already there is skipped and reported, never re\-downloaded and never deleted. The downloads are sequential, not atomic: if one fails, the files already downloaded stay
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
