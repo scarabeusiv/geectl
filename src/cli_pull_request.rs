@@ -47,7 +47,7 @@
 
 use crate::auth::{Credentials, EnvGiteaAuth, EnvObsAuth};
 use crate::config::{self, DEFAULT_GITEA_URL};
-use crate::debug::{strip_terminal_controls_marked, Debug};
+use crate::debug::{strip_terminal_controls, strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{
     parse_gitea_repo, parse_scmsync_url, validate_gitea_base, GiteaClient, GiteaMergeMethod,

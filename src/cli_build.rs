@@ -45,7 +45,7 @@
 
 use crate::auth::{alias_for_url, same_api_url, Credentials, EnvObsAuth};
 use crate::config;
-use crate::debug::{strip_terminal_controls_marked, Debug};
+use crate::debug::{strip_terminal_controls, strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{Timeout, UreqClient};
 use crate::obs::{
