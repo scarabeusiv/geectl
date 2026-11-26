@@ -2501,7 +2501,7 @@ fn payload_json<T: Serialize>(value: &T) -> Result<Value, GeectlError> {
 
 /// The `show` text: the reference first (the coordinate echo),
 /// then the fields in order — title and description only when
-/// present, the merge flags only when set, the endpoints only
+/// present, the merge flags and the merge-base only when set,
 /// when non-empty, one line per review, the labels last.
 fn render_pull_request_text(pr: &PullRequest) -> String {
     let mut lines = vec![format!("reference: {}", pr.reference)];
@@ -2524,6 +2524,12 @@ fn render_pull_request_text(pr: &PullRequest) -> String {
     }
     if let Some(mergeable) = pr.mergeable {
         lines.push(format!("mergeable: {mergeable}"));
+    }
+    if let Some(merge_base) = &pr.merge_base {
+        lines.push(format!(
+            "merge-base: {}",
+            strip_terminal_controls(merge_base)
+        ));
     }
     if let Some(text) = endpoint_text(&pr.source) {
         lines.push(format!("source: {text}"));
@@ -2777,6 +2783,7 @@ mod tests {
         assert_eq!(payload["draft"], false);
         assert_eq!(payload["merged"], false);
         assert_eq!(payload["mergeable"], true);
+        assert_eq!(payload["merge_base"], serde_json::Value::Null);
         assert!(
             payload.as_object().unwrap().contains_key("reviews_error"),
             "reviews_error must be emitted on every read"
@@ -2904,6 +2911,34 @@ mod tests {
         assert!(
             !text.contains("review 1:"),
             "no reviews must render when the fetch failed:\n{text}"
+        );
+    }
+
+    #[test]
+    fn show_text_names_the_merge_base() {
+        let mut pr = fixture_gitea_pull_request();
+        pr.merge_base = Some("0123456789abcdef0123456789abcdef01234567".to_string());
+        let text = render_pull_request_text(&pr);
+        assert!(
+            text.contains("merge-base: 0123456789abcdef0123456789abcdef01234567"),
+            "the text must name the merge base:\n{text}"
+        );
+    }
+
+    #[test]
+    fn show_text_strips_terminal_controls_from_the_merge_base() {
+        // The merge base is server text like the title: control
+        // characters must not reach the terminal through show text.
+        let mut pr = fixture_gitea_pull_request();
+        pr.merge_base = Some("0123456789abcdef\u{1b}[31m01234567".to_string());
+        let text = render_pull_request_text(&pr);
+        assert!(
+            text.contains("merge-base: 0123456789abcdef[31m01234567"),
+            "the text must name the stripped merge base:\n{text}"
+        );
+        assert!(
+            !text.contains('\u{1b}'),
+            "no escape must survive the render:\n{text}"
         );
     }
 

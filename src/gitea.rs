@@ -520,6 +520,10 @@ pub struct GiteaPullRequest {
     pub head: GiteaPullRequestRef,
     /// Where the change goes to.
     pub base: GiteaPullRequestRef,
+    /// The merge-base commit SHA: the common ancestor of the head
+    /// and base commits. `None` when the server omits it.
+    #[serde(default)]
+    pub merge_base: Option<String>,
 }
 
 /// One endpoint of a Gitea pull request: the repo, branch, and head

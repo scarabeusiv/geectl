@@ -393,6 +393,11 @@ pub struct PullRequest {
     /// The Gitea mergeable flag; `None` on OBS.
     #[serde(default)]
     pub mergeable: Option<bool>,
+    /// The Gitea merge-base SHA: the common ancestor of the head
+    /// and base commits; `None` on OBS, whose requests carry no
+    /// merge base.
+    #[serde(default)]
+    pub merge_base: Option<String>,
     /// Where the change comes from.
     #[serde(default)]
     pub source: PullRequestEndpoint,
@@ -448,6 +453,7 @@ impl PullRequest {
             draft: false,
             merged: request.state.name == RequestState::Accepted,
             mergeable: None,
+            merge_base: None,
             source,
             target,
             reviews,
@@ -487,6 +493,7 @@ impl PullRequest {
             draft: pr.draft,
             merged: pr.merged,
             mergeable: pr.mergeable,
+            merge_base: pr.merge_base.clone().filter(|s| !s.is_empty()),
             source: gitea_endpoint(&pr.head),
             target: gitea_endpoint(&pr.base),
             reviews: opinions,
@@ -1989,6 +1996,7 @@ mod tests {
             draft: false,
             merged: false,
             mergeable: None,
+            merge_base: None,
             source: endpoint("home:scarabeus_iv:patterns/patterns-base"),
             target: endpoint("openSUSE:Factory/patterns-base"),
             reviews: vec![ReviewOpinion {
@@ -2008,6 +2016,7 @@ mod tests {
         assert_eq!(json["draft"], false);
         assert_eq!(json["merged"], false);
         assert_eq!(json["mergeable"], serde_json::Value::Null);
+        assert_eq!(json["merge_base"], serde_json::Value::Null);
         assert_eq!(json["reviews"][0]["state"], "approved");
         assert!(
             json.as_object().unwrap().contains_key("reviews_error"),
@@ -2180,6 +2189,7 @@ mod tests {
         assert_eq!(pr.author, "scarabeusiv");
         assert_eq!(pr.status, PullRequestStatus::Open);
         assert_eq!(pr.mergeable, Some(true));
+        assert!(pr.merge_base.is_none());
         assert_eq!(pr.source.repository, "scarabeusiv/geectl");
         assert_eq!(pr.source.branch.as_deref(), Some("change-review-state"));
         assert_eq!(pr.target.repository, "openSUSE/geectl");
@@ -2190,6 +2200,68 @@ mod tests {
         assert_eq!(pr.reviews[0].state, OpinionState::Approved);
         assert_eq!(pr.reviews[0].comment, "Looks good.");
         assert_eq!(pr.reviews[1].state, OpinionState::Commented);
+    }
+
+    #[test]
+    fn show_gitea_carries_the_merge_base() {
+        // The wire `merge_base` is the merge base of the head and
+        // base commits: the old side of a pull-request comparison
+        // is addressed at it, never at the base tip, which moves.
+        // The fixture mirrors the packaging skill's mock PR, which
+        // serves `merge_base` as a top-level SHA.
+        let pr_json = PR_JSON.replace(
+            "\"mergeable\": true",
+            "\"mergeable\": true, \"merge_base\": \"0123456789abcdef0123456789abcdef01234567\"",
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &pr_json,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let reference = PullRequestRef::Gitea {
+            owner: "openSUSE".to_string(),
+            repo: "geectl".to_string(),
+            number: 122,
+        };
+        let pr = client.show(&reference).unwrap();
+        assert_eq!(
+            pr.merge_base.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+    }
+
+    #[test]
+    fn show_gitea_empty_merge_base_reads_as_none() {
+        // An empty wire `merge_base` normalizes to None on ingest:
+        // it renders no line and serializes as null, never "".
+        let pr_json = PR_JSON.replace(
+            "\"mergeable\": true",
+            "\"mergeable\": true, \"merge_base\": \"\"",
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &pr_json,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let reference = PullRequestRef::Gitea {
+            owner: "openSUSE".to_string(),
+            repo: "geectl".to_string(),
+            number: 122,
+        };
+        let pr = client.show(&reference).unwrap();
+        assert!(pr.merge_base.is_none());
     }
 
     #[test]

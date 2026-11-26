@@ -148,6 +148,7 @@ empty by default.
 `merged: bool` — Gitea merged flag; an accepted OBS request reads as
 merged.
 `mergeable: Option<bool>` — Gitea mergeable flag; `None` on OBS.
+`merge_base: Option<String>` — Gitea merge-base SHA, the common ancestor of the head and base commits; `None` on OBS.
 `source`, `target: PullRequestEndpoint` — `repository` (OBS
 `project/package`; Gitea `owner/repo`), `branch: Option<String>` (Gitea
 branch; `None` on OBS), `commit: Option<String>` (Gitea head and base SHA;
