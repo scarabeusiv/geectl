@@ -895,11 +895,222 @@ fn git_network(
     args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Result<String, GeectlError> {
-    let output = run_git_inner(dir, &[], subcommand, args, extra_env, git_network_timeout())?;
+    // The sharing command is owned here: the combined environment
+    // borrows it, so it outlives the git run below.
+    let multiplex = ssh_multiplex_command();
+    let env = network_git_env(extra_env, multiplex.as_deref());
+    let output = run_git_inner(dir, &[], subcommand, args, &env, git_network_timeout())?;
     if output.success {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
         Err(git_error(subcommand, &output.stderr))
+    }
+}
+
+/// Combine the caller's environment with the ssh sharing command:
+/// the caller's entries first, the sharing command last so it wins
+/// over a value the caller passed. Split out of `git_network` so
+/// the composition is testable without spawning git.
+fn network_git_env<'a>(
+    extra_env: &[(&'a str, &'a str)],
+    multiplex: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut env: Vec<(&str, &str)> = extra_env.to_vec();
+    if let Some(command) = multiplex {
+        env.push(("GIT_SSH_COMMAND", command));
+    }
+    env
+}
+
+// SSH connection sharing for the network git operations of one
+// invocation.
+//
+// One command runs several network operations against the same
+// remote — a git-backed commit fetches, then pushes — and each
+// operation spawns a fresh ssh. A key that asks for its PIN on
+// every use, with no agent caching it, asks once per operation.
+// The operations of one invocation share one ssh connection
+// instead, so the PIN is asked at most once per command.
+//
+// The sharing is ssh's own connection multiplexing: the first
+// operation opens the connection and becomes the master, later
+// operations reuse it through the control socket. The control
+// directory is per-process (`gssh-<pid>` under the temp
+// directory), so concurrent geectl runs never share a master. The
+// socket path is `<dir>/%C`, where `%C` expands to a 40-character
+// hash — when that path would exceed the socket limit the sharing
+// is skipped and the git operation runs exactly as before, never
+// failed by the sharing setup.
+//
+// The master lingers at most `PRECOMMIT_TIMEOUT_SECS` after the
+// last operation goes idle: that is the precommit gate budget,
+// the longest gap between two network operations of one command
+// (the fetch, then the gate, then the push of a commit). The
+// normal path closes the master when the command ends
+// (`close_ssh_control_masters`); the persist is only the backstop
+// for a crash or a kill.
+//
+// Unix only: the Windows ssh has no multiplexing, so there the
+// network operations run exactly as before.
+
+/// The control directory leaf: short, because the socket path must
+/// fit the unix socket limit — 104 characters on macOS, 108 on
+/// Linux. A longer leaf would push a macOS temp directory over the
+/// limit and switch the sharing off there.
+const SSH_CONTROL_DIR_LEAF_PREFIX: &str = "gssh-";
+
+/// The longest a control socket path may be: the macOS limit (104
+/// including the terminating NUL) is the tighter of the two, so 103
+/// keeps the path valid on both.
+const SSH_CONTROL_PATH_MAX: usize = 103;
+
+/// The `%C` token in a ControlPath expands to a 40-character hash
+/// of the connection parameters (local host, remote host, port,
+/// remote user).
+const SSH_CONTROL_HASH_LEN: usize = 40;
+
+/// Whether the control socket path for `dir` fits the limit: the
+/// directory, a slash, and the 40 characters `%C` expands to.
+fn ssh_control_path_fits(dir: &Path) -> bool {
+    dir.as_os_str().len() + 1 + SSH_CONTROL_HASH_LEN <= SSH_CONTROL_PATH_MAX
+}
+
+/// The per-process ssh control directory for this invocation:
+/// `<temp>/gssh-<pid>/`. `None` on non-unix and when the socket
+/// path would exceed the limit — the caller then runs without
+/// sharing.
+fn ssh_control_dir() -> Option<PathBuf> {
+    #[cfg(not(unix))]
+    return None;
+    #[cfg(unix)]
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "{SSH_CONTROL_DIR_LEAF_PREFIX}{}",
+            std::process::id()
+        ));
+        if !ssh_control_path_fits(&dir) {
+            return None;
+        }
+        Some(dir)
+    }
+}
+
+/// Build the sharing command for `dir`: the ssh invocation with
+/// the multiplexing options and the control socket under `dir`.
+/// Split out of `ssh_multiplex_command` so the value is testable
+/// without creating the directory.
+fn ssh_multiplex_command_for(dir: &Path) -> String {
+    // The ControlPath is double-quoted: the temp directory may
+    // contain spaces, and git splits GIT_SSH_COMMAND shell-style.
+    // `%C` stays literal here — ssh expands it, not the shell.
+    // Inside the quotes the shell still expands `$` and backtick,
+    // so those are backslash-escaped too, alongside quote and
+    // backslash. `!` is deliberately not escaped: a non-interactive
+    // shell performs no history expansion, and a backslash before
+    // `!` inside double quotes is preserved literally by POSIX sh,
+    // which would put a backslash into the socket path ssh sees.
+    let path = format!("{}/%C", dir.display());
+    let quote = char::from(34);
+    let backslash = char::from(92);
+    let mut quoted = String::from(quote);
+    for c in path.chars() {
+        if c == quote || c == backslash || c == '$' || c == '`' {
+            quoted.push(backslash);
+        }
+        quoted.push(c);
+    }
+    quoted.push(quote);
+    format!(
+        "ssh -o ControlMaster=auto -o ControlPath={quoted} -o ControlPersist={}",
+        PRECOMMIT_TIMEOUT_SECS
+    )
+}
+
+/// Ensure the control directory exists, private to the user, and
+/// return the `GIT_SSH_COMMAND` that shares one ssh connection
+/// across the network git operations of this invocation. `None`
+/// when sharing is unavailable (non-unix, an overlong path, or a
+/// directory that cannot be created) — the caller then runs the
+/// git operation exactly as before.
+fn ssh_multiplex_command() -> Option<String> {
+    let dir = ssh_control_dir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::create_dir_all(&dir).is_err() {
+            return None;
+        }
+        // Sharing is best-effort: a directory that cannot be made
+        // private must not carry a control socket.
+        if std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).is_err() {
+            return None;
+        }
+    }
+    Some(ssh_multiplex_command_for(&dir))
+}
+
+/// Close the ssh master connections this invocation opened and
+/// remove the control directory. Best-effort throughout: a missing
+/// ssh binary, a master that already exited, or a directory that
+/// cannot be removed is ignored — the `ControlPersist` backstop
+/// terminates any master left behind. Called once per CLI command,
+/// after the command runs.
+pub fn close_ssh_control_masters() {
+    #[cfg(not(unix))]
+    return;
+    #[cfg(unix)]
+    {
+        if let Some(dir) = ssh_control_dir() {
+            close_ssh_control_masters_in(&dir);
+        }
+    }
+}
+
+/// Close the masters behind the sockets in `dir` and remove it.
+/// Split out of `close_ssh_control_masters` so the removal is
+/// testable on a directory the test owns.
+#[cfg(unix)]
+fn close_ssh_control_masters_in(dir: &Path) {
+    // Each socket is one master (one host, one user, one port):
+    // tell it to exit, then drop the directory. A literal
+    // ControlPath makes the host argument irrelevant — ssh
+    // connects to the socket named, not to the host.
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let _ = run_ssh_control_exit(&entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Tell the master behind `socket` to exit, waiting at most a few
+/// seconds: the close runs at the end of the command and must not
+/// hold the exit up on a stuck ssh. Every failure is ignored by
+/// the caller.
+#[cfg(unix)]
+fn run_ssh_control_exit(socket: &Path) -> std::io::Result<()> {
+    let mut child = Command::new("ssh")
+        .arg("-O")
+        .arg("exit")
+        .arg("-o")
+        .arg(format!("ControlPath={}", socket.display()))
+        .arg("geectl-control")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait()? {
+            Some(_) => return Ok(()),
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 }
 
@@ -10254,6 +10465,118 @@ mod tests {
             env[2],
             ("GIT_CONFIG_VALUE_0", "Authorization: token SECRET")
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ssh_control_dir_is_per_process() {
+        let dir = ssh_control_dir().expect("sharing is available on unix");
+        assert_eq!(
+            dir.file_name().unwrap().to_string_lossy(),
+            format!("gssh-{}", std::process::id())
+        );
+        assert!(ssh_control_path_fits(&dir));
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn ssh_sharing_is_unix_only() {
+        assert!(ssh_control_dir().is_none());
+        assert!(ssh_multiplex_command().is_none());
+    }
+
+    #[test]
+    fn ssh_control_path_fits_refuses_an_overlong_directory() {
+        let long = PathBuf::from("x".repeat(200));
+        assert!(!ssh_control_path_fits(&long));
+        let short = PathBuf::from("/tmp");
+        assert!(ssh_control_path_fits(&short));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ssh_multiplex_command_shares_one_connection() {
+        use std::os::unix::fs::PermissionsExt;
+        let command = ssh_multiplex_command().expect("sharing is available on unix");
+        let quote = char::from(34);
+        assert!(command.contains("ControlMaster=auto"), "{command}");
+        assert!(
+            command.contains(&format!("ControlPath={quote}")),
+            "{command}"
+        );
+        assert!(command.contains(&format!("%C{quote}")), "{command}");
+        assert!(
+            command.contains(&format!("ControlPersist={PRECOMMIT_TIMEOUT_SECS}")),
+            "{command}"
+        );
+        // The directory exists now, private to the user.
+        let dir = ssh_control_dir().expect("sharing is available on unix");
+        assert!(dir.is_dir());
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // The close is cleanup here, not an assertion: another
+        // test thread may recreate the directory right after.
+        close_ssh_control_masters();
+    }
+
+    #[test]
+    fn ssh_multiplex_command_for_quotes_a_path_with_spaces() {
+        let dir = PathBuf::from("/tmp/a dir/with spaces");
+        let command = ssh_multiplex_command_for(&dir);
+        let quote = char::from(34);
+        assert_eq!(
+            command,
+            format!(
+                "ssh -o ControlMaster=auto -o ControlPath={quote}/tmp/a dir/with spaces/%C{quote} -o ControlPersist={PRECOMMIT_TIMEOUT_SECS}"
+            )
+        );
+    }
+
+    #[test]
+    fn ssh_multiplex_command_for_escapes_shell_expansion_in_the_path() {
+        // A temp directory carrying `$(...)`, a backtick, a quote or
+        // a backslash must reach ssh verbatim: inside the double
+        // quotes the shell would otherwise expand `$(...)` and
+        // backticks, or run a command. `!` passes through
+        // unescaped: no history expansion happens in a
+        // non-interactive shell, and a backslash before `!` inside
+        // double quotes is literal under POSIX sh.
+        let dir = PathBuf::from("/tmp/$(echo pwned)`id`\"a\\b!c");
+        let command = ssh_multiplex_command_for(&dir);
+        let quote = char::from(34);
+        assert_eq!(
+            command,
+            format!(
+                "ssh -o ControlMaster=auto -o ControlPath={quote}/tmp/\\$(echo pwned)\\`id\\`\\\"a\\\\b!c/%C{quote} -o ControlPersist={PRECOMMIT_TIMEOUT_SECS}"
+            )
+        );
+    }
+
+    #[test]
+    fn network_git_env_appends_the_sharing_command_last() {
+        let caller = [("GIT_ALLOW_PROTOCOL", "http:https")];
+        let env = network_git_env(&caller, Some("ssh -o ControlMaster=auto"));
+        assert_eq!(env[0], ("GIT_ALLOW_PROTOCOL", "http:https"));
+        assert_eq!(env[1], ("GIT_SSH_COMMAND", "ssh -o ControlMaster=auto"));
+        let env = network_git_env(&caller, None);
+        assert_eq!(env, caller);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn close_ssh_control_masters_in_removes_the_directory() {
+        let dir = TempDirGuard::new("ssh-close");
+        std::fs::write(dir.path.join("dead-socket"), b"").unwrap();
+        close_ssh_control_masters_in(&dir.path);
+        assert!(!dir.path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn close_ssh_control_masters_is_a_noop_without_a_directory() {
+        // No network operation ran, or the directory was already
+        // closed: either way the close is a no-op, never an error.
+        close_ssh_control_masters();
     }
 
     /// A one-shot HTTP server on 127.0.0.1 that records the

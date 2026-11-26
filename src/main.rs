@@ -828,7 +828,7 @@ fn real_main() -> ExitCode {
             return ExitCode::from(err.exit_code() as u8);
         }
     };
-    match run(cli, &debug, format, format_source) {
+    let code = match run(cli, &debug, format, format_source) {
         Ok(payload) => match write_payload(&payload) {
             Ok(()) => ExitCode::from(0),
             Err(err) => {
@@ -840,7 +840,11 @@ fn real_main() -> ExitCode {
             write_error(&err, format);
             ExitCode::from(err.exit_code() as u8)
         }
-    }
+    };
+    // The ssh masters a command's git operations shared are closed
+    // here, after the command ran and before the process exits.
+    geectl::working_copy::close_ssh_control_masters();
+    code
 }
 
 #[cfg(test)]
