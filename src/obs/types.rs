@@ -1112,6 +1112,10 @@ pub struct CreateTokenOptions {
     /// A description identifying the token, at most 64 characters.
     /// The server's `description`.
     pub description: Option<String>,
+    /// The SCM personal access token OBS uses to talk to the SCM on
+    /// the user's behalf. The server's `scm_token`; meaningful only
+    /// for workflow tokens.
+    pub scm_token: Option<String>,
 }
 
 /// A token just created by [`ObsClient::create_token`]: the id and

@@ -78,7 +78,10 @@
 //! truncated message).
 //! The JSON payload remains the complete record in every case.
 
-use crate::auth::{Credentials, EnvObsAuth};
+use crate::auth::{
+    read_secret_file_production, resolve_scm_token, snapshot_env, Credentials, EnvObsAuth,
+    FileReader, VarLookup, SCM_TOKEN_FILE_VAR, SCM_TOKEN_VAR,
+};
 use crate::config;
 use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::{ErrorKind, GeectlError};
@@ -629,6 +632,14 @@ pub enum RemoteCommand {
         /// A description identifying the token, at most 64 characters.
         #[arg(long)]
         description: Option<String>,
+        /// The SCM personal access token OBS uses to talk to the SCM
+        /// on the user's behalf. Workflow tokens only. The flag wins
+        /// over the environment; without it, `GEECTL_SCM_TOKEN` (or
+        /// `GEECTL_SCM_TOKEN_FILE`, a file whose whole content is the
+        /// token) supplies it, so the secret stays out of `ps` and
+        /// shell history.
+        #[arg(long)]
+        scm_token: Option<String>,
     },
     /// Delete a package. A mutation: dry-run is the default (only
     /// the plan is printed); `--live` performs the deletion.
@@ -1672,12 +1683,22 @@ pub fn run_remote(
             project,
             package,
             description,
+            scm_token,
         } => {
+            let scm_token = {
+                let env = snapshot_env(&[SCM_TOKEN_VAR, SCM_TOKEN_FILE_VAR])?;
+                effective_scm_token(
+                    scm_token,
+                    &|name| env.get(name).cloned(),
+                    &read_secret_file_production,
+                )?
+            };
             let options = CreateTokenOptions {
                 operation,
                 project,
                 package,
                 description: description.filter(|d| !d.is_empty()),
+                scm_token,
             };
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
             let created = client.create_token(&options, &dry_run)?;
@@ -2253,6 +2274,23 @@ fn create_package_result(
         dry_run,
         plan,
     )
+}
+
+/// The effective SCM token for a token creation: the `--scm-token`
+/// flag wins over the environment; without the flag,
+/// `GEECTL_SCM_TOKEN` (or `GEECTL_SCM_TOKEN_FILE`) supplies it.
+/// Both environment sources set is a configuration error (see
+/// [`resolve_scm_token`]); the flag is never combined with them, it
+/// replaces them.
+fn effective_scm_token(
+    flag: Option<String>,
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Option<String>, GeectlError> {
+    match flag {
+        Some(flag) => Ok(Some(flag)),
+        None => resolve_scm_token(vars, read_file),
+    }
 }
 
 /// The `create-token` result: the payload carries the operation,
@@ -5093,6 +5131,7 @@ mod tests {
                 project: Some(project),
                 package: Some(package),
                 description: Some(description),
+                scm_token: None,
             } if project == "test:factory" && package == "test-pkgA" && description == "nightly rebuild"
         ));
         let parsed = parse(&[
@@ -5109,7 +5148,27 @@ mod tests {
                 project: None,
                 package: None,
                 description: None,
+                scm_token: None,
             }
+        ));
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "create-token",
+            "--operation",
+            "workflow",
+            "--scm-token",
+            "ghp_scm_pat",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::CreateToken {
+                operation: TokenOperation::Workflow,
+                project: None,
+                package: None,
+                description: None,
+                scm_token: Some(token),
+            } if token == "ghp_scm_pat"
         ));
         assert!(
             Cli::try_parse_from(["geectl", "remote", "create-token", "--operation", "bogus"])
@@ -5165,6 +5224,102 @@ mod tests {
     }
 
     #[test]
+    fn create_token_result_omits_scm_token_from_payload_and_text() {
+        let created = CreatedToken {
+            id: 9,
+            token: "s3cr3t-token".to_string(),
+            operation: TokenOperation::Workflow,
+            project: None,
+            package: None,
+            description: None,
+        };
+        let options = CreateTokenOptions {
+            operation: TokenOperation::Workflow,
+            scm_token: Some("ghp_scm_pat".to_string()),
+            ..CreateTokenOptions::default()
+        };
+        let (payload, text) = create_token_result(&options, Some(&created), false, None);
+        assert_eq!(payload.get("scm_token"), None);
+        assert!(!text.contains("ghp_scm_pat"));
+        assert_eq!(payload["operation"], "workflow");
+    }
+
+    fn scm_lookup(
+        map: &std::collections::HashMap<String, String>,
+    ) -> impl Fn(&str) -> Option<String> + '_ {
+        move |name| map.get(name).cloned()
+    }
+
+    fn scm_reader(
+        map: &std::collections::HashMap<std::path::PathBuf, String>,
+    ) -> impl Fn(&std::path::Path) -> std::io::Result<String> + '_ {
+        move |path| {
+            map.get(path)
+                .cloned()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))
+        }
+    }
+
+    #[test]
+    fn effective_scm_token_flag_wins_over_env() {
+        let map =
+            std::collections::HashMap::from([(SCM_TOKEN_VAR.to_string(), "env-pat".to_string())]);
+        let files = std::collections::HashMap::new();
+        let token = effective_scm_token(
+            Some("flag-pat".to_string()),
+            &scm_lookup(&map),
+            &scm_reader(&files),
+        )
+        .unwrap();
+        assert_eq!(token.as_deref(), Some("flag-pat"));
+    }
+
+    #[test]
+    fn effective_scm_token_env_var_supplies_it() {
+        let map =
+            std::collections::HashMap::from([(SCM_TOKEN_VAR.to_string(), "env-pat".to_string())]);
+        let files = std::collections::HashMap::new();
+        let token = effective_scm_token(None, &scm_lookup(&map), &scm_reader(&files)).unwrap();
+        assert_eq!(token.as_deref(), Some("env-pat"));
+    }
+
+    #[test]
+    fn effective_scm_token_file_var_supplies_it() {
+        let map = std::collections::HashMap::from([(
+            SCM_TOKEN_FILE_VAR.to_string(),
+            "/run/secrets/scm-token".to_string(),
+        )]);
+        let files = std::collections::HashMap::from([(
+            std::path::PathBuf::from("/run/secrets/scm-token"),
+            "file-pat\n".to_string(),
+        )]);
+        let token = effective_scm_token(None, &scm_lookup(&map), &scm_reader(&files)).unwrap();
+        assert_eq!(token.as_deref(), Some("file-pat"));
+    }
+
+    #[test]
+    fn effective_scm_token_both_env_sources_is_config_error() {
+        let map = std::collections::HashMap::from([
+            (SCM_TOKEN_VAR.to_string(), "env-pat".to_string()),
+            (
+                SCM_TOKEN_FILE_VAR.to_string(),
+                "/run/secrets/scm-token".to_string(),
+            ),
+        ]);
+        let files = std::collections::HashMap::new();
+        let err = effective_scm_token(None, &scm_lookup(&map), &scm_reader(&files)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+    }
+
+    #[test]
+    fn effective_scm_token_unconfigured_is_none() {
+        let map = std::collections::HashMap::new();
+        let files = std::collections::HashMap::new();
+        let token = effective_scm_token(None, &scm_lookup(&map), &scm_reader(&files)).unwrap();
+        assert_eq!(token, None);
+    }
+
+    #[test]
     fn create_token_result_carries_id_and_secret_in_both_formats() {
         let created = CreatedToken {
             id: 1,
@@ -5179,6 +5334,7 @@ mod tests {
             project: Some("test:factory".to_string()),
             package: Some("test-pkgA".to_string()),
             description: Some("nightly rebuild".to_string()),
+            scm_token: None,
         };
         let (payload, text) = create_token_result(&options, Some(&created), false, None);
         assert_eq!(payload["operation"], "rebuild");

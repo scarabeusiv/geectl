@@ -1704,9 +1704,10 @@ impl UreqClient {
 }
 
 /// Strip any userinfo (`user:pass@`) from a URL before it is used in an
-/// error context. A URL with embedded credentials must never leak into
-/// an error message, a log, or stdout — the context names the resource,
-/// not the credential.
+/// error context, and redact the values of credential-named query
+/// parameters (`scm_token`, `token`, ...). A URL with embedded
+/// credentials must never leak into an error message, a log, or
+/// stdout — the context names the resource, not the credential.
 ///
 /// Public so the live-test harness strips userinfo the same way before
 /// printing a URL.
@@ -1725,12 +1726,45 @@ pub fn sanitize_url_for_error(url: &str) -> String {
     // password may itself contain `@` (e.g. user:p@ss@host), so
     // stripping at the first `@` would leave part of the password in
     // the sanitized URL.
-    let Some(at) = rest[..authority_end].rfind('@') else {
+    let stripped = match rest[..authority_end].rfind('@') {
+        Some(at) => {
+            let mut out = String::with_capacity(url.len());
+            out.push_str(&url[..after_scheme]);
+            out.push_str(&rest[at + 1..]);
+            out
+        }
+        None => url.to_string(),
+    };
+    redact_credential_query_values(&stripped)
+}
+
+/// Redact the values of credential-named query parameters: the query
+/// is part of the URL the debug channel and error messages print, so
+/// a secret carried as a query value (the create-token `scm_token`)
+/// must read `[redacted]` there, never the value. Non-credential
+/// parameters pass through unchanged.
+fn redact_credential_query_values(url: &str) -> String {
+    let Some(query_start) = url.find('?') else {
         return url.to_string();
     };
+    let (head, query) = url.split_at(query_start + 1);
+    let query_end = query.find('#').unwrap_or(query.len());
+    let (query, tail) = query.split_at(query_end);
     let mut out = String::with_capacity(url.len());
-    out.push_str(&url[..after_scheme]);
-    out.push_str(&rest[at + 1..]);
+    out.push_str(head);
+    for (index, pair) in query.split('&').enumerate() {
+        if index > 0 {
+            out.push('&');
+        }
+        match pair.split_once('=') {
+            Some((name, _)) if crate::debug::is_credential_name(name) => {
+                out.push_str(name);
+                out.push_str("=[redacted]");
+            }
+            _ => out.push_str(pair),
+        }
+    }
+    out.push_str(tail);
     out
 }
 
@@ -2538,6 +2572,29 @@ mod tests {
         assert_eq!(
             sanitize_url_for_error("https://user:secret@example.com/path?x=@y"),
             "https://example.com/path?x=@y"
+        );
+    }
+
+    #[test]
+    fn credential_query_values_are_redacted() {
+        // A secret carried as a query value (the create-token
+        // `scm_token`) must read `[redacted]` in the sanitized URL
+        // the debug channel and error messages print — never the
+        // value. Non-credential parameters pass through unchanged,
+        // and redaction is by parameter name, never by value.
+        assert_eq!(
+            sanitize_url_for_error("https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=workflow&scm_token=ghp_scm_pat"),
+            "https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=workflow&scm_token=[redacted]"
+        );
+        assert_eq!(
+            sanitize_url_for_error(
+                "https://user:secret@example.com/path?scm_token=ghp_scm_pat&x=1"
+            ),
+            "https://example.com/path?scm_token=[redacted]&x=1"
+        );
+        assert_eq!(
+            sanitize_url_for_error("https://example.com/search?q=token"),
+            "https://example.com/search?q=token"
         );
     }
 

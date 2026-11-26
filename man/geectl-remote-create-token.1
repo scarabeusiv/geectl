@@ -4,7 +4,7 @@
 .SH NAME
 geectl\-remote\-create\-token \- Create an operation\-scoped trigger token for the authenticated user. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the creation. The secret prints once, at creation: store it now. Project and package go together: give both to scope the token to a package, or neither for a global token
 .SH SYNOPSIS
-\fBgeectl remote create\-token\fR [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-operation\fR> 
+\fBgeectl remote create\-token\fR [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-\-description\fR] [\fB\-\-scm\-token\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-operation\fR> 
 .SH DESCRIPTION
 Create an operation\-scoped trigger token for the authenticated user. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the creation. The secret prints once, at creation: store it now. Project and package go together: give both to scope the token to a package, or neither for a global token
 .SH OPTIONS
@@ -34,6 +34,9 @@ The package the token is scoped to
 .TP
 \fB\-\-description\fR \fI<DESCRIPTION>\fR
 A description identifying the token, at most 64 characters
+.TP
+\fB\-\-scm\-token\fR \fI<SCM_TOKEN>\fR
+The SCM personal access token OBS uses to talk to the SCM on the user\*(Aqs behalf. Workflow tokens only. The flag wins over the environment; without it, `GEECTL_SCM_TOKEN` (or `GEECTL_SCM_TOKEN_FILE`, a file whose whole content is the token) supplies it, so the secret stays out of `ps` and shell history
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

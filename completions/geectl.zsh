@@ -607,6 +607,7 @@ workflow\:"Run SCM/CI workflows\: the \`workflow\` trigger"))' \
 '--project=[The project of the package the token is scoped to]:PROJECT:_default' \
 '--package=[The package the token is scoped to]:PACKAGE:_default' \
 '--description=[A description identifying the token, at most 64 characters]:DESCRIPTION:_default' \
+'--scm-token=[The SCM personal access token OBS uses to talk to the SCM on the user'\''s behalf. Workflow tokens only. The flag wins over the environment; without it, \`GEECTL_SCM_TOKEN\` (or \`GEECTL_SCM_TOKEN_FILE\`, a file whose whole content is the token) supplies it, so the secret stays out of \`ps\` and shell history]:SCM_TOKEN:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \

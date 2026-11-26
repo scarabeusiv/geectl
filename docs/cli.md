@@ -174,7 +174,7 @@ directory's `.env` only.
 - `geectl remote upload-file --from <FROM> <PROJECT> <PACKAGE> <FILE>` — Upload a file into a package; key flags: --binary
 - `geectl remote create-project --title <TITLE> --description <DESCRIPTION> <PROJECT>` — Create a project.
 - `geectl remote create-package --title <TITLE> --description <DESCRIPTION> <PROJECT> <PACKAGE>` — Create a package; key flags: --scmsync <SCMSYNC>, --force
-- `geectl remote create-token --operation <OPERATION>` — Create an operation-scoped trigger token for the authenticated user; key flags: --project <PROJECT>, --package <PACKAGE>, --description <DESCRIPTION>
+- `geectl remote create-token --operation <OPERATION>` — Create an operation-scoped trigger token for the authenticated user; key flags: --project <PROJECT>, --package <PACKAGE>, --description <DESCRIPTION>, --scm-token <TOKEN>; without --scm-token the SCM token comes from GEECTL_SCM_TOKEN (or GEECTL_SCM_TOKEN_FILE), which keeps it out of ps and shell history
 - `geectl remote delete-package <PROJECT> <PACKAGE>` — Delete a package; key flags: --force, --message <MESSAGE>
 - `geectl remote delete-link <PROJECT> <PACKAGE>` — Delete a `_link` file from a package.
 - `geectl remote delete-file <PROJECT> <PACKAGE> <FILE>` — Delete a file from a package.

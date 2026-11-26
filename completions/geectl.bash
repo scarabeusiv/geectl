@@ -8220,7 +8220,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__remote__subcmd__create__subcmd__token)
-            opts="-h --operation --project --package --description --format --debug --debug-body --live --help"
+            opts="-h --operation --project --package --description --scm-token --format --debug --debug-body --live --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -8239,6 +8239,10 @@ _geectl() {
                     return 0
                     ;;
                 --description)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --scm-token)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

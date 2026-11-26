@@ -130,6 +130,26 @@ pub fn validate_bearer_token(token: &str) -> Result<String, GeectlError> {
     Ok(token.to_string())
 }
 
+/// Validate an SCM personal access token: surrounding whitespace is
+/// trimmed (a paste artifact, not part of the token); what remains
+/// must be non-empty and free of control characters.
+fn validate_scm_token(token: &str) -> Result<String, GeectlError> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "SCM token is empty or whitespace-only",
+        ));
+    }
+    if has_control_chars(token) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "SCM token contains control characters",
+        ));
+    }
+    Ok(token.to_string())
+}
+
 /// Validate a Basic username: non-empty, no control characters, no
 /// `:` — RFC 7617 reserves the colon as the separator between user-id
 /// and password, so one in the username would corrupt the credential.
@@ -213,6 +233,14 @@ pub const GITEA_TOKEN_VAR: &str = "GEECTL_GITEA_TOKEN";
 /// is the Gitea API token. Set exactly one of this and
 /// [`GITEA_TOKEN_VAR`].
 pub const GITEA_TOKEN_FILE_VAR: &str = "GEECTL_GITEA_TOKEN_FILE";
+/// Environment variable holding the SCM personal access token for
+/// `remote create-token --operation workflow`. Set exactly one of
+/// this and [`SCM_TOKEN_FILE_VAR`].
+pub const SCM_TOKEN_VAR: &str = "GEECTL_SCM_TOKEN";
+/// Environment variable holding the path to a file whose whole
+/// content is the SCM personal access token. Set exactly one of
+/// this and [`SCM_TOKEN_VAR`].
+pub const SCM_TOKEN_FILE_VAR: &str = "GEECTL_SCM_TOKEN_FILE";
 /// Environment variable holding the path to the Gitea SSH private key,
 /// for git operations.
 pub const GITEA_SSH_KEY_VAR: &str = "GEECTL_GITEA_SSH_KEY";
@@ -961,6 +989,51 @@ fn resolve_gitea_bearer_with(
             };
             let token = validate_bearer_token(&token).map_err(|e| config_error(token_source, e))?;
             Ok(Credentials::Bearer { token })
+        }
+    }
+}
+
+/// Resolve the SCM personal access token from the environment.
+///
+/// Sources (at most one): `GEECTL_SCM_TOKEN`, or
+/// `GEECTL_SCM_TOKEN_FILE` (a file whose whole content is the
+/// token). Returns `None` when neither is set. Both set is a
+/// `ConfigError`: the source must be unambiguous. A malformed value
+/// fails here, as `ConfigError` naming the variable, instead of at
+/// the first request.
+pub fn resolve_scm_token(
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Option<String>, GeectlError> {
+    let token = vars(SCM_TOKEN_VAR);
+    let token_file = vars(SCM_TOKEN_FILE_VAR);
+    if token.is_some() && token_file.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("both {SCM_TOKEN_VAR} and {SCM_TOKEN_FILE_VAR} are set; set exactly one"),
+        ));
+    }
+    let token_from_file = token_file.is_some();
+    let token = if let Some(token) = token {
+        Some(token)
+    } else if let Some(file) = token_file {
+        Some(read_secret_file(Path::new(&file), read_file)?)
+    } else {
+        None
+    };
+    match token {
+        None => Ok(None),
+        Some(token) => {
+            // The failure names its own source: a bad token must not
+            // be attributed to the env variable when it came from
+            // the file (or vice versa).
+            let token_source = if token_from_file {
+                SCM_TOKEN_FILE_VAR
+            } else {
+                SCM_TOKEN_VAR
+            };
+            let token = validate_scm_token(&token).map_err(|e| config_error(token_source, e))?;
+            Ok(Some(token))
         }
     }
 }
@@ -2157,6 +2230,55 @@ mod tests {
     fn gitea_bearer_unreadable_token_file_is_config_error() {
         let map = vars(&[(GITEA_TOKEN_FILE_VAR, "/run/secrets/missing")]);
         let err = resolve_gitea_bearer(&lookup(&map), &reader(&empty_files())).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("/run/secrets/missing"));
+    }
+
+    #[test]
+    fn scm_token_resolves_from_env() {
+        let map = vars(&[(SCM_TOKEN_VAR, "ghp_scm_pat")]);
+        let token = resolve_scm_token(&lookup(&map), &reader(&empty_files())).unwrap();
+        assert_eq!(token.as_deref(), Some("ghp_scm_pat"));
+    }
+
+    #[test]
+    fn scm_token_resolves_from_file_and_trims_newline() {
+        let map = vars(&[(SCM_TOKEN_FILE_VAR, "/run/secrets/scm-token")]);
+        let files = files(&[("/run/secrets/scm-token", "ghp_file_pat\r\n")]);
+        let token = resolve_scm_token(&lookup(&map), &reader(&files)).unwrap();
+        assert_eq!(token.as_deref(), Some("ghp_file_pat"));
+    }
+
+    #[test]
+    fn scm_token_unconfigured_is_none() {
+        let map = vars(&[]);
+        let token = resolve_scm_token(&lookup(&map), &reader(&empty_files())).unwrap();
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn scm_token_both_sources_is_config_error() {
+        let map = vars(&[
+            (SCM_TOKEN_VAR, "a"),
+            (SCM_TOKEN_FILE_VAR, "/run/secrets/scm-token"),
+        ]);
+        let err = resolve_scm_token(&lookup(&map), &reader(&empty_files())).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains(SCM_TOKEN_VAR));
+    }
+
+    #[test]
+    fn scm_token_whitespace_only_is_config_error() {
+        let map = vars(&[(SCM_TOKEN_VAR, "   ")]);
+        let err = resolve_scm_token(&lookup(&map), &reader(&empty_files())).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains(SCM_TOKEN_VAR));
+    }
+
+    #[test]
+    fn scm_token_unreadable_file_is_config_error() {
+        let map = vars(&[(SCM_TOKEN_FILE_VAR, "/run/secrets/missing")]);
+        let err = resolve_scm_token(&lookup(&map), &reader(&empty_files())).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(err.context.contains("/run/secrets/missing"));
     }

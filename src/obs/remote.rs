@@ -304,9 +304,9 @@ fn create_package_option_suffix(options: &CreatePackageOptions) -> String {
 }
 
 /// The dry-run plan line for a token creation: the operation,
-/// the scoped package when there is one, and the description when
-/// there is one, so a dry-run plan reads what the creation would
-/// have done.
+/// the scoped package when there is one, the description when there
+/// is one, and whether an SCM token rides along — never the value —
+/// so a dry-run plan reads what the creation would have done.
 fn create_token_plan(options: &CreateTokenOptions) -> String {
     let mut plan = format!("create {} token", options.operation.as_str());
     if let (Some(project), Some(package)) = (&options.project, &options.package) {
@@ -314,6 +314,13 @@ fn create_token_plan(options: &CreateTokenOptions) -> String {
     }
     if let Some(description) = options.description.as_deref().filter(|d| !d.is_empty()) {
         plan.push_str(&format!(" (description: {description})"));
+    }
+    if options
+        .scm_token
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty())
+    {
+        plan.push_str(" (with SCM token)");
     }
     plan
 }
@@ -5326,7 +5333,10 @@ impl<'a> ObsClient<'a> {
     /// project is refused, and a project without a package is refused
     /// too: the server would silently drop a lone project and create
     /// a global token. The description is at most 64 characters,
-    /// like the server's validation.
+    /// like the server's validation. An SCM token only applies to
+    /// workflow tokens: any other operation is refused, since no other
+    /// token type reads the value — passing it would look like it
+    /// worked and do nothing. An empty SCM token is refused too.
     pub fn create_token(
         &self,
         options: &CreateTokenOptions,
@@ -5360,6 +5370,23 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
+        let scm_token = options
+            .scm_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        if options.scm_token.is_some() && scm_token.is_none() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "an SCM token must not be empty or whitespace-only".to_string(),
+            ));
+        }
+        if scm_token.is_some() && options.operation != super::TokenOperation::Workflow {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "an SCM token only applies to workflow tokens: --operation workflow".to_string(),
+            ));
+        }
         if !dry_run.allow(&create_token_plan(options)) {
             return Ok(None);
         }
@@ -5385,6 +5412,9 @@ impl<'a> ObsClient<'a> {
         }
         if let Some(description) = description {
             query.push(("description", description));
+        }
+        if let Some(scm_token) = scm_token {
+            query.push(("scm_token", scm_token));
         }
         let url = build_url(&self.base, &["person", login, "token"], &query);
         let body = self.http.post(&url, "", &self.credentials)?;
@@ -7404,6 +7434,7 @@ mod tests {
             project: Some("test:factory".to_string()),
             package: Some("test-pkgA".to_string()),
             description: Some("nightly rebuild".to_string()),
+            scm_token: None,
         };
         let created = client.create_token(&options, &DryRun::new(false)).unwrap();
         assert_eq!(
@@ -7447,6 +7478,119 @@ mod tests {
             })
         );
         assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn create_token_workflow_with_scm_token_posts_it() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=workflow&scm_token=ghp_scm_pat",
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"token\">s3cr3t-token</data><data name=\"id\">9</data></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = CreateTokenOptions {
+            operation: TokenOperation::Workflow,
+            scm_token: Some("ghp_scm_pat".to_string()),
+            ..CreateTokenOptions::default()
+        };
+        let created = client.create_token(&options, &DryRun::new(false)).unwrap();
+        assert_eq!(
+            created,
+            Some(CreatedToken {
+                id: 9,
+                token: "s3cr3t-token".to_string(),
+                operation: TokenOperation::Workflow,
+                project: None,
+                package: None,
+                description: None,
+            })
+        );
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn create_token_scm_token_refused_for_non_workflow() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .create_token(
+                &CreateTokenOptions {
+                    operation: TokenOperation::Rebuild,
+                    scm_token: Some("ghp_scm_pat".to_string()),
+                    ..CreateTokenOptions::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn create_token_empty_scm_token_refused() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .create_token(
+                &CreateTokenOptions {
+                    operation: TokenOperation::Workflow,
+                    scm_token: Some(String::new()),
+                    ..CreateTokenOptions::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn create_token_whitespace_only_scm_token_refused() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .create_token(
+                &CreateTokenOptions {
+                    operation: TokenOperation::Workflow,
+                    scm_token: Some("  \t ".to_string()),
+                    ..CreateTokenOptions::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn create_token_scm_token_trimmed_before_post() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=workflow&scm_token=ghp_scm_pat",
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"token\">s3cr3t-token</data><data name=\"id\">9</data></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let created = client
+            .create_token(
+                &CreateTokenOptions {
+                    operation: TokenOperation::Workflow,
+                    scm_token: Some("  ghp_scm_pat\t".to_string()),
+                    ..CreateTokenOptions::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap();
+        assert!(created.is_some());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn create_token_plan_names_scm_token_without_the_value() {
+        let plan = create_token_plan(&CreateTokenOptions {
+            operation: TokenOperation::Workflow,
+            scm_token: Some("ghp_scm_pat".to_string()),
+            ..CreateTokenOptions::default()
+        });
+        assert_eq!(plan, "create workflow token (with SCM token)");
+        assert!(!plan.contains("ghp_scm_pat"));
     }
 
     #[test]
@@ -7647,6 +7791,7 @@ mod tests {
             project: Some("test:factory".to_string()),
             package: Some("test-pkgA".to_string()),
             description: Some("nightly rebuild".to_string()),
+            scm_token: None,
         };
         assert_eq!(client.create_token(&options, &dry_run).unwrap(), None);
         assert_eq!(

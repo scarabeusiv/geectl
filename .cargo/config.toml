@@ -1,0 +1,11 @@
+# Test threads need a bigger stack than Rust's 2 MiB default: building the
+# full CLI command tree (`Cli::command()`, 164 leaves) in a debug build
+# needs ~2 MiB of stack for one call (measured with a temporary probe),
+# so a debug `cargo test` overflows its test thread on Windows
+# (STATUS_STACK_OVERFLOW in the `cli_remote` parse tests) and sits ~60 KiB
+# from the limit on macOS. The release build needs ~256 KiB for the same
+# call, so the shipped binary is unaffected. 8388608 bytes (8 MiB) gives the suite headroom
+# as the tree grows; it applies to every `cargo` invocation in this tree,
+# local runs included.
+[env]
+RUST_MIN_STACK = "8388608"

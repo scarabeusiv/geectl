@@ -240,7 +240,7 @@ fn is_authorization_name(name: &str) -> bool {
     normalize_name(name).contains("authorization")
 }
 
-fn is_credential_name(name: &str) -> bool {
+pub(crate) fn is_credential_name(name: &str) -> bool {
     let normalized = normalize_name(name);
     [
         "user",
