@@ -83,7 +83,7 @@ use crate::auth::{
     FileReader, VarLookup, SCM_TOKEN_FILE_VAR, SCM_TOKEN_VAR,
 };
 use crate::config;
-use crate::debug::{strip_terminal_controls, Debug};
+use crate::debug::{strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{Timeout, UreqClient};
 use crate::obs::{
@@ -3712,13 +3712,18 @@ fn render_maintainers(maintainers: &[NamedRole]) -> String {
     if maintainers.is_empty() {
         return "no maintainers".to_string();
     }
+    // The name and email are stripped at the render, leaving a
+    // marker where characters were removed.
     let rows: Vec<Vec<String>> = maintainers
         .iter()
         .map(|role| {
             vec![
-                role.name.clone(),
+                strip_terminal_controls_marked(&role.name),
                 role.role.clone(),
-                role.email.clone().unwrap_or_default(),
+                role.email
+                    .as_deref()
+                    .map(strip_terminal_controls_marked)
+                    .unwrap_or_default(),
             ]
         })
         .collect();
@@ -4166,21 +4171,30 @@ fn render_file_patch_sections(files: &[FilePatch]) -> String {
 }
 
 fn render_named_roles(label: &str, roles: &[NamedRole]) -> Vec<String> {
+    // The name is stripped at the render, leaving a marker where
+    // characters were removed — meta roles round-trip to the server,
+    // so the parse keeps the name verbatim.
     roles
         .iter()
-        .map(|role| format!("{label} {} ({})", role.name, role.role))
+        .map(|role| {
+            format!(
+                "{label} {} ({})",
+                strip_terminal_controls_marked(&role.name),
+                role.role
+            )
+        })
         .collect()
 }
 
 fn render_project_meta(meta: &ProjectMeta) -> String {
     let mut lines = vec![format!("name: {}", meta.name)];
     if let Some(title) = &meta.title {
-        lines.push(format!("title: {}", strip_terminal_controls(title)));
+        lines.push(format!("title: {}", strip_terminal_controls_marked(title)));
     }
     if let Some(description) = &meta.description {
         lines.push(format!(
             "description: {}",
-            strip_terminal_controls(description)
+            strip_terminal_controls_marked(description)
         ));
     }
     if let Some(url) = &meta.url {
@@ -4224,12 +4238,12 @@ fn render_package_meta(meta: &PackageMeta) -> String {
         format!("project: {}", meta.project),
     ];
     if let Some(title) = &meta.title {
-        lines.push(format!("title: {}", strip_terminal_controls(title)));
+        lines.push(format!("title: {}", strip_terminal_controls_marked(title)));
     }
     if let Some(description) = &meta.description {
         lines.push(format!(
             "description: {}",
-            strip_terminal_controls(description)
+            strip_terminal_controls_marked(description)
         ));
     }
     if let Some(url) = &meta.url {
@@ -4264,7 +4278,7 @@ fn render_package_matches(term: &str, matches: &[PackageMatch]) -> String {
                 match_
                     .title
                     .as_deref()
-                    .map(strip_terminal_controls)
+                    .map(strip_terminal_controls_marked)
                     .unwrap_or_else(|| "-".to_string()),
             ]
         })
@@ -4284,7 +4298,7 @@ fn render_project_matches(term: &str, matches: &[ProjectMatch]) -> String {
                 match_
                     .title
                     .as_deref()
-                    .map(strip_terminal_controls)
+                    .map(strip_terminal_controls_marked)
                     .unwrap_or_else(|| "-".to_string()),
             ]
         })
@@ -4433,18 +4447,19 @@ fn render_owners(owners: &[Owner], verbose: bool) -> String {
 /// one (owner searches fill the email in from `whois()`; meta roles
 /// carry none).
 fn render_named_role(role: &NamedRole) -> String {
-    // The name and email are stripped here, not at the meta parse:
-    // meta roles round-trip to the server (a role grant writes the
-    // parsed role list back), so stripping at the parse would
-    // silently rewrite the stored name. Owner-search roles are
-    // stripped at their parse too; this is the defense in depth.
-    let name = strip_terminal_controls(&role.name);
+    // The name and email are stripped here, leaving a marker where
+    // characters were removed, not at the meta parse: meta roles
+    // round-trip to the server (a role grant writes the parsed role
+    // list back), so stripping at the parse would silently rewrite
+    // the stored name. Owner-search roles are stripped at their
+    // parse too; this is the defense in depth.
+    let name = strip_terminal_controls_marked(&role.name);
     match &role.email {
         Some(email) => format!(
             "{} ({}) <{}>",
             name,
             role.role,
-            strip_terminal_controls(email)
+            strip_terminal_controls_marked(email)
         ),
         None => format!("{} ({})", name, role.role),
     }
@@ -4455,11 +4470,20 @@ fn render_named_role(role: &NamedRole) -> String {
 /// (`login (<email>)`), never a blank. Without an email there is
 /// nothing verbose to show, so the role form stands.
 fn render_named_role_verbose(role: &NamedRole) -> String {
+    // The name, real name, and email are stripped at the render,
+    // leaving a marker where characters were removed — like the
+    // role form, the parse keeps them verbatim.
+    let name = strip_terminal_controls_marked(&role.name);
     match (&role.realname, &role.email) {
         (Some(realname), Some(email)) => {
-            format!("{} ({realname} <{email}>)", role.name)
+            format!(
+                "{} ({} <{}>)",
+                name,
+                strip_terminal_controls_marked(realname),
+                strip_terminal_controls_marked(email)
+            )
         }
-        (None, Some(email)) => format!("{} (<{email}>)", role.name),
+        (None, Some(email)) => format!("{} (<{}>)", name, strip_terminal_controls_marked(email)),
         (_, None) => render_named_role(role),
     }
 }
@@ -4467,10 +4491,13 @@ fn render_named_role_verbose(role: &NamedRole) -> String {
 fn render_person(person: &Person) -> String {
     let mut lines = vec![format!("login: {}", person.login)];
     if let Some(email) = &person.email {
-        lines.push(format!("email: {}", strip_terminal_controls(email)));
+        lines.push(format!("email: {}", strip_terminal_controls_marked(email)));
     }
     if let Some(realname) = &person.realname {
-        lines.push(format!("realname: {}", strip_terminal_controls(realname)));
+        lines.push(format!(
+            "realname: {}",
+            strip_terminal_controls_marked(realname)
+        ));
     }
     lines.push(format!("state: {}", person.state));
     lines.join("\n")
@@ -7721,12 +7748,13 @@ mod tests {
     }
 
     #[test]
-    fn project_meta_text_strips_terminal_controls_from_title_and_description() {
+    fn project_meta_text_marks_stripped_terminal_controls_in_title_and_description() {
         // Meta title and description are maintainer text and reach
         // the terminal through the meta render: escape sequences,
-        // bells, and bidirectional marks are stripped, while
-        // newlines survive. The parse keeps them verbatim — meta is
-        // written back to the server (the setter compares the parsed
+        // bells, and bidirectional marks are stripped, leaving a
+        // marker where characters were removed, while newlines
+        // survive. The parse keeps them verbatim — meta is written
+        // back to the server (the setter compares the parsed
         // current meta, and branch copies the title/description to
         // the new package), so stripping at the parse would silently
         // rewrite what gets filed.
@@ -7737,9 +7765,9 @@ mod tests {
         assert!(!text.contains('\u{1b}'), "text: {text}");
         assert!(!text.contains('\u{7}'), "text: {text}");
         assert!(!text.contains('\u{202e}'), "text: {text}");
-        assert!(text.contains("title: Fa[2Jctory"), "text: {text}");
+        assert!(text.contains("title: Fa…[2Jctory"), "text: {text}");
         assert!(
-            text.contains("description: The rolling\ndistribution"),
+            text.contains("description: The… rolling\ndistri…bution"),
             "text: {text}"
         );
     }
@@ -7769,10 +7797,11 @@ mod tests {
     }
 
     #[test]
-    fn package_meta_text_strips_terminal_controls_from_title_and_description() {
+    fn package_meta_text_marks_stripped_terminal_controls_in_title_and_description() {
         // Same rule as the project meta: strip at the render only,
         // never at the parse — the title/description round-trip to
-        // the server.
+        // the server — leaving a marker where characters were
+        // removed.
         let meta = PackageMeta {
             name: "vim".to_string(),
             project: "openSUSE:Factory".to_string(),
@@ -7789,9 +7818,9 @@ mod tests {
         assert!(!text.contains('\u{1b}'), "text: {text}");
         assert!(!text.contains('\r'), "text: {text}");
         assert!(!text.contains('\u{7}'), "text: {text}");
-        assert!(text.contains("title: Vi[2J IMproved"), "text: {text}");
+        assert!(text.contains("title: Vi…[2J IMproved"), "text: {text}");
         assert!(
-            text.contains("description: Avery long description"),
+            text.contains("description: A…very long… description"),
             "text: {text}"
         );
     }
@@ -7932,11 +7961,12 @@ mod tests {
     }
 
     #[test]
-    fn search_text_strips_terminal_controls_from_titles() {
+    fn search_text_marks_stripped_terminal_controls_in_titles() {
         // Search titles are maintainer text and reach the terminal
         // through the search tables: escape sequences, bells, and
-        // bidirectional marks are stripped. Descriptions stay
-        // JSON-only and are not rendered.
+        // bidirectional marks are stripped, leaving a marker where
+        // characters were removed. Descriptions stay JSON-only and
+        // are not rendered.
         let packages = vec![PackageMatch {
             name: "vim".to_string(),
             project: "openSUSE:Factory".to_string(),
@@ -7945,7 +7975,7 @@ mod tests {
         }];
         let text = render_package_matches("vim", &packages);
         assert!(!text.contains('\u{1b}'), "text: {text}");
-        assert!(text.contains("Vi[2J IMproved"), "text: {text}");
+        assert!(text.contains("Vi…[2J IMproved"), "text: {text}");
         assert!(!text.contains("A very long description"), "text: {text}");
         let projects = vec![ProjectMatch {
             name: "devel:languages:python".to_string(),
@@ -7955,7 +7985,7 @@ mod tests {
         let text = render_project_matches("python", &projects);
         assert!(!text.contains('\u{7}'), "text: {text}");
         assert!(!text.contains('\u{202e}'), "text: {text}");
-        assert!(text.contains("Python"), "text: {text}");
+        assert!(text.contains("Py…thon…"), "text: {text}");
     }
 
     #[test]
@@ -7977,11 +8007,12 @@ mod tests {
     }
 
     #[test]
-    fn person_and_role_text_strip_terminal_controls() {
+    fn person_and_role_text_marks_stripped_terminal_controls() {
         // The real name and email are account-holder free text and
         // reach the terminal through the person render and role
         // lines: escape sequences, bells, and bidirectional marks
-        // are stripped. The name is stripped here, not at the meta
+        // are stripped, leaving a marker where characters were
+        // removed. The name is stripped here, not at the meta
         // parse — meta roles round-trip to the server on a role
         // grant, so stripping at the parse would silently rewrite
         // the stored name.
@@ -7995,8 +8026,11 @@ mod tests {
         assert!(!text.contains('\u{1b}'), "text: {text}");
         assert!(!text.contains('\u{7}'), "text: {text}");
         assert!(!text.contains('\u{202e}'), "text: {text}");
-        assert!(text.contains("email: alice[2J@example.com"), "text: {text}");
-        assert!(text.contains("realname: Alice"), "text: {text}");
+        assert!(
+            text.contains("email: alice…[2J@example.com"),
+            "text: {text}"
+        );
+        assert!(text.contains("realname: Al…ice…"), "text: {text}");
         let role = NamedRole {
             name: "al\u{1b}[2Jice".to_string(),
             role: "maintainer".to_string(),
@@ -8006,7 +8040,82 @@ mod tests {
         let text = render_named_role(&role);
         assert!(!text.contains('\u{1b}'), "text: {text}");
         assert!(!text.contains('\u{7}'), "text: {text}");
-        assert_eq!(text, "al[2Jice (maintainer) <alice@example.com>");
+        assert_eq!(text, "al…[2Jice (maintainer) <alice…@example.com>");
+    }
+
+    #[test]
+    fn project_meta_text_marks_stripped_terminal_controls_in_role_names() {
+        // Meta role names reach the terminal through the meta
+        // render's role lines: escape sequences, bells, and
+        // bidirectional marks are stripped, leaving a marker where
+        // characters were removed. The parse keeps them verbatim —
+        // meta roles round-trip to the server on a role grant.
+        let mut meta = sample_project_meta();
+        meta.persons = vec![NamedRole {
+            name: "al\u{1b}[2Jice".to_string(),
+            role: "maintainer".to_string(),
+            email: None,
+            realname: None,
+        }];
+        meta.groups = vec![NamedRole {
+            name: "ed\u{7}itors".to_string(),
+            role: "bugowner".to_string(),
+            email: None,
+            realname: None,
+        }];
+        let text = render_project_meta(&meta);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\u{7}'), "text: {text}");
+        assert!(
+            text.contains("person al…[2Jice (maintainer)"),
+            "text: {text}"
+        );
+        assert!(text.contains("group ed…itors (bugowner)"), "text: {text}");
+    }
+
+    #[test]
+    fn owners_render_verbose_marks_stripped_terminal_controls() {
+        // The verbose owner form prints the real name and email:
+        // escape sequences, bells, and bidirectional marks are
+        // stripped, leaving a marker where characters were removed.
+        let owners = vec![Owner {
+            root_project: "openSUSE:Factory".to_string(),
+            project: "openSUSE:Factory".to_string(),
+            package: Some("vim".to_string()),
+            persons: vec![NamedRole {
+                name: "alice".to_string(),
+                role: "maintainer".to_string(),
+                email: Some("alice\u{1b}[2J@example.com".to_string()),
+                realname: Some("Al\u{7}ice\u{202e}".to_string()),
+            }],
+            groups: vec![],
+        }];
+        let text = render_owners(&owners, true);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\u{7}'), "text: {text}");
+        assert!(!text.contains('\u{202e}'), "text: {text}");
+        assert!(
+            text.contains("persons: alice (Al…ice… <alice…[2J@example.com>)"),
+            "text: {text}"
+        );
+    }
+
+    #[test]
+    fn maintainers_text_marks_stripped_terminal_controls() {
+        // The maintainers table prints the name and email: escape
+        // sequences, bells, and bidirectional marks are stripped,
+        // leaving a marker where characters were removed.
+        let maintainers = vec![NamedRole {
+            name: "al\u{1b}[2Jice".to_string(),
+            role: "maintainer".to_string(),
+            email: Some("alice\u{7}@example.com".to_string()),
+            realname: None,
+        }];
+        let text = render_maintainers(&maintainers);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\u{7}'), "text: {text}");
+        assert!(text.contains("al…[2Jice"), "text: {text}");
+        assert!(text.contains("alice…@example.com"), "text: {text}");
     }
 
     #[test]

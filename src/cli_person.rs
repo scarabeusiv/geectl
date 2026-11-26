@@ -32,7 +32,7 @@
 
 use crate::auth::{EnvGiteaAuth, EnvObsAuth};
 use crate::config::{self, DEFAULT_GITEA_URL};
-use crate::debug::{strip_terminal_controls, Debug};
+use crate::debug::{strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{GiteaClient, GiteaUser};
 use crate::http::{HttpClient, Timeout, UreqClient};
@@ -242,7 +242,7 @@ fn render_project_matches(term: &str, matches: &[ProjectMatch]) -> Result<String
                 match_
                     .title
                     .as_deref()
-                    .map(strip_terminal_controls)
+                    .map(strip_terminal_controls_marked)
                     .unwrap_or_else(|| "-".to_string()),
             ]
         })
@@ -263,7 +263,7 @@ fn render_users(term: &str, users: &[GiteaUser]) -> Result<String, GeectlError> 
             vec![
                 user.login.clone(),
                 {
-                    let full_name = strip_terminal_controls(&user.full_name);
+                    let full_name = strip_terminal_controls_marked(&user.full_name);
                     if full_name.is_empty() {
                         "-".to_string()
                     } else {
@@ -271,7 +271,7 @@ fn render_users(term: &str, users: &[GiteaUser]) -> Result<String, GeectlError> 
                     }
                 },
                 {
-                    let email = strip_terminal_controls(&user.email);
+                    let email = strip_terminal_controls_marked(&user.email);
                     if email.is_empty() {
                         "-".to_string()
                     } else {
@@ -491,15 +491,17 @@ mod tests {
     }
 
     #[test]
-    fn search_text_strips_terminal_controls_from_titles_and_users() {
+    fn search_text_marks_stripped_terminal_controls_in_titles_and_users() {
         // Project titles and Gitea full names and emails reach the
         // terminal through the person search tables: escape
         // sequences, bells, and bidirectional marks are stripped,
-        // while a name that strips to empty still renders as `-`.
+        // leaving a marker where characters were removed, while a
+        // name that is empty still renders as `-`. A name of only
+        // removed characters renders as the marker itself.
         let projects = vec![project("devel:languages:python", Some("Py\u{1b}[2Jthon"))];
         let text = render_project_matches("alice", &projects).unwrap();
         assert!(!text.contains('\u{1b}'), "text: {text}");
-        assert!(text.contains("Py[2Jthon"), "text: {text}");
+        assert!(text.contains("Py…[2Jthon"), "text: {text}");
         let users = vec![
             user("alice", "Al\u{7}ice\u{202e}", "alice@example.com"),
             user("bob", "\u{7}", ""),
@@ -508,7 +510,9 @@ mod tests {
         assert!(!text.contains('\u{1b}'), "text: {text}");
         assert!(!text.contains('\u{7}'), "text: {text}");
         assert!(!text.contains('\u{202e}'), "text: {text}");
-        assert!(text.contains("Alice"), "text: {text}");
+        assert!(text.contains("Al…ice…"), "text: {text}");
         assert!(text.contains("bob"), "text: {text}");
+        let text = render_users("bob", &[user("bob", "\u{7}", "")]).unwrap();
+        assert!(text.contains("…"), "text: {text}");
     }
 }

@@ -41,7 +41,7 @@
 
 use crate::auth::EnvGiteaAuth;
 use crate::config::{self, DEFAULT_GITEA_URL};
-use crate::debug::{strip_terminal_controls, Debug};
+use crate::debug::{strip_terminal_controls_marked, Debug};
 use crate::error::GeectlError;
 use crate::gitea::{
     require_credentials_for_url, CleanupForkEntry, CleanupForkOutcome, CleanupForksResult,
@@ -848,7 +848,10 @@ fn commit_status_json(status: &GiteaCommitStatus) -> Value {
 }
 
 /// Commit statuses as a table: context, state, description, and
-/// target URL. An empty list reads `no statuses`.
+/// target URL. An empty list reads `no statuses`. The context,
+/// description, and target URL are stripped at the render, leaving
+/// a marker where characters were removed: they are server free
+/// text and reach the terminal through this table.
 fn render_commit_statuses(statuses: &[GiteaCommitStatus]) -> String {
     if statuses.is_empty() {
         return "no statuses".to_string();
@@ -861,10 +864,10 @@ fn render_commit_statuses(statuses: &[GiteaCommitStatus]) -> String {
             // strip keeps newlines by design, and the table needs
             // one line per status.
             vec![
-                strip_terminal_controls(&status.context).replace('\n', " "),
+                strip_terminal_controls_marked(&status.context).replace('\n', " "),
                 status.state.clone(),
-                strip_terminal_controls(&status.description).replace('\n', " "),
-                status.target_url.clone(),
+                strip_terminal_controls_marked(&status.description).replace('\n', " "),
+                strip_terminal_controls_marked(&status.target_url),
             ]
         })
         .collect();
@@ -1139,15 +1142,33 @@ mod tests {
         // A status description carrying a newline (server-authored
         // free text) would break the table rows; the render keeps
         // one line per status, and escape sequences strip the same
-        // way as the other tables.
+        // way as the other tables — leaving a marker where
+        // characters were removed.
         let mut status = sample_status();
         status.description = "Build\nsucceeded".to_string();
         status.context = "ob\u{1b}[2Js".to_string();
         let text = render_commit_statuses(&[status]);
         assert_eq!(
             text,
-            "CONTEXT STATE   DESCRIPTION     TARGET\nob[2Js  success Build succeeded https://ci.example.org/1"
+            "CONTEXT STATE   DESCRIPTION     TARGET\nob…[2Js success Build succeeded https://ci.example.org/1"
         );
+    }
+
+    #[test]
+    fn render_commit_statuses_marks_stripped_terminal_controls() {
+        // The context and description are server free text and reach
+        // the terminal through the table: escape sequences, bells,
+        // and bidirectional marks are stripped, leaving a marker
+        // where characters were removed.
+        let mut status = sample_status();
+        status.context = "o\u{202e}bs".to_string();
+        status.description = "bu\u{1b}[2Jild\u{7} ok".to_string();
+        let text = render_commit_statuses(&[status]);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\u{7}'), "text: {text}");
+        assert!(!text.contains('\u{202e}'), "text: {text}");
+        assert!(text.contains("o…bs"), "text: {text}");
+        assert!(text.contains("bu…[2Jild… ok"), "text: {text}");
     }
 
     #[test]

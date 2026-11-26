@@ -32,7 +32,7 @@
 
 use crate::auth::EnvObsAuth;
 use crate::config;
-use crate::debug::{strip_terminal_controls, Debug};
+use crate::debug::{strip_terminal_controls_marked, Debug};
 use crate::error::GeectlError;
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{DryRun, ObsClient, ServiceDef, ServiceState, ServiceTrigger, OBS_API_BASE};
@@ -297,7 +297,7 @@ fn render_service_state(state: &Option<ServiceState>) -> String {
                 // hand-built state must not reach it unfiltered. The
                 // parse already strips the server's text; the strip
                 // is idempotent.
-                lines.push(format!("error: {}", strip_terminal_controls(error)));
+                lines.push(format!("error: {}", strip_terminal_controls_marked(error)));
             }
             lines.join("\n")
         }
@@ -539,11 +539,12 @@ mod tests {
     }
 
     #[test]
-    fn state_renders_error_without_terminal_controls() {
+    fn state_renders_error_with_stripped_terminal_controls_marked() {
         // The error is server text, and the render is the terminal
         // boundary: escape sequences, carriage returns, bells, and
-        // bidirectional marks are stripped, while the error's own
-        // newlines survive.
+        // bidirectional marks are stripped, leaving a marker where
+        // characters were removed, while the error's own newlines
+        // survive.
         let state = ServiceState {
             code: ServiceCode::Failed,
             xsrcmd5: None,
@@ -552,7 +553,7 @@ mod tests {
         };
         assert_eq!(
             render_service_state(&Some(state)),
-            "code: failed\nerror: bad[2Jlinewithbell\nandbidi"
+            "code: failed\nerror: bad…[2Jline…with…bell\nand…bidi"
         );
     }
 

@@ -45,7 +45,7 @@
 
 use crate::auth::{alias_for_url, same_api_url, Credentials, EnvObsAuth};
 use crate::config;
-use crate::debug::{strip_terminal_controls, Debug};
+use crate::debug::{strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{Timeout, UreqClient};
 use crate::obs::{
@@ -1780,7 +1780,7 @@ pub(crate) fn render_results_text(results: &BuildResults) -> String {
                     "{} {}: {}",
                     cell.repository,
                     cell.arch,
-                    strip_terminal_controls(details)
+                    strip_terminal_controls_marked(details)
                 ));
             }
             for status in &cell.statuses {
@@ -1816,7 +1816,7 @@ pub(crate) fn render_results_text(results: &BuildResults) -> String {
 /// A code with its server detail text in parentheses, when present.
 fn code_with_details(code: &str, details: &Option<String>) -> String {
     match details {
-        Some(details) => format!("{code} ({})", strip_terminal_controls(details)),
+        Some(details) => format!("{code} ({})", strip_terminal_controls_marked(details)),
         None => code.to_string(),
     }
 }
@@ -2048,7 +2048,7 @@ fn render_job_status_text(job: &Option<JobStatus>) -> String {
     lines.extend(opt_line("result", &job.result));
     lines.extend(opt_line(
         "details",
-        &job.details.as_deref().map(strip_terminal_controls),
+        &job.details.as_deref().map(strip_terminal_controls_marked),
     ));
     lines.extend(opt_num_line("starttime", &job.starttime));
     lines.extend(opt_num_line("endtime", &job.endtime));
@@ -2118,7 +2118,7 @@ fn buildinfo_payload(
 fn render_buildinfo_text(info: &BuildInfo) -> String {
     let mut lines = Vec::new();
     match &info.error {
-        Some(error) => lines.push(format!("error: {}", strip_terminal_controls(error))),
+        Some(error) => lines.push(format!("error: {}", strip_terminal_controls_marked(error))),
         None => lines.push("no blocking error".to_string()),
     }
     if info.bdeps.is_empty() {
@@ -2394,11 +2394,14 @@ fn render_fileinfo_text(info: &FileInfo) -> String {
     lines.extend(opt_line("source", &info.source));
     lines.extend(opt_line(
         "summary",
-        &info.summary.as_deref().map(strip_terminal_controls),
+        &info.summary.as_deref().map(strip_terminal_controls_marked),
     ));
     lines.extend(opt_line(
         "description",
-        &info.description.as_deref().map(strip_terminal_controls),
+        &info
+            .description
+            .as_deref()
+            .map(strip_terminal_controls_marked),
     ));
     lines.extend(opt_line("disturl", &info.disturl));
     lines.extend(opt_num_line("size", &info.size));
@@ -3650,11 +3653,12 @@ mod tests {
     }
 
     #[test]
-    fn results_text_strips_terminal_controls_from_details() {
+    fn results_text_marks_stripped_terminal_controls_in_details() {
         // Cell-level detail text (in the code cell and in the note
         // line) and package-level detail text reach the terminal
         // through the results render: escape sequences, bells, and
-        // bidirectional marks are stripped.
+        // bidirectional marks are stripped, leaving a marker where
+        // characters were removed.
         let mut results = results_fixture();
         results.results[0].details = Some("repo\u{1b}[2J broken".to_string());
         results.results[0].statuses[0].details = Some("miss\u{7}ing foo\u{202e}".to_string());
@@ -3663,10 +3667,10 @@ mod tests {
         assert!(!text.contains('\u{7}'), "text: {text}");
         assert!(!text.contains('\u{202e}'), "text: {text}");
         assert!(
-            text.contains("standard x86_64: repo[2J broken"),
+            text.contains("standard x86_64: repo…[2J broken"),
             "text: {text}"
         );
-        assert!(text.contains("failed (missing foo)"), "text: {text}");
+        assert!(text.contains("succeeded (miss…ing foo…)"), "text: {text}");
     }
 
     #[test]
@@ -3714,9 +3718,11 @@ mod tests {
     }
 
     #[test]
-    fn job_status_text_strips_terminal_controls_from_details() {
+    fn job_status_text_marks_stripped_terminal_controls_in_details() {
         // Job detail text is server-authored free text and reaches
-        // the terminal through the job status render.
+        // the terminal through the job status render: escape
+        // sequences, bells, and bidirectional marks are stripped,
+        // leaving a marker where characters were removed.
         let job = Some(JobStatus {
             code: "building".to_string(),
             result: None,
@@ -3735,7 +3741,7 @@ mod tests {
         let text = render_job_status_text(&job);
         assert!(!text.contains('\u{1b}'), "text: {text}");
         assert!(!text.contains('\u{7}'), "text: {text}");
-        assert!(text.contains("details: build[2Jing"), "text: {text}");
+        assert!(text.contains("details: build…[2Jing…"), "text: {text}");
     }
 
     #[test]
@@ -3814,11 +3820,12 @@ mod tests {
     }
 
     #[test]
-    fn buildinfo_renders_error_without_terminal_controls() {
+    fn buildinfo_renders_error_with_stripped_terminal_controls_marked() {
         // The error is server text, and the render is the terminal
         // boundary: escape sequences, carriage returns, bells, and
-        // bidirectional marks are stripped, while the error's own
-        // newlines survive.
+        // bidirectional marks are stripped, leaving a marker where
+        // characters were removed, while the error's own newlines
+        // survive.
         let blocked = BuildInfo {
             error: Some("bad\u{1b}[2Jline\rwith\u{7}bell\nand\u{202e}bidi".to_string()),
             bdeps: vec![],
@@ -3828,7 +3835,7 @@ mod tests {
         };
         assert_eq!(
             render_buildinfo_text(&blocked),
-            "error: bad[2Jlinewithbell\nandbidi\nno dependencies"
+            "error: bad…[2Jline…with…bell\nand…bidi\nno dependencies"
         );
     }
 
@@ -4151,11 +4158,12 @@ mod tests {
     }
 
     #[test]
-    fn fileinfo_text_strips_terminal_controls_from_summary_and_description() {
+    fn fileinfo_text_marks_stripped_terminal_controls_in_summary_and_description() {
         // The summary and description are RPM author text and reach
         // the terminal through the fileinfo render: escape sequences,
         // carriage returns, bells, and bidirectional marks are
-        // stripped, while newlines survive.
+        // stripped, leaving a marker where characters were removed,
+        // while newlines survive.
         let mut info = fileinfo_fixture();
         info.summary = Some("A\u{1b}[2J foo".to_string());
         info.description = Some("Does\rfoo\u{7}.\nMore\u{202e} text".to_string());
@@ -4164,9 +4172,9 @@ mod tests {
         assert!(!text.contains('\r'), "text: {text}");
         assert!(!text.contains('\u{7}'), "text: {text}");
         assert!(!text.contains('\u{202e}'), "text: {text}");
-        assert!(text.contains("summary: A[2J foo"), "text: {text}");
+        assert!(text.contains("summary: A…[2J foo"), "text: {text}");
         assert!(
-            text.contains("description: Doesfoo.\nMore text"),
+            text.contains("description: Does…foo….\nMore… text"),
             "text: {text}"
         );
     }

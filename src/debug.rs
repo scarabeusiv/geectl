@@ -536,11 +536,12 @@ pub fn format_body_preview(body: &str) -> String {
     }
     let redacted = redact_body(body);
     // Terminal control and bidirectional / format characters are
-    // stripped: the preview is printed raw to the terminal, and a
-    // text body may carry a raw C1 control character (the binary
-    // check only catches C0 bytes). Newlines survive: they are
-    // the preview's own line structure.
-    let redacted = strip_terminal_controls(&redacted);
+    // stripped, leaving a marker where characters were removed:
+    // the preview is printed raw to the terminal, and a text body
+    // may carry a raw C1 control character (the binary check only
+    // catches C0 bytes). Newlines survive: they are the preview's
+    // own line structure.
+    let redacted = strip_terminal_controls_marked(&redacted);
     if redacted.len() <= DEBUG_BODY_CAP {
         return redacted;
     }
@@ -555,6 +556,23 @@ pub fn format_body_preview(body: &str) -> String {
     )
 }
 
+/// Whether a character may reach the terminal: a newline, or any
+/// character that is neither a control character nor a
+/// bidirectional / format character that reorders displayed text
+/// (U+061C, U+200E-U+200F, U+202A-U+202E, U+2066-U+2069, U+FEFF).
+fn is_terminal_safe(c: char) -> bool {
+    c == '\n'
+        || (!c.is_control()
+            && !matches!(
+                c,
+                '\u{061c}'
+                    | '\u{200e}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{feff}'
+            ))
+}
+
 /// Strip the characters that must not reach the terminal from a
 /// string: C0/C1 control characters (except newline) and the
 /// bidirectional / format characters that reorder displayed text
@@ -562,20 +580,33 @@ pub fn format_body_preview(body: &str) -> String {
 /// `_service` files, error bodies, and service run errors are untrusted
 /// input, and all are printed raw to the terminal.
 pub fn strip_terminal_controls(text: &str) -> String {
-    text.chars()
-        .filter(|c| {
-            *c == '\n'
-                || (!c.is_control()
-                    && !matches!(
-                        *c,
-                        '\u{061c}'
-                            | '\u{200e}'..='\u{200f}'
-                            | '\u{202a}'..='\u{202e}'
-                            | '\u{2066}'..='\u{2069}'
-                            | '\u{feff}'
-                    ))
-        })
-        .collect()
+    text.chars().filter(|c| is_terminal_safe(*c)).collect()
+}
+
+/// The marker left where [`strip_terminal_controls_marked`] removed
+/// characters: an ellipsis, one per run of removed characters, so a
+/// reader of the text output can tell that something was there.
+pub const STRIP_MARKER: char = '\u{2026}';
+
+/// Strip the characters [`strip_terminal_controls`] removes, leaving
+/// a marker ([`STRIP_MARKER`]) at each removal spot: one marker per
+/// run of removed characters. Text renders use this; the parse keeps
+/// the silent form, so the payload — and the JSON output — never
+/// carry the marker, and values that round-trip to the server are
+/// filed unstripped.
+pub fn strip_terminal_controls_marked(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_removed_run = false;
+    for c in text.chars() {
+        if is_terminal_safe(c) {
+            out.push(c);
+            in_removed_run = false;
+        } else if !in_removed_run {
+            out.push(STRIP_MARKER);
+            in_removed_run = true;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -931,21 +962,41 @@ Host: api.opensuse.org";
     }
 
     #[test]
+    fn strip_terminal_controls_marked_leaves_a_marker_per_removed_run() {
+        // The marked form removes the same characters, leaving one
+        // ellipsis per run of removed characters: a lone removal
+        // marks once, adjacent removals collapse to one marker, and
+        // a clean string carries no marker at all. Newlines survive.
+        assert_eq!(strip_terminal_controls_marked("a\u{1b}[2Jb"), "a…[2Jb");
+        assert_eq!(strip_terminal_controls_marked("a\u{7}b"), "a…b");
+        assert_eq!(strip_terminal_controls_marked("a\rb"), "a…b");
+        assert_eq!(strip_terminal_controls_marked("a\nb"), "a\nb");
+        assert_eq!(strip_terminal_controls_marked("a\u{202e}b"), "a…b");
+        assert_eq!(strip_terminal_controls_marked("a\u{feff}b"), "a…b");
+        assert_eq!(strip_terminal_controls_marked("a\tb"), "a…b");
+        assert_eq!(strip_terminal_controls_marked("a\u{1b}\u{7}b"), "a…b");
+        assert_eq!(strip_terminal_controls_marked("\u{1b}ab\u{202e}"), "…ab…");
+        assert_eq!(strip_terminal_controls_marked("plain"), "plain");
+        assert_eq!(strip_terminal_controls_marked(""), "");
+    }
+
+    #[test]
     fn body_preview_never_dumps_binary_bodies() {
         let body = "ok\0binary";
         assert_eq!(format_body_preview(body), "<binary body, 9 bytes>");
     }
 
     #[test]
-    fn body_preview_strips_terminal_controls() {
+    fn body_preview_marks_stripped_terminal_controls() {
         // A raw C1 control character is not caught by the binary
         // check (it only looks at C0 bytes), so the preview must
         // strip it; a bidirectional mark is stripped too. The
-        // preview is printed raw to the terminal.
+        // preview is printed raw to the terminal, so each removed
+        // run leaves a marker where characters were removed.
         let preview = format_body_preview("ok\u{9b}te\u{202e}xt");
         assert!(!preview.chars().any(|c| c.is_control() && c != '\n'));
         assert!(!preview.contains('\u{202e}'));
-        assert!(preview.contains("text"));
+        assert_eq!(preview, "ok…te…xt");
     }
 
     #[test]

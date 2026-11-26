@@ -70,7 +70,7 @@ use serde::Serialize;
 
 use crate::auth::{split_api_url, Credentials};
 use crate::config::Config;
-use crate::debug::{strip_terminal_controls, Debug};
+use crate::debug::{strip_terminal_controls_marked, Debug};
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
 use crate::obs::services::parse_services;
@@ -1357,7 +1357,10 @@ impl<'a> LocalBuild<'a> {
         if let Some(error) = &info.error {
             return Err(GeectlError::new(
                 ErrorKind::ServerError,
-                format!("build cannot start: {}", strip_terminal_controls(error)),
+                format!(
+                    "build cannot start: {}",
+                    strip_terminal_controls_marked(error)
+                ),
             ));
         }
         // Dep fields are server data: validate them before the trust

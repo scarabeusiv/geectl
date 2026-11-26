@@ -59,7 +59,7 @@
 
 use crate::auth::{Credentials, EnvObsAuth};
 use crate::config;
-use crate::debug::{strip_terminal_controls, Debug};
+use crate::debug::{strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{
@@ -2176,12 +2176,12 @@ fn render_request_text(request: &Request) -> String {
     }
     lines.push(format!("creator: {}", request.creator));
     if let Some(title) = &request.title {
-        lines.push(format!("title: {}", strip_terminal_controls(title)));
+        lines.push(format!("title: {}", strip_terminal_controls_marked(title)));
     }
     if !request.description.is_empty() {
         lines.push(format!(
             "description: {}",
-            strip_terminal_controls(&request.description)
+            strip_terminal_controls_marked(&request.description)
         ));
     }
     if let Some(priority) = request.priority {
@@ -2199,7 +2199,7 @@ fn render_request_text(request: &Request) -> String {
     if !request.state.comment.is_empty() {
         lines.push(format!(
             "state comment: {}",
-            strip_terminal_controls(&request.state.comment)
+            strip_terminal_controls_marked(&request.state.comment)
         ));
     }
     for (index, action) in request.actions.iter().enumerate() {
@@ -2473,7 +2473,10 @@ fn review_text(index: usize, review: &RequestReview) -> String {
         (None, None) => {}
     }
     if !review.comment.is_empty() {
-        line.push_str(&format!(" — {}", strip_terminal_controls(&review.comment)));
+        line.push_str(&format!(
+            " — {}",
+            strip_terminal_controls_marked(&review.comment)
+        ));
     }
     line
 }
@@ -2498,10 +2501,16 @@ fn review_target_text(review: &RequestReview) -> String {
 fn history_text(entry: &RequestHistory) -> String {
     let mut line = format!("{} {}", entry.who, entry.when);
     if !entry.description.is_empty() {
-        line.push_str(&format!(" {}", strip_terminal_controls(&entry.description)));
+        line.push_str(&format!(
+            " {}",
+            strip_terminal_controls_marked(&entry.description)
+        ));
     }
     if !entry.comment.is_empty() {
-        line.push_str(&format!(" — {}", strip_terminal_controls(&entry.comment)));
+        line.push_str(&format!(
+            " — {}",
+            strip_terminal_controls_marked(&entry.comment)
+        ));
     }
     line
 }
@@ -2715,7 +2724,7 @@ fn markdown_to_plaintext(markdown: &str) -> String {
     // Terminal control characters are stripped from the converted
     // text: comment bodies are free text from another user, and the
     // Markdown parser passes escape sequences through as text.
-    strip_terminal_controls(&text)
+    strip_terminal_controls_marked(&text)
 }
 
 fn render_comments_text(id: &str, comments: &[RequestComment]) -> String {
@@ -2962,12 +2971,13 @@ mod tests {
     }
 
     #[test]
-    fn request_text_strips_terminal_controls_from_free_text_fields() {
+    fn request_text_marks_stripped_terminal_controls_in_free_text_fields() {
         // Free text from the server reaches the terminal through the
         // request render: escape sequences, carriage returns, bells,
-        // and bidirectional marks are stripped, while newlines
-        // survive. The description is stripped here at the render —
-        // it round-trips to the server on forward, so the parse keeps
+        // and bidirectional marks are stripped, leaving a marker
+        // where characters were removed, while newlines survive.
+        // The description is stripped here at the render — it
+        // round-trips to the server on forward, so the parse keeps
         // it verbatim.
         let mut request = fixture_request();
         request.title = Some("ti\u{1b}[2Jtle".to_string());
@@ -2981,12 +2991,12 @@ mod tests {
         assert!(!text.contains('\u{7}'), "text: {text}");
         assert!(!text.contains('\r'), "text: {text}");
         assert!(!text.contains('\u{202e}'), "text: {text}");
-        assert!(text.contains("title: ti[2Jtle"), "text: {text}");
-        assert!(text.contains("description: desc\nription"), "text: {text}");
-        assert!(text.contains("state comment: state"), "text: {text}");
-        assert!(text.contains(" — re]8;;http://xview"), "text: {text}");
+        assert!(text.contains("title: ti…[2Jtle"), "text: {text}");
+        assert!(text.contains("description: de…sc\nription"), "text: {text}");
+        assert!(text.contains("state comment: st…ate"), "text: {text}");
+        assert!(text.contains(" — re…]8;;http://x…view"), "text: {text}");
         assert!(
-            text.contains("history 1: creator 2010-12-11T00:00:00 history — comment"),
+            text.contains("history 1: creator 2010-12-11T00:00:00 hi…story — co…mment"),
             "text: {text}"
         );
     }
@@ -3099,10 +3109,11 @@ mod tests {
     }
 
     #[test]
-    fn comments_text_strips_terminal_controls_from_bodies() {
+    fn comments_text_marks_stripped_terminal_controls_in_bodies() {
         // Comment bodies are free text from another user, and the
         // Markdown parser passes escape sequences through as text:
-        // the converted plaintext is stripped at the render, while
+        // the converted plaintext is stripped at the render,
+        // leaving a marker where characters were removed, while
         // the JSON payload keeps the raw Markdown.
         let xml = "<comments request=\"42\">\n  <comment who=\"user1\" when=\"2010-12-29T10:00:00\" id=\"1\">fix\u{1b}[2Jit\u{7}now\nline\u{202e}two</comment>\n</comments>";
         let comments = parse_comments(xml).expect("comments parse");
@@ -3111,7 +3122,7 @@ mod tests {
         assert!(!text.contains('\u{7}'), "text: {text}");
         assert!(!text.contains('\u{202e}'), "text: {text}");
         assert!(
-            text.contains("comment 1 by user1 at 2010-12-29T10:00:00: fix[2Jitnow linetwo"),
+            text.contains("comment 1 by user1 at 2010-12-29T10:00:00: fix…[2Jit…now line…two"),
             "text: {text}"
         );
     }
