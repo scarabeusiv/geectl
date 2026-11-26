@@ -1494,8 +1494,19 @@ pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
         let mut found = None;
         for (element, _) in elements(inner, "devel")? {
             if let Some(project) = tag_attr(&element, "project") {
+                // A second `<devel>` carrying a project is rejected,
+                // not read as the first: a single-value child with
+                // two occurrences has no defined kept value, like
+                // `<master>` in a download. A `<devel>` without a
+                // `project` attribute carries no value and is skipped
+                // while scanning.
+                if found.is_some() {
+                    return Err(GeectlError::new(
+                        ErrorKind::ServerError,
+                        "unexpected OBS project meta response: duplicate <devel> in <project>",
+                    ));
+                }
                 found = Some(xml_unescape(&project));
-                break;
             }
         }
         found
@@ -1713,9 +1724,17 @@ pub fn parse_package_meta(body: &str) -> Result<PackageMeta, GeectlError> {
                 // A missing package attribute means the devel package
                 // keeps this package's name: the setter omits it in
                 // exactly that case (see `set_devel_project`).
+                // A second `<devel>` carrying a project is rejected,
+                // not read as the first: a single-value child with
+                // two occurrences has no defined kept value.
+                if found.is_some() {
+                    return Err(GeectlError::new(
+                        ErrorKind::ServerError,
+                        "unexpected OBS package meta response: duplicate <devel> in <package>",
+                    ));
+                }
                 let devel_package = tag_attr(&element, "package").unwrap_or_else(|| name.clone());
                 found = Some((xml_unescape(&devel_project), xml_unescape(&devel_package)));
-                break;
             }
         }
         found
@@ -13863,5 +13882,64 @@ mod tests {
                 err.context
             );
         }
+    }
+
+    #[test]
+    fn project_meta_rejects_a_duplicate_devel() {
+        // A second `<devel>` carrying a project is rejected, not
+        // read as the first: a single-value child with two
+        // occurrences has no defined kept value, like `<master>` in
+        // a download.
+        for body in [
+            "<project name=\"p\"><devel project=\"a\"/><devel project=\"b\"/></project>",
+            "<project name=\"p\"><devel project=\"a\"/><devel project=\"a\"/></project>",
+        ] {
+            let err = parse_project_meta(body).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError);
+            assert!(
+                err.context.contains("duplicate <devel> in <project>"),
+                "{body}: {}",
+                err.context
+            );
+        }
+        // A `<devel>` without a `project` attribute carries no value
+        // and is skipped while scanning: one before the valued one,
+        // and one on its own, both read fine.
+        let meta =
+            parse_project_meta("<project name=\"p\"><devel/><devel project=\"a\"/></project>")
+                .unwrap();
+        assert_eq!(meta.devel.as_deref(), Some("a"));
+        let meta = parse_project_meta("<project name=\"p\"><devel/></project>").unwrap();
+        assert_eq!(meta.devel, None);
+    }
+
+    #[test]
+    fn package_meta_rejects_a_duplicate_devel() {
+        // A second `<devel>` carrying a project is rejected, not
+        // read as the first: a single-value child with two
+        // occurrences has no defined kept value.
+        for body in [
+            "<package name=\"foo\" project=\"p\"><devel project=\"a\"/><devel project=\"b\"/></package>",
+            "<package name=\"foo\" project=\"p\"><devel project=\"a\"/><devel project=\"a\"/></package>",
+        ] {
+            let err = parse_package_meta(body).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError);
+            assert!(
+                err.context.contains("duplicate <devel> in <package>"),
+                "{body}: {}",
+                err.context
+            );
+        }
+        // A `<devel>` without a `project` attribute carries no value
+        // and is skipped while scanning: one before the valued one,
+        // and one on its own, both read fine.
+        let meta = parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><devel/><devel project=\"a\" package=\"foo\"/></package>",
+        )
+        .unwrap();
+        assert_eq!(meta.devel, Some(("a".to_string(), "foo".to_string())));
+        let meta =
+            parse_package_meta("<package name=\"foo\" project=\"p\"><devel/></package>").unwrap();
+        assert_eq!(meta.devel, None);
     }
 }
