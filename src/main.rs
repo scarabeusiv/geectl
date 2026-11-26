@@ -109,7 +109,7 @@ fn run(
             rev,
         }) => geectl::cli_working_copy::checkout(
             &project,
-            &package,
+            package.as_deref(),
             rev.as_deref(),
             debug,
             cli.live,

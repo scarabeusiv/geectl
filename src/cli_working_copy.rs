@@ -25,7 +25,8 @@ use crate::error::{ErrorKind, GeectlError};
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{DryRun, ObsClient, RevisionSpec, OBS_API_BASE};
 use crate::working_copy::{
-    self, Backend, CommitReport, PullReport, StatusCode, UpdateReport, WorkingCopy,
+    self, Backend, CheckoutProjectReport, CommitReport, PullReport, StatusCode, UpdateReport,
+    WorkingCopy,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -231,15 +232,22 @@ fn mutation_result(
 }
 
 /// Check out package `package` in project `project` into
-/// `<project>/<package>/` under the current directory.
+/// `<project>/<package>/` under the current directory; without a
+/// package, every package in the project, one working copy each.
 pub fn checkout(
     project: &str,
-    package: &str,
+    package: Option<&str>,
     rev: Option<&str>,
     debug: &Debug,
     live: bool,
     instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
+    if package.is_none() && rev.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "checkout --rev needs a package: a revision pin is per package",
+        ));
+    }
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let endpoints = endpoints(instance)?;
     let client = obs_client(&http, &endpoints, "checkout", live, debug)?;
@@ -250,24 +258,40 @@ pub fn checkout(
     let auth = gitea_auth_ref(&auth);
     let rev = rev.map(RevisionSpec::parse).transpose()?;
     let dir = current_dir()?;
-    let target = working_copy::checkout_target(&dir, project, package)?;
-    let wc = working_copy::checkout(
-        &client,
-        project,
-        package,
-        rev.as_ref(),
-        &dir,
-        auth.as_ref(),
-        &dry_run,
-    )?;
-    Ok(checkout_result(
-        project,
-        package,
-        &target,
-        wc.as_ref(),
-        dry_run.enabled(),
-        plan_of(&dry_run),
-    ))
+    match package {
+        Some(package) => {
+            let target = working_copy::checkout_target(&dir, project, package)?;
+            let wc = working_copy::checkout(
+                &client,
+                project,
+                package,
+                rev.as_ref(),
+                &dir,
+                auth.as_ref(),
+                &dry_run,
+            )?;
+            Ok(checkout_result(
+                project,
+                package,
+                &target,
+                wc.as_ref(),
+                dry_run.enabled(),
+                plan_of(&dry_run),
+            ))
+        }
+        None => {
+            let project_dir = working_copy::checkout_project_target(&dir, project)?;
+            let report =
+                working_copy::checkout_project(&client, project, &dir, auth.as_ref(), &dry_run)?;
+            Ok(checkout_project_result(
+                project,
+                &project_dir,
+                &report,
+                dry_run.enabled(),
+                plan_of(&dry_run),
+            ))
+        }
+    }
 }
 
 /// The `checkout` result: the checkout record when live, the target
@@ -312,6 +336,77 @@ fn checkout_result(
             mutation_result(payload, header, result_line, dry_run, plan)
         }
     }
+}
+
+/// The `checkout` result without a package: the packages written
+/// and the packages skipped, in alphabetical order. In dry-run
+/// the plan names each target; the per-package lines carry the
+/// live record only.
+fn checkout_project_result(
+    project: &str,
+    project_dir: &Path,
+    report: &CheckoutProjectReport,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let header = format!("project: {project}");
+    let mut packages = Vec::new();
+    let mut detail = Vec::new();
+    for entry in &report.packages {
+        match &entry.record {
+            Some(wc) => {
+                packages.push(json!({
+                    "package": entry.package,
+                    "dir": entry.dir.to_string_lossy(),
+                    "backend": backend_name(wc.backend),
+                    "base_rev": wc.base_rev,
+                }));
+                detail.push(format!(
+                    "{} ({} base {})",
+                    entry.package,
+                    backend_name(wc.backend),
+                    wc.base_rev
+                ));
+            }
+            None => {
+                packages.push(json!({
+                    "package": entry.package,
+                    "dir": entry.dir.to_string_lossy(),
+                }));
+            }
+        }
+    }
+    let mut skipped = Vec::new();
+    for skip in &report.skipped {
+        skipped.push(json!({
+            "package": skip.package,
+            "reason": skip.reason,
+        }));
+        detail.push(format!("skipped {}: {}", skip.package, skip.reason));
+    }
+    let count = report.packages.len();
+    let noun = if count == 1 { "package" } else { "packages" };
+    let mut result_line = if dry_run {
+        format!(
+            "dry-run: would check out {count} {noun} into {}",
+            project_dir.display()
+        )
+    } else {
+        format!("checked out {count} {noun} into {}", project_dir.display())
+    };
+    if !report.skipped.is_empty() {
+        result_line.push_str(&format!(" ({} skipped)", report.skipped.len()));
+    }
+    if !detail.is_empty() {
+        result_line.push('\n');
+        result_line.push_str(&detail.join("\n"));
+    }
+    let payload = json!({
+        "project": project,
+        "packages": packages,
+        "skipped": skipped,
+    });
+    mutation_result(payload, header, result_line, dry_run, plan)
 }
 
 /// Update the working copy in the current directory to the latest
@@ -866,6 +961,103 @@ mod tests {
         );
         assert!(text.contains(&format!(
             "dry-run: would check out home:alice/foo into {target_text}"
+        )));
+    }
+
+    fn wc_for(package: &str) -> WorkingCopy {
+        WorkingCopy {
+            root: PathBuf::from("/tmp").join("home_alice").join(package),
+            project: "home:alice".to_string(),
+            package: package.to_string(),
+            apiurl: "https://api.opensuse.org".to_string(),
+            backend: Backend::Obs,
+            base_rev: "1".to_string(),
+            base_srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            mtimes: Vec::new(),
+            scmsync_url: None,
+            scmsync_branch: None,
+        }
+    }
+
+    fn project_report() -> CheckoutProjectReport {
+        use crate::working_copy::{CheckoutProjectPackage, ProjectCheckoutSkip};
+        let project_dir = PathBuf::from("/tmp").join("home_alice");
+        CheckoutProjectReport {
+            packages: vec![
+                CheckoutProjectPackage {
+                    package: "bar".to_string(),
+                    dir: project_dir.join("bar"),
+                    record: Some(wc_for("bar")),
+                },
+                CheckoutProjectPackage {
+                    package: "foo".to_string(),
+                    dir: project_dir.join("foo"),
+                    record: Some(wc()),
+                },
+            ],
+            skipped: vec![ProjectCheckoutSkip {
+                package: "baz".to_string(),
+                reason: "already checked out".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn checkout_project_result_live_lists_packages_and_skips() {
+        let project_dir = PathBuf::from("/tmp").join("home_alice");
+        let (payload, text) =
+            checkout_project_result("home:alice", &project_dir, &project_report(), false, None);
+        assert!(text.contains("project: home:alice"));
+        assert!(text.contains("dry_run: false"));
+        assert!(text.contains(&format!(
+            "checked out 2 packages into {} (1 skipped)",
+            project_dir.display()
+        )));
+        assert!(text.contains("bar (obs base 1)"));
+        assert!(text.contains("foo (obs base 1)"));
+        assert!(text.contains("skipped baz: already checked out"));
+        assert_eq!(payload["packages"][0]["package"], json!("bar"));
+        assert_eq!(payload["packages"][0]["backend"], json!("obs"));
+        assert_eq!(payload["packages"][1]["package"], json!("foo"));
+        assert_eq!(payload["skipped"][0]["package"], json!("baz"));
+        assert_eq!(
+            payload["skipped"][0]["reason"],
+            json!("already checked out")
+        );
+    }
+
+    #[test]
+    fn checkout_project_result_dry_run_carries_the_plan() {
+        use crate::working_copy::CheckoutProjectPackage;
+        let project_dir = PathBuf::from("/tmp").join("home_alice");
+        let report = CheckoutProjectReport {
+            packages: vec![CheckoutProjectPackage {
+                package: "foo".to_string(),
+                dir: project_dir.join("foo"),
+                record: None,
+            }],
+            skipped: Vec::new(),
+        };
+        let (payload, text) = checkout_project_result(
+            "home:alice",
+            &project_dir,
+            &report,
+            true,
+            Some(vec![format!(
+                "checkout home:alice/foo into {}",
+                project_dir.join("foo").display()
+            )]),
+        );
+        assert_eq!(payload["dry_run"], json!(true));
+        assert_eq!(payload["packages"][0]["package"], json!("foo"));
+        assert!(payload["packages"][0].get("backend").is_none());
+        assert!(text.contains(&format!(
+            "dry-run: would check out 1 package into {}",
+            project_dir.display()
+        )));
+        assert!(text.contains(&format!(
+            "checkout home:alice/foo into {}",
+            project_dir.join("foo").display()
         )));
     }
 

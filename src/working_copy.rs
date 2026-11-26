@@ -2103,15 +2103,23 @@ fn check_name_segment(kind: &str, name: &str) -> Result<(), GeectlError> {
     Ok(())
 }
 
+/// The checkout directory for a project: `<dir>/<project>/` with
+/// `:` sanitized (see `path_segment`). The CLI renders the same
+/// target for a dry-run project checkout, so the plan names the
+/// directory the live checkout creates.
+pub fn checkout_project_target(dir: &Path, project: &str) -> Result<PathBuf, GeectlError> {
+    check_name_segment("project", project)?;
+    Ok(dir.join(path_segment(project)))
+}
+
 /// The checkout directory for a project and package:
 /// `<dir>/<project>/<package>/` with `:` sanitized (see
 /// `path_segment`). The CLI renders the same target for a dry-run
 /// checkout, so the plan names the directory the live checkout
 /// creates.
 pub fn checkout_target(dir: &Path, project: &str, package: &str) -> Result<PathBuf, GeectlError> {
-    check_name_segment("project", project)?;
     check_name_segment("package", package)?;
-    Ok(dir.join(path_segment(project)).join(path_segment(package)))
+    Ok(checkout_project_target(dir, project)?.join(path_segment(package)))
 }
 
 /// Refuse a directory listing whose entries are not plain file
@@ -2245,6 +2253,97 @@ pub fn checkout(
             Err(err)
         }
     }
+}
+
+/// One package a project checkout wrote: the package name, the
+/// directory it landed in, and the checkout record when live
+/// (`None` in dry-run, where nothing was written).
+pub struct CheckoutProjectPackage {
+    pub package: String,
+    pub dir: PathBuf,
+    pub record: Option<WorkingCopy>,
+}
+
+/// One package a project checkout skipped, with the reason: a
+/// target that already exists, or a multibuild flavor, whose
+/// source lives in the base package.
+pub struct ProjectCheckoutSkip {
+    pub package: String,
+    pub reason: String,
+}
+
+/// The project checkout report: the packages written, in
+/// alphabetical order, and the packages skipped.
+pub struct CheckoutProjectReport {
+    pub packages: Vec<CheckoutProjectPackage>,
+    pub skipped: Vec<ProjectCheckoutSkip>,
+}
+
+/// Check out every package in project `project`, one git working
+/// copy per package under `<dir>/<project>/<package>/`. The
+/// project listing carries multibuild flavors as separate entries
+/// (`pkg:flavor`); a flavor has no source of its own (its `_meta`
+/// 404s), so flavors collapse onto the base package, which is
+/// checked out once. A package whose target already exists is
+/// skipped, not overwritten - a checkout recorded from another
+/// instance still refuses with the apiurl mismatch, the same as a
+/// single checkout - so a retry after a failure resumes where it
+/// stopped. A failure in any package aborts the run, leaving the
+/// packages already checked out in place: each is a complete
+/// checkout. There is no revision pin here: a pin is per package,
+/// and a single pin across a whole project is meaningless; the
+/// CLI refuses `--rev` without a package.
+pub fn checkout_project(
+    client: &ObsClient,
+    project: &str,
+    dir: &Path,
+    gitea_auth: Option<&GiteaAuth<'_>>,
+    dry_run: &DryRun,
+) -> Result<CheckoutProjectReport, GeectlError> {
+    check_name_segment("project", project)?;
+    let mut names = client.list_packages(project)?;
+    names.sort();
+    names.dedup();
+    let mut packages = Vec::new();
+    let mut skipped = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for name in &names {
+        // A flavor entry (`pkg:flavor`) names no package of its
+        // own: the base package holds the source.
+        let base = name.split(':').next().unwrap_or(name.as_str());
+        if base != name.as_str() {
+            skipped.push(ProjectCheckoutSkip {
+                package: name.clone(),
+                reason: format!("multibuild flavor of {base}"),
+            });
+        }
+        if !seen.insert(base.to_string()) {
+            continue;
+        }
+        let target = checkout_target(dir, project, base)?;
+        if target.exists() {
+            // The same refusal a single checkout gives: a working
+            // copy recorded from another instance refuses with
+            // the apiurl mismatch, naming both URLs. Anything
+            // else that already sits at the target is left alone
+            // and reported, not overwritten.
+            if let Ok(existing) = open_read(&target) {
+                existing.check_apiurl(&client.base)?;
+            }
+            skipped.push(ProjectCheckoutSkip {
+                package: base.to_string(),
+                reason: "already checked out".to_string(),
+            });
+            continue;
+        }
+        let record = checkout(client, project, base, None, dir, gitea_auth, dry_run)?;
+        packages.push(CheckoutProjectPackage {
+            package: base.to_string(),
+            dir: target,
+            record,
+        });
+    }
+    Ok(CheckoutProjectReport { packages, skipped })
 }
 
 /// Download `name` at the pinned `rev` and verify it against the
@@ -7239,6 +7338,155 @@ mod tests {
         write_file(&dir.path, "foo.spec", "Name: foo\n");
         let err = open(&dir.path).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::WorkingCopyNotFound);
+    }
+
+    /// The `bar` listing: one spec and an empty tarball at
+    /// revision 1.
+    fn listing_bar() -> String {
+        format!(
+            "<directory name=\"bar\" rev=\"1\" srcmd5=\"{SRCMD5_2}\" vrev=\"1\">\
+            <entry md5=\"cf0d04a286833ebd00a5f5b2d54474a9\" mtime=\"1282047302\" name=\"bar.spec\" size=\"10\" />\
+            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"bar.tar.gz\" size=\"0\" />\
+            </directory>"
+        )
+    }
+
+    /// The project listing for `home:alice` holding `foo` and
+    /// `bar`, each an OBS-native package with one spec and an
+    /// empty tarball. The project listing body is a parameter so
+    /// the flavor test can carry the same packages under flavor
+    /// names.
+    fn project_http_with(project_listing: &str) -> FakeHttp {
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice",
+                project_listing,
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo",
+                &listing_rev1(),
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=1",
+                b"Name: foo\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=1",
+                b"",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/bar/_meta",
+                "<package name=\"bar\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/bar",
+                &listing_bar(),
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/bar/bar.spec?rev=1",
+                b"Name: bar\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/bar/bar.tar.gz?rev=1",
+                b"",
+            )
+    }
+
+    fn project_http() -> FakeHttp {
+        project_http_with("<directory><entry name=\"foo\"/><entry name=\"bar\"/></directory>")
+    }
+
+    #[test]
+    fn checkout_project_checks_out_each_package() {
+        let dir = TempDirGuard::new("project-checkout");
+        let http = project_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let report =
+            checkout_project(&client, "home:alice", &dir.path, None, &DryRun::new(false)).unwrap();
+        assert!(report.skipped.is_empty());
+        assert_eq!(report.packages.len(), 2);
+        assert_eq!(report.packages[0].package, "bar");
+        assert_eq!(report.packages[1].package, "foo");
+        let foo = &report.packages[1];
+        let record = foo.record.as_ref().unwrap();
+        assert_eq!(record.base_rev, "1");
+        assert_eq!(record.base_srcmd5, SRCMD5_1);
+        assert!(dir
+            .path
+            .join("home_alice")
+            .join("foo")
+            .join("foo.spec")
+            .exists());
+        assert!(dir
+            .path
+            .join("home_alice")
+            .join("bar")
+            .join("bar.spec")
+            .exists());
+    }
+
+    #[test]
+    fn checkout_project_skips_an_existing_target() {
+        let dir = TempDirGuard::new("project-skip");
+        std::fs::create_dir_all(dir.path.join("home_alice").join("foo")).unwrap();
+        let http = project_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let report =
+            checkout_project(&client, "home:alice", &dir.path, None, &DryRun::new(false)).unwrap();
+        assert_eq!(report.packages.len(), 1);
+        assert_eq!(report.packages[0].package, "bar");
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].package, "foo");
+        assert_eq!(report.skipped[0].reason, "already checked out");
+    }
+
+    #[test]
+    fn checkout_project_collapses_multibuild_flavors() {
+        let dir = TempDirGuard::new("project-flavors");
+        let http = project_http_with(
+            "<directory><entry name=\"foo:flavor1\"/><entry name=\"foo:flavor2\"/><entry name=\"bar\"/></directory>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let report =
+            checkout_project(&client, "home:alice", &dir.path, None, &DryRun::new(false)).unwrap();
+        assert_eq!(report.packages.len(), 2);
+        assert_eq!(report.packages[0].package, "bar");
+        assert_eq!(report.packages[1].package, "foo");
+        assert_eq!(report.skipped.len(), 2);
+        assert_eq!(report.skipped[0].package, "foo:flavor1");
+        assert_eq!(report.skipped[0].reason, "multibuild flavor of foo");
+        assert_eq!(report.skipped[1].package, "foo:flavor2");
+        assert!(dir
+            .path
+            .join("home_alice")
+            .join("foo")
+            .join("foo.spec")
+            .exists());
+    }
+
+    #[test]
+    fn checkout_project_dry_run_plans_each_package_and_writes_nothing() {
+        let dir = TempDirGuard::new("project-dry-run");
+        let http = project_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let report = checkout_project(&client, "home:alice", &dir.path, None, &dry_run).unwrap();
+        assert_eq!(report.packages.len(), 2);
+        assert!(report.packages.iter().all(|entry| entry.record.is_none()));
+        assert!(report.skipped.is_empty());
+        assert!(!dir.path.join("home_alice").exists());
+        assert!(
+            dry_run
+                .plan()
+                .iter()
+                .any(|line| line.contains("would: checkout home:alice/bar into")),
+            "plan: {:?}",
+            dry_run.plan()
+        );
     }
 
     #[test]

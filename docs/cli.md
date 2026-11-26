@@ -355,13 +355,15 @@ without evaluating trust.
 The working-copy leaves operate on the checkout in the current
 directory: `checkout` writes `<dir>/<project>/<package>/` under the
 current directory (a `:` in a project or package name becomes `_` in
-the directory name), the rest open the checkout found there. `commit`
+the directory name); without a package it writes one working copy
+per package in the project, multibuild flavors collapsing onto the
+base package. The rest open the checkout found there. `commit`
 runs the source services and `pre_checkin.sh` before sending, with
 `--noservice` skipping that gate. The base record lives in the checkout's git
 config (`geectl.apiurl`, `geectl.project`, `geectl.package`,
 `geectl.backend`, `geectl.base-rev`, `geectl.base-srcmd5`).
 
-- `geectl checkout <PROJECT> <PACKAGE>` — Check out a package into a git working copy, under the current directory; key flags: --rev <REV>
+- `geectl checkout <PROJECT> [PACKAGE]` — Check out a package into a git working copy, under the current directory; without a package, every package in the project; key flags: --rev <REV>
 - `geectl update` — Update the working copy in the current directory to the latest base; key flags: --rev <REV>
 - `geectl status` — Show the working copy's state against the base.
 - `geectl diff` — Show the diff of the worktree and the index against the base, plus the link diff on a linked checkout.

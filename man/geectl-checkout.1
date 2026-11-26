@@ -2,15 +2,15 @@
 .el .ds Aq '
 .TH geectl-checkout 1  "geectl-checkout 0.2.3" 
 .SH NAME
-geectl\-checkout \- Check out a package into a git working copy, under the current directory
+geectl\-checkout \- Check out a package into a git working copy, under the current directory. Without a package, every package in the project, one working copy each
 .SH SYNOPSIS
-\fBgeectl checkout\fR [\fB\-\-rev\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> 
+\fBgeectl checkout\fR [\fB\-\-rev\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> [\fIPACKAGE\fR] 
 .SH DESCRIPTION
-Check out a package into a git working copy, under the current directory
+Check out a package into a git working copy, under the current directory. Without a package, every package in the project, one working copy each
 .SH OPTIONS
 .TP
 \fB\-\-rev\fR \fI<REV>\fR
-The revision to check out (a number or a source md5). The latest when omitted
+The revision to check out (a number or a source md5). The latest when omitted. Needs a package
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
@@ -18,7 +18,7 @@ Print help
 <\fIPROJECT\fR>
 The OBS project
 .TP
-<\fIPACKAGE\fR>
-The OBS package
+[\fIPACKAGE\fR]
+The OBS package. The whole project when omitted
 .SH VERSION
 v0.2.3

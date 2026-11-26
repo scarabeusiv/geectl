@@ -168,14 +168,15 @@ pub enum Command {
         command: cli_changelog::ChangelogCommand,
     },
     /// Check out a package into a git working copy, under the
-    /// current directory.
+    /// current directory. Without a package, every package in the
+    /// project, one working copy each.
     Checkout {
         /// The OBS project.
         project: String,
-        /// The OBS package.
-        package: String,
+        /// The OBS package. The whole project when omitted.
+        package: Option<String>,
         /// The revision to check out (a number or a source md5).
-        /// The latest when omitted.
+        /// The latest when omitted. Needs a package.
         #[arg(long)]
         rev: Option<String>,
     },
