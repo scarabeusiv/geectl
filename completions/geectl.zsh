@@ -2744,6 +2744,19 @@ _arguments "${_arguments_options[@]}" : \
 ':sha -- The commit SHA:_default' \
 && ret=0
 ;;
+(git-tree)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':owner -- The repository owner:_default' \
+':repo -- The repository name:_default' \
+':sha -- The commit or tree SHA:_default' \
+&& ret=0
+;;
 (maintainers)
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
@@ -2820,6 +2833,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (commit-statuses)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(git-tree)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -4196,6 +4213,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(git-tree)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (maintainers)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -5000,6 +5021,7 @@ _geectl__subcmd__gitea_commands() {
 'branch-head:Print the head commit SHA of a branch. Content command\: the text IS the SHA, with no header' \
 'raw-file:Print one file from a repository verbatim. Content command\: the text IS the file content, with no header. \`--ref\` reads from a branch, tag, or commit instead of the default branch. A missing file is \`NotFound\`, never empty content — the 404 is the existence answer' \
 'commit-statuses:List a commit'\''s statuses\: the CI states reported for that commit' \
+'git-tree:Show the recursive tree of a repository at a commit\: the paths, modes, types, and blob SHAs, flattened. A tree larger than one page (1000 entries) is an error, never a partial list' \
 'maintainers:Show the maintainers recorded in a git project'\''s \`_maintainership.json\`\: the project maintainers and the per-package maintainers. The git-side counterpart of \`remote maintainers\`, read from the repo'\''s default branch' \
 'cleanup-forks:List obsolete Gitea forks and their OBS home test projects, and delete them. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. A project is deleted only when its description marker names a fork that no longer exists on Gitea; every other project is listed and left in place' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -5031,6 +5053,11 @@ _geectl__subcmd__gitea__subcmd__commit-statuses_commands() {
     local commands; commands=()
     _describe -t commands 'geectl gitea commit-statuses commands' commands "$@"
 }
+(( $+functions[_geectl__subcmd__gitea__subcmd__git-tree_commands] )) ||
+_geectl__subcmd__gitea__subcmd__git-tree_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl gitea git-tree commands' commands "$@"
+}
 (( $+functions[_geectl__subcmd__gitea__subcmd__help_commands] )) ||
 _geectl__subcmd__gitea__subcmd__help_commands() {
     local commands; commands=(
@@ -5045,6 +5072,7 @@ _geectl__subcmd__gitea__subcmd__help_commands() {
 'branch-head:Print the head commit SHA of a branch. Content command\: the text IS the SHA, with no header' \
 'raw-file:Print one file from a repository verbatim. Content command\: the text IS the file content, with no header. \`--ref\` reads from a branch, tag, or commit instead of the default branch. A missing file is \`NotFound\`, never empty content — the 404 is the existence answer' \
 'commit-statuses:List a commit'\''s statuses\: the CI states reported for that commit' \
+'git-tree:Show the recursive tree of a repository at a commit\: the paths, modes, types, and blob SHAs, flattened. A tree larger than one page (1000 entries) is an error, never a partial list' \
 'maintainers:Show the maintainers recorded in a git project'\''s \`_maintainership.json\`\: the project maintainers and the per-package maintainers. The git-side counterpart of \`remote maintainers\`, read from the repo'\''s default branch' \
 'cleanup-forks:List obsolete Gitea forks and their OBS home test projects, and delete them. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. A project is deleted only when its description marker names a fork that no longer exists on Gitea; every other project is listed and left in place' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -5075,6 +5103,11 @@ _geectl__subcmd__gitea__subcmd__help__subcmd__cleanup-forks_commands() {
 _geectl__subcmd__gitea__subcmd__help__subcmd__commit-statuses_commands() {
     local commands; commands=()
     _describe -t commands 'geectl gitea help commit-statuses commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__gitea__subcmd__help__subcmd__git-tree_commands] )) ||
+_geectl__subcmd__gitea__subcmd__help__subcmd__git-tree_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl gitea help git-tree commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__gitea__subcmd__help__subcmd__help_commands] )) ||
 _geectl__subcmd__gitea__subcmd__help__subcmd__help_commands() {
@@ -5472,6 +5505,7 @@ _geectl__subcmd__help__subcmd__gitea_commands() {
 'branch-head:Print the head commit SHA of a branch. Content command\: the text IS the SHA, with no header' \
 'raw-file:Print one file from a repository verbatim. Content command\: the text IS the file content, with no header. \`--ref\` reads from a branch, tag, or commit instead of the default branch. A missing file is \`NotFound\`, never empty content — the 404 is the existence answer' \
 'commit-statuses:List a commit'\''s statuses\: the CI states reported for that commit' \
+'git-tree:Show the recursive tree of a repository at a commit\: the paths, modes, types, and blob SHAs, flattened. A tree larger than one page (1000 entries) is an error, never a partial list' \
 'maintainers:Show the maintainers recorded in a git project'\''s \`_maintainership.json\`\: the project maintainers and the per-package maintainers. The git-side counterpart of \`remote maintainers\`, read from the repo'\''s default branch' \
 'cleanup-forks:List obsolete Gitea forks and their OBS home test projects, and delete them. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. A project is deleted only when its description marker names a fork that no longer exists on Gitea; every other project is listed and left in place' \
     )
@@ -5501,6 +5535,11 @@ _geectl__subcmd__help__subcmd__gitea__subcmd__cleanup-forks_commands() {
 _geectl__subcmd__help__subcmd__gitea__subcmd__commit-statuses_commands() {
     local commands; commands=()
     _describe -t commands 'geectl help gitea commit-statuses commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__help__subcmd__gitea__subcmd__git-tree_commands] )) ||
+_geectl__subcmd__help__subcmd__gitea__subcmd__git-tree_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help gitea git-tree commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help__subcmd__gitea__subcmd__maintainers_commands] )) ||
 _geectl__subcmd__help__subcmd__gitea__subcmd__maintainers_commands() {

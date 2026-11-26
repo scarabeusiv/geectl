@@ -305,6 +305,7 @@ without evaluating trust.
 - `geectl gitea branch-head <OWNER> <REPO> <BRANCH>` — Print the head commit SHA of a branch.
 - `geectl gitea raw-file <OWNER> <REPO> <PATH>` — Print one file from a repository verbatim; key flags: --ref <REF>
 - `geectl gitea commit-statuses <OWNER> <REPO> <SHA>` — List a commit's statuses: the CI states reported for that commit.
+- `geectl gitea git-tree <OWNER> <REPO> <SHA>` — Show the recursive tree of a repository at a commit: the paths, modes, types, and blob SHAs, flattened.
 - `geectl gitea maintainers <OWNER> <REPO>` — Show the maintainers recorded in a git project's `_maintainership.json`: the project maintainers and the per-package maintainers.
 - `geectl gitea cleanup-forks` — List obsolete Gitea forks and their OBS home test projects, and delete them; key flags: --user <USER>
 
@@ -407,6 +408,7 @@ geectl gitea repo-search geectl
 geectl gitea branch-head pool systemd factory
 geectl gitea raw-file pool systemd .obs
 geectl gitea commit-statuses pool systemd 0123456789abcdef0123456789abcdef01234567
+geectl gitea git-tree pool systemd 3c96114b2bd40ee352cebbe7fa6cf0e1a5f7b51d4bcd0fac1a4810fecaf3347a
 geectl gitea maintainers pool systemd
 geectl gitea repo-create vim --private
 

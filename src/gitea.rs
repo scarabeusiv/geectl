@@ -384,6 +384,70 @@ pub struct GiteaCommitStatus {
     pub updated_at: String,
 }
 
+/// The object type of a git-tree entry: a file, a directory, or
+/// a submodule commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GiteaTreeEntryType {
+    /// A file.
+    Blob,
+    /// A directory.
+    Tree,
+    /// A submodule commit.
+    Commit,
+}
+
+impl GiteaTreeEntryType {
+    /// The wire spelling of this type, as it appears in the
+    /// entry's `type` field.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GiteaTreeEntryType::Blob => "blob",
+            GiteaTreeEntryType::Tree => "tree",
+            GiteaTreeEntryType::Commit => "commit",
+        }
+    }
+}
+
+/// One entry of a repository's recursive git tree: the path,
+/// the git mode, the object type, and the object SHA. Only the
+/// fields the read needs are modelled — the entry `url` is not
+/// parsed. The size is the blob size when the server sent one;
+/// trees and submodule commits carry no size, so a missing size
+/// reads as zero.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaTreeEntry {
+    /// The path inside the repository.
+    pub path: String,
+    /// The git mode (`100644`, `100755`, `120000`, `160000`,
+    /// `40000`).
+    pub mode: String,
+    /// The object type: `blob`, `tree`, or `commit`.
+    #[serde(rename = "type")]
+    pub entry_type: GiteaTreeEntryType,
+    /// The object SHA.
+    pub sha: String,
+    /// The blob size in bytes; zero when the server sent none.
+    #[serde(default)]
+    pub size: u64,
+}
+
+/// The wire shape of a recursive git-tree read: the entries
+/// plus the `truncated` flag. Only the fields the read needs
+/// are modelled — `page` rides along unread, and the response
+/// `sha` is the tree object id, not the commit asked for, so it
+/// is not cross-checked.
+#[derive(Debug, Deserialize)]
+struct GiteaTreeResponse {
+    /// The entries, flattened by `recursive=true`.
+    tree: Vec<GiteaTreeEntry>,
+    /// Whether the page holds the whole tree.
+    truncated: bool,
+    /// The entry total, when the server sent it.
+    #[serde(default)]
+    total_count: Option<u64>,
+}
+
 /// The maintainers of one scope in a git project's
 /// `_maintainership.json`: the users and groups recorded for the
 /// project itself or for one package. Groups are bare logins here —
@@ -2756,6 +2820,38 @@ impl<'a> GiteaClient<'a> {
         )
     }
 
+    /// Read a repository's recursive git tree (`GET
+    /// /api/v1/repos/{owner}/{repo}/git/trees/{sha}?recursive=true&per_page=1000`):
+    /// every entry of the tree at that commit, flattened, with
+    /// path, mode, type, SHA, and blob size. One page of 1000
+    /// entries; a tree larger than the page is `ServerError`,
+    /// never a partial list — the caller asked for the whole
+    /// tree, and a truncated answer is not it. The SHA is a
+    /// commit or a tree SHA (40 or 64 hex digits); a missing
+    /// commit or tree is `NotFound`.
+    pub fn git_tree(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Vec<GiteaTreeEntry>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        if !looks_like_commit_sha(sha) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid Gitea commit SHA: {sha:?} (expected a 40- or 64-hex-digit SHA)"),
+            ));
+        }
+        let url = build_url(
+            &self.base,
+            &["api", "v1", "repos", owner, repo, "git", "trees", sha],
+            &[("recursive", "true"), ("per_page", "1000")],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_tree(&body, owner, repo, sha)
+    }
+
     /// Read one pull request (`GET
     /// /api/v1/repos/{owner}/{repo}/pulls/{number}`): the title and
     /// body, state and merge flags, author, labels, and the
@@ -4830,6 +4926,54 @@ fn parse_branch(
         ));
     }
     Ok(parsed)
+}
+
+/// Parse a recursive git-tree document into its entries. The
+/// document carries the entries under `tree` and a `truncated`
+/// flag: a truncated tree is a server error naming the repo, the
+/// SHA, and the entry total when the server sent it — the caller
+/// asked for the whole tree, and a partial page is not it. An
+/// entry is malformed when its path is empty or its SHA is not a
+/// 40- or 64-hex-digit SHA; an unknown entry type fails the
+/// deserialization. A missing `tree` list or a missing
+/// `truncated` flag is a server error too: the body is not a
+/// tree document.
+fn parse_tree(
+    body: &str,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+) -> Result<Vec<GiteaTreeEntry>, GeectlError> {
+    let parsed: GiteaTreeResponse = serde_json::from_str(body).map_err(|err| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected Gitea tree response for {owner}/{repo}@{sha}: {err}"),
+        )
+    })?;
+    if parsed.truncated {
+        return Err(GeectlError::new(
+            ErrorKind::ServerError,
+            match parsed.total_count {
+                Some(total) => format!(
+                    "the recursive tree of {owner}/{repo}@{sha} is truncated ({total} entries; the leaf reads one page of 1000)"
+                ),
+                None => format!(
+                    "the recursive tree of {owner}/{repo}@{sha} is truncated (the leaf reads one page of 1000)"
+                ),
+            },
+        ));
+    }
+    for entry in &parsed.tree {
+        if entry.path.is_empty() || !looks_like_commit_sha(&entry.sha) {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea tree response for {owner}/{repo}@{sha}: malformed entry {entry:?}"
+                ),
+            ));
+        }
+    }
+    Ok(parsed.tree)
 }
 
 /// Parse a `_maintainership.json` document (the `obs-maintainers`
@@ -8523,6 +8667,81 @@ mod tests {
         let err = client(&http)
             .commit_statuses("pool", "systemd", sha)
             .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn git_tree_reads_the_recursive_tree() {
+        let sha = "3c96114b2bd40ee352cebbe7fa6cf0e1a5f7b51d4bcd0fac1a4810fecaf3347a";
+        let http = FakeHttp::new().with_get(
+            &format!(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/git/trees/{sha}?recursive=true&per_page=1000"
+            ),
+            r#"{"sha": "2e7bc1c979a342337be7098dcf39642c15aa06dedcf2ec71eaeb780873fc08af", "url": "https://src.opensuse.org/api/v1/repos/pool/systemd/git/trees/2e7bc1c979a342337be7098dcf39642c15aa06dedcf2ec71eaeb780873fc08af", "tree": [{"path": ".gitattributes", "mode": "100644", "type": "blob", "size": 998, "sha": "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b", "url": "https://src.opensuse.org/api/v1/repos/pool/systemd/git/blobs/37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b"}, {"path": ".gitignore", "mode": "100644", "type": "blob", "size": 33, "sha": "8b731c36e6ed8ff156667c50cd932fbfa144e0ac90f5c0341625787cca0fbf1e", "url": "https://src.opensuse.org/api/v1/repos/pool/systemd/git/blobs/8b731c36e6ed8ff156667c50cd932fbfa144e0ac90f5c0341625787cca0fbf1e"}, {"path": "0001-Drop-or-soften-some-upstream-warnings.patch", "mode": "100644", "type": "blob", "size": 2477, "sha": "25ad21d9319f78b4a78cb530543247160269bebc19bd2ab53d3d3a023832d513", "url": "https://src.opensuse.org/api/v1/repos/pool/systemd/git/blobs/25ad21d9319f78b4a78cb530543247160269bebc19bd2ab53d3d3a023832d513"}], "truncated": false, "total_count": 33, "page": 1}"#,
+        );
+        let entries = client(&http).git_tree("pool", "systemd", sha).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].path, ".gitattributes");
+        assert_eq!(entries[0].mode, "100644");
+        assert_eq!(entries[0].entry_type, GiteaTreeEntryType::Blob);
+        assert_eq!(entries[0].size, 998);
+        assert_eq!(
+            entries[0].sha,
+            "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b"
+        );
+        assert_eq!(entries[2].size, 2477);
+    }
+
+    #[test]
+    fn git_tree_refuses_a_truncated_tree() {
+        let sha = "3c96114b2bd40ee352cebbe7fa6cf0e1a5f7b51d4bcd0fac1a4810fecaf3347a";
+        let http = FakeHttp::new().with_get(
+            &format!(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/git/trees/{sha}?recursive=true&per_page=1000"
+            ),
+            r#"{"sha": "2e7bc1c979a342337be7098dcf39642c15aa06dedcf2ec71eaeb780873fc08af", "tree": [{"path": ".gitattributes", "mode": "100644", "type": "blob", "size": 998, "sha": "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b"}], "truncated": true, "total_count": 33}"#,
+        );
+        let err = client(&http).git_tree("pool", "systemd", sha).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn git_tree_rejects_a_malformed_entry() {
+        let sha = "3c96114b2bd40ee352cebbe7fa6cf0e1a5f7b51d4bcd0fac1a4810fecaf3347a";
+        let http = FakeHttp::new().with_get(
+            &format!(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/git/trees/{sha}?recursive=true&per_page=1000"
+            ),
+            r#"{"tree": [{"path": ".gitattributes", "mode": "100644", "type": "symlink", "size": 998, "sha": "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b"}], "truncated": false}"#,
+        );
+        let err = client(&http).git_tree("pool", "systemd", sha).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn git_tree_rejects_a_non_sha_without_http() {
+        let http = FakeHttp::new();
+        for sha in [
+            "factory",
+            "0123",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            let err = client(&http).git_tree("pool", "systemd", sha).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "sha {sha:?}");
+        }
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn git_tree_missing_tree_is_not_found() {
+        let sha = "3c96114b2bd40ee352cebbe7fa6cf0e1a5f7b51d4bcd0fac1a4810fecaf3347a";
+        let http = FakeHttp::new().with_get_error(
+            &format!(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/git/trees/{sha}?recursive=true&per_page=1000"
+            ),
+            ErrorKind::NotFound,
+        );
+        let err = client(&http).git_tree("pool", "systemd", sha).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 

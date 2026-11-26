@@ -45,8 +45,8 @@ use crate::debug::Debug;
 use crate::error::GeectlError;
 use crate::gitea::{
     require_credentials_for_url, CleanupForkEntry, CleanupForkOutcome, CleanupForksResult,
-    ForkRepoOptions, GiteaBranch, GiteaClient, GiteaCommitStatus, GiteaRepository, MaintainerInfo,
-    Maintainership, RepoCreateOptions,
+    ForkRepoOptions, GiteaBranch, GiteaClient, GiteaCommitStatus, GiteaRepository, GiteaTreeEntry,
+    MaintainerInfo, Maintainership, RepoCreateOptions,
 };
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::DryRun;
@@ -147,6 +147,18 @@ pub enum GiteaCommand {
         /// The repository name.
         repo: String,
         /// The commit SHA.
+        sha: String,
+    },
+    /// Show the recursive tree of a repository at a commit: the
+    /// paths, modes, types, and blob SHAs, flattened. A tree
+    /// larger than one page (1000 entries) is an error, never a
+    /// partial list.
+    GitTree {
+        /// The repository owner.
+        owner: String,
+        /// The repository name.
+        repo: String,
+        /// The commit or tree SHA.
         sha: String,
     },
     /// Show the maintainers recorded in a git project's
@@ -416,6 +428,22 @@ pub fn run_gitea(
                 with_header(
                     &format!("owner: {owner} repo: {repo} commit: {sha}"),
                     render_commit_statuses(&statuses),
+                ),
+            ))
+        }
+        GiteaCommand::GitTree { owner, repo, sha } => {
+            let entries = client.git_tree(&owner, &repo, &sha)?;
+            let payload = json!({
+                "owner": owner,
+                "repo": repo,
+                "sha": sha,
+                "entries": entries.iter().map(git_tree_entry_json).collect::<Vec<_>>(),
+            });
+            Ok((
+                payload,
+                with_header(
+                    &format!("owner: {owner} repo: {repo} tree: {sha}"),
+                    render_git_tree(&entries),
                 ),
             ))
         }
@@ -866,6 +894,39 @@ fn render_commit_statuses(statuses: &[GiteaCommitStatus]) -> String {
     render_table(&["CONTEXT", "STATE", "DESCRIPTION", "TARGET"], &rows)
 }
 
+/// One git-tree entry as JSON: the path, mode, type, SHA, and
+/// blob size.
+fn git_tree_entry_json(entry: &GiteaTreeEntry) -> Value {
+    json!({
+        "path": entry.path,
+        "mode": entry.mode,
+        "type": entry.entry_type.as_str(),
+        "sha": entry.sha,
+        "size": entry.size,
+    })
+}
+
+/// A recursive git tree as a table: path, mode, type, SHA, and
+/// blob size. An empty tree reads `no entries`.
+fn render_git_tree(entries: &[GiteaTreeEntry]) -> String {
+    if entries.is_empty() {
+        return "no entries".to_string();
+    }
+    let rows: Vec<Vec<String>> = entries
+        .iter()
+        .map(|entry| {
+            vec![
+                entry.path.clone(),
+                entry.mode.clone(),
+                entry.entry_type.as_str().to_string(),
+                entry.sha.clone(),
+                entry.size.to_string(),
+            ]
+        })
+        .collect();
+    render_table(&["PATH", "MODE", "TYPE", "SHA", "SIZE"], &rows)
+}
+
 /// The maintainership read as its JSON payload and its text
 /// rendering: the whole document in both — the typed form is the
 /// document, so the payload carries the project scope and every
@@ -975,7 +1036,9 @@ fn join_row(cells: &[&str], widths: &[usize]) -> String {
 mod tests {
     use super::*;
     use crate::cli::{Cli, Command};
-    use crate::gitea::{GiteaBranchCommit, GiteaOwner, GiteaParent, GiteaPermissions};
+    use crate::gitea::{
+        GiteaBranchCommit, GiteaOwner, GiteaParent, GiteaPermissions, GiteaTreeEntryType,
+    };
     use clap::Parser;
 
     fn parse(args: &[&str]) -> GiteaCommand {
@@ -1134,6 +1197,50 @@ mod tests {
         assert_eq!(render_commit_statuses(&[]), "no statuses");
     }
 
+    fn sample_tree_entry() -> GiteaTreeEntry {
+        GiteaTreeEntry {
+            path: ".gitattributes".to_string(),
+            mode: "100644".to_string(),
+            entry_type: GiteaTreeEntryType::Blob,
+            sha: "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b".to_string(),
+            size: 998,
+        }
+    }
+
+    #[test]
+    fn git_tree_entry_json_carries_the_entry_fields() {
+        let payload = git_tree_entry_json(&sample_tree_entry());
+        assert_eq!(payload["path"], json!(".gitattributes"));
+        assert_eq!(payload["mode"], json!("100644"));
+        assert_eq!(payload["type"], json!("blob"));
+        assert_eq!(
+            payload["sha"],
+            json!("37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b")
+        );
+        assert_eq!(payload["size"], json!(998));
+    }
+
+    #[test]
+    fn render_git_tree_renders_a_table() {
+        let second = GiteaTreeEntry {
+            path: "0001-Drop-or-soften-some-upstream-warnings.patch".to_string(),
+            mode: "100644".to_string(),
+            entry_type: GiteaTreeEntryType::Blob,
+            sha: "25ad21d9319f78b4a78cb530543247160269bebc19bd2ab53d3d3a023832d513".to_string(),
+            size: 2477,
+        };
+        let text = render_git_tree(&[sample_tree_entry(), second]);
+        assert_eq!(
+            text,
+            "PATH                                             MODE   TYPE SHA                                                              SIZE\n.gitattributes                                   100644 blob 37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b 998\n0001-Drop-or-soften-some-upstream-warnings.patch 100644 blob 25ad21d9319f78b4a78cb530543247160269bebc19bd2ab53d3d3a023832d513 2477"
+        );
+    }
+
+    #[test]
+    fn render_git_tree_empty_is_no_entries() {
+        assert_eq!(render_git_tree(&[]), "no entries");
+    }
+
     #[test]
     fn gitea_commands_parse() {
         assert!(matches!(
@@ -1253,6 +1360,17 @@ mod tests {
                 "0123456789abcdef0123456789abcdef01234567"
             ]),
             GiteaCommand::CommitStatuses { .. }
+        ));
+        assert!(matches!(
+            parse(&[
+                "geectl",
+                "gitea",
+                "git-tree",
+                "pool",
+                "systemd",
+                "3c96114b2bd40ee352cebbe7fa6cf0e1a5f7b51d4bcd0fac1a4810fecaf3347a"
+            ]),
+            GiteaCommand::GitTree { .. }
         ));
     }
 
