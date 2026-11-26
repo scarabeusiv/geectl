@@ -2242,6 +2242,33 @@ impl<'a> LocalBuild<'a> {
     /// hostile local writer with access to the root could still
     /// swap entries, but the swap can only delete entries inside
     /// the root, never traverse out of it.
+    /// Make a directory tree owner-writable, so `remove_dir_all`
+    /// can remove it: the engine's chroot carries read-only system
+    /// dirs (mode 0555), and removing an entry needs write
+    /// permission on its parent dir. Symlinks are never followed:
+    /// a link is unlinked, never traversed, and its target is
+    /// untouched. Best-effort: a failure leaves the tree as it
+    /// was, and the removal reports its own error.
+    #[cfg(unix)]
+    fn make_tree_writable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    Self::make_tree_writable(&entry.path());
+                }
+            }
+        }
+        if let Ok(metadata) = fs::symlink_metadata(path) {
+            let mut perms = metadata.permissions();
+            let mode = perms.mode();
+            if mode & 0o200 == 0 {
+                perms.set_mode(mode | 0o200);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+    }
+
     fn wipe_root_contents(&self, root: &Path) -> Result<(), GeectlError> {
         let entries = fs::read_dir(root).map_err(|e| {
             GeectlError::new(
@@ -2269,6 +2296,11 @@ impl<'a> LocalBuild<'a> {
                 })?
                 .file_type();
             if file_type.is_dir() {
+                // The engine's chroot carries read-only system
+                // dirs: make the tree writable first, or the
+                // removal fails with permission denied.
+                #[cfg(unix)]
+                Self::make_tree_writable(&path);
                 fs::remove_dir_all(&path).map_err(|e| {
                     GeectlError::new(
                         ErrorKind::InternalError,
@@ -4269,16 +4301,34 @@ struct BuildContainer {
 static BUILD_CONTAINER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The install exec argv for the build container: the `build`
-/// package, without recommends. The container runs as root, so no
-/// elevation is needed (unlike the service container, which runs
-/// as the invoking user and elevates only the install).
+/// package plus the perl modules its scripts use. The modules are
+/// the package's own Recommends, named as capabilities: this
+/// container's zypper does not install Recommends even on a plain
+/// install, so naming them is the only way the engine arrives
+/// complete. The first of them is the one that bites:
+/// changelog2spec needs perl(Date::Parse) to turn the .changes
+/// file into the spec's %changelog section — without it the
+/// changelog stays empty and rpmbuild fails on
+/// %source_date_epoch_from_changelog. The container runs as root,
+/// so no elevation is needed (unlike the service container, which
+/// runs as the invoking user and elevates only the install).
 fn build_engine_install_argv() -> Vec<String> {
     vec![
         "zypper".to_string(),
         "--non-interactive".to_string(),
         "install".to_string(),
-        "--no-recommends".to_string(),
         "build".to_string(),
+        // The `build` package's Recommends, as capabilities.
+        "perl(Archive::Tar)".to_string(),
+        "perl(Config::IniFiles)".to_string(),
+        "perl(Date::Language)".to_string(),
+        "perl(Date::Parse)".to_string(),
+        "perl(LWP::UserAgent)".to_string(),
+        "perl(Pod::Usage)".to_string(),
+        "perl(Time::Zone)".to_string(),
+        "perl(URI)".to_string(),
+        "perl(XML::Parser)".to_string(),
+        "perl(YAML::LibYAML)".to_string(),
     ]
 }
 
@@ -12224,6 +12274,31 @@ exit 0
             fs::write(root.join("stale-output"), b"stale").unwrap();
             let source = write_source(dir.path(), "foo.spec");
             (root, source)
+        }
+
+        #[test]
+        fn wipe_root_contents_removes_read_only_dirs() {
+            // The engine's chroot carries read-only system dirs
+            // (mode 0555): a --clean wipe must remove them, not
+            // fail with permission denied.
+            let dir = TempDir::new();
+            let (podman, _, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), podman);
+            let root = dir.path().join("root");
+            let mount = root.join(".mount");
+            let sysdir = mount.join("usr").join("bin");
+            fs::create_dir_all(&sysdir).unwrap();
+            fs::write(sysdir.join("sh"), b"shell").unwrap();
+            let mut perms = fs::metadata(&sysdir).unwrap().permissions();
+            perms.set_mode(0o555);
+            fs::set_permissions(&sysdir, perms).unwrap();
+            let mut perms = fs::metadata(&mount).unwrap().permissions();
+            perms.set_mode(0o555);
+            fs::set_permissions(&mount, perms).unwrap();
+            vertical.wipe_root_contents(&root).unwrap();
+            assert!(!mount.exists());
         }
 
         #[test]
