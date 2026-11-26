@@ -64,17 +64,19 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub live: bool,
 
-    /// Select the OBS instance for this call, by its alias in the
+    /// Select the instance for this call, by its alias in the
     /// config file's `[instances]` table. The flag is authoritative:
     /// it beats the `GEECTL_OBS_URL` environment variable, the
-    /// configured URL, and any working-copy state. Credentials
-    /// resolve only from the flagged instance's own variables
-    /// (`GEECTL_OBS_USERNAME_<ALIAS>` /
+    /// configured URL, and any working-copy state. For OBS, the
+    /// flagged alias's URL replaces the configured URL and
+    /// credentials resolve only from the flagged instance's own
+    /// variables (`GEECTL_OBS_USERNAME_<ALIAS>` /
     /// `GEECTL_OBS_PASSWORD[_FILE]_<ALIAS>` /
     /// `GEECTL_OBS_APIKEY[_FILE]_<ALIAS>`); another instance's
     /// variables are never borrowed, and a missing credential for
-    /// the flagged instance fails the call. The Gitea instance is
-    /// unaffected.
+    /// the flagged instance fails the call. For Gitea, the host is
+    /// unaffected, but every Gitea call authenticates with the
+    /// flagged alias's `GEECTL_GITEA_TOKEN[_FILE]_<ALIAS>` only.
     #[arg(long, global = true, value_name = "ALIAS")]
     pub instance: Option<String>,
 

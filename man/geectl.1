@@ -32,7 +32,7 @@ Also print request and response bodies on the debug channel (capped at 2048 byte
 Actually perform mutations. Without it, only the plan is printed: dry\-run is the default for mutations
 .TP
 \fB\-\-instance\fR \fI<ALIAS>\fR
-Select the OBS instance for this call, by its alias in the config file\*(Aqs `[instances]` table. The flag is authoritative: it beats the `GEECTL_OBS_URL` environment variable, the configured URL, and any working\-copy state. Credentials resolve only from the flagged instance\*(Aqs own variables (`GEECTL_OBS_USERNAME_<ALIAS>` / `GEECTL_OBS_PASSWORD[_FILE]_<ALIAS>` / `GEECTL_OBS_APIKEY[_FILE]_<ALIAS>`); another instance\*(Aqs variables are never borrowed, and a missing credential for the flagged instance fails the call. The Gitea instance is unaffected
+Select the instance for this call, by its alias in the config file\*(Aqs `[instances]` table. The flag is authoritative: it beats the `GEECTL_OBS_URL` environment variable, the configured URL, and any working\-copy state. For OBS, the flagged alias\*(Aqs URL replaces the configured URL and credentials resolve only from the flagged instance\*(Aqs own variables (`GEECTL_OBS_USERNAME_<ALIAS>` / `GEECTL_OBS_PASSWORD[_FILE]_<ALIAS>` / `GEECTL_OBS_APIKEY[_FILE]_<ALIAS>`); another instance\*(Aqs variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias\*(Aqs `GEECTL_GITEA_TOKEN[_FILE]_<ALIAS>` only
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help

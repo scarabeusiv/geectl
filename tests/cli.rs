@@ -8061,6 +8061,127 @@ fn pull_request_submit_gitea_text_dry_run_prints_plan() {
 }
 
 #[test]
+fn pull_request_submit_gitea_instance_flag_uses_the_alias_token() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    let addr = serve_gitea_submit(
+        &[("/api/v1/repos/owner/repo", SUBMIT_FORK_REPO_JSON)],
+        &["main"],
+    );
+    let origin = format!("http://{addr}/owner/repo");
+    git_in(
+        &checkout,
+        &["config", "--local", "remote.origin.url", origin.as_str()],
+    );
+    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "--instance",
+            "example",
+            "pull-request",
+            "submit",
+            "--base",
+            "main",
+            "--title",
+            "Update foo",
+        ])
+        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
+        .env("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token")
+        .output()
+        .unwrap();
+    // The flagged alias's token files the dry-run plan: no plain
+    // token is set, so success proves the alias token resolved.
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: create pull request in pool/repo from owner:main to main"
+    );
+}
+
+#[test]
+fn pull_request_submit_gitea_instance_flag_never_borrows_the_plain_token() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    let addr = serve_gitea_submit(
+        &[("/api/v1/repos/owner/repo", SUBMIT_FORK_REPO_JSON)],
+        &["main"],
+    );
+    let origin = format!("http://{addr}/owner/repo");
+    git_in(
+        &checkout,
+        &["config", "--local", "remote.origin.url", origin.as_str()],
+    );
+    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "--instance",
+            "example",
+            "pull-request",
+            "submit",
+            "--base",
+            "main",
+            "--title",
+            "Update foo",
+        ])
+        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
+        .env("GEECTL_GITEA_TOKEN", "plain-token")
+        .output()
+        .unwrap();
+    // The plain token belongs to the configured instance and never
+    // serves the flagged one: the call fails naming the alias vars.
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("GEECTL_GITEA_TOKEN_EXAMPLE"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn pull_request_submit_gitea_instance_flag_unknown_alias_names_the_known_aliases() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    let addr = serve_gitea_submit(
+        &[("/api/v1/repos/owner/repo", SUBMIT_FORK_REPO_JSON)],
+        &["main"],
+    );
+    let origin = format!("http://{addr}/owner/repo");
+    git_in(
+        &checkout,
+        &["config", "--local", "remote.origin.url", origin.as_str()],
+    );
+    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "--instance",
+            "missing",
+            "pull-request",
+            "submit",
+            "--base",
+            "main",
+            "--title",
+            "Update foo",
+        ])
+        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
+        .env("GEECTL_GITEA_TOKEN", "plain-token")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("missing"), "stderr: {stderr}");
+    assert!(stderr.contains("example"), "stderr: {stderr}");
+}
+
+#[test]
 fn pull_request_submit_obs_with_repo_is_invalid_input() {
     let dir = TempDir::new();
     let checkout = obs_submit_checkout(&dir, "https://api.opensuse.org");

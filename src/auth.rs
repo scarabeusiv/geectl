@@ -1114,6 +1114,36 @@ pub fn gitea_alias_vars(alias: &str) -> (String, String) {
     )
 }
 
+/// Resolve Gitea credentials strictly for one named instance —
+/// the `--instance` path. Only the alias's own variables resolve
+/// (`GEECTL_GITEA_TOKEN[_FILE]_<ALIAS>`); the plain variables
+/// never apply here, and another instance's variables are never
+/// borrowed. A missing token for the named instance is a
+/// `ConfigError` naming the variables to set — it fails closed
+/// even when nothing is configured anywhere, unlike
+/// [`resolve_gitea_bearer_for_url`], which returns
+/// [`Credentials::None`] in that case. The alias's URL is not
+/// used: the flag selects the account, not the host — the Gitea
+/// host stays the configured one.
+pub fn resolve_gitea_for_instance(
+    alias: &str,
+    instances: &[(String, String)],
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Credentials, GeectlError> {
+    let _ = url_for_alias(instances, alias)?;
+    let (token_var, token_file_var) = gitea_alias_vars(alias);
+    match resolve_gitea_bearer_with(&token_var, &token_file_var, vars, read_file)? {
+        Credentials::None => Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!(
+                "no Gitea token configured for instance {alias:?}; set {token_var} or {token_file_var}"
+            ),
+        )),
+        creds => Ok(creds),
+    }
+}
+
 /// Resolve the Gitea API token for one Gitea URL.
 ///
 /// Precedence, in order:
@@ -1722,6 +1752,28 @@ impl EnvGiteaAuth {
             &read_secret_file_production,
         )
     }
+
+    /// Gitea credentials strictly for one named instance from the
+    /// process environment — the `--instance` path. See
+    /// [`resolve_gitea_for_instance`]: only the alias's own variables
+    /// resolve, and a missing token fails closed. The alias
+    /// variables are snapshotted so resolution sees one consistent
+    /// view of the environment.
+    pub fn credentials_for_instance(
+        alias: &str,
+        instances: &[(String, String)],
+    ) -> Result<Credentials, GeectlError> {
+        let (token_var, token_file_var) = gitea_alias_vars(alias);
+        let names = [token_var, token_file_var];
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let env = snapshot_env(&refs)?;
+        resolve_gitea_for_instance(
+            alias,
+            instances,
+            &|name| env.get(name).cloned(),
+            &read_secret_file_production,
+        )
+    }
 }
 
 /// Gitea SSH key from the process environment. See
@@ -2002,6 +2054,68 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(creds, Credentials::Bearer { ref token } if token == "target-token"));
+    }
+
+    #[test]
+    fn instance_flag_resolves_the_alias_gitea_token() {
+        let map = vars(&[("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token")]);
+        let creds = resolve_gitea_for_instance(
+            "example",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(matches!(creds, Credentials::Bearer { ref token } if token == "alias-token"));
+    }
+
+    #[test]
+    fn instance_flag_never_borrows_another_instances_gitea_keys() {
+        let map = vars(&[
+            (GITEA_TOKEN_VAR, "plain-token"),
+            ("GEECTL_GITEA_TOKEN_OTHER", "other-token"),
+        ]);
+        let err = resolve_gitea_for_instance(
+            "example",
+            &instances(&[
+                ("example", "https://api.example.org"),
+                ("other", "https://other.example.org"),
+            ]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("GEECTL_GITEA_TOKEN_EXAMPLE"));
+    }
+
+    #[test]
+    fn instance_flag_with_no_gitea_token_fails_closed() {
+        let map = vars(&[]);
+        let err = resolve_gitea_for_instance(
+            "example",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("GEECTL_GITEA_TOKEN_EXAMPLE"));
+    }
+
+    #[test]
+    fn instance_flag_unknown_alias_names_the_known_aliases_for_gitea() {
+        let map = vars(&[]);
+        let err = resolve_gitea_for_instance(
+            "missing",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("missing"));
+        assert!(err.context.contains("example"));
     }
 
     #[test]

@@ -72,8 +72,10 @@ flagged alias's URL replaces the configured URL, ahead of the
 `GEECTL_OBS_URL` environment variable and any working-copy state,
 and credentials resolve only from the flagged alias's own variables.
 A call with the flag and no credentials for that alias fails naming
-the variables to set. The Gitea instance is unaffected: `--instance`
-selects the OBS instance only.
+the variables to set. The Gitea host is unaffected, but the account
+every Gitea call uses is selected the same way: with the flag, the
+call authenticates with the flagged alias's
+`GEECTL_GITEA_TOKEN_<ALIAS>` only.
 
 The same rule applies to Gitea: `GEECTL_GITEA_TOKEN_<ALIAS>` (or
 `GEECTL_GITEA_TOKEN_FILE_<ALIAS>`) for the instance named in

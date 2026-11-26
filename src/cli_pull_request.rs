@@ -840,6 +840,9 @@ fn with_gitea<T>(
 /// are validated before any credential resolution — like the other
 /// arms validate their handles and targets first. Each arm then
 /// refuses a checkout that is not submittable before filing.
+/// `--instance` selects the account on both arms: the OBS instance
+/// on the OBS arm, the Gitea token on the Gitea arm; the Gitea host
+/// stays the configured one.
 fn submit(
     args: SubmitArgs,
     debug: &Debug,
@@ -910,7 +913,7 @@ fn submit(
             // not a misleading "no token configured".
             validate_gitea_base(&base)?;
             let parts = git_submit_parts(&args, &wc, &base)?;
-            let token = gitea_token_for(&base, &instances)?;
+            let token = gitea_token_for(&base, &instances, instance)?;
             let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
             let gitea = GiteaClient::with_base(
                 &http,
@@ -990,15 +993,26 @@ fn gitea_instance() -> Result<(String, Vec<(String, String)>), GeectlError> {
     Ok((base, file_config.instances))
 }
 
-/// The Gitea token for `base`, alias-aware: the matching alias's
-/// variables from `[instances]` when one matches, else the plain
-/// variables (see `resolve_gitea_bearer_for_url`). The one
+/// The Gitea token for `base`: with `--instance`, strictly the
+/// flagged alias's variables (see `resolve_gitea_for_instance`) —
+/// the flag selects the account the filing authenticates as; the
+/// host stays `base`. Without it, alias-aware by URL: the matching
+/// alias's variables from `[instances]` when one matches, else the
+/// plain variables (see `resolve_gitea_bearer_for_url`). The one
 /// resolution the submit arm shares between its API client and its
 /// pre-filing fetch. A missing token fails closed with the plain
 /// message; the alias-aware error names the alias variables when
 /// an alias matches.
-fn gitea_token_for(base: &str, instances: &[(String, String)]) -> Result<String, GeectlError> {
-    match EnvGiteaAuth::credentials_for_url(base, base, instances)? {
+fn gitea_token_for(
+    base: &str,
+    instances: &[(String, String)],
+    instance: Option<&str>,
+) -> Result<String, GeectlError> {
+    let credentials = match instance {
+        Some(alias) => EnvGiteaAuth::credentials_for_instance(alias, instances)?,
+        None => EnvGiteaAuth::credentials_for_url(base, base, instances)?,
+    };
+    match credentials {
         Credentials::Bearer { token } => Ok(token),
         _ => Err(GeectlError::new(
             ErrorKind::ConfigError,
