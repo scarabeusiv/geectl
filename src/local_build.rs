@@ -68,7 +68,7 @@ use std::time::UNIX_EPOCH;
 use fs2::FileExt;
 use serde::Serialize;
 
-use crate::auth::Credentials;
+use crate::auth::{split_api_url, Credentials};
 use crate::config::Config;
 use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::ErrorKind;
@@ -609,6 +609,7 @@ impl ServiceRunRequest {
 /// `--project`. `osc` sets the same three variables when it
 /// runs services with a project known; the names are kept in
 /// sync with the server-side service runner.
+#[derive(Debug)]
 struct ServiceContext {
     project: Option<String>,
     package: Option<String>,
@@ -642,6 +643,14 @@ fn resolve_service_context(
     };
     match checkout {
         Some(checkout) => {
+            // The checkout's apiurl is a full API URL, and it rides
+            // verbatim into the service container's environment: a
+            // corrupted record fails here instead of feeding
+            // arbitrary text to the container. The split validates
+            // the shape without echoing the value (it could carry
+            // userinfo); `is_bare_authority` does not apply, the
+            // record carries scheme://host, not a bare authority.
+            split_api_url(&checkout.apiurl)?;
             if let Some(project) = project {
                 if project != checkout.project {
                     return Err(GeectlError::new(
@@ -18676,6 +18685,25 @@ exit 0
                 log.contains("-e OBS_SERVICE_PROJECT=home:alice"),
                 "container carries no project: {log}"
             );
+        }
+
+        #[test]
+        fn resolve_service_context_refuses_a_garbage_checkout_apiurl() {
+            // The checkout's apiurl rides verbatim into the service
+            // container's environment: a corrupted record fails here
+            // instead of feeding arbitrary text to the container.
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            make_working_copy(&src, "home:alice", "foo", "git");
+            let status = Command::new("git")
+                .args(["config", "--local", "geectl.apiurl", "not a url"])
+                .current_dir(&src)
+                .status()
+                .expect("git runs in the fixture");
+            assert!(status.success());
+            let err = resolve_service_context(&src, None).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
         }
 
         #[test]

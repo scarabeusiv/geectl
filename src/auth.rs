@@ -508,7 +508,7 @@ fn resolve_obs_bearer_with(
 /// are `InvalidInput`. The URL itself is never
 /// echoed in the error: it could carry userinfo. IPv6 hosts
 /// arrive without their brackets.
-fn split_api_url(url: &str) -> Result<(String, String, Option<u16>), GeectlError> {
+pub(crate) fn split_api_url(url: &str) -> Result<(String, String, Option<u16>), GeectlError> {
     // The URL itself is never echoed: it could carry userinfo
     // (`ftp://user:secret@host` fails the scheme check before
     // the `@` check), and an error must never carry a credential.
