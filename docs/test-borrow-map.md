@@ -51,15 +51,26 @@ Surveyed: osc's Behave suite (77 feature files, 272 scenarios) and unit suite (5
 
 ## Reconciliation with issue #40
 
-The map states 227 adopted (120 behave / 107 unit). Issue #40 totals
-246 (129 behave / 117 unit). The gap is 19 (9 behave + 10 unit):
-since the totals stood at 231, the issue added 15 adoptions (+4
-behave, +11 unit) — PR #217 (+6 unit), PR #232 (+1 unit), PR #207
-(+3 unit), PR #177 (+1 behave), PR #298 (+3 behave) and PR #300
-(+1 unit) — while the map's adopted totals rose by only 2 (both
-unit). The map's per-batch table is gone, so the two sides cannot be
-cross-checked case by case; the issue's per-section running counts
-are the live record.
+The map states 227 adopted (120 behave / 107 unit). The verified
+adopted total is 240 (124 behave / 116 unit), re-derived item by
+item in #40 against osc @89f6bdc and the geectl tree at main
+`549f57b`. The 13 adoptions in the verified total but not in this
+map are #217 (+6 unit), #207 (+3 unit), #177 (+1 behave) and #298
+(+3 behave). The other two adoptions the issue added since the
+totals stood at 231, #232 (+1 unit) and #300 (+1 unit), are already
+counted in the map's 227: they took it from 225 to 227. #232 pins
+osc `tests/test_grabber.py::test_invalid_scheme` as
+`download_dep_ignores_a_non_http_mirror_url`; #300 pins osc
+`tests/test_gitea_api_user.py::test_object` as
+`user_search_parses_users_and_ignores_unknown_fields`. Issue #40's
+headline 246 overstates the verified total by 6: 5 behave are the
+batch-4 scenarios also counted under batch 3
+(`showlinked-project-package.feature` :10/:18,
+`develproject-project-package.feature` :9/:17/:26), and the 1 unit
+has no itemization in the record — the 103 pre-sweep unit
+enumeration is verified against the osc checkout (see the
+re-derivation in #40), so it is a transcription slip in the
+pre-sweep running total.
 
 ## Osc-test quirks
 
