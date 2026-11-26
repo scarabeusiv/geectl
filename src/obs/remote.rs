@@ -13985,4 +13985,17 @@ mod tests {
         .unwrap();
         assert_eq!(meta.title.as_deref(), Some("t"));
     }
+
+    #[test]
+    fn project_meta_skips_unmodeled_children() {
+        // Unmodeled children are skipped, not rejected: real meta
+        // carries settings outside the typed model, and the write
+        // path preserves them.
+        let meta = parse_project_meta(
+            "<project name=\"p\"><foo>x</foo><lock><enable/></lock><project name=\"x\"><foo>y</foo></project></project>",
+        )
+        .unwrap();
+        assert_eq!(meta.name, "p");
+        assert!(meta.repositories.is_empty());
+    }
 }

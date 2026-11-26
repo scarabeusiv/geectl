@@ -856,7 +856,7 @@ pub(crate) fn xml_elements<'a>(body: &'a str, name: &str) -> Result<Vec<&'a str>
 /// its opening tag), honouring nesting of the same element name.
 /// None when the element is unterminated. The opening tag must not be
 /// self-closing: the caller checks that first.
-fn xml_element_end(inner: &str, start: usize, name: &str) -> Option<usize> {
+pub(crate) fn xml_element_end(inner: &str, start: usize, name: &str) -> Option<usize> {
     let after_lt = &inner[start + 1..];
     let gt = find_tag_end(after_lt)?;
     let mut depth = 1;
@@ -1373,8 +1373,12 @@ pub(crate) fn xml_child_elements<'a>(
 /// inside an attribute-only child is rejected too: the readers take
 /// its attributes only, so the text would vanish. A modeled
 /// tag hidden in skipped content is rejected as well: the descendant
-/// readers search raw text and would still find it there. Errors carry
-/// the byte offset of the offending content within `inner`.
+/// readers search raw text and would still find it there. Unmodeled
+/// children are skipped deliberately, not rejected: real meta carries
+/// settings outside the typed model, and the write path preserves
+/// them — the gate rejects only content the readers would misread.
+/// Errors carry the byte offset of the offending content within
+/// `inner`.
 /// What a modeled child of a gated element holds: plain text the
 /// readers decode, attributes only with no text, or a structured
 /// child whose own inner is gated separately.
@@ -1636,9 +1640,13 @@ pub(crate) fn xml_reject_stray_text(
                         }
                     }
                 } else {
-                    // Any other child is skipped whole, but a modeled
-                    // tag hidden in one would still be found by the
-                    // descendant readers, so any occurrence is rejected.
+                    // Any other child is skipped whole, deliberately:
+                    // real meta carries settings outside the typed
+                    // model (lock, publish, build flags), and the
+                    // write path preserves them. The gate rejects
+                    // only content the readers would misread, so a
+                    // modeled tag hidden in one is still rejected:
+                    // the descendant readers would find it there.
                     if let Some((tag, rel)) = hidden_tag(&inner[after_name..elem_end]) {
                         return Err(hidden_modeled_tag(tag, after_name + rel));
                     }
@@ -3072,5 +3080,50 @@ mod tests {
             "OBS project meta response"
         )
         .is_err());
+    }
+
+    #[test]
+    fn xml_reject_stray_text_skips_unmodeled_children_deliberately() {
+        // Unmodeled children are skipped, not rejected: real meta
+        // carries settings outside the typed model, and the write
+        // path preserves them. The skip holds at every level the
+        // gate covers, for an unknown child, for the settings real
+        // meta carries, and for a nested element of the gated
+        // element's own name — as long as no modeled tag hides
+        // inside.
+        for (inner, element) in [
+            ("<foo>x</foo>", "project"),
+            ("<foo>x</foo>", "repository"),
+            ("<foo>x</foo>", "download"),
+            ("<lock><enable/></lock>", "project"),
+            ("<build><disable/></build>", "project"),
+            ("<project name=\"x\"><foo>y</foo></project>", "project"),
+        ] {
+            assert!(
+                xml_reject_stray_text(inner, element, "OBS project meta response").is_ok(),
+                "{inner} in <{element}>"
+            );
+        }
+        // A modeled tag hidden inside a skipped child is still
+        // rejected: the descendant readers would find it there.
+        for (inner, element, tag) in [
+            ("<foo><title>t</title></foo>", "project", "title"),
+            (
+                "<project name=\"x\"><title>t</title></project>",
+                "project",
+                "title",
+            ),
+            ("<foo><arch>x86_64</arch></foo>", "repository", "arch"),
+        ] {
+            let err =
+                xml_reject_stray_text(inner, element, "OBS project meta response").unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError);
+            assert!(
+                err.context
+                    .contains(&format!("hidden <{tag}> in <{element}>")),
+                "{inner} in <{element}>: {}",
+                err.context
+            );
+        }
     }
 }

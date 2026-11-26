@@ -13,6 +13,7 @@ use crate::url::UrlBuilder;
 use crate::xml::find_tag_end;
 use crate::xml::xml_attr_blank;
 use crate::xml::xml_descendant_spans;
+use crate::xml::xml_element_end;
 use crate::xml::xml_unescape;
 
 /// The OBS API base (production).
@@ -1105,16 +1106,24 @@ pub(crate) fn meta_envelope<'a>(
     if open_tag.trim_end().ends_with('/') {
         return Ok((open_tag, ""));
     }
-    let inner = &after_open[end + 1..];
-    let close = format!("</{root}>");
-    let Some(close_pos) = inner.find(&close) else {
+    let inner_start = open.len() + end + 1;
+    // The close is the root's own: nested elements of the same name
+    // read whole, so the search counts nesting instead of stopping
+    // at the first close tag — a nested element of the root's name
+    // is an unmodeled child the gate skips, not the end of the
+    // document.
+    let Some(elem_end) = xml_element_end(body, 0, root) else {
         return Err(malformed());
     };
     // Nothing but whitespace may follow the closing tag.
-    if !inner[close_pos + close.len()..].trim().is_empty() {
+    if !body[elem_end..].trim().is_empty() {
         return Err(malformed());
     }
-    Ok((open_tag, &inner[..close_pos]))
+    let close_start = body[inner_start..elem_end]
+        .rfind('<')
+        .map(|rel| inner_start + rel)
+        .unwrap_or(elem_end);
+    Ok((open_tag, &body[inner_start..close_start]))
 }
 
 #[cfg(test)]
@@ -1935,5 +1944,27 @@ mod tests {
         let found = elements(block, "devel").unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].1, "<devel project=\"b\"/>");
+    }
+
+    #[test]
+    fn meta_envelope_reads_a_nested_element_of_the_roots_name_whole() {
+        // The close is the root's own: a nested element of the same
+        // name does not end the document, and a close tag inside a
+        // comment is not a close at all.
+        let (tag, inner) = meta_envelope(
+            "<project name=\"p\"><project name=\"x\"><foo>y</foo></project></project>",
+            "project",
+        )
+        .unwrap();
+        assert_eq!(tag, " name=\"p\"");
+        assert_eq!(inner, "<project name=\"x\"><foo>y</foo></project>");
+        let (_, inner) = meta_envelope(
+            "<project name=\"p\"><!-- </project> --><title>t</title></project>",
+            "project",
+        )
+        .unwrap();
+        assert_eq!(inner, "<!-- </project> --><title>t</title>");
+        // An unclosed root is still malformed, not a shorter inner.
+        assert!(meta_envelope("<project name=\"p\"><title>t</title>", "project").is_err());
     }
 }
