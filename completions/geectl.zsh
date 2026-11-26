@@ -2776,6 +2776,7 @@ _arguments "${_arguments_options[@]}" : \
 (whoami)
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
 '--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
