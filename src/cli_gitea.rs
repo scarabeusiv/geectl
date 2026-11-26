@@ -41,7 +41,7 @@
 
 use crate::auth::EnvGiteaAuth;
 use crate::config::{self, DEFAULT_GITEA_URL};
-use crate::debug::Debug;
+use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::GeectlError;
 use crate::gitea::{
     require_credentials_for_url, CleanupForkEntry, CleanupForkOutcome, CleanupForksResult,
@@ -856,10 +856,14 @@ fn render_commit_statuses(statuses: &[GiteaCommitStatus]) -> String {
     let rows: Vec<Vec<String>> = statuses
         .iter()
         .map(|status| {
+            // Description and context are server-authored free text:
+            // strip terminal controls, then flatten newlines — the
+            // strip keeps newlines by design, and the table needs
+            // one line per status.
             vec![
-                status.context.clone(),
+                strip_terminal_controls(&status.context).replace('\n', " "),
                 status.state.clone(),
-                status.description.clone(),
+                strip_terminal_controls(&status.description).replace('\n', " "),
                 status.target_url.clone(),
             ]
         })
@@ -1127,6 +1131,22 @@ mod tests {
         assert_eq!(
             text,
             "CONTEXT STATE   DESCRIPTION     TARGET\nobs     success Build succeeded https://ci.example.org/1"
+        );
+    }
+
+    #[test]
+    fn render_commit_statuses_flattens_newlines_and_strips_controls() {
+        // A status description carrying a newline (server-authored
+        // free text) would break the table rows; the render keeps
+        // one line per status, and escape sequences strip the same
+        // way as the other tables.
+        let mut status = sample_status();
+        status.description = "Build\nsucceeded".to_string();
+        status.context = "ob\u{1b}[2Js".to_string();
+        let text = render_commit_statuses(&[status]);
+        assert_eq!(
+            text,
+            "CONTEXT STATE   DESCRIPTION     TARGET\nob[2Js  success Build succeeded https://ci.example.org/1"
         );
     }
 
