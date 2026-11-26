@@ -6915,7 +6915,9 @@ fn live_trigger_service_without_service_file_is_not_found() {
 }
 
 /// A dry-run trigger sends nothing to the server: no run is
-/// queued and the plan names the trigger.
+/// queued and the plan names the trigger. The unnamed form needs
+/// no validation read; the named form validates first, so its dry
+/// run reads the stored file and fails where `--live` would.
 #[test]
 fn live_trigger_service_dry_run_sends_nothing() {
     let Some(base) = live_url() else {
@@ -6924,8 +6926,7 @@ fn live_trigger_service_dry_run_sends_nothing() {
     let authed = live_client_authed(&base);
     let package = live_package();
     let source_project = create_source_branch(&authed, &package);
-    // No `_service` upload: dry-run short-circuits before any read,
-    // so the trigger never looks at the stored file.
+    // The unnamed form plans without any read.
     let dry_run = DryRun::new(true);
     assert_eq!(
         authed
@@ -6938,6 +6939,43 @@ fn live_trigger_service_dry_run_sends_nothing() {
         vec![format!(
             "[dry-run] would: trigger services for {source_project}/{package}"
         )]
+    );
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "_service",
+            LIVE_SERVICE_MIXED,
+            &DryRun::new(false),
+        )
+        .expect("upload _service on the live instance");
+    // The named form validates against the stored file, then plans
+    // the trigger without posting it.
+    let dry_run = DryRun::new(true);
+    assert_eq!(
+        authed
+            .trigger_service(&source_project, &package, Some("download_url"), &dry_run)
+            .expect("a named dry-run trigger returns without error"),
+        None
+    );
+    assert_eq!(
+        dry_run.plan(),
+        vec![format!(
+            "[dry-run] would: trigger services for {source_project}/{package} (service download_url)"
+        )]
+    );
+    // An unknown name fails in dry-run exactly where `--live` would.
+    assert_eq!(
+        authed
+            .trigger_service(
+                &source_project,
+                &package,
+                Some("no_such_service"),
+                &DryRun::new(true),
+            )
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
     );
 }
 
