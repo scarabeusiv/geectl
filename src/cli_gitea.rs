@@ -23,8 +23,9 @@
 //! Coordinate header (design rule 1):
 //! every text rendering opens with one header line echoing the query
 //! coordinates (`owner: … repo: …`, `repo: owner/name`), except the
-//! content commands `branch-head`, whose text IS the bare SHA, and
-//! `raw-file`, whose text IS the file content.
+//! content commands `branch-head`, whose text IS the bare SHA,
+//! `raw-file`, whose text IS the file content, and `git-blob`,
+//! whose text IS the blob content.
 //! Tables stay as designed.
 //!
 //! Documented omissions (not gaps): `repo-list` and `repo-search`
@@ -45,11 +46,12 @@ use crate::debug::Debug;
 use crate::error::GeectlError;
 use crate::gitea::{
     require_credentials_for_url, CleanupForkEntry, CleanupForkOutcome, CleanupForksResult,
-    ForkRepoOptions, GiteaBranch, GiteaClient, GiteaCommitStatus, GiteaRepository, GiteaTreeEntry,
-    MaintainerInfo, Maintainership, RepoCreateOptions,
+    ForkRepoOptions, GiteaBlob, GiteaBranch, GiteaClient, GiteaCommitStatus, GiteaRepository,
+    GiteaTreeEntry, MaintainerInfo, Maintainership, RepoCreateOptions,
 };
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::DryRun;
+use base64::Engine;
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
@@ -159,6 +161,18 @@ pub enum GiteaCommand {
         /// The repository name.
         repo: String,
         /// The commit or tree SHA.
+        sha: String,
+    },
+    /// Show one git blob by its SHA: the decoded content of a
+    /// file at a blob SHA. The text IS the content (as UTF-8,
+    /// invalid sequences replaced); the JSON payload carries the
+    /// exact bytes base64-encoded.
+    GitBlob {
+        /// The repository owner.
+        owner: String,
+        /// The repository name.
+        repo: String,
+        /// The blob SHA.
         sha: String,
     },
     /// Show the maintainers recorded in a git project's
@@ -446,6 +460,11 @@ pub fn run_gitea(
                     render_git_tree(&entries),
                 ),
             ))
+        }
+        GiteaCommand::GitBlob { owner, repo, sha } => {
+            let blob = client.git_blob(&owner, &repo, &sha)?;
+            let payload = git_blob_json(&blob);
+            Ok((payload, render_git_blob(&blob)))
         }
         GiteaCommand::Maintainers { owner, repo } => {
             let maintainership = client.maintainership(&owner, &repo)?;
@@ -927,6 +946,23 @@ fn render_git_tree(entries: &[GiteaTreeEntry]) -> String {
     render_table(&["PATH", "MODE", "TYPE", "SHA", "SIZE"], &rows)
 }
 
+/// One git blob as JSON: the SHA, the size, and the exact
+/// content base64-encoded.
+fn git_blob_json(blob: &GiteaBlob) -> Value {
+    json!({
+        "sha": blob.sha,
+        "size": blob.size,
+        "content_base64": base64::engine::general_purpose::STANDARD.encode(&blob.content),
+    })
+}
+
+/// A git blob as text: the content as UTF-8, invalid sequences
+/// replaced. The JSON payload carries the exact bytes; the text
+/// rendering is for reading, like `raw-file`.
+fn render_git_blob(blob: &GiteaBlob) -> String {
+    String::from_utf8_lossy(&blob.content).into_owned()
+}
+
 /// The maintainership read as its JSON payload and its text
 /// rendering: the whole document in both — the typed form is the
 /// document, so the payload carries the project scope and every
@@ -1241,6 +1277,42 @@ mod tests {
         assert_eq!(render_git_tree(&[]), "no entries");
     }
 
+    fn sample_blob() -> GiteaBlob {
+        GiteaBlob {
+            sha: "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b".to_string(),
+            size: 30,
+            content: b"*.changes merge=merge-changes\n".to_vec(),
+        }
+    }
+
+    #[test]
+    fn git_blob_json_carries_the_blob_fields() {
+        let payload = git_blob_json(&sample_blob());
+        assert_eq!(
+            payload["sha"],
+            json!("37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b")
+        );
+        assert_eq!(payload["size"], json!(30));
+        assert_eq!(
+            payload["content_base64"],
+            json!("Ki5jaGFuZ2VzIG1lcmdlPW1lcmdlLWNoYW5nZXMK")
+        );
+    }
+
+    #[test]
+    fn render_git_blob_renders_the_content() {
+        assert_eq!(
+            render_git_blob(&sample_blob()),
+            "*.changes merge=merge-changes\n"
+        );
+        let binary = GiteaBlob {
+            sha: "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b".to_string(),
+            size: 2,
+            content: vec![0xff, b'a'],
+        };
+        assert_eq!(render_git_blob(&binary), "\u{fffd}a");
+    }
+
     #[test]
     fn gitea_commands_parse() {
         assert!(matches!(
@@ -1371,6 +1443,17 @@ mod tests {
                 "3c96114b2bd40ee352cebbe7fa6cf0e1a5f7b51d4bcd0fac1a4810fecaf3347a"
             ]),
             GiteaCommand::GitTree { .. }
+        ));
+        assert!(matches!(
+            parse(&[
+                "geectl",
+                "gitea",
+                "git-blob",
+                "pool",
+                "systemd",
+                "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b",
+            ]),
+            GiteaCommand::GitBlob { .. }
         ));
     }
 

@@ -56,6 +56,7 @@ use crate::obs::DryRun;
 use crate::obs::ObsClient;
 use crate::obs::ResultsQuery;
 use crate::url::UrlBuilder;
+use base64::Engine;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -446,6 +447,36 @@ struct GiteaTreeResponse {
     /// The entry total, when the server sent it.
     #[serde(default)]
     total_count: Option<u64>,
+}
+
+/// One git blob: the SHA, the size, and the decoded content.
+/// The content is bytes — a blob is any file, not necessarily
+/// text — so the CLI payload carries it base64-encoded and the
+/// text rendering is the content as UTF-8 with invalid
+/// sequences replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GiteaBlob {
+    /// The blob SHA.
+    pub sha: String,
+    /// The blob size in bytes.
+    pub size: u64,
+    /// The decoded blob content.
+    pub content: Vec<u8>,
+}
+
+/// The wire shape of a git-blob read: the SHA, the size, and
+/// the base64 content with its encoding. Only the fields the
+/// read needs are modelled — the blob `url` is not parsed.
+#[derive(Debug, Deserialize)]
+struct GiteaBlobResponse {
+    /// The blob SHA.
+    sha: String,
+    /// The blob size in bytes.
+    size: u64,
+    /// The base64-encoded content.
+    content: String,
+    /// The content encoding; the leaf only accepts `base64`.
+    encoding: String,
 }
 
 /// The maintainers of one scope in a git project's
@@ -2852,6 +2883,33 @@ impl<'a> GiteaClient<'a> {
         parse_tree(&body, owner, repo, sha)
     }
 
+    /// Read one git blob by its SHA (`GET
+    /// /api/v1/repos/{owner}/{repo}/git/blobs/{sha}`): the decoded
+    /// content, with the SHA and size the server sent. The server
+    /// answers base64; the leaf decodes it, so the caller gets
+    /// bytes, not an encoding. A blob whose echoed SHA is not the
+    /// SHA asked for, whose content is not base64, or whose
+    /// decoded size is not the size the server sent is a server
+    /// error. The SHA is a blob SHA (40 or 64 hex digits); a
+    /// missing blob is `NotFound`.
+    pub fn git_blob(&self, owner: &str, repo: &str, sha: &str) -> Result<GiteaBlob, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        if !looks_like_commit_sha(sha) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid Gitea commit SHA: {sha:?} (expected a 40- or 64-hex-digit SHA)"),
+            ));
+        }
+        let url = build_url(
+            &self.base,
+            &["api", "v1", "repos", owner, repo, "git", "blobs", sha],
+            &[],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_blob(&body, owner, repo, sha)
+    }
+
     /// Read one pull request (`GET
     /// /api/v1/repos/{owner}/{repo}/pulls/{number}`): the title and
     /// body, state and merge flags, author, labels, and the
@@ -4974,6 +5032,71 @@ fn parse_tree(
         }
     }
     Ok(parsed.tree)
+}
+
+/// Parse a git-blob document into its decoded form. The document
+/// carries the content base64-encoded with an `encoding` field:
+/// any other encoding is a server error, like a body that is not
+/// a blob document. The echoed SHA must be the SHA asked for and
+/// the decoded length must be the size the server sent — a blob
+/// that fails either check is a server error naming the repo and
+/// the SHA. Base64 line breaks are stripped before decoding: a
+/// wrapping server sends the same bytes.
+fn parse_blob(body: &str, owner: &str, repo: &str, sha: &str) -> Result<GiteaBlob, GeectlError> {
+    let parsed: GiteaBlobResponse = serde_json::from_str(body).map_err(|err| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected Gitea blob response for {owner}/{repo}@{sha}: {err}"),
+        )
+    })?;
+    if parsed.encoding != "base64" {
+        return Err(GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected Gitea blob response for {owner}/{repo}@{sha}: encoding is {:?}, not base64",
+                parsed.encoding
+            ),
+        ));
+    }
+    if parsed.sha != sha {
+        return Err(GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected Gitea blob response for {owner}/{repo}@{sha}: the server answered for {}",
+                parsed.sha
+            ),
+        ));
+    }
+    let stripped: String = parsed
+        .content
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    let content = base64::engine::general_purpose::STANDARD
+        .decode(stripped.as_bytes())
+        .map_err(|err| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea blob response for {owner}/{repo}@{sha}: not base64: {err}"
+                ),
+            )
+        })?;
+    if content.len() as u64 != parsed.size {
+        return Err(GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected Gitea blob response for {owner}/{repo}@{sha}: decoded size {} is not the size the server sent ({})",
+                content.len(),
+                parsed.size
+            ),
+        ));
+    }
+    Ok(GiteaBlob {
+        sha: parsed.sha,
+        size: parsed.size,
+        content,
+    })
 }
 
 /// Parse a `_maintainership.json` document (the `obs-maintainers`
@@ -8742,6 +8865,113 @@ mod tests {
             ErrorKind::NotFound,
         );
         let err = client(&http).git_tree("pool", "systemd", sha).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn git_blob_reads_and_decodes_the_blob() {
+        let sha = "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b";
+        let http = FakeHttp::new().with_get(
+            &format!(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/git/blobs/{sha}"
+            ),
+            r#"{"sha": "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b", "size": 998, "url": "https://src.opensuse.org/api/v1/repos/pool/systemd/git/blobs/37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b", "content": "Ki5jaGFuZ2VzIG1lcmdlPW1lcmdlLWNoYW5nZXMKKi43eiBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLmJzcCBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLmJ6MiBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLmdlbSBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLmd6IGZpbHRlcj1sZnMgZGlmZj1sZnMgbWVyZ2U9bGZzIC10ZXh0CiouamFyIGZpbHRlcj1sZnMgZGlmZj1sZnMgbWVyZ2U9bGZzIC10ZXh0CioubHogZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi5sem1hIGZpbHRlcj1sZnMgZGlmZj1sZnMgbWVyZ2U9bGZzIC10ZXh0Cioub2JzY3BpbyBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLm94dCBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnBkZiBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnBuZyBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnJwbSBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnRhciBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnRieiBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnRiejIgZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi50Z3ogZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi50dGYgZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi50eHogZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi53aGwgZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi54eiBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnppcCBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnpzdCBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAo=", "encoding": "base64"}"#,
+        );
+        let blob = client(&http).git_blob("pool", "systemd", sha).unwrap();
+        assert_eq!(blob.sha, sha);
+        assert_eq!(blob.size, 998);
+        assert_eq!(blob.content.len(), 998);
+        assert!(blob.content.starts_with(b"*.changes merge=merge-changes"));
+    }
+
+    #[test]
+    fn git_blob_tolerates_wrapped_base64() {
+        let sha = "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b";
+        let http = FakeHttp::new().with_get(
+            &format!(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/git/blobs/{sha}"
+            ),
+            r#"{"sha": "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b", "size": 998, "content": "Ki5jaGFuZ2VzIG1lcmdlPW1lcmdlLWNoYW5nZXMKKi43eiBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1l\ncmdlPWxmcyAtdGV4dAoqLmJzcCBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoq\nLmJ6MiBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLmdlbSBmaWx0ZXI9bGZz\nIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLmd6IGZpbHRlcj1sZnMgZGlmZj1sZnMgbWVyZ2U9\nbGZzIC10ZXh0CiouamFyIGZpbHRlcj1sZnMgZGlmZj1sZnMgbWVyZ2U9bGZzIC10ZXh0CioubHog\nZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi5sem1hIGZpbHRlcj1sZnMgZGlm\nZj1sZnMgbWVyZ2U9bGZzIC10ZXh0Cioub2JzY3BpbyBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdl\nPWxmcyAtdGV4dAoqLm94dCBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnBk\nZiBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnBuZyBmaWx0ZXI9bGZzIGRp\nZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnJwbSBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxm\ncyAtdGV4dAoqLnRhciBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnRieiBm\naWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnRiejIgZmlsdGVyPWxmcyBkaWZm\nPWxmcyBtZXJnZT1sZnMgLXRleHQKKi50Z3ogZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMg\nLXRleHQKKi50dGYgZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi50eHogZmls\ndGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi53aGwgZmlsdGVyPWxmcyBkaWZmPWxm\ncyBtZXJnZT1sZnMgLXRleHQKKi54eiBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4\ndAoqLnppcCBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnpzdCBmaWx0ZXI9\nbGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAo=", "encoding": "base64"}"#,
+        );
+        let blob = client(&http).git_blob("pool", "systemd", sha).unwrap();
+        assert_eq!(blob.content.len(), 998);
+        assert!(blob.content.starts_with(b"*.changes merge=merge-changes"));
+    }
+
+    #[test]
+    fn git_blob_refuses_a_non_base64_encoding() {
+        let sha = "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b";
+        let http = FakeHttp::new().with_get(
+            &format!(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/git/blobs/{sha}"
+            ),
+            r#"{"sha": "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b", "size": 998, "content": "aGVsbG8K", "encoding": "utf-8"}"#,
+        );
+        let err = client(&http).git_blob("pool", "systemd", sha).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn git_blob_refuses_a_sha_mismatch() {
+        let sha = "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b";
+        let http = FakeHttp::new().with_get(
+            &format!(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/git/blobs/{sha}"
+            ),
+            r#"{"sha": "0000000000000000000000000000000000000000000000000000000000000000", "size": 6, "content": "aGVsbG8K", "encoding": "base64"}"#,
+        );
+        let err = client(&http).git_blob("pool", "systemd", sha).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn git_blob_refuses_bad_base64() {
+        let sha = "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b";
+        let http = FakeHttp::new().with_get(
+            &format!(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/git/blobs/{sha}"
+            ),
+            r#"{"sha": "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b", "size": 6, "content": "!!!", "encoding": "base64"}"#,
+        );
+        let err = client(&http).git_blob("pool", "systemd", sha).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn git_blob_refuses_a_size_mismatch() {
+        let sha = "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b";
+        let http = FakeHttp::new().with_get(
+            &format!(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/git/blobs/{sha}"
+            ),
+            r#"{"sha": "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b", "size": 997, "content": "Ki5jaGFuZ2VzIG1lcmdlPW1lcmdlLWNoYW5nZXMKKi43eiBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLmJzcCBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLmJ6MiBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLmdlbSBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLmd6IGZpbHRlcj1sZnMgZGlmZj1sZnMgbWVyZ2U9bGZzIC10ZXh0CiouamFyIGZpbHRlcj1sZnMgZGlmZj1sZnMgbWVyZ2U9bGZzIC10ZXh0CioubHogZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi5sem1hIGZpbHRlcj1sZnMgZGlmZj1sZnMgbWVyZ2U9bGZzIC10ZXh0Cioub2JzY3BpbyBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLm94dCBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnBkZiBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnBuZyBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnJwbSBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnRhciBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnRieiBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnRiejIgZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi50Z3ogZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi50dGYgZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi50eHogZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi53aGwgZmlsdGVyPWxmcyBkaWZmPWxmcyBtZXJnZT1sZnMgLXRleHQKKi54eiBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnppcCBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAoqLnpzdCBmaWx0ZXI9bGZzIGRpZmY9bGZzIG1lcmdlPWxmcyAtdGV4dAo=", "encoding": "base64"}"#,
+        );
+        let err = client(&http).git_blob("pool", "systemd", sha).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn git_blob_rejects_a_non_sha_without_http() {
+        let http = FakeHttp::new();
+        for sha in [
+            "factory",
+            "0123",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            let err = client(&http).git_blob("pool", "systemd", sha).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "sha {sha:?}");
+        }
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn git_blob_missing_blob_is_not_found() {
+        let sha = "37a8eaae01b47a00744d0b5176949c17d596f4fbfa972b5fc05726d571a5ae9b";
+        let http = FakeHttp::new().with_get_error(
+            &format!("https://src.opensuse.org/api/v1/repos/pool/systemd/git/blobs/{sha}"),
+            ErrorKind::NotFound,
+        );
+        let err = client(&http).git_blob("pool", "systemd", sha).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 

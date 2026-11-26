@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-gitea-git-blob 1  "geectl-gitea-git-blob 0.2.2" 
+.SH NAME
+geectl\-gitea\-git\-blob \- Show one git blob by its SHA: the decoded content of a file at a blob SHA. The text IS the content (as UTF\-8, invalid sequences replaced); the JSON payload carries the exact bytes base64\-encoded
+.SH SYNOPSIS
+\fBgeectl gitea git\-blob\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIOWNER\fR> <\fIREPO\fR> <\fISHA\fR> 
+.SH DESCRIPTION
+Show one git blob by its SHA: the decoded content of a file at a blob SHA. The text IS the content (as UTF\-8, invalid sequences replaced); the JSON payload carries the exact bytes base64\-encoded
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIOWNER\fR>
+The repository owner
+.TP
+<\fIREPO\fR>
+The repository name
+.TP
+<\fISHA\fR>
+The blob SHA
+.SH VERSION
+v0.2.2
