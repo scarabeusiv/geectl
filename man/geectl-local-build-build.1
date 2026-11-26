@@ -45,7 +45,7 @@ Build in this directory instead of the derived cache\-dir root
 Skip the root initialization: start the build immediately in the existing root. Needs an initialized root (a previous build wrote the rpmlist and buildconfig there)
 .TP
 \fB\-\-preinstall\-image\fR
-Use the preinstall image when the buildinfo offers one. Off by default: the engine extracts the image with bsdtar `\-\-chroot` plus device nodes, which fail as a non\-root user, so a rootless build never selects the image. Only set it when the engine runs as root
+Use the preinstall image when the buildinfo offers one. Off by default: the engine extracts the image with bsdtar `\-\-chroot` plus device nodes, which need root. The engine always runs as container root, so the image is always selectable
 .TP
 \fB\-k\fR, \fB\-\-keep\-rpms\fR \fI<KEEP_RPMS>\fR
 Save the built RPMs into this directory (created when missing) on a green build

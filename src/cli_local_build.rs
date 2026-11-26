@@ -168,9 +168,9 @@ pub enum LocalBuildCommand {
         noinit: bool,
         /// Use the preinstall image when the buildinfo offers one.
         /// Off by default: the engine extracts the image with
-        /// bsdtar `--chroot` plus device nodes, which fail as a
-        /// non-root user, so a rootless build never selects the
-        /// image. Only set it when the engine runs as root.
+        /// bsdtar `--chroot` plus device nodes, which need root.
+        /// The engine always runs as container root, so the image
+        /// is always selectable.
         #[arg(long)]
         preinstall_image: bool,
         /// Save the built RPMs into this directory (created when

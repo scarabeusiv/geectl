@@ -13,6 +13,13 @@
 //! anything goes to the server. The server stays the source of truth
 //! for service results; local is for iterating fast.
 //!
+//! The engine runs inside the container too, like the service runs:
+//! geectl starts the build container from the Tumbleweed image,
+//! installs the `build` package in it, and runs the engine there.
+//! The host needs only podman — no `build` script on any platform —
+//! and the engine runs as container root, so it mounts filesystems
+//! and chroots into the build root the invoking user cannot.
+//!
 //! Layout (one geectl cache dir, `$XDG_CACHE_HOME/geectl/` by
 //! default, overridable by config `build.cache_dir`):
 //! - `pkg/<project>/<repo>/<arch>/` — the shared package cache, hdrmd5-verified
@@ -31,10 +38,11 @@
 //! anything used within 24 h, and the current image digest are never
 //! evicted.
 //!
-//! Test story: PR-level tests use a stub engine (a script that records
-//! its argv and emits a canned log with a `finished` line and fake
-//! RPMs) plus a stub podman — no real build runs in CI. The scheduled
-//! live run proves the real engine + image + cache end to end.
+//! Test story: PR-level tests use a stub podman (a script that plays
+//! the build container: run, exec, install, version, and the engine
+//! exec with a canned log and fake RPMs) — no real build runs in CI.
+//! The scheduled live run proves the real engine + image + cache end
+//! to end.
 //!
 //! Known limits, recorded here rather than hidden:
 //! - The library transport caps response bodies at 10 MiB, so a dep
@@ -47,8 +55,6 @@ use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -102,10 +108,6 @@ pub const IMAGE_REFRESH_DAYS: u64 = 7;
 pub const GRACE_PERIOD_SECS: u64 = 24 * 3600;
 /// The default build timeout (seconds).
 pub const DEFAULT_BUILD_TIMEOUT_SECS: u64 = 3600;
-/// How long the timeout kill waits after SIGTERM before SIGKILL.
-/// Unix only — the Windows kill is immediate.
-#[cfg(unix)]
-const KILL_GRACE_SECS: u64 = 5;
 /// How long a one-shot engine/podman probe may take (seconds):
 /// `--version`, image inspect, image listing, image size, image
 /// remove. A probe that cannot answer in this long is hung, not
@@ -117,11 +119,6 @@ const PROBE_TIMEOUT_SECS: u64 = 60;
 /// delay the timeout error. The bound matches the 10s `stop`
 /// passes to the container.
 const KILL_TIMEOUT_SECS: u64 = 10;
-/// How long one package-owner version probe may take (seconds):
-/// the query answers in ms on a healthy host; the budget only
-/// bounds a hung package manager. At most three run in sequence,
-/// after `--version`, so the chain stays bounded.
-const PACKAGE_PROBE_TIMEOUT_SECS: u64 = 10;
 /// How long the caller waits for a drain thread to finish after
 /// the child exits (seconds): the drain only has to read what is
 /// already in the pipe, so this is generous — but a descendant
@@ -209,8 +206,8 @@ pub struct BuildRequest {
     /// Use the preinstall image when the buildinfo offers one:
     /// `--preinstall-image`. Off by default: the engine extracts
     /// the image with bsdtar `--chroot` plus device nodes, which
-    /// fail as a non-root user, so a rootless build never selects
-    /// the image. Only set it when the engine runs as root.
+    /// need root. The engine always runs as container root, so
+    /// the image is always selectable.
     pub preinstall_image: bool,
     /// Copy the built RPMs into this directory on a green build;
     /// the directory is created when missing.
@@ -410,7 +407,7 @@ pub struct EnginePlan {
     /// The directory preferred RPMs are taken from, when
     /// `--prefer-packages` was passed.
     pub prefer_packages: Option<PathBuf>,
-    /// The engine argv, engine binary first, spec last.
+    /// The in-container engine argv, `build` first, spec last.
     pub argv: Vec<String>,
 }
 
@@ -433,8 +430,8 @@ pub struct BuildRecord {
     pub checks: Option<CheckSummary>,
     /// The resolved image digest, when podman answered.
     pub image_digest: Option<String>,
-    /// The engine version, when the engine reports one: its `--version`
-    /// answer, else the version of the package owning the engine binary.
+    /// The engine version, when the container's `rpm -q build`
+    /// answers one.
     pub engine_version: Option<String>,
     pub root_path: PathBuf,
     /// True when the build reused an existing root.
@@ -844,7 +841,6 @@ pub struct LocalBuild<'a> {
     obs: &'a ObsClient<'a>,
     cache_dir: PathBuf,
     cache_cap_bytes: u64,
-    engine: PathBuf,
     podman: PathBuf,
     debug: Debug,
     /// Pause between warm retries (fixed). Tests set it to
@@ -867,7 +863,6 @@ impl<'a> LocalBuild<'a> {
             obs,
             cache_dir: std::path::absolute(&cache_dir).unwrap_or(cache_dir),
             cache_cap_bytes: DEFAULT_CACHE_CAP_GIB * 1024 * 1024 * 1024,
-            engine: PathBuf::from("build"),
             podman: PathBuf::from("podman"),
             debug: Debug::disabled(),
             warm_retry_delay: WARM_RETRY_DELAY,
@@ -894,13 +889,6 @@ impl<'a> LocalBuild<'a> {
                 .saturating_mul(1024);
         }
         Ok(vertical)
-    }
-
-    /// The engine binary (`build` by default). Tests point it at a
-    /// stub script.
-    pub fn with_engine(mut self, engine: PathBuf) -> Self {
-        self.engine = engine;
-        self
     }
 
     /// The podman binary (`podman` by default). Tests point it at a
@@ -1221,14 +1209,6 @@ impl<'a> LocalBuild<'a> {
                 _ => {}
             }
         }
-        // A dry run prints the plan and touches nothing, so it does
-        // not need the engine installed: a missing engine records
-        // as an unknown version instead of failing the plan.
-        let engine_version = if req.dry_run {
-            self.engine_version().ok().flatten()
-        } else {
-            self.engine_version()?
-        };
         // A custom root replaces the derived cache-dir root: the
         // marker, lock, log, rpmlist, buildconfig, and the sccache
         // store all live under it. It is absolute: the engine runs
@@ -1293,7 +1273,9 @@ impl<'a> LocalBuild<'a> {
                 rpmlint: RpmlintSummary::default(),
                 checks: None,
                 image_digest: None,
-                engine_version,
+                // A dry run starts no container, so there is no
+                // engine to probe: the version is unknown.
+                engine_version: None,
                 root_path: root.clone(),
                 root_reused: root_existed,
                 cache: CacheStats::default(),
@@ -1406,6 +1388,17 @@ impl<'a> LocalBuild<'a> {
             }
             self.wipe_root_contents(&root)?;
         }
+        // The build container carries the engine: it starts here,
+        // installs the `build` package, and reports its version
+        // for the marker and the record. It lives for the whole
+        // build and stops on drop, on every path out.
+        let container = BuildContainer::start(self, &source_dir, &root, deadline)?;
+        container.install_engine(deadline)?;
+        let engine_version = container.engine_version(deadline);
+        if engine_version.is_none() {
+            self.debug
+                .emit("local-build: engine reported no version; recording unknown");
+        }
         self.ensure_marker(&root, req, &package, &image, &engine_version)?;
         let root_reused = root_existed && !req.clean;
 
@@ -1493,11 +1486,7 @@ impl<'a> LocalBuild<'a> {
         );
         self.debug
             .emit(&format!("local-build engine: {}", argv.join(" ")));
-        let (outcome, _, _) = run_engine(
-            &argv,
-            &source_dir,
-            deadline.saturating_duration_since(std::time::Instant::now()),
-        )?;
+        let (outcome, _, _) = run_engine_in_container(&container, &argv, deadline)?;
         let record = self.finish_build(
             req,
             &package,
@@ -1728,9 +1717,11 @@ impl<'a> LocalBuild<'a> {
         fs::remove_dir(root)
     }
 
-    /// The engine argv for a build, in the shape the existing tool
-    /// uses: root, rpmlist, dist, arch, the podman VM options, the
-    /// build flags, the sccache URI, and the spec last.
+    /// The engine argv for a build, in the shape the engine takes
+    /// inside the container: root, rpmlist, dist, arch, the build
+    /// flags, the sccache URI, and the spec last. No VM options:
+    /// the engine already runs inside the container, so there is
+    /// no VM to start.
     // Six arguments: the engine invocation's inputs — root, spec,
     // request, rpmlist, buildconfig, sccache URI. Grouping them
     // would hide the argv shape.
@@ -1745,14 +1736,11 @@ impl<'a> LocalBuild<'a> {
         sccache_uri: &Path,
     ) -> Vec<String> {
         let mut argv = vec![
-            self.engine.to_string_lossy().to_string(),
+            "build".to_string(),
             format!("--root={}", root.join(".mount").display()),
             format!("--rpmlist={}", rpmlist.display()),
             format!("--dist={}", buildconfig.display()),
             format!("--arch={}", req.arch),
-            "--vm-type=podman".to_string(),
-            format!("--vm-disk={}", root.join("img").display()),
-            format!("--vm-swap={}", root.join("swap").display()),
             format!("--logfile={}", root.join(BUILD_LOG).display()),
             "--statistics".to_string(),
             "--norootforbuild".to_string(),
@@ -1870,43 +1858,6 @@ impl<'a> LocalBuild<'a> {
                 foreign.join(", ")
             ),
         ))
-    }
-
-    /// The engine version, when the engine reports one: the engine's
-    /// own `--version` answer (first line), else the version of the
-    /// package owning the engine binary. The build script answers no
-    /// `--version`, so the package version is the version it reports.
-    /// An engine that reports no version either way reads as unknown
-    /// rather than failing the build — the record carries it when
-    /// known.
-    fn engine_version(&self) -> Result<Option<String>, GeectlError> {
-        let engine = which(&self.engine).ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::NoBuildEngine,
-                format!(
-                    "build engine {:?} not found on PATH; install the openSUSE build package (zypper install build) or put the build script on PATH",
-                    self.engine.to_string_lossy()
-                ),
-            )
-        })?;
-        let mut cmd = Command::new(&engine);
-        cmd.arg("--version");
-        let output = run_with_timeout(&mut cmd, Duration::from_secs(PROBE_TIMEOUT_SECS));
-        if let Ok(output) = output {
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                let first = text.lines().next().map(|l| l.trim().to_string());
-                if let Some(first) = first.filter(|l| !l.is_empty()) {
-                    return Ok(Some(first));
-                }
-            }
-        }
-        if let Some(version) = engine_package_version(&engine) {
-            return Ok(Some(version));
-        }
-        self.debug
-            .emit("local-build: engine reported no version; recording unknown");
-        Ok(None)
     }
 
     /// Create the root marker on first build, or refresh the
@@ -4101,16 +4052,12 @@ impl<'a> LocalBuild<'a> {
         // for aging while it is still being built.
         touch(&self.sccache_dir_for_req(req, package, root));
         if outcome.timed_out {
-            // On unix the timeout kills the engine's process group;
-            // on Windows only the direct child is killed.
-            #[cfg(unix)]
-            let killed = "the engine's process group was killed";
-            #[cfg(not(unix))]
-            let killed = "the engine process was killed; its children may still be running";
+            // The timeout kills the build container by name, so
+            // nothing the engine started keeps running after it.
             return Err(GeectlError::new(
                 ErrorKind::BuildTimeout,
                 format!(
-                    "build of {package} timed out after {}s; partial log at {}; {killed}, but the container it started may still be running",
+                    "build of {package} timed out after {}s; partial log at {}; the build container was killed",
                     req_timeout(req),
                     log_path.display()
                 ),
@@ -4196,23 +4143,268 @@ struct EngineOutcome {
     timed_out: bool,
 }
 
-/// Run the engine with a bounded timeout, draining its stdout and
-/// stderr (capped) while waiting. Returns the exit, whether the
-/// timeout killed it, and the captured output (stdout, stderr).
-/// On unix, the engine spawns in its own process group
-/// (`process_group(0)`), so on timeout the kill reaches the engine
-/// and its children in the host process group — killing the wrapper
-/// alone would leave the engine running. The container the engine
-/// started is NOT stopped by that kill: it lives in its own pid
-/// namespace, and conmon keeps it running after podman dies —
-/// stopping it needs the container id, which the engine does not
-/// report (see the design doc's "Timeout and abort"). On unix, the
-/// child gets SIGTERM, then SIGKILL after a grace period (see
-/// [`kill_child`]); on Windows only the direct child is killed.
-fn run_engine(
+/// One ephemeral container for a build or a `build-shell` run: the
+/// build engine runs inside it. Started detached on `sleep` so the
+/// steps run as `podman exec` calls in the same container, stopped
+/// on drop. The container runs as root (the podman default): the
+/// engine mounts filesystems inside the build root and chroots
+/// into it, which the invoking user cannot do. The container runs
+/// privileged with `SYS_ADMIN` and `MKNOD`: the engine mounts
+/// dev, proc, and sys inside the build root, and the default cap
+/// set denies those mounts (verified live on the Mac podman
+/// machine, where caps alone mount /dev and /proc but not /sys).
+/// That is the flag set the engine's own privileged podman mode
+/// uses. The network stays open — the engine package is installed
+/// from the image's repositories at container start. A timed-out
+/// `exec` kills the container: the exec'd process ends with it
+/// instead of running on to the sleep budget. Unlike the engine's
+/// own podman mode, geectl owns this container by name, so a
+/// timeout kill stops the container instead of leaving it running.
+struct BuildContainer {
+    podman: PathBuf,
+    name: String,
+    workdir: PathBuf,
+}
+
+static BUILD_CONTAINER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The install exec argv for the build container: the `build`
+/// package, without recommends. The container runs as root, so no
+/// elevation is needed (unlike the service container, which runs
+/// as the invoking user and elevates only the install).
+fn build_engine_install_argv() -> Vec<String> {
+    vec![
+        "zypper".to_string(),
+        "--non-interactive".to_string(),
+        "install".to_string(),
+        "--no-recommends".to_string(),
+        "build".to_string(),
+    ]
+}
+
+impl BuildContainer {
+    fn start(
+        vertical: &LocalBuild<'_>,
+        workdir: &Path,
+        root: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<Self, GeectlError> {
+        // The mounts carry the cache dir (the root, the pkg cache,
+        // the sccache store), the workdir (the source dir for a
+        // build, the root itself for a shell), and the root when it
+        // sits outside the cache dir (a custom `--root`), all at
+        // their host paths, so every argv path the engine takes
+        // resolves inside the container exactly as on the host.
+        check_mount_source(&vertical.cache_dir)?;
+        check_mount_source(workdir)?;
+        check_mount_source(root)?;
+        let podman = which(&vertical.podman).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ImageUnavailable,
+                format!(
+                    "podman {:?} not found on PATH; install podman to run local builds",
+                    vertical.podman.to_string_lossy()
+                ),
+            )
+        })?;
+        let n = BUILD_CONTAINER_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let name = format!("geectl-build-{}-{n}", std::process::id());
+        let sleep_secs = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs()
+            .max(1);
+        let mut mounts: Vec<String> = vec![
+            format!(
+                "type=bind,src={},target={}",
+                vertical.cache_dir.display(),
+                vertical.cache_dir.display()
+            ),
+            format!(
+                "type=bind,src={},target={}",
+                workdir.display(),
+                workdir.display()
+            ),
+        ];
+        if !root.starts_with(&vertical.cache_dir) && root != workdir {
+            mounts.push(format!(
+                "type=bind,src={},target={}",
+                root.display(),
+                root.display()
+            ));
+        }
+        let mut cmd = Command::new(&podman);
+        cmd.arg("run");
+        cmd.args([
+            "-d",
+            "--rm",
+            "--name",
+            &name,
+            // Privileged, with the mount caps: the engine mounts
+            // dev, proc, and sys inside the build root (see the
+            // struct doc). The service container stays locked
+            // down; the build container cannot be — mounting is
+            // the engine's job.
+            "--privileged",
+            "--cap-add",
+            "SYS_ADMIN",
+            "--cap-add",
+            "MKNOD",
+        ]);
+        for mount in &mounts {
+            cmd.args(["--mount", mount]);
+        }
+        cmd.args([
+            "-w",
+            &workdir.to_string_lossy(),
+            DEFAULT_IMAGE,
+            "sleep",
+            &sleep_secs.to_string(),
+        ]);
+        let output =
+            run_with_timeout(&mut cmd, Duration::from_secs(PROBE_TIMEOUT_SECS)).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::ImageUnavailable,
+                    format!("cannot start the build container: {e}"),
+                )
+            })?;
+        if !output.status.success() {
+            return Err(GeectlError::new(
+                ErrorKind::ImageUnavailable,
+                format!(
+                    "cannot start the build container: {}",
+                    last_lines(&String::from_utf8_lossy(&output.stderr), 20).join("\n")
+                ),
+            ));
+        }
+        if String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::ImageUnavailable,
+                "podman run started no container: empty container id",
+            ));
+        }
+        Ok(BuildContainer {
+            podman,
+            name,
+            workdir: workdir.to_path_buf(),
+        })
+    }
+
+    /// Install the `build` engine package inside the container.
+    /// The image is plain Tumbleweed: the engine arrives with the
+    /// container, not with the host.
+    fn install_engine(&self, deadline: std::time::Instant) -> Result<(), GeectlError> {
+        let output = self.exec(&build_engine_install_argv(), deadline)?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(GeectlError::new(
+            ErrorKind::ImageUnavailable,
+            format!(
+                "cannot install the build engine in the container: {}",
+                last_lines(&String::from_utf8_lossy(&output.stderr), 20).join("\n")
+            ),
+        ))
+    }
+
+    /// The installed engine's version, from `rpm -q build` inside
+    /// the container. `None` when the probe answers nothing — the
+    /// record carries it when known. A failed probe is by design,
+    /// not an error: the build proceeds and the record carries an
+    /// unknown version instead of failing.
+    fn engine_version(&self, deadline: std::time::Instant) -> Option<String> {
+        let output = self
+            .exec(
+                &["rpm".to_string(), "-q".to_string(), "build".to_string()],
+                deadline,
+            )
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let version = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if version.is_empty() {
+            None
+        } else {
+            Some(version)
+        }
+    }
+
+    /// Run `argv` in the container, bounded by the deadline. The
+    /// argv form carries no shell. Every call sets the working
+    /// directory explicitly instead of relying on the create-time
+    /// value.
+    fn exec(
+        &self,
+        argv: &[String],
+        deadline: std::time::Instant,
+    ) -> Result<std::process::Output, GeectlError> {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(GeectlError::new(
+                ErrorKind::BuildTimeout,
+                "build container budget exhausted before the command started",
+            ));
+        }
+        let mut cmd = Command::new(&self.podman);
+        cmd.arg("exec")
+            .arg("-w")
+            .arg(&self.workdir)
+            .arg(&self.name)
+            .args(argv);
+        run_with_timeout(&mut cmd, remaining).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                self.kill();
+                GeectlError::new(
+                    ErrorKind::BuildTimeout,
+                    format!(
+                        "build container command timed out: {}",
+                        argv.first().map(String::as_str).unwrap_or("")
+                    ),
+                )
+            } else {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot run a command in the build container: {e}"),
+                )
+            }
+        })
+    }
+
+    fn stop(&self) {
+        let mut cmd = Command::new(&self.podman);
+        cmd.args(["stop", "--time", "10", &self.name]);
+        let _ = run_with_timeout(&mut cmd, Duration::from_secs(PROBE_TIMEOUT_SECS));
+    }
+
+    /// Kill the container at once: the run has already failed, so
+    /// nothing in the container has anything left to finish.
+    fn kill(&self) {
+        let mut cmd = Command::new(&self.podman);
+        cmd.args(["kill", &self.name]);
+        let _ = run_with_timeout(&mut cmd, Duration::from_secs(KILL_TIMEOUT_SECS));
+    }
+}
+
+impl Drop for BuildContainer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Run the engine in the build container, bounded by the
+/// deadline. Returns the exit, whether the timeout killed it, and
+/// the captured output (stdout, stderr). On timeout the container
+/// is killed by name (see [`BuildContainer::exec`]), so unlike the
+/// old host-engine run nothing keeps running after a timeout.
+fn run_engine_in_container(
+    container: &BuildContainer,
     argv: &[String],
-    cwd: &Path,
-    timeout: Duration,
+    deadline: std::time::Instant,
 ) -> Result<(EngineOutcome, Vec<u8>, Vec<u8>), GeectlError> {
     if argv.is_empty() {
         return Err(GeectlError::new(
@@ -4220,126 +4412,25 @@ fn run_engine(
             "cannot run the build engine: empty argv",
         ));
     }
-    let mut child = spawn_with_retry(|| {
-        let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..])
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // Its own process group: the timeout kill signals the group
-        // (`kill -- -$pgid`), not just the wrapper — the engine and
-        // its host-side children die with it. The container does
-        // not: it lives in its own pid namespace (see the doc above).
-        // `process_group` is safe std, no `unsafe`, so the crate's
-        // `unsafe` forbid still holds. Unix-only: Windows has no
-        // process groups in std.
-        #[cfg(unix)]
-        cmd.process_group(0);
-        cmd.spawn()
-    })
-    .map_err(|e| {
-        GeectlError::new(
-            ErrorKind::NoBuildEngine,
-            format!("cannot run the build engine {}: {e}", argv[0]),
-        )
-    })?;
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let stdout_drain = spawn_drain(stdout.take());
-    let stderr_drain = spawn_drain(stderr.take());
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return Ok((
-                    EngineOutcome {
-                        exit_code: status.code().unwrap_or(-1),
-                        timed_out: false,
-                    },
-                    take_drain(stdout_drain),
-                    take_drain(stderr_drain),
-                ));
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    kill_child(&mut child);
-                    let _ = child.wait();
-                    // The timeout path discards the captured output
-                    // (the log file is the record): detach the
-                    // drains instead of waiting out the join timeout.
-                    drop(stdout_drain);
-                    drop(stderr_drain);
-                    return Ok((
-                        EngineOutcome {
-                            exit_code: -1,
-                            timed_out: true,
-                        },
-                        Vec::new(),
-                        Vec::new(),
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => {
-                return Err(GeectlError::new(
-                    ErrorKind::InternalError,
-                    format!("cannot wait for the build engine: {e}"),
-                ));
-            }
-        }
+    match container.exec(argv, deadline) {
+        Ok(output) => Ok((
+            EngineOutcome {
+                exit_code: output.status.code().unwrap_or(-1),
+                timed_out: false,
+            },
+            output.stdout,
+            output.stderr,
+        )),
+        Err(e) if e.kind() == ErrorKind::BuildTimeout => Ok((
+            EngineOutcome {
+                exit_code: -1,
+                timed_out: true,
+            },
+            Vec::new(),
+            Vec::new(),
+        )),
+        Err(e) => Err(e),
     }
-}
-
-/// On unix, SIGTERM the child's process group, then SIGKILL after a
-/// grace period. The engine runs in its own process group (see
-/// [`run_engine`]), so the signal reaches the engine and its
-/// host-side children — killing the wrapper alone would leave the
-/// engine running. It does NOT stop the container the engine
-/// started (own pid namespace; conmon keeps it running) — see
-/// [`run_engine`]. `kill` is the system binary (present on Linux
-/// and macOS); when it is missing the SIGKILL below is the whole
-/// kill, and only the direct child dies. On Windows there is no
-/// `kill` binary and no process group to signal, so the child is
-/// killed directly instead (see below).
-#[cfg(unix)]
-fn kill_child(child: &mut std::process::Child) {
-    let pgid = child.id();
-    let _ = Command::new("kill")
-        .args(["-TERM", "--", &format!("-{pgid}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let deadline = std::time::Instant::now() + Duration::from_secs(KILL_GRACE_SECS);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(_) => break,
-        }
-    }
-    let _ = Command::new("kill")
-        .args(["-KILL", "--", &format!("-{pgid}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let _ = child.kill();
-}
-
-/// Kill the direct child immediately. Windows has no `kill`
-/// binary and no process group to signal, so the grace-period
-/// wait would only burn time polling a child nothing terminates.
-/// Grandchildren are not stopped.
-#[cfg(not(unix))]
-fn kill_child(child: &mut std::process::Child) {
-    let _ = child.kill();
 }
 
 /// Spawn attempts, at most: a momentary fork failure clears in
@@ -4438,11 +4529,11 @@ fn spawn_with_retry(
 }
 
 /// Run a one-shot command with a deadline, capturing stdout/stderr
-/// (capped, as in [`run_engine`]). On expiry the child is killed
-/// and `TimedOut` is returned — a probe must never hang the caller.
-/// The engine run has its own deadline loop ([`run_engine`]); this
-/// is for the probes (`--version` and package-owner version,
-/// image inspect/listing/size, image remove, image pull).
+/// (capped). On expiry the child is killed and `TimedOut` is
+/// returned — a probe must never hang the caller. This is for the
+/// one-shot commands (image inspect/listing/size, image remove,
+/// image pull, container run/exec/stop/kill): the engine exec goes
+/// through it too, bounded by the build deadline.
 fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<std::process::Output> {
     let mut child = spawn_with_retry(|| {
         cmd.stdin(Stdio::null())
@@ -4549,62 +4640,8 @@ fn drain_into(stream: Option<impl Read + Send + 'static>, buf: &Arc<Mutex<Vec<u8
     }
 }
 
-/// The version of the package owning `engine`, when the host package
-/// manager can tell: `rpm -qf` on rpm systems, `dpkg-query` on
-/// Debian systems. `None` when neither answers — the engine is not
-/// installed from a package, or no package manager is present.
-fn engine_package_version(engine: &Path) -> Option<String> {
-    let engine = engine.to_str()?;
-    let mut cmd = Command::new("rpm");
-    cmd.args(["-qf", "--queryformat", "%{VERSION}-%{RELEASE}", engine]);
-    if let Ok(output) = run_with_timeout(&mut cmd, Duration::from_secs(PACKAGE_PROBE_TIMEOUT_SECS))
-    {
-        if output.status.success() {
-            let version = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if !version.is_empty() {
-                return Some(version);
-            }
-        }
-    }
-    let mut cmd = Command::new("dpkg-query");
-    cmd.args(["-S", engine]);
-    let owner = run_with_timeout(&mut cmd, Duration::from_secs(PACKAGE_PROBE_TIMEOUT_SECS)).ok()?;
-    if !owner.status.success() {
-        return None;
-    }
-    // The owner line is `package: <path>` (or `package:arch: <path>`);
-    // a diverted path also prints `local diversion ...` lines naming
-    // the same path, so select the line whose package field has no
-    // whitespace — a package name never does.
-    let stdout = String::from_utf8_lossy(&owner.stdout);
-    let package = stdout
-        .lines()
-        .filter(|line| line.ends_with(&format!(": {engine}")))
-        .filter_map(|line| line.split(':').next().map(str::trim))
-        .find(|package| !package.is_empty() && !package.contains(char::is_whitespace));
-    let package = package?;
-    let mut cmd = Command::new("dpkg-query");
-    cmd.args(["-W", "-f", "${Version}", package]);
-    let output =
-        run_with_timeout(&mut cmd, Duration::from_secs(PACKAGE_PROBE_TIMEOUT_SECS)).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if version.is_empty() {
-        None
-    } else {
-        Some(version)
-    }
-}
-
-/// Find the engine (or podman) binary: an absolute path as-is, a
-/// bare name resolved via `PATH`.
+/// Find the podman binary: an absolute path as-is, a bare name
+/// resolved via `PATH`.
 fn which(path: &Path) -> Option<PathBuf> {
     if path.components().count() > 1 {
         return if path.exists() {
@@ -6406,14 +6443,11 @@ impl<'a> LocalBuild<'a> {
         }
         let shell_cmd = commands.join(" && ");
         let argv = [
-            self.engine.to_string_lossy().to_string(),
+            "build".to_string(),
             format!("--root={}", root.join(".mount").display()),
             format!("--rpmlist={}", rpmlist_path.display()),
             format!("--dist={}", buildconfig_path.display()),
             format!("--arch={arch}"),
-            "--vm-type=podman".to_string(),
-            format!("--vm-disk={}", root.join("img").display()),
-            format!("--vm-swap={}", root.join("swap").display()),
             "--shell-cmd".to_string(),
             shell_cmd,
         ];
@@ -6425,19 +6459,21 @@ impl<'a> LocalBuild<'a> {
             "local-build shell: {} --shell-cmd [redacted]",
             argv[..argv.len() - 2].join(" ")
         ));
-        let (outcome, stdout, stderr) =
-            run_engine(&argv, &root, Duration::from_secs(timeout_secs))?;
+        // The shell runs in a build container, like the engine:
+        // the container starts here, installs the engine, and
+        // stops on drop. The shell works on the preserved root,
+        // so the container's workdir is the root itself.
+        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let container = BuildContainer::start(self, &root, &root, deadline)?;
+        container.install_engine(deadline)?;
+        let (outcome, stdout, stderr) = run_engine_in_container(&container, &argv, deadline)?;
         if outcome.timed_out {
-            // On unix the timeout kills the engine's process group;
-            // on Windows only the direct child is killed.
-            #[cfg(unix)]
-            let killed = "the engine's process group was killed";
-            #[cfg(not(unix))]
-            let killed = "the engine process was killed; its children may still be running";
+            // The timeout kills the build container by name, so
+            // nothing the shell started keeps running after it.
             return Err(GeectlError::new(
                 ErrorKind::BuildTimeout,
                 format!(
-                    "shell in build root {} timed out after {timeout_secs}s; {killed}, but the container it started may still be running",
+                    "shell in build root {} timed out after {timeout_secs}s; the build container was killed",
                     root.display()
                 ),
             ));
@@ -7170,7 +7206,7 @@ impl<'a> LocalBuild<'a> {
             });
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-        ServiceContainer::check_mount_source(&source_dir)?;
+        check_mount_source(&source_dir)?;
         let image = self.resolve_image(false, timeout_secs, deadline)?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let container =
@@ -7303,7 +7339,7 @@ impl<'a> LocalBuild<'a> {
                 plan: None,
             });
         }
-        ServiceContainer::check_mount_source(&source_dir).inspect_err(|_| {
+        check_mount_source(&source_dir).inspect_err(|_| {
             remove_stash(&stash, &self.debug);
         })?;
         let image = self
@@ -7454,7 +7490,7 @@ impl<'a> LocalBuild<'a> {
                 "precommit budget exhausted before pre_checkin.sh; the services ran, the script did not",
             ));
         }
-        ServiceContainer::check_mount_source(source_dir)?;
+        check_mount_source(source_dir)?;
         let image = self.resolve_image(false, remaining.as_secs(), deadline)?;
         self.debug.emit(&format!(
             "precommit image: {} digest {}",
@@ -7554,25 +7590,26 @@ fn service_install_argv(packages: &[String]) -> Vec<String> {
     argv
 }
 
-impl ServiceContainer {
-    /// A source directory the `--mount` form can carry: it holds
-    /// no `,`, which splits the comma-separated value with no
-    /// escape — podman refuses the fragment as an invalid mount
-    /// option. Refusing here names the path instead of letting
-    /// the container fail to start.
-    fn check_mount_source(source_dir: &Path) -> Result<(), GeectlError> {
-        if source_dir.to_string_lossy().contains(',') {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "source directory {} contains a ','; the --mount form cannot carry a comma in the path",
-                    source_dir.display()
-                ),
-            ));
-        }
-        Ok(())
+/// A source directory the `--mount` form can carry: it holds
+/// no `,`, which splits the comma-separated value with no
+/// escape — podman refuses the fragment as an invalid mount
+/// option. Refusing here names the path instead of letting
+/// the container fail to start. Shared by the service and build
+/// containers.
+fn check_mount_source(source_dir: &Path) -> Result<(), GeectlError> {
+    if source_dir.to_string_lossy().contains(',') {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "source directory {} contains a ','; the --mount form cannot carry a comma in the path",
+                source_dir.display()
+            ),
+        ));
     }
+    Ok(())
+}
 
+impl ServiceContainer {
     fn start(
         vertical: &LocalBuild<'_>,
         source_dir: &Path,
@@ -7582,7 +7619,7 @@ impl ServiceContainer {
     ) -> Result<Self, GeectlError> {
         // Checked at the entry points before any image work; kept
         // here so a future caller cannot build the mount unchecked.
-        Self::check_mount_source(source_dir)?;
+        check_mount_source(source_dir)?;
         let podman = which(&vertical.podman).ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ImageUnavailable,
@@ -9009,7 +9046,7 @@ mod tests {
     #[test]
     fn chroot_live_refuses_an_unknown_root() {
         // No build yet: the shell's marker check refuses before
-        // any engine runs, so no stub engine is needed here.
+        // any engine runs, so no stub podman is needed here.
         let http = FakeHttp::new();
         let client = ObsClient::new(&http);
         let dir = TempDir::new();
@@ -9465,8 +9502,8 @@ mod tests {
     }
 
     /// The stub tests below run shell scripts, so they are unix-only.
-    /// They prove the flow end to end against a stub engine and a
-    /// stub podman — no real build runs in CI.
+    /// They prove the flow end to end against a stub podman
+    /// that plays the build container — no real build runs in CI.
     #[cfg(unix)]
     mod unix_tests {
         use super::*;
@@ -9479,69 +9516,53 @@ mod tests {
             fs::set_permissions(path, perms).unwrap();
         }
 
-        /// A stub engine: answers `--version`, records its argv,
-        /// writes a canned log with a `finished` line, and drops a
-        /// fake RPM into the root's `.build.packages/RPMS/` — the
-        /// subdir the real engine uses. With `--shell-cmd` it
-        /// echoes the command to stdout (the captured shell output).
-        fn stub_engine(dir: &Path) -> (PathBuf, PathBuf) {
-            stub_engine_with_shell_exit(dir, 0)
+        /// Options for the podman stub's engine exec: what the
+        /// in-container engine run does. Defaults are the happy
+        /// path (install ok, version answers, finished line).
+        struct PodmanStubOpts {
+            with_image: bool,
+            shell_exit: i32,
+            version_fails: bool,
+            install_fails: bool,
+            engine_sleeps: bool,
+            finish_line: bool,
         }
 
-        /// A stub engine whose `--shell-cmd` run exits with
-        /// `shell_exit` (and reports the failure on stderr) while
-        /// the build path still exits 0: a failing repro is data,
-        /// not an engine failure.
-        fn stub_engine_with_shell_exit(dir: &Path, shell_exit: i32) -> (PathBuf, PathBuf) {
-            let script = dir.join("build-stub");
-            let argv_log = dir.join("engine-argv.log");
-            write_script(
-                &script,
-                &format!(
-                    r#"#!/bin/sh
-if [ "$1" = "--version" ]; then echo "build stub 1.0"; exit 0; fi
-echo "$@" >> "{argv_log}"
-root=""
-logfile=""
-spec=""
-shell_cmd=""
-prev=""
-for arg in "$@"; do
-  case "$arg" in
-    --root=*) root="${{arg#--root=}}" ;;
-    --logfile=*) logfile="${{arg#--logfile=}}" ;;
-    *.spec) spec="$arg" ;;
-  esac
-  if [ "$prev" = "--shell-cmd" ]; then shell_cmd="$arg"; fi
-  prev="$arg"
-done
-if [ -n "$shell_cmd" ]; then echo "shell output: $shell_cmd"; echo "shell error: $shell_cmd" >&2; exit {shell_exit}; fi
-if [ -n "$spec" ]; then
-  pkg=$(basename "$spec" .spec)
-  mkdir -p "$root/.build.packages/RPMS"
-  touch "$root/.build.packages/RPMS/$pkg-1.0-1.{arch}.rpm"
-  # A completed init leaves these behind: the image gate reads them.
-  mkdir -p "$root/installed-pkg" "$root/.build"
-  touch "$root/.build/init_buildsystem.data"
-  if [ -n "$logfile" ]; then printf 'build log\nfinished "build %s.spec"\n' "$pkg" > "$logfile"; fi
-fi
-"#,
-                    argv_log = argv_log.display(),
-                    arch = host_arch(),
-                    shell_exit = shell_exit,
-                ),
-            );
-            (script, argv_log)
+        impl PodmanStubOpts {
+            fn new(with_image: bool) -> Self {
+                PodmanStubOpts {
+                    with_image,
+                    shell_exit: 0,
+                    version_fails: false,
+                    install_fails: false,
+                    engine_sleeps: false,
+                    finish_line: true,
+                }
+            }
         }
 
-        /// A stub podman: `image inspect` reports a digest (or
-        /// nothing, when `with_image` is false), `pull` succeeds,
-        /// `images` lists the digest with its repository, `rmi`
-        /// succeeds.
-        fn stub_podman(dir: &Path, with_image: bool) -> (PathBuf, PathBuf) {
+        /// A stub podman that plays the build container: `image
+        /// inspect` reports a digest (or nothing, when `with_image`
+        /// is false), `pull` succeeds, `images` lists the digest
+        /// with its repository, `rmi` succeeds, `run` reports a
+        /// fake container id, `exec` dispatches on the inner argv —
+        /// the `zypper install build` exec installs the engine,
+        /// `rpm -q build` reports its version, and a `build` exec
+        /// runs the engine: records its argv, writes a canned log
+        /// with a `finished` line, and drops a fake RPM into the
+        /// root's `.build.packages/RPMS/` — the subdir the real
+        /// engine uses. With `--shell-cmd` it echoes the command
+        /// to stdout (the captured shell output). Returns the
+        /// script, the podman call log, and the engine argv log.
+        fn stub_podman(dir: &Path, with_image: bool) -> (PathBuf, PathBuf, PathBuf) {
+            stub_podman_opts(dir, PodmanStubOpts::new(with_image))
+        }
+
+        fn stub_podman_opts(dir: &Path, opts: PodmanStubOpts) -> (PathBuf, PathBuf, PathBuf) {
             let script = dir.join("podman-stub");
             let call_log = dir.join("podman-calls.log");
-            let digest_line = if with_image {
+            let argv_log = dir.join("engine-argv.log");
+            let digest_line = if opts.with_image {
                 "echo \"sha256:fake-digest-1234\""
             } else {
                 // Real podman reports a missing image on stderr
@@ -9550,6 +9571,21 @@ fi
                 // the stderr text, so the stub must print it — a
                 // bare `exit 1` would now read as a storage error.
                 "echo \"Error: image not known\" >&2; exit 1"
+            };
+            let version_line = if opts.version_fails {
+                "exit 1"
+            } else {
+                "echo \"build-1.0-1\""
+            };
+            let install_line = if opts.install_fails {
+                "echo \"install failed\" >&2; exit 1"
+            } else {
+                "exit 0"
+            };
+            let sleep_line = if opts.engine_sleeps {
+                "sleep 30"
+            } else {
+                "true"
             };
             write_script(
                 &script,
@@ -9569,13 +9605,61 @@ if [ "$1" = "images" ]; then
   exit 0
 fi
 if [ "$1" = "rmi" ]; then exit 0; fi
+if [ "$1" = "run" ]; then echo "fake-container-id"; exit 0; fi
+if [ "$1" = "stop" ]; then exit 0; fi
+if [ "$1" = "kill" ]; then exit 0; fi
+if [ "$1" = "exec" ]; then
+  shift 1
+  if [ "$1" = "-w" ]; then shift 2; fi
+  shift 1
+  if [ "$1" = "zypper" ]; then {install_line}; fi
+  if [ "$1" = "rpm" ]; then {version_line}; exit 0; fi
+  if [ "$1" = "build" ]; then
+    {sleep_line}
+    echo "$@" >> "{argv_log}"
+    root=""
+    logfile=""
+    spec=""
+    shell_cmd=""
+    prev=""
+    for arg in "$@"; do
+      case "$arg" in
+        --root=*) root="${{arg#--root=}}" ;;
+        --logfile=*) logfile="${{arg#--logfile=}}" ;;
+        *.spec) spec="$arg" ;;
+      esac
+      if [ "$prev" = "--shell-cmd" ]; then shell_cmd="$arg"; fi
+      prev="$arg"
+    done
+    if [ -n "$shell_cmd" ]; then echo "shell output: $shell_cmd"; echo "shell error: $shell_cmd" >&2; exit {shell_exit}; fi
+    if [ -n "$spec" ]; then
+      pkg=$(basename "$spec" .spec)
+      mkdir -p "$root/.build.packages/RPMS"
+      touch "$root/.build.packages/RPMS/$pkg-1.0-1.{arch}.rpm"
+      # A completed init leaves these behind: the image gate reads them.
+      mkdir -p "$root/installed-pkg" "$root/.build"
+      touch "$root/.build/init_buildsystem.data"
+      if [ -n "$logfile" ]; then if {finish_line}; then printf 'build log\\nfinished "build %s.spec"\\n' "$pkg" > "$logfile"; else printf 'build log\\nno finished line\\n' > "$logfile"; fi; fi
+    fi
+    exit 0
+  fi
+  exit 0
+fi
 exit 0
 "#,
                     call_log = call_log.display(),
-                    with_image = with_image,
+                    argv_log = argv_log.display(),
+                    digest_line = digest_line,
+                    with_image = opts.with_image,
+                    install_line = install_line,
+                    version_line = version_line,
+                    sleep_line = sleep_line,
+                    finish_line = opts.finish_line,
+                    arch = host_arch(),
+                    shell_exit = opts.shell_exit,
                 ),
             );
-            (script, call_log)
+            (script, call_log, argv_log)
         }
 
         fn client_with(http: &FakeHttp) -> ObsClient<'_> {
@@ -9848,15 +9932,8 @@ exit 0
             }
         }
 
-        fn vertical<'a>(
-            client: &'a ObsClient<'a>,
-            dir: &Path,
-            engine: PathBuf,
-            podman: PathBuf,
-        ) -> LocalBuild<'a> {
-            LocalBuild::new(client, dir.join("cache"))
-                .with_engine(engine)
-                .with_podman(podman)
+        fn vertical<'a>(client: &'a ObsClient<'a>, dir: &Path, podman: PathBuf) -> LocalBuild<'a> {
+            LocalBuild::new(client, dir.join("cache")).with_podman(podman)
         }
 
         /// Apply a one-item eviction plan, retrying while the item's
@@ -9884,11 +9961,10 @@ exit 0
         #[test]
         fn dry_run_returns_the_plan_and_touches_nothing() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.dry_run = true;
@@ -9896,7 +9972,8 @@ exit 0
             assert_eq!(record.verdict, "dry-run");
             assert!(record.dry_run);
             let plan = record.plan.unwrap();
-            assert!(plan.argv.iter().any(|a| a == "--vm-type=podman"));
+            assert_eq!(plan.argv.first().unwrap(), "build");
+            assert!(!plan.argv.iter().any(|a| a.starts_with("--vm-")));
             assert!(plan.argv.iter().any(|a| a.starts_with("--sccache-uri=")));
             assert!(plan.argv.last().unwrap().ends_with("foo.spec"));
             // Nothing was created: no root, no cache, no server call.
@@ -10067,11 +10144,10 @@ exit 0
         #[test]
         fn dry_run_plan_carries_the_new_flags() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let root = dir.path().join("custom-root");
             fs::create_dir_all(&root).unwrap();
@@ -10120,11 +10196,10 @@ exit 0
             // --noinit takes no --prefer-packages, so its argv pin
             // lives in its own test with an initialized root.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let root = dir.path().join("custom-root");
             fs::create_dir_all(&root).unwrap();
@@ -10152,11 +10227,10 @@ exit 0
             // buildconfig, so a dry run prints it without consulting
             // the root; the refusal stays a real-build check.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.dry_run = true;
@@ -10173,11 +10247,10 @@ exit 0
         #[test]
         fn noinit_build_on_a_fresh_root_is_refused() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let root = dir.path().join("fresh-root");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
@@ -10247,11 +10320,10 @@ exit 0
         #[test]
         fn build_fetches_buildinfo_for_the_alternative_project() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = alt_setup(&buildinfo_ok());
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.alternative_project = Some("openSUSE:Factory".to_string());
@@ -10278,8 +10350,7 @@ exit 0
             // under --alternative-project it resolves from the fetch
             // project, not the package's own project.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let http = FakeHttp::new()
                 .with_get(
@@ -10303,7 +10374,7 @@ exit 0
                     b"fake noproject rpm",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.alternative_project = Some("openSUSE:Factory".to_string());
@@ -10335,8 +10406,7 @@ exit 0
         #[test]
         fn build_prefers_a_package_from_the_prefer_dir() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let prefer = dir.path().join("prefer");
             fs::create_dir_all(&prefer).unwrap();
             let rpm_path = prefer.join(format!("glibc-2.38-1.{}.rpm", host_arch()));
@@ -10389,7 +10459,7 @@ exit 0
                     b"fake helper rpm",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.prefer_packages = Some(prefer);
@@ -10412,8 +10482,7 @@ exit 0
             // rebuilt RPM in the prefer dir is used on the next run
             // instead of the stale cached one.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let rpm_bytes = make_rpm(b"preferred glibc");
             let prefer = dir.path().join("prefer");
             fs::create_dir_all(&prefer).unwrap();
@@ -10467,7 +10536,7 @@ exit 0
                     b"fake helper rpm",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             // First build, no prefer: the download is cached.
             let req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
@@ -10494,8 +10563,7 @@ exit 0
         #[test]
         fn build_fails_closed_on_a_preferred_package_with_a_bad_digest() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let prefer = dir.path().join("prefer");
             fs::create_dir_all(&prefer).unwrap();
             let rpm_path = prefer.join(format!("glibc-2.38-1.{}.rpm", host_arch()));
@@ -10507,7 +10575,7 @@ exit 0
                 )
                 .with_get(&buildconfig_url(), "Macro: test 1\n");
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.prefer_packages = Some(prefer);
@@ -10519,11 +10587,10 @@ exit 0
         #[test]
         fn build_keeps_rpms_in_the_keep_dir() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let keep = dir.path().join("keep");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
@@ -10540,39 +10607,16 @@ exit 0
             // An engine that exits 0 but never writes the finished
             // line: verdict failed, so nothing is kept.
             let dir = TempDir::new();
-            let script = dir.path().join("build-stub-nofinish");
-            let argv_log = dir.path().join("engine-argv-nofinish.log");
-            write_script(
-                &script,
-                &format!(
-                    r#"#!/bin/sh
-if [ "$1" = "--version" ]; then echo "build stub 1.0"; exit 0; fi
-echo "$@" >> "{argv_log}"
-root=""
-logfile=""
-spec=""
-for arg in "$@"; do
-  case "$arg" in
-    --root=*) root="${{arg#--root=}}" ;;
-    --logfile=*) logfile="${{arg#--logfile=}}" ;;
-    *.spec) spec="$arg" ;;
-  esac
-done
-if [ -n "$spec" ]; then
-  pkg=$(basename "$spec" .spec)
-  mkdir -p "$root/.build.packages/RPMS"
-  touch "$root/.build.packages/RPMS/$pkg-1.0-1.{arch}.rpm"
-  if [ -n "$logfile" ]; then printf 'build log\nno finished line\n' > "$logfile"; fi
-fi
-"#,
-                    argv_log = argv_log.display(),
-                    arch = host_arch(),
-                ),
+            let (podman, _, _) = stub_podman_opts(
+                dir.path(),
+                PodmanStubOpts {
+                    finish_line: false,
+                    ..PodmanStubOpts::new(true)
+                },
             );
-            let (podman, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), script, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let keep = dir.path().join("keep");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
@@ -10586,11 +10630,10 @@ fi
         #[test]
         fn build_fails_when_a_kept_rpm_cannot_be_copied() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let keep = dir.path().join("keep");
             // A directory where the RPM would be copied: the copy
@@ -10609,11 +10652,10 @@ fi
         #[test]
         fn noinit_build_after_a_normal_build_is_green() {
             let dir = TempDir::new();
-            let (engine, argv_log) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, argv_log) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
             let first = vertical.build(&req).unwrap();
@@ -10650,11 +10692,10 @@ fi
             // stale file is gone. (The lock exclusion itself is
             // pinned by the unit test and the empty-root test.)
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let root = dir.path().join("custom-root");
             fs::create_dir_all(&root).unwrap();
@@ -10676,11 +10717,10 @@ fi
             // exclusion this build would refuse on the file the lock
             // just created.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let root = dir.path().join("custom-root");
             fs::create_dir_all(&root).unwrap();
@@ -10694,11 +10734,10 @@ fi
         #[test]
         fn build_refuses_another_architecture() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", other_arch());
             let err = vertical.build(&req).unwrap_err();
@@ -10778,8 +10817,7 @@ fi
         #[test]
         fn build_refuses_a_foreign_home_project() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new()
                 .with_get(
                     &buildinfo_url(),
@@ -10792,7 +10830,7 @@ fi
                 )
                 .with_get(&buildconfig_url(), "Macro: test 1\n");
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
             let err = vertical.build(&req).unwrap_err();
@@ -10809,8 +10847,7 @@ fi
             // the terminal through the `UntrustedProject` error or
             // the debug line: validation runs before `check_trust`.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new()
                 .with_get(
                     &buildinfo_url(),
@@ -10823,7 +10860,7 @@ fi
                 )
                 .with_get(&buildconfig_url(), "Macro: test 1\n");
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
             let err = vertical.build(&req).unwrap_err();
@@ -10841,8 +10878,7 @@ fi
             // why instead of telling the user to pass the broad
             // flag for their own home.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new()
                 .with_get(
                     &buildinfo_url(),
@@ -10861,7 +10897,7 @@ fi
                 },
             )
             .unwrap();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
             let err = vertical.build(&req).unwrap_err();
@@ -10877,8 +10913,7 @@ fi
             // build is green and the record lists no accepted
             // project.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new()
                 .with_get(
                     &buildinfo_url(),
@@ -10908,7 +10943,7 @@ fi
                     b"fake ownpkg rpm",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.trust_all_projects = true;
@@ -10923,8 +10958,7 @@ fi
             // home:, and a non-home: project: only the foreign one
             // is listed as accepted.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new()
                 .with_get(
                     &buildinfo_url(),
@@ -10963,7 +10997,7 @@ fi
                     b"fake make rpm",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.trust_all_projects = true;
@@ -10978,8 +11012,7 @@ fi
             // own subtree: without the flag it refuses, with the
             // flag it is accepted and listed.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new()
                 .with_get(
                     &buildinfo_url(),
@@ -11000,7 +11033,7 @@ fi
                     b"fake glibc rpm",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
             let err = vertical.build(&req).unwrap_err();
@@ -11021,8 +11054,7 @@ fi
             // The flag overrides trust, not validation: a `..`
             // project still fails in `validate_dep`.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new()
                 .with_get(
                     &buildinfo_url(),
@@ -11035,7 +11067,7 @@ fi
                 )
                 .with_get(&buildconfig_url(), "Macro: test 1\n");
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.trust_all_projects = true;
@@ -11051,8 +11083,7 @@ fi
             // flag, not a package the build would install, so it
             // joins no trust set and must not refuse the build.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new()
                 .with_get(
                     &buildinfo_url(),
@@ -11073,7 +11104,7 @@ fi
                     b"fake glibc rpm",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
             let record = vertical.build(&req).unwrap();
@@ -11087,8 +11118,7 @@ fi
             // build proceeds, and the accepted project is recorded
             // in the build record and reported on the debug channel.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new()
                 .with_get(
                     &buildinfo_url(),
@@ -11110,7 +11140,7 @@ fi
                 );
             let client = client_with(&http);
             let (debug, lines) = Debug::captured(true, false);
-            let vertical = vertical(&client, dir.path(), engine, podman).with_debug(debug);
+            let vertical = vertical(&client, dir.path(), podman).with_debug(debug);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.trust_all_projects = true;
@@ -11130,14 +11160,13 @@ fi
         #[test]
         fn build_fails_closed_on_an_unresolvable_buildinfo() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new().with_get(
                 &buildinfo_url(),
                 "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"x86_64\"><error>unresolvable: DOES-NOT-EXIST</error></buildinfo>",
             );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
             let err = vertical.build(&req).unwrap_err();
@@ -11148,11 +11177,10 @@ fi
         #[test]
         fn multibuild_requires_a_flavor() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             fs::write(
                 source.join("_multibuild"),
@@ -11171,11 +11199,10 @@ fi
         #[test]
         fn stub_build_end_to_end_and_second_run_reuses_the_root() {
             let dir = TempDir::new();
-            let (engine, argv_log) = stub_engine(dir.path());
-            let (podman, podman_log) = stub_podman(dir.path(), true);
+            let (podman, podman_log, argv_log) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
 
@@ -11188,7 +11215,7 @@ fi
                 record.image_digest.as_deref(),
                 Some("sha256:fake-digest-1234")
             );
-            assert_eq!(record.engine_version.as_deref(), Some("build stub 1.0"));
+            assert_eq!(record.engine_version.as_deref(), Some("build-1.0-1"));
             assert_eq!(record.cache.pkg_misses, 4);
             assert_eq!(record.cache.pkg_hits, 0);
             assert!(record.log_path.exists());
@@ -11203,7 +11230,8 @@ fi
             assert!(root.join(BUILDCONFIG).exists());
             // The engine got the shape the existing tool uses.
             let argv = fs::read_to_string(&argv_log).unwrap();
-            assert!(argv.contains("--vm-type=podman"));
+            assert!(!argv.contains("--vm-"));
+            assert!(argv.contains("build --root="));
             assert!(argv.contains("--sccache-uri="));
             assert!(argv.contains("--norootforbuild"));
             assert!(argv.contains("--changelog"));
@@ -11254,8 +11282,7 @@ fi
             // download URL by the dep's own
             // project/repository/repoarch.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let http = FakeHttp::new()
                 .with_get(
@@ -11274,7 +11301,7 @@ fi
                     b"fake glibc rpm",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", arch);
             let record = vertical.build(&req).unwrap();
@@ -11307,8 +11334,7 @@ fi
             // `noinstall:` / `installonly:` line when non-empty
             // and a `sysroot: ` prefix for sysroot deps.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let http = FakeHttp::new()
                 .with_get(
@@ -11348,7 +11374,7 @@ fi
                     b"fake sysdep rpm",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", arch);
             let record = vertical.build(&req).unwrap();
@@ -11369,8 +11395,7 @@ fi
             // subprojects) is trusted exactly like the home
             // project itself.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let http = FakeHttp::new()
                 .with_get(
@@ -11389,7 +11414,7 @@ fi
                     b"fake ownpkg rpm",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", arch);
             let record = vertical.build(&req).unwrap();
@@ -11405,8 +11430,7 @@ fi
             // would still be judged on its own; only the exact
             // project is excluded.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let http = FakeHttp::new()
                 .with_get(
@@ -11430,7 +11454,7 @@ fi
                     b"fake ownpkg rpm",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "home:someoneelse", "standard", arch);
             let record = vertical.build(&req).unwrap();
@@ -11442,11 +11466,10 @@ fi
             // A zero timeout is an instant timeout, never a build
             // — and never an instant shell.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.timeout_secs = 0;
@@ -11477,11 +11500,10 @@ fi
         #[test]
         fn concurrent_build_of_the_same_root_refuses() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
             // Hold the root's lock before the build starts.
@@ -11519,11 +11541,10 @@ fi
             // invariant the race depends on instead of running a
             // live two-build race.)
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let root = dir
                 .path()
                 .join("cache")
@@ -11593,11 +11614,10 @@ fi
         #[test]
         fn wipe_source_root_wipes_a_marked_root() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let (root, source) = wipe_fixture(&dir);
             let outcome = vertical
                 .wipe_source_root(
@@ -11632,11 +11652,10 @@ fi
         #[test]
         fn wipe_source_root_dry_run_wipes_nothing() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let (root, source) = wipe_fixture(&dir);
             let outcome = vertical
                 .wipe_source_root(&source, "testproject", "standard", host_arch(), &None, true)
@@ -11665,11 +11684,10 @@ fi
         #[test]
         fn wipe_named_root_wipes_by_path_and_reads_the_marker() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let (root, _) = wipe_fixture(&dir);
             // The marker carries the package: the lock file the wipe
             // leaves behind names it in the holder line.
@@ -11719,11 +11737,10 @@ fi
         #[test]
         fn wipe_named_root_ignores_a_planted_marker_for_the_holder() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let (root, _) = wipe_fixture(&dir);
             // A marker for another package planted in this root:
             // it parses, so the wipe proceeds, but it does not
@@ -11750,11 +11767,10 @@ fi
         #[test]
         fn roots_for_package_lists_only_verified_roots_for_the_package() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let (root_a, _) = wipe_fixture(&dir);
             // A second root for the same package, another repo.
             let root_b = dir
@@ -11826,11 +11842,10 @@ fi
         #[test]
         fn roots_for_package_errors_when_the_package_entry_cannot_be_listed() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             // A file where the package directory should be: the
             // listing fails with an I/O error other than NotFound,
             // so the call must fail instead of reporting no roots.
@@ -11851,11 +11866,10 @@ fi
         #[test]
         fn wipe_source_root_refuses_a_marker_that_does_not_match() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let (root, source) = wipe_fixture(&dir);
             // A marker for another project: the root is not the
             // one the coordinates name.
@@ -11916,11 +11930,10 @@ fi
         #[test]
         fn wipe_root_contents_unlinks_symlinks_without_traversing() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let (root, source) = wipe_fixture(&dir);
             // Symlink entries pointing outside the root: the wipe
             // unlinks the links, never the targets.
@@ -11969,11 +11982,10 @@ fi
         #[test]
         fn wipe_named_root_refuses_roots_outside_the_cache() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             // A valid marker planted outside the cache: the marker
             // alone never proves a root.
             let outside = dir.path().join("outside");
@@ -12000,11 +12012,10 @@ fi
         #[test]
         fn wipe_named_root_refuses_a_root_with_no_file_name() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let err = vertical.wipe_named_root(Path::new("/"), false).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
         }
@@ -12012,11 +12023,10 @@ fi
         #[test]
         fn wipe_plan_counts_entries_and_bytes() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let (root, source) = wipe_fixture(&dir);
             let marker_bytes = fs::read(root.join(ROOT_MARKER)).unwrap().len() as u64;
             // The lock file stays, so it is not part of the plan.
@@ -12034,11 +12044,10 @@ fi
         #[test]
         fn wipe_named_root_refuses_a_project_or_package_level_root() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let (root, _) = wipe_fixture(&dir);
             // One valid marker planted at the project level must
             // not buy a whole-subtree wipe.
@@ -12070,11 +12079,10 @@ fi
         #[test]
         fn wipe_refuses_a_lock_file_symlink() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let (root, _) = wipe_fixture(&dir);
             // A planted lock symlink to a victim file: the wipe
             // must refuse before the lock open can truncate it.
@@ -12090,11 +12098,10 @@ fi
         #[test]
         fn wipe_refuses_a_marker_symlink() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let (root, _) = wipe_fixture(&dir);
             // A marker symlink to a valid marker elsewhere: the
             // wipe must refuse on borrowed identity.
@@ -12112,11 +12119,10 @@ fi
         #[test]
         fn shell_wipe_and_log_round_trip() {
             let dir = TempDir::new();
-            let (engine, argv_log) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, argv_log) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
 
@@ -12227,11 +12233,10 @@ fi
             // returns only the last 4 MiB of whole lines and
             // reports truncated, instead of reading the whole file.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let root = dir
                 .path()
                 .join("cache")
@@ -12300,11 +12305,10 @@ fi
             // read returns the whole log uncapped and reports no
             // truncation, while the default read still caps.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let root = dir
                 .path()
                 .join("cache")
@@ -12376,11 +12380,10 @@ fi
             // the build's own coordinates name — the same root the
             // wipe fixture builds.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let (root, source) = wipe_fixture(&dir);
             fs::write(
                 root.join(BUILD_LOG),
@@ -12526,11 +12529,10 @@ fi
             // A root that never built has no log to read: InvalidInput
             // naming the log path, like the coordinate-keyed read.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let err = vertical
                 .build_log_for_source(
@@ -12552,11 +12554,10 @@ fi
             // spec, and a multibuild source without a flavor, fail
             // before any log is read.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let empty = dir.path().join("empty");
             fs::create_dir_all(&empty).unwrap();
             let err = vertical
@@ -12610,11 +12611,10 @@ fi
             // string joined by ` && `: a shell fragment for the
             // container, not two host commands.
             let dir = TempDir::new();
-            let (engine, argv_log) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, argv_log) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
             vertical.build(&req).unwrap();
@@ -12644,12 +12644,11 @@ fi
             // while the real argv still carries the fragments to
             // the engine.
             let dir = TempDir::new();
-            let (engine, argv_log) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, argv_log) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
             let (debug, lines) = Debug::captured(true, false);
-            let vertical = vertical(&client, dir.path(), engine, podman).with_debug(debug);
+            let vertical = vertical(&client, dir.path(), podman).with_debug(debug);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
             vertical.build(&req).unwrap();
@@ -12691,11 +12690,10 @@ fi
             // result, and the build log still reads the build's
             // `finished` line (no `--logfile` on the shell run).
             let dir = TempDir::new();
-            let (engine, argv_log) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, argv_log) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
             let record = vertical.build(&req).unwrap();
@@ -12746,11 +12744,16 @@ fi
             // and the exit code plus both captured streams ride in
             // the result — a caller reads `exit:` instead of `$?`.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine_with_shell_exit(dir.path(), 1);
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman_opts(
+                dir.path(),
+                PodmanStubOpts {
+                    shell_exit: 1,
+                    ..PodmanStubOpts::new(true)
+                },
+            );
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
             let record = vertical.build(&req).unwrap();
@@ -12780,11 +12783,10 @@ fi
             // the shell to pass: the shell refuses rather than
             // running a build shape with missing inputs.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let root = dir
                 .path()
                 .join("cache")
@@ -12859,11 +12861,10 @@ fi
         #[test]
         fn stub_build_uses_the_preinstall_image_for_a_fresh_root() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new().with_preinstall_image();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.preinstall_image = true;
@@ -12916,11 +12917,10 @@ fi
         #[test]
         fn stub_build_second_run_reuses_the_root_and_drops_the_image() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new().with_preinstall_image();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.preinstall_image = true;
@@ -12948,11 +12948,10 @@ fi
         #[test]
         fn stub_build_skips_the_preinstall_image_without_the_flag() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new().with_preinstall_image();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
 
@@ -12970,11 +12969,10 @@ fi
         #[test]
         fn preinstall_image_empty_info_file_drops_only_the_info_line() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new().with_preinstall_image_empty_info();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.preinstall_image = true;
@@ -12992,11 +12990,10 @@ fi
         #[test]
         fn preinstall_image_bad_binary_names_stay_plain_deps() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new().with_preinstall_image_bad_binary();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.preinstall_image = true;
@@ -13018,11 +13015,10 @@ fi
         #[test]
         fn preinstall_image_bad_digest_falls_back_to_the_filename() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new().with_preinstall_image_bad_digest();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.preinstall_image = true;
@@ -13042,11 +13038,10 @@ fi
         #[test]
         fn preinstall_image_cache_hit_without_info_retries_the_info_file() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new().with_preinstall_image();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             // The image is already cached, but the `.info` file is
             // absent: an earlier run failed that download while the
             // image itself landed. The build fetches the info file
@@ -13080,11 +13075,10 @@ fi
         #[test]
         fn preinstall_image_download_failure_builds_from_plain_deps() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new().with_preinstall_image_buildinfo_only();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.preinstall_image = true;
@@ -13104,11 +13098,10 @@ fi
         #[test]
         fn preinstall_image_with_bad_magic_builds_from_plain_deps() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new().with_preinstall_image_bad_magic();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.preinstall_image = true;
@@ -13132,11 +13125,10 @@ fi
         #[test]
         fn preinstall_image_without_info_file_still_seeds_the_root() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new().with_preinstall_image_no_info();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.preinstall_image = true;
@@ -13154,11 +13146,10 @@ fi
         #[test]
         fn corrupt_cached_preinstall_image_is_redownloaded() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new().with_preinstall_image();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             // A corrupt image already in the cache: garbage bytes
             // under the offered file name.
             let pkg_dir = dir
@@ -13190,12 +13181,10 @@ fi
         #[test]
         fn build_evicts_old_pkg_files_but_keeps_the_offered_image() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new().with_preinstall_image();
             let client = setup.client();
-            let vertical =
-                vertical(&client, dir.path(), engine, podman).with_cache_cap_bytes(1024 * 1024);
+            let vertical = vertical(&client, dir.path(), podman).with_cache_cap_bytes(1024 * 1024);
             // The offered image, already cached and old (an eviction
             // candidate without the file-name protection), plus an
             // old dep file that must evict.
@@ -13342,12 +13331,10 @@ fi
         #[test]
         fn prune_evicts_old_pkg_files_and_nothing_under_cap() {
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), false);
+            let (podman, _, _) = stub_podman(dir.path(), false);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical =
-                vertical(&client, dir.path(), engine, podman).with_cache_cap_bytes(1024 * 1024);
+            let vertical = vertical(&client, dir.path(), podman).with_cache_cap_bytes(1024 * 1024);
             // Nothing cached yet: the plan is empty.
             let plan = vertical.prune_plan().unwrap();
             assert!(plan.evicted.is_empty());
@@ -13388,15 +13375,13 @@ fi
         #[test]
         fn dry_run_without_an_engine_returns_the_plan() {
             // A dry run prints the plan and touches nothing, so it
-            // does not need the engine installed: a missing engine
-            // records as an unknown version instead of failing.
+            // starts no container: the version is unknown instead
+            // of failing.
             let dir = TempDir::new();
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = LocalBuild::new(&client, dir.path().join("cache"))
-                .with_engine(PathBuf::from("/nonexistent/build"))
-                .with_podman(podman);
+            let vertical = LocalBuild::new(&client, dir.path().join("cache")).with_podman(podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.dry_run = true;
@@ -13406,302 +13391,91 @@ fi
             assert!(record.plan.is_some());
         }
 
-        /// Serializes the tests that read or mutate PATH for the
-        /// package-manager probes: a stub manager on PATH must not
-        /// leak into a test expecting the real ones.
-        static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-        /// Prepends `dir` to PATH, restoring it on drop.
-        struct RestorePath(Option<std::ffi::OsString>);
-
-        impl RestorePath {
-            fn prepend(dir: &Path) -> Self {
-                let old = std::env::var_os("PATH");
-                let mut paths =
-                    std::env::split_paths(&old.clone().unwrap_or_default()).collect::<Vec<_>>();
-                paths.insert(0, dir.to_path_buf());
-                std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
-                RestorePath(old)
-            }
-        }
-
-        impl Drop for RestorePath {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(old) => std::env::set_var("PATH", old),
-                    None => std::env::remove_var("PATH"),
-                }
-            }
+        #[test]
+        fn engine_version_is_unknown_when_the_container_probe_fails() {
+            // `rpm -q build` refuses inside the container: the
+            // build still goes green, and the record carries an
+            // unknown version instead of failing.
+            let dir = TempDir::new();
+            let (podman, _, _) = stub_podman_opts(
+                dir.path(),
+                PodmanStubOpts {
+                    version_fails: true,
+                    ..PodmanStubOpts::new(true)
+                },
+            );
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert_eq!(record.engine_version, None);
         }
 
         #[test]
-        fn engine_version_falls_back_to_the_package_version() {
-            // A --version-refusing engine plus a stub rpm answering
-            // -qf: the record carries the package version.
-            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fn build_fails_when_the_engine_install_fails() {
+            // The `build` package cannot install in the container:
+            // the build fails closed instead of running an engine
+            // that is not there.
             let dir = TempDir::new();
-            let engine = dir.path().join("silent-engine");
-            write_script(&engine, "#!/bin/sh\nexit 1\n");
-            write_script(
-                &dir.path().join("rpm"),
-                "#!/bin/sh\nif [ \"$1\" = \"-qf\" ]; then echo \"9.9-9\"; exit 0; fi\nexit 1\n",
+            let (podman, _, _) = stub_podman_opts(
+                dir.path(),
+                PodmanStubOpts {
+                    install_fails: true,
+                    ..PodmanStubOpts::new(true)
+                },
             );
-            let _restore = RestorePath::prepend(dir.path());
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ImageUnavailable);
+            assert!(err.to_string().contains("cannot install the build engine"));
+        }
+
+        #[test]
+        fn build_fails_without_podman_on_path() {
+            // No podman on PATH: the build fails closed with
+            // ImageUnavailable instead of falling back to a host
+            // engine — there is no host engine any more.
+            let dir = TempDir::new();
             let setup = Setup::new();
             let client = setup.client();
             let vertical = LocalBuild::new(&client, dir.path().join("cache"))
-                .with_engine(engine)
-                .with_podman(PathBuf::from("podman"));
-            assert_eq!(vertical.engine_version().unwrap().as_deref(), Some("9.9-9"));
-        }
-
-        #[test]
-        fn engine_version_falls_back_to_dpkg_when_rpm_refuses() {
-            // rpm refuses and dpkg-query answers -S and -W: the record
-            // carries the dpkg version. The rpm stub masks a real rpm
-            // on PATH so the dpkg branch is the one that runs.
-            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let dir = TempDir::new();
-            let engine = dir.path().join("silent-engine");
-            write_script(&engine, "#!/bin/sh\nexit 1\n");
-            write_script(&dir.path().join("rpm"), "#!/bin/sh\nexit 1\n");
-            write_script(
-                &dir.path().join("dpkg-query"),
-                "#!/bin/sh\nif [ \"$1\" = \"-S\" ]; then echo \"obs-build: $2\"; exit 0; fi\nif [ \"$1\" = \"-W\" ]; then echo \"8.8-8\"; exit 0; fi\nexit 1\n",
-            );
-            let _restore = RestorePath::prepend(dir.path());
-            let setup = Setup::new();
-            let client = setup.client();
-            let vertical = LocalBuild::new(&client, dir.path().join("cache"))
-                .with_engine(engine)
-                .with_podman(PathBuf::from("podman"));
-            assert_eq!(vertical.engine_version().unwrap().as_deref(), Some("8.8-8"));
-        }
-
-        /// Whether a package manager on PATH owns `binary`: `Some(true)`
-        /// when one answers for it, `Some(false)` when both ran (or
-        /// are absent) and neither owns it, `None` when an ownership
-        /// probe could not run (spawn failure or timeout) — no
-        /// evidence either way, so the caller retries instead of
-        /// concluding. A manager present without owning the binary
-        /// (a Homebrew rpm, whose files are not in the rpm
-        /// database) answers neither.
-        fn manager_owns_binary(binary: &Path) -> Option<bool> {
-            let binary = binary.to_str()?;
-            let mut rpm = Command::new("rpm");
-            rpm.args(["-qf", "--queryformat", "%{VERSION}-%{RELEASE}", binary]);
-            let rpm_unknown =
-                match run_with_timeout(&mut rpm, Duration::from_secs(PACKAGE_PROBE_TIMEOUT_SECS)) {
-                    Ok(output)
-                        if output.status.success()
-                            && !String::from_utf8_lossy(&output.stdout).trim().is_empty() =>
-                    {
-                        return Some(true);
-                    }
-                    Ok(_) => false,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(_) => true,
-                };
-            let mut dpkg = Command::new("dpkg-query");
-            dpkg.args(["-S", binary]);
-            let owner_line = |stdout: &[u8]| {
-                String::from_utf8_lossy(stdout)
-                    .lines()
-                    .any(|line| line.ends_with(&format!(": {binary}")))
-            };
-            match run_with_timeout(&mut dpkg, Duration::from_secs(PACKAGE_PROBE_TIMEOUT_SECS)) {
-                Ok(output) if output.status.success() && owner_line(&output.stdout) => Some(true),
-                Ok(_) if !rpm_unknown => Some(false),
-                Ok(_) => None,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if rpm_unknown {
-                        None
-                    } else {
-                        Some(false)
-                    }
-                }
-                Err(_) => None,
-            }
-        }
-
-        /// The live-manager check, factored so the stub tests can
-        /// drive it too. Callers hold PATH_LOCK: the probes read
-        /// PATH, and a PATH-mutating probe test must not swap the
-        /// managers under this one.
-        fn check_engine_package_version() {
-            // The package manager on the host answers for a binary it
-            // owns: rpm on rpm systems, dpkg-query on Debian systems.
-            // The check skips when neither is on PATH (the case on a
-            // stock macOS host).
-            let rpm = which(Path::new("rpm"));
-            let dpkg = which(Path::new("dpkg-query"));
-            let binary = match (rpm, dpkg) {
-                (Some(path), _) => path,
-                (None, Some(path)) => path,
-                (None, None) => {
-                    eprintln!("skipping: no rpm or dpkg-query on PATH");
-                    return;
-                }
-            };
-            // One probe attempt can fail transiently under parallel
-            // load while the managers are healthy, so retry a few
-            // times before concluding. Each attempt costs at most
-            // five probe timeouts when the managers hang (three in
-            // the version probe, two in the ownership probe); the
-            // common case is milliseconds. When no manager owns the
-            // binary (a Homebrew rpm, whose files are not in the
-            // rpm database), there is nothing to answer: skip. A
-            // manager that owns the binary while the probe still
-            // answers nothing after retries is a broken probe: fail.
-            // An ownership probe that could not run is no evidence
-            // either way: retry instead of concluding. When ownership
-            // could not be determined at all after retries, fail too:
-            // a host whose managers never answer is broken, and
-            // skipping would hide it.
-            const ATTEMPTS: u32 = 3;
-            const RETRY_DELAY: Duration = Duration::from_millis(100);
-            let mut owned = false;
-            for attempt in 0..ATTEMPTS {
-                if engine_package_version(&binary).is_some_and(|version| !version.is_empty()) {
-                    return;
-                }
-                match manager_owns_binary(&binary) {
-                    Some(true) => {
-                        owned = true;
-                    }
-                    Some(false) => {
-                        eprintln!("skipping: no package manager owns {}", binary.display());
-                        return;
-                    }
-                    None => {
-                        eprintln!(
-                            "ownership probe could not run for {}; retrying",
-                            binary.display()
-                        );
-                    }
-                }
-                if attempt + 1 < ATTEMPTS {
-                    std::thread::sleep(RETRY_DELAY);
-                }
-            }
-            if owned {
-                panic!(
-                    "a package manager owns {} but the probe answered no version",
-                    binary.display()
-                );
-            }
-            panic!(
-                "the probe answered no version for {} and ownership could not be determined",
-                binary.display()
-            );
-        }
-
-        #[test]
-        fn engine_package_version_reads_the_owning_package() {
-            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            check_engine_package_version();
-        }
-
-        #[test]
-        fn engine_package_version_skips_when_no_manager_owns_the_binary() {
-            // Hold the lock: the ownership check reads PATH, and a
-            // PATH-mutating probe test must not swap the managers.
-            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let dir = TempDir::new();
-            // rpm refuses -qf and no dpkg-query stub answers: no
-            // manager owns the binary, so the check skips instead
-            // of failing.
-            write_script(&dir.path().join("rpm"), "#!/bin/sh\nexit 1\n");
-            let _restore = RestorePath::prepend(dir.path());
-            check_engine_package_version();
-        }
-
-        #[test]
-        fn engine_package_version_retries_a_transient_probe_failure() {
-            // Hold the lock: the ownership check reads PATH, and a
-            // PATH-mutating probe test must not swap the managers.
-            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let dir = TempDir::new();
-            // rpm refuses -qf exactly once, then answers: the first
-            // probe attempt returns nothing while a manager owns
-            // the binary, and the retry answers it.
-            write_script(
-                &dir.path().join("rpm"),
-                &format!(
-                    "#!/bin/sh\nif [ \"$1\" = \"-qf\" ]; then if [ -f \"{}/rpm-failed-once-{}\" ]; then echo \"9.9-9\"; exit 0; fi; touch \"{}/rpm-failed-once-{}\"; exit 1; fi\nexit 1\n",
-                    dir.path().display(),
-                    std::process::id(),
-                    dir.path().display(),
-                    std::process::id()
-                ),
-            );
-            let _restore = RestorePath::prepend(dir.path());
-            check_engine_package_version();
-        }
-
-        #[test]
-        #[should_panic(expected = "but the probe answered no version")]
-        fn engine_package_version_fails_when_a_manager_owns_the_binary_but_the_probe_answers_nothing(
-        ) {
-            // Hold the lock: the ownership check reads PATH, and a
-            // PATH-mutating probe test must not swap the managers.
-            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let dir = TempDir::new();
-            // rpm answers -qf with an empty version and dpkg-query
-            // -S names an owner but -W refuses: the probe answers
-            // nothing while a manager owns the binary.
-            write_script(
-                &dir.path().join("rpm"),
-                "#!/bin/sh\nif [ \"$1\" = \"-qf\" ]; then exit 0; fi\nexit 1\n",
-            );
-            write_script(
-                &dir.path().join("dpkg-query"),
-                "#!/bin/sh\nif [ \"$1\" = \"-S\" ]; then echo \"obs-build: $2\"; exit 0; fi\nexit 1\n",
-            );
-            let _restore = RestorePath::prepend(dir.path());
-            check_engine_package_version();
-        }
-
-        #[test]
-        fn engine_version_is_unknown_when_nothing_answers() {
-            // Hold the lock: the fallback reads PATH, and a
-            // PATH-mutating probe test must not swap the managers.
-            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // A stub engine that refuses --version and is owned by no
-            // package records an unknown version instead of failing.
-            let dir = TempDir::new();
-            let script = dir.path().join("silent-stub");
-            write_script(&script, "#!/bin/sh\nexit 1\n");
-            let setup = Setup::new();
-            let client = setup.client();
-            let vertical = LocalBuild::new(&client, dir.path().join("cache"))
-                .with_engine(script)
-                .with_podman(PathBuf::from("podman"));
-            assert_eq!(vertical.engine_version().unwrap(), None);
+                .with_podman(PathBuf::from("/nonexistent/podman"));
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ImageUnavailable);
         }
 
         #[test]
         fn build_times_out_on_a_sleeping_engine() {
             let dir = TempDir::new();
-            // A stub engine that answers --version and then sleeps:
-            // the build must time out instead of hanging.
-            let script = dir.path().join("sleep-stub");
-            write_script(
-                &script,
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"build stub 1.0\"; exit 0; fi\nsleep 5\n",
+            // A stub podman whose engine exec sleeps: the build
+            // must time out instead of hanging.
+            let (podman, _, _) = stub_podman_opts(
+                dir.path(),
+                PodmanStubOpts {
+                    engine_sleeps: true,
+                    ..PodmanStubOpts::new(true)
+                },
             );
-            let (podman, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), script, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.timeout_secs = 1;
             let err = vertical.build(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::BuildTimeout);
-            // The timeout message must not claim the container was
-            // killed: the group kill does not stop it.
-            assert!(err.context.contains("may still be running"));
+            // The timeout kills the build container by name, so
+            // the message says so.
+            assert!(err.context.contains("the build container was killed"));
         }
 
         #[test]
@@ -13711,19 +13485,17 @@ fi
             // not a fresh 3 s. Without the shared deadline this
             // build takes 2 + 3 = 5 s; with it, ~3 s.
             let dir = TempDir::new();
-            let script = dir.path().join("sleep-stub");
-            write_script(
-                &script,
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"build stub 1.0\"; exit 0; fi\nsleep 30\n",
-            );
+            // A slow pull (2 s) plus an engine exec that sleeps:
+            // the pull eats the budget, so the engine exec times
+            // out at the deadline instead of getting a fresh one.
             let slow_podman = dir.path().join("podman-slow-pull");
             write_script(
                 &slow_podman,
-                "#!/bin/sh\nif [ \"$1\" = \"pull\" ]; then sleep 2; exit 0; fi\nif [ \"$1\" = \"image\" ] && [ \"$2\" = \"inspect\" ]; then echo \"sha256:fake-digest-1234\"; exit 0; fi\nexit 0\n",
+                "#!/bin/sh\nif [ \"$1\" = \"pull\" ]; then sleep 2; exit 0; fi\nif [ \"$1\" = \"image\" ] && [ \"$2\" = \"inspect\" ]; then echo \"sha256:fake-digest-1234\"; exit 0; fi\nif [ \"$1\" = \"run\" ]; then echo \"fake-container-id\"; exit 0; fi\nif [ \"$1\" = \"stop\" ]; then exit 0; fi\nif [ \"$1\" = \"kill\" ]; then exit 0; fi\nif [ \"$1\" = \"exec\" ]; then shift 1; if [ \"$1\" = \"-w\" ]; then shift 2; fi; shift 1; if [ \"$1\" = \"zypper\" ]; then exit 0; fi; if [ \"$1\" = \"rpm\" ]; then echo \"build-1.0-1\"; exit 0; fi; if [ \"$1\" = \"build\" ]; then sleep 30; fi; exit 0; fi\nexit 0\n",
             );
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), script, slow_podman);
+            let vertical = vertical(&client, dir.path(), slow_podman);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.timeout_secs = 3;
@@ -13754,6 +13526,8 @@ if [ "$1" = "exec" ]; then
   # reach the installed command.
   if [ "$1" = "setpriv" ]; then shift 4; fi
   if [ "$1" = "zypper" ]; then exit 0; fi
+  if [ "$1" = "rpm" ]; then echo "build-1.0-1"; exit 0; fi
+  if [ "$1" = "build" ]; then sleep 30; exit 0; fi
   if [ "$1" = "bash" ]; then cd "{SRC}" && bash ./pre_checkin.sh; exit $?; fi
   case "$1" in
     /usr/lib/obs/service/*)
@@ -13788,11 +13562,6 @@ exit 0
             // the documented budget: 4 s of services, 4 s of
             // precommit, then a fresh 10 s for the engine.
             let dir = TempDir::new();
-            let script = dir.path().join("sleep-stub");
-            write_script(
-                &script,
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"build stub 1.0\"; exit 0; fi\nsleep 30\n",
-            );
             let src = write_source(dir.path(), "foo.spec");
             fs::write(
                 src.join("_service"),
@@ -13803,7 +13572,7 @@ exit 0
             let slow_podman = stub_slow_service_podman(dir.path(), &src);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), script, slow_podman);
+            let vertical = vertical(&client, dir.path(), slow_podman);
             let mut service_req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             service_req.timeout_secs = 10;
             let mut build_req =
@@ -13830,11 +13599,6 @@ exit 0
             // gate would let it finish and push the run past the
             // bound.
             let dir = TempDir::new();
-            let script = dir.path().join("sleep-stub");
-            write_script(
-                &script,
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"build stub 1.0\"; exit 0; fi\nsleep 30\n",
-            );
             let src = write_source(dir.path(), "foo.spec");
             fs::write(
                 src.join("_service"),
@@ -13845,7 +13609,7 @@ exit 0
             let slow_podman = stub_slow_service_podman(dir.path(), &src);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), script, slow_podman);
+            let vertical = vertical(&client, dir.path(), slow_podman);
             let mut service_req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             service_req.timeout_secs = 10;
             let mut build_req =
@@ -13982,7 +13746,7 @@ exit 0
             let slow_podman = stub_slow_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), slow_podman);
+            let vertical = vertical(&client, dir.path(), slow_podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             let deadline = std::time::Instant::now() + Duration::from_secs(1);
             let err = vertical
@@ -13996,10 +13760,10 @@ exit 0
             // A pull due on an exhausted budget is a timeout, and
             // it names the budget — and the pull is never started.
             let dir = TempDir::new();
-            let (podman, call_log) = stub_podman(dir.path(), false);
+            let (podman, call_log, _) = stub_podman(dir.path(), false);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
             let past = std::time::Instant::now() - Duration::from_secs(1);
@@ -14034,7 +13798,7 @@ exit 0
             );
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), slow_podman);
+            let vertical = vertical(&client, dir.path(), slow_podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
             let deadline = std::time::Instant::now() + Duration::from_millis(500);
@@ -14054,8 +13818,7 @@ exit 0
             // resolves it: the list must not assume the binary
             // name is the package.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new().with_get(
                 &format!(
                     "https://api.opensuse.org/build/testproject/standard/{}/helper",
@@ -14067,7 +13830,7 @@ exit 0
                 ),
             );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(
                 dir.path().join("source"),
                 "testproject",
@@ -14105,11 +13868,10 @@ exit 0
             // compute it with the same format string the
             // implementation uses.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(
                 dir.path().join("source"),
                 "testproject",
@@ -14150,8 +13912,7 @@ exit 0
             // green, and the RPM lands in the cache under the
             // dep's own project/repo/arch.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let http = FakeHttp::new()
                 .with_get(
@@ -14170,7 +13931,7 @@ exit 0
                     b"fake libz1 rpm",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", arch);
             let record = vertical.build(&req).unwrap();
@@ -14197,8 +13958,7 @@ exit 0
             // downloaded), so the build refuses with `InvalidInput`
             // before any path is built from it.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let http = FakeHttp::new()
                 .with_get(
@@ -14211,7 +13971,7 @@ exit 0
                 )
                 .with_get(&buildconfig_url(), "Macro: test 1\n");
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", arch);
             let err = vertical.build(&req).unwrap_err();
@@ -14233,12 +13993,11 @@ exit 0
             // Without the check the planted file is returned as the
             // cached dep.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let inter = dir
                 .path()
                 .join("cache")
@@ -14301,8 +14060,7 @@ exit 0
             // the warmed digest — the placeholder would reject the
             // real file as corrupt.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"bash payload");
             let real_hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -14325,7 +14083,7 @@ exit 0
                     ),
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "bash".to_string(),
@@ -14391,8 +14149,7 @@ exit 0
             // placeholder hdrmd5 in buildinfo — there is no real
             // digest to check it against, so the hit verifies as ok.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"bash payload");
             let filename = format!("bash-5.3.20-11.1.{arch}.rpm");
@@ -14408,7 +14165,7 @@ exit 0
             fs::write(&cached, &rpm).unwrap();
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "bash".to_string(),
@@ -14452,8 +14209,7 @@ exit 0
             // value, so the mismatch is a corrupt cache entry — the
             // file is deleted and the build fails, not silently kept.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"bash payload");
             let other = make_rpm(b"other payload");
@@ -14477,7 +14233,7 @@ exit 0
                     ),
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "bash".to_string(),
@@ -14529,8 +14285,7 @@ exit 0
             // different digest for the fetched file, so the file is
             // not the one the server fetched and is rejected.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"bash payload");
             let real_hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -14555,7 +14310,7 @@ exit 0
                     ),
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "bash".to_string(),
@@ -14641,8 +14396,7 @@ exit 0
             // verifies, and the cache holds the whole file — with no
             // temp file left behind.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(&vec![b'k'; crate::http::MAX_BODY_BYTES]);
             let real_hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -14653,7 +14407,7 @@ exit 0
                 .with_get_bytes_cap_error(&download_url)
                 .with_get_to_file(&download_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "kernel-obs-build".to_string(),
@@ -14713,8 +14467,7 @@ exit 0
             // in the cache, so the ensure fails `CacheCorrupt` and
             // neither the package nor the temp file is left behind.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"big payload");
             let download_url = format!(
@@ -14735,7 +14488,7 @@ exit 0
                     "<binaryversionlist><binary name=\"big.rpm\" hdrmd5=\"00000000000000000000000000000000\" sizek=\"10\"/></binaryversionlist>",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "big".to_string(),
@@ -14799,8 +14552,7 @@ exit 0
             // full EVRA filename 404s again. Without the retry the
             // build fails on the first 404.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let download_url = format!(
                 "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
@@ -14822,7 +14574,7 @@ exit 0
                     "<binaryversionlist><binary name=\"glibc.rpm\" hdrmd5=\"abc\" sizek=\"10\"/></binaryversionlist>",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -14892,8 +14644,7 @@ exit 0
             // two timed-out listings, then the listing answers and
             // the retry under the reported name finds the binary.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let download_url = format!(
                 "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
@@ -14916,7 +14667,7 @@ exit 0
                     "<binaryversionlist><binary name=\"glibc.rpm\" hdrmd5=\"abc\" sizek=\"10\"/></binaryversionlist>",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman)
+            let vertical = vertical(&client, dir.path(), podman)
                 .with_warm_retry_delay(Duration::from_millis(1));
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
@@ -14988,8 +14739,7 @@ exit 0
             // seconds.
 
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let download_url = format!(
                 "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
@@ -15004,7 +14754,7 @@ exit 0
                     &[ErrorKind::Timeout, ErrorKind::Timeout, ErrorKind::Timeout],
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman)
+            let vertical = vertical(&client, dir.path(), podman)
                 .with_warm_retry_delay(Duration::from_millis(1));
 
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
@@ -15072,8 +14822,7 @@ exit 0
             // allow more. The delay is milliseconds so the retries
             // do not sleep real seconds.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let glibc_download_url = format!(
                 "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
@@ -15099,7 +14848,7 @@ exit 0
                     &[ErrorKind::Timeout, ErrorKind::Timeout, ErrorKind::Timeout],
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman)
+            let vertical = vertical(&client, dir.path(), podman)
                 .with_warm_retry_delay(Duration::from_millis(1))
                 .with_warm_retry_budget(2);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
@@ -15192,8 +14941,7 @@ exit 0
             // instead: the retry under the reported name 404s, and
             // one final retry under the EVRA filename finds it.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let download_url = format!(
                 "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
@@ -15213,7 +14961,7 @@ exit 0
                     "<binaryversionlist><binary name=\"glibc.rpm\" hdrmd5=\"abc\" sizek=\"10\"/></binaryversionlist>",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -15279,8 +15027,7 @@ exit 0
             // the warm listing reports it unavailable and the retry
             // 404s again. Exactly one warm and one retry: no loop.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let download_url = format!(
                 "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
@@ -15298,7 +15045,7 @@ exit 0
                     "<binaryversionlist><binary name=\"glibc\" error=\"not available\"/></binaryversionlist>",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -15352,8 +15099,7 @@ exit 0
             // A warm that itself fails keeps the original 404: the
             // caller sees the missing binary, not the warm failure.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let download_url = format!(
                 "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
@@ -15365,7 +15111,7 @@ exit 0
                 .with_get_bytes_error_sequence(&download_url, &[ErrorKind::NotFound])
                 .with_get_error(&warm_url, ErrorKind::ServerError);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -15421,8 +15167,7 @@ exit 0
             // still sees the original 404, not the warm failure.
 
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let download_url = format!(
                 "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
@@ -15434,7 +15179,7 @@ exit 0
                 .with_get_bytes_error_sequence(&download_url, &[ErrorKind::NotFound])
                 .with_get_error(&warm_url, ErrorKind::NetworkError);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
 
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
@@ -15489,15 +15234,14 @@ exit 0
             // Only a 404 warms: a server error fails straight away
             // with no listing request.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let download_url = format!(
                 "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
             );
             let http = FakeHttp::new().with_get_error(&download_url, ErrorKind::ServerError);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -15540,8 +15284,7 @@ exit 0
             // failure, and the error is the timeout, not the 404.
 
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let download_url = format!(
                 "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
@@ -15563,7 +15306,7 @@ exit 0
                     "<binaryversionlist><binary name=\"glibc.rpm\" hdrmd5=\"abc\" sizek=\"10\"/></binaryversionlist>",
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
 
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
@@ -15626,8 +15369,7 @@ exit 0
             // refuse: the dep streams to a temp file in the given
             // directory, and the caller owns the temp file from there.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"streamed payload");
             let download_url = format!(
@@ -15637,7 +15379,7 @@ exit 0
                 .with_get_bytes_cap_error(&download_url)
                 .with_get_to_file(&download_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -15682,8 +15424,7 @@ exit 0
             // The stream fails mid-download: the error propagates,
             // and no partial temp file is left in the directory.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let download_url = format!(
                 "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
@@ -15696,7 +15437,7 @@ exit 0
                     ErrorKind::NetworkError,
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -15748,8 +15489,7 @@ exit 0
             // the retry loop must not spin on an error that never
             // created a file.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let download_url = format!(
                 "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
@@ -15762,7 +15502,7 @@ exit 0
                     ErrorKind::AlreadyExists,
                 );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -15813,8 +15553,7 @@ exit 0
             // file and verified there, the API URL is never hit,
             // and the mirror request carries no credentials.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -15823,7 +15562,7 @@ exit 0
             );
             let http = FakeHttp::new().with_mirror_file(&mirror_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -15870,8 +15609,7 @@ exit 0
             // mirror first in call order, and only the API request
             // carries credentials.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -15885,7 +15623,7 @@ exit 0
                 .with_mirror_error(&mirror_url, ErrorKind::NotFound)
                 .with_get_bytes(&api_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -15936,8 +15674,7 @@ exit 0
             // and the mirror is attempted exactly once, not retried
             // three times with backoff.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -15951,7 +15688,7 @@ exit 0
                 .with_mirror_error(&mirror_url, ErrorKind::NetworkError)
                 .with_get_bytes(&api_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -16000,8 +15737,7 @@ exit 0
             // match the buildinfo value, so the API path runs next
             // and its bytes are the ones returned.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let stale = make_rpm(b"stale payload");
@@ -16016,7 +15752,7 @@ exit 0
                 .with_mirror_file(&mirror_url, &stale)
                 .with_get_bytes(&api_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -16066,8 +15802,7 @@ exit 0
             // ones returned — nothing is left behind in the
             // download directory.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let stale = make_rpm(b"stale payload");
@@ -16082,7 +15817,7 @@ exit 0
                 .with_mirror_file(&mirror_url, &stale)
                 .with_get_bytes(&api_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -16133,8 +15868,7 @@ exit 0
             // there before it is returned, and the API URL is never
             // hit.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"streamed payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -16143,7 +15877,7 @@ exit 0
             );
             let http = FakeHttp::new().with_mirror_file(&mirror_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -16191,8 +15925,7 @@ exit 0
             // The existing tool pins the same shape for its mirror
             // group (an invalid scheme must not fail the fetch).
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let api_url = format!(
@@ -16200,7 +15933,7 @@ exit 0
             );
             let http = FakeHttp::new().with_get_bytes(&api_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -16259,8 +15992,7 @@ exit 0
             // scheme is still a mirror URL, fetched with no
             // credentials.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -16269,7 +16001,7 @@ exit 0
             );
             let http = FakeHttp::new().with_mirror_file(&mirror_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -16327,8 +16059,7 @@ exit 0
             // from the mirror, lands the verified file in the cache,
             // and never touches the API.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"helper payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -16337,7 +16068,7 @@ exit 0
             );
             let http = FakeHttp::new().with_mirror_file(&mirror_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "helper".to_string(),
@@ -16408,8 +16139,7 @@ exit 0
             // mirror is never attempted — an unverified mirror body
             // must not be installed.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let api_url = format!(
@@ -16417,7 +16147,7 @@ exit 0
             );
             let http = FakeHttp::new().with_get_bytes(&api_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = mirror_dep(None);
             let DownloadedDep::InMemory(bytes, warmed) = vertical
@@ -16446,8 +16176,7 @@ exit 0
             // digest: a dep carrying only it is treated exactly
             // like a dep with no digest at all.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let api_url = format!(
@@ -16455,7 +16184,7 @@ exit 0
             );
             let http = FakeHttp::new().with_get_bytes(&api_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = mirror_dep(Some(DOD_PLACEHOLDER_HDRMD5.to_string()));
             let DownloadedDep::InMemory(bytes, warmed) = vertical
@@ -16484,8 +16213,7 @@ exit 0
             // read: the temp file is deleted, and the API bytes are
             // the ones returned — nothing is left behind.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -16499,7 +16227,7 @@ exit 0
                 .with_mirror_file(&mirror_url, &[b'x'; 200])
                 .with_get_bytes(&api_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = mirror_dep(Some(hdrmd5));
             let dl = dir.path().join("dl");
@@ -16531,8 +16259,7 @@ exit 0
             // dep carries a usable digest: only `https` mirrors are
             // tried, and the API path runs as if no mirror existed.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -16541,7 +16268,7 @@ exit 0
             );
             let http = FakeHttp::new().with_get_bytes(&api_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = mirror_dep(Some(hdrmd5));
             let mut urls = HashMap::new();
@@ -16582,8 +16309,7 @@ exit 0
             // download follows it (https to https, no credentials)
             // and lands the file, and the API is never hit.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -16597,7 +16323,7 @@ exit 0
                 .with_mirror_redirect(&mirror_url, &target_url)
                 .with_mirror_file(&target_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = mirror_dep(Some(hdrmd5));
             let downloaded = vertical
@@ -16627,8 +16353,7 @@ exit 0
             // A mirror redirect to plain `http` is refused: the
             // download fails and the API path runs next.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -16647,7 +16372,7 @@ exit 0
                 )
                 .with_get_bytes(&api_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = mirror_dep(Some(hdrmd5));
             let DownloadedDep::InMemory(bytes, warmed) = vertical
@@ -16676,8 +16401,7 @@ exit 0
             // the hop limit and then fails: the API path runs next,
             // and the mirror was attempted exactly limit + 1 times.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -16691,7 +16415,7 @@ exit 0
                 .with_mirror_redirect(&mirror_url, &mirror_url)
                 .with_get_bytes(&api_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = mirror_dep(Some(hdrmd5));
             let DownloadedDep::InMemory(bytes, warmed) = vertical
@@ -16727,8 +16451,7 @@ exit 0
             // arch: published repos file each RPM under its own
             // package arch.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -16737,7 +16460,7 @@ exit 0
                     .to_string();
             let http = FakeHttp::new().with_mirror_file(&mirror_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = mirror_dep(Some(hdrmd5));
             let dep = BuildDep {
@@ -16770,8 +16493,7 @@ exit 0
             // (project, repo) goes straight to the API, and the
             // mirror sees exactly one attempt for both deps.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -16785,7 +16507,7 @@ exit 0
                 .with_mirror_error(&mirror_url, ErrorKind::ServerError)
                 .with_get_bytes(&api_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = mirror_dep(Some(hdrmd5));
             let dead_mirrors: std::sync::Mutex<std::collections::HashSet<(String, String)>> =
@@ -16825,8 +16547,7 @@ exit 0
             // file behind: the partial file is deleted, and the API
             // bytes are the ones returned.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -16844,7 +16565,7 @@ exit 0
                 )
                 .with_get_bytes(&api_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = mirror_dep(Some(hdrmd5));
             let dl = dir.path().join("dl");
@@ -16876,8 +16597,7 @@ exit 0
             // path: it cannot truncate the path or become a
             // fragment, and the request goes to the encoded URL.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -16887,7 +16607,7 @@ exit 0
             );
             let http = FakeHttp::new().with_mirror_file(&mirror_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = mirror_dep(Some(hdrmd5));
             let downloaded = vertical
@@ -16915,8 +16635,7 @@ exit 0
             // names no mirror URL: the API path runs as if no
             // mirror existed.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"glibc payload");
             let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
@@ -16925,7 +16644,7 @@ exit 0
             );
             let http = FakeHttp::new().with_get_bytes(&api_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = mirror_dep(Some(hdrmd5));
             let dep = BuildDep {
@@ -16959,8 +16678,7 @@ exit 0
             // next name instead of failing, and leaves the file it
             // did not create alone.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let arch = host_arch();
             let rpm = make_rpm(b"streamed payload");
             let download_url = format!(
@@ -16971,7 +16689,7 @@ exit 0
                 .with_get_to_file_error_sequence(&download_url, &[ErrorKind::AlreadyExists])
                 .with_get_to_file(&download_url, &rpm);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = BuildDep {
                 name: "glibc".to_string(),
@@ -17035,8 +16753,7 @@ exit 0
             // download — the binary list of the source package
             // resolves it instead, exactly like a missing one.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new().with_get(
                 &format!(
                     "https://api.opensuse.org/build/testproject/standard/{}/helper",
@@ -17048,7 +16765,7 @@ exit 0
                 ),
             );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(
                 dir.path().join("source"),
                 "testproject",
@@ -17111,11 +16828,10 @@ exit 0
             // No HTTP is canned: the failure must fire before any
             // listing is attempted.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = BuildRequest::new(
                 dir.path().join("source"),
                 "testproject",
@@ -17192,10 +16908,9 @@ exit 0
             // once; when the download fails the check too, the build
             // refuses with CacheCorrupt and the bad file is gone.
             let (dir, http, _) = hdrmd5_setup(b"also corrupt bytes");
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let cache_file = dir
                 .path()
                 .join("cache")
@@ -17220,10 +16935,9 @@ exit 0
             // the verified bytes.
             let good = make_rpm(b"the real payload");
             let (dir, http, _) = hdrmd5_setup(&good);
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let cache_file = dir
                 .path()
                 .join("cache")
@@ -17253,12 +16967,10 @@ exit 0
             // same package in another repo can evict — see
             // prune_evicts_the_older_root_of_the_same_package.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), false);
+            let (podman, _, _) = stub_podman(dir.path(), false);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical =
-                vertical(&client, dir.path(), engine, podman).with_cache_cap_bytes(1024 * 1024);
+            let vertical = vertical(&client, dir.path(), podman).with_cache_cap_bytes(1024 * 1024);
             let now = now_unix();
             let roots_base = dir.path().join("cache").join("build-roots");
             let mk_root = |package: &str, last_build: u64| -> PathBuf {
@@ -17360,12 +17072,10 @@ exit 0
             // ever had. A root of a different package stays
             // protected as its own package's most recent.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), false);
+            let (podman, _, _) = stub_podman(dir.path(), false);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical =
-                vertical(&client, dir.path(), engine, podman).with_cache_cap_bytes(1024 * 1024);
+            let vertical = vertical(&client, dir.path(), podman).with_cache_cap_bytes(1024 * 1024);
             let now = now_unix();
             let roots_base = dir.path().join("cache").join("build-roots");
             let mk_root = |package: &str, repo: &str, last_build: u64| -> PathBuf {
@@ -17429,11 +17139,10 @@ exit 0
             // to read, so it is never attributed to the wrong
             // package — and neither is a deeper path.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let cache = dir.path().join("cache");
             assert_eq!(
                 vertical.store_project_package(
@@ -17496,11 +17205,10 @@ exit 0
             // directories on Windows too. The encoding is injective:
             // `home:foo` and `home_foo` get distinct roots.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let cache = dir.path().join("cache");
             let no_flavor: Option<String> = None;
             assert_eq!(
@@ -17578,11 +17286,10 @@ exit 0
             // encodes too — otherwise a locked root's store
             // evicts while the root is in use.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let no_flavor: Option<String> = None;
             let root = vertical.root_path("home:foo", "foo", "standard", "x86_64", &no_flavor);
             fs::create_dir_all(&root).unwrap();
@@ -17622,11 +17329,10 @@ exit 0
             // never touches the other's, and a marker written for
             // one never validates the other.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let no_flavor: Option<String> = None;
             let colon_root =
                 vertical.root_path("home:foo", "foo", "standard", "x86_64", &no_flavor);
@@ -17704,11 +17410,10 @@ exit 0
             // is still trusted.
             use std::os::unix::fs::symlink;
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let now = now_unix();
             let no_flavor: Option<String> = None;
             let marker = |project: &str,
@@ -17851,11 +17556,10 @@ exit 0
             // only a marker that belongs to its root can claim a
             // lock.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let no_flavor: Option<String> = None;
             let marker = |project: &str, package: &str| RootMarker {
                 project: project.to_string(),
@@ -17908,12 +17612,10 @@ exit 0
             // nor deleted as one — the plan reports the shortfall
             // instead of protecting the planted bytes.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), false);
+            let (podman, _, _) = stub_podman(dir.path(), false);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical =
-                vertical(&client, dir.path(), engine, podman).with_cache_cap_bytes(1024 * 1024);
+            let vertical = vertical(&client, dir.path(), podman).with_cache_cap_bytes(1024 * 1024);
             let now = now_unix();
             let fake = dir.path().join("cache").join("build-roots").join("planted");
             fs::create_dir_all(&fake).unwrap();
@@ -17954,11 +17656,10 @@ exit 0
             // unguarded. The current four-level shape still takes
             // its lock.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let cache = dir.path().join("cache");
             let legacy = cache
                 .join("pkg")
@@ -17990,11 +17691,10 @@ exit 0
             // encode the `%` a second time and take a different
             // lock — a download in flight would not block the delete.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let cache = dir.path().join("cache");
             let current = cache
                 .join("pkg")
@@ -18021,11 +17721,10 @@ exit 0
             // download in flight. Both are refused, neither is
             // deleted — only the diagnosis differs.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let cache = dir.path().join("cache");
             let legacy = cache
                 .join("pkg")
@@ -18082,11 +17781,10 @@ exit 0
             // recorded; once the lock releases the same plan
             // deletes it.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let cache = dir.path().join("cache");
             let root_name = format!("standard-{}", host_arch());
             let root = cache
@@ -18141,11 +17839,10 @@ exit 0
             // of running inside a half-deleted root. Afterwards a
             // build can lock a fresh root at the same path.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let cache = dir.path().join("cache");
             let root = cache
                 .join("build-roots")
@@ -18196,11 +17893,10 @@ exit 0
             // call; once it stops being the most recent digest
             // the same plan deletes it.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, call_log) = stub_podman(dir.path(), true);
+            let (podman, call_log, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let cache = dir.path().join("cache");
             let root = cache
                 .join("build-roots")
@@ -18250,11 +17946,10 @@ exit 0
             // by now is skipped, not deleted, and no `rmi` runs
             // for it.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, call_log) = stub_podman(dir.path(), true);
+            let (podman, call_log, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let digest = "sha256:fake-digest-1234";
             let mut report = EvictionReport {
                 evicted: vec![EvictedItem {
@@ -18280,11 +17975,10 @@ exit 0
             // remove an image in use. The item is skipped with
             // a failure recorded and no `rmi` runs for it.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, call_log) = stub_podman(dir.path(), true);
+            let (podman, call_log, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman.clone());
+            let vertical = vertical(&client, dir.path(), podman.clone());
             // The digest query can no longer run: the stub is
             // not executable, so the spawn fails and the query
             // errors instead of answering.
@@ -18317,11 +18011,10 @@ exit 0
             // (`BuildInProgress`): the caller asked to wipe, not to
             // build.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let root = dir
                 .path()
                 .join("cache")
@@ -18355,11 +18048,10 @@ exit 0
             // is "absent", not a digest to record and protect — a build
             // would otherwise never pull.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman.clone());
+            let vertical = vertical(&client, dir.path(), podman.clone());
             let none_podman = dir.path().join("podman-none");
             write_script(
                 &none_podman,
@@ -18382,11 +18074,10 @@ exit 0
             // unknown" and skips the image, while None would let
             // it `rmi` the image in use.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
-            let (podman, _) = stub_podman(dir.path(), true);
+            let (podman, _, _) = stub_podman(dir.path(), true);
             let setup = Setup::new();
             let client = setup.client();
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let vertical = vertical(&client, dir.path(), podman);
             // A storage failure: non-zero exit, no "not known" text.
             let failing = dir.path().join("podman-failing");
             write_script(
@@ -18424,7 +18115,6 @@ exit 0
             // may be this item, so it is skipped with a failure
             // recorded and no `rmi` runs for it.
             let dir = TempDir::new();
-            let (engine, _) = stub_engine(dir.path());
             let setup = Setup::new();
             let client = setup.client();
             let call_log = dir.path().join("podman-calls.log");
@@ -18436,7 +18126,7 @@ exit 0
                     call_log = call_log.display(),
                 ),
             );
-            let vertical = vertical(&client, dir.path(), engine, failing);
+            let vertical = vertical(&client, dir.path(), failing);
             let digest = "sha256:fake-digest-1234";
             let mut report = EvictionReport {
                 evicted: vec![EvictedItem {
@@ -18910,7 +18600,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             let record = vertical.service_run(&req).unwrap();
             assert_eq!(record.mode, "run");
@@ -18959,7 +18649,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             req.dry_run = true;
             let record = vertical.service_run(&req).unwrap();
@@ -18987,7 +18677,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             let record = vertical.service_run(&req).unwrap();
             assert!(record.ran.is_empty());
@@ -19010,7 +18700,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             let record = vertical.service_run(&req).unwrap();
             assert!(record.ran.is_empty());
@@ -19033,7 +18723,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             let record = vertical.service_run(&req).unwrap();
             assert_eq!(record.ran.len(), 1);
@@ -19104,7 +18794,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             req.project = Some("home:alice".to_string());
             let record = vertical.service_run(&req).unwrap();
@@ -19139,7 +18829,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             let record = vertical.service_run(&req).unwrap();
             assert_eq!(record.project.as_deref(), Some("home:alice"));
@@ -19183,7 +18873,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             req.project = Some("home:bob".to_string());
             let err = vertical.service_run(&req).unwrap_err();
@@ -19213,7 +18903,7 @@ exit 0
             let (podman, _) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             req.project = Some("home:bob".to_string());
             req.dry_run = true;
@@ -19234,7 +18924,7 @@ exit 0
             let (podman, _) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             req.project = Some("has space".to_string());
             let err = vertical.service_run(&req).unwrap_err();
@@ -19258,7 +18948,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             let record = vertical.service_run(&req).unwrap();
             assert_eq!(record.project, None);
@@ -19283,7 +18973,7 @@ exit 0
             let (podman, _) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let record = vertical
                 .precommit(&src, Some("home:alice"), 3600, false)
                 .unwrap();
@@ -19304,7 +18994,7 @@ exit 0
             let (podman, _) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let err = vertical
                 .precommit(&src, Some("home:bob"), 3600, false)
                 .unwrap_err();
@@ -19326,7 +19016,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             let record = vertical.service_run(&req).unwrap();
             assert_eq!(record.ran.len(), 1);
@@ -19376,7 +19066,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             let err = vertical.service_run(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -19411,7 +19101,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             let record = vertical.service_run(&req).unwrap();
             assert_eq!(record.ran.len(), 1);
@@ -19446,7 +19136,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             let record = vertical.service_run(&req).unwrap();
             assert_eq!(record.ran.len(), 1);
@@ -19490,7 +19180,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             req.timeout_secs = 2;
             let started = std::time::Instant::now();
@@ -19523,7 +19213,7 @@ exit 0
             let (podman, _) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             let err = vertical.service_run(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::ServiceFailed);
@@ -19553,7 +19243,7 @@ exit 0
             let (podman, _) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             req.service = Some("beta".to_string());
             let record = vertical.service_run(&req).unwrap();
@@ -19571,7 +19261,7 @@ exit 0
             let (podman, _) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             req.timeout_secs = 0;
             let err = vertical.service_run(&req).unwrap_err();
@@ -19592,7 +19282,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
             let err = vertical.service_run(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -19620,7 +19310,7 @@ exit 0
             let (podman, _) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let record = vertical.precommit(&src, None, 3600, false).unwrap();
             assert!(!record.dry_run);
             assert_eq!(record.services.ran.len(), 1);
@@ -19641,7 +19331,7 @@ exit 0
             let (podman, _) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let record = vertical.precommit(&src, None, 3600, false).unwrap();
             assert!(record.services.ran.is_empty());
             assert!(!record.pre_checkin.ran);
@@ -19659,7 +19349,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let deadline = std::time::Instant::now() + Duration::from_secs(3600);
             let err = vertical.run_precheckin(&src, deadline, false).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -19683,7 +19373,7 @@ exit 0
             let (podman, _) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let err = vertical.precommit(&src, None, 3600, false).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::ServiceFailed);
             assert!(
@@ -19704,7 +19394,7 @@ exit 0
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let err = vertical
                 .spec_cleaner(&src, Path::new("foo.spec"), &[], 3600, false)
                 .unwrap_err();
@@ -19729,7 +19419,7 @@ exit 0
             let (podman, _) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let vertical = vertical(&client, dir.path(), podman);
             let result = vertical
                 .spec_cleaner(&src, Path::new("foo.spec"), &[], 3600, false)
                 .unwrap();

@@ -2,7 +2,7 @@
 //!
 //! Runs only when `GEECTL_LOCAL_BUILD_E2E` is `1` (the local-build-e2e CI
 //! job sets it). Without the marker the test skips, so `cargo test` stays
-//! green without podman, the engine, or a local OBS instance.
+//! green without podman or a local OBS instance.
 //!
 //! With the marker set, the test builds the fixture package
 //! (`tests/local_build_e2e/geectl-e2e-hello.spec`) against the local OBS instance
@@ -144,12 +144,10 @@ fn real_podman_build_of_fixture_package_succeeds() {
         eprintln!("skipping local-build e2e test: GEECTL_LOCAL_BUILD_E2E is not set to 1");
         return;
     }
-    for binary in ["build", "podman"] {
-        assert!(
-            on_path(binary),
-            "{binary} is not on PATH: the local-build-e2e workflow installs it"
-        );
-    }
+    assert!(
+        on_path("podman"),
+        "podman is not on PATH: the local-build-e2e workflow installs it"
+    );
     // The debug channel is on in this test: the run talks to a
     // live backend, and a failure without the channel is
     // undiagnosable — the download-on-demand warm failure in

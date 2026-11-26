@@ -62,8 +62,6 @@ pub enum ErrorKind {
     /// The requested operation has no implementation on the host
     /// operating system (no periodic schedule ships there).
     UnsupportedOs,
-    /// The `build` engine binary is not installed.
-    NoBuildEngine,
     /// The build image could not be pulled or resolved.
     ImageUnavailable,
     /// A cached package failed its hdrmd5 check after re-download.
@@ -133,7 +131,6 @@ impl ErrorKind {
             ErrorKind::MultibuildFlavorRequired => "multibuild_flavor_required",
             ErrorKind::UnsupportedArch => "unsupported_arch",
             ErrorKind::UnsupportedOs => "unsupported_os",
-            ErrorKind::NoBuildEngine => "no_build_engine",
             ErrorKind::ImageUnavailable => "image_unavailable",
             ErrorKind::CacheCorrupt => "cache_corrupt",
             ErrorKind::BuildRootInUse => "build_root_in_use",
@@ -177,7 +174,6 @@ impl ErrorKind {
             }
             ErrorKind::UnsupportedArch => "the requested architecture is not the host architecture",
             ErrorKind::UnsupportedOs => "the host operating system is not supported",
-            ErrorKind::NoBuildEngine => "the build engine is not installed",
             ErrorKind::ImageUnavailable => "the build image could not be pulled or resolved",
             ErrorKind::CacheCorrupt => "a cached package failed its hdrmd5 check",
             ErrorKind::BuildRootInUse => "the build root is in use",
@@ -243,9 +239,6 @@ impl ErrorKind {
             ErrorKind::UnsupportedOs => {
                 "the periodic schedule ships only on Linux, macOS and Windows"
             }
-            ErrorKind::NoBuildEngine => {
-                "install the openSUSE build package (zypper install build) or put the build script on PATH"
-            }
             ErrorKind::ImageUnavailable => {
                 "check the network and the image name, then retry"
             }
@@ -309,7 +302,8 @@ impl ErrorKind {
             ErrorKind::UntrustedProject => 14,
             ErrorKind::MultibuildFlavorRequired => 15,
             ErrorKind::UnsupportedArch => 16,
-            ErrorKind::NoBuildEngine => 17,
+            // Exit 17 is unused: it belonged to a removed kind and
+            // is never reused.
             ErrorKind::ImageUnavailable => 18,
             ErrorKind::CacheCorrupt => 19,
             ErrorKind::BuildRootInUse => 20,
@@ -351,7 +345,6 @@ impl ErrorKind {
             ErrorKind::UntrustedProject,
             ErrorKind::MultibuildFlavorRequired,
             ErrorKind::UnsupportedArch,
-            ErrorKind::NoBuildEngine,
             ErrorKind::ImageUnavailable,
             ErrorKind::CacheCorrupt,
             ErrorKind::BuildRootInUse,

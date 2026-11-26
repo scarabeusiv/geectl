@@ -3,7 +3,7 @@
 #
 # This is the live proof for the local-build vertical (see
 # docs/local-build-design.md): the per-PR suite proves the logic with a
-# stub engine, this job proves the real engine, image, and cache end to
+# stub podman, this job proves the real engine, image, and cache end to
 # end. It gates PRs: it is a required status check. When it regresses,
 # it blocks the merge until fixed. It runs
 # on every pull request, weekly (Mondays 06:00 UTC, the same slot as
@@ -21,8 +21,8 @@
 # instance's bootstrap admin credentials authenticate the test — no
 # real OBS credential is used anywhere.
 #
-# The job installs podman and the `build` engine (`obs-build`, the
-# Debian name for the openSUSE build script) and runs the
+# The job installs podman (the host needs nothing else: the engine
+# runs inside the container) and runs the
 # `local_build_e2e` integration test, which skips unless
 # `GEECTL_LOCAL_BUILD_E2E` is `1`.
 
@@ -92,24 +92,13 @@ jobs:
       # the cache export (no error, no cache). Pinned to the v4 tag's
       # commit; Dependabot tracks SHA pins and proposes updates.
       - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4
-      # Podman plus the `build` engine. The engine ships as `obs-build`
-      # (the Debian name for the openSUSE build script) in the
-      # openSUSE:Tools repository; the repo path follows the runner's
-      # Ubuntu release so a runner upgrade does not silently point at
-      # a missing directory.
-      - name: Install podman and the build engine
+      # Podman only: the engine runs inside the build container,
+      # so the host needs no `build` script.
+      - name: Install podman
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y podman
-          ubuntu_version="$(lsb_release -rs)"
-          echo "deb https://download.opensuse.org/repositories/openSUSE:/Tools/xUbuntu_${ubuntu_version}/ /" | sudo tee /etc/apt/sources.list.d/obs-tools.list > /dev/null
-          curl -fsSL "https://download.opensuse.org/repositories/openSUSE:/Tools/xUbuntu_${ubuntu_version}/Release.key" | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/obs-tools.gpg
-          sudo apt-get update
-          sudo apt-get install -y obs-build
-          # The build script answers no --version: its version is the
-          # package version. The query fails when the package is absent.
-          dpkg-query -W -f='${Version}\n' obs-build
           podman --version
       # The fixture repository's arch, derived once so the cache key,
       # the link into the backend in tests/live/provision.sh and

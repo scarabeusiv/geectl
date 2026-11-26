@@ -2398,7 +2398,7 @@ _arguments "${_arguments_options[@]}" : \
 '--trust-all-projects[Allow build dependencies from other users'\'' \`home\:\` projects (their packages run code in the build root). Without this such builds are refused]' \
 '--refresh-image[Force an image pull even when the local image is fresh]' \
 '--noinit[Skip the root initialization\: start the build immediately in the existing root. Needs an initialized root (a previous build wrote the rpmlist and buildconfig there)]' \
-'--preinstall-image[Use the preinstall image when the buildinfo offers one. Off by default\: the engine extracts the image with bsdtar \`--chroot\` plus device nodes, which fail as a non-root user, so a rootless build never selects the image. Only set it when the engine runs as root]' \
+'--preinstall-image[Use the preinstall image when the buildinfo offers one. Off by default\: the engine extracts the image with bsdtar \`--chroot\` plus device nodes, which need root. The engine always runs as container root, so the image is always selectable]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
 '--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
