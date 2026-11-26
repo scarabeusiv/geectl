@@ -314,6 +314,14 @@ project and package, and the `clone_url` and `ssh_url` for the agent's own
 `git clone`. The fork result returns the URLs; the clone runs through the
 git CLI.
 
+The composite records the fork in the test project's description as one
+`geectl-branch:` marker line naming the fork, the source, and the target.
+Accept-time cleanup and `cleanup-forks` delete only what a parsed marker
+names exactly: the marker is read on the authenticated project-meta route,
+the delete runs with the caller's own credentials against the caller's own
+home test project, and only a marker naming exactly that project and
+package authorizes a delete.
+
 The composite waits for the first build of the forked package in the
 fork's test project and reports it on the result: settled once the
 build matrix settles, still running with the latest matrix when the
