@@ -28,6 +28,7 @@ fn run(
     format: Format,
     format_source: &'static str,
 ) -> Result<String, GeectlError> {
+    let instance = cli.instance.as_deref();
     let (payload, text) = match cli.command {
         Some(Command::Version) | None => {
             let payload = json!({
@@ -85,7 +86,7 @@ fn run(
         }
         Some(Command::Gitea { command }) => geectl::cli_gitea::run_gitea(command, debug, cli.live)?,
         Some(Command::PullRequest { command }) => {
-            geectl::cli_pull_request::run_pull_request(command, debug, cli.live)?
+            geectl::cli_pull_request::run_pull_request(command, debug, cli.live, instance)?
         }
         Some(Command::Person { command }) => {
             geectl::cli_person::run_person(command, debug, cli.live)?

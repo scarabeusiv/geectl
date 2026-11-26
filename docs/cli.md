@@ -14,7 +14,7 @@ truth for the full text: run `geectl --help` or
 ## Invocation shape
 
 ```sh
-geectl [--format json|text] [--debug] [--debug-body] [--live] <group> <command> [args] [flags]
+geectl [--format json|text] [--debug] [--debug-body] [--live] [--instance <ALIAS>] <group> <command> [args] [flags]
 ```
 
 Required coordinates are positionals where the leaf takes them; the build group orders them project, package, repository, arch. Branch and maintenance take coordinates as long flags. The exact order per leaf is in its `--help` output. Everything else is a named long flag. Group/leaf options take long flags only, apart from clap's built-in `-h`/`-V`, `commit -m`, and `local-build build -k`/`-p`. Each command has a single name.
@@ -66,6 +66,16 @@ alias, the `[instances]` entry to add otherwise — and
 the configured instance's credentials stay with it.
 `branch copy-package --to-apiurl` resolves the target's
 credentials this way.
+
+`--instance <alias>` selects the OBS instance for one call: the
+flagged alias's URL replaces the configured URL, ahead of the
+`GEECTL_OBS_URL` environment variable and any working-copy state,
+and credentials resolve only from the flagged alias's own variables.
+A call with the flag and no credentials for that alias fails naming
+the variables to set. The Gitea host is unaffected, but the account
+a pull-request filing uses is selected the same way: with the flag,
+the filing authenticates with the flagged alias's
+`GEECTL_GITEA_TOKEN_<ALIAS>` only.
 
 The same rule applies to Gitea: `GEECTL_GITEA_TOKEN_<ALIAS>` (or
 `GEECTL_GITEA_TOKEN_FILE_<ALIAS>`) for the instance named in
