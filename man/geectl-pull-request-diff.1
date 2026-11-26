@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-pull-request-diff 1  "geectl-pull-request-diff 0.2.3" 
+.SH NAME
+geectl\-pull\-request\-diff \- Show the diff of a pull request: the unified diff, like `request diff`. With `\-\-xml` the OBS arm renders the request XML with the diff injected; `\-\-xml` is refused on a Gitea pull request, which has no request XML. A read, always live
+.SH SYNOPSIS
+\fBgeectl pull\-request diff\fR [\fB\-\-xml\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
+.SH DESCRIPTION
+Show the diff of a pull request: the unified diff, like `request diff`. With `\-\-xml` the OBS arm renders the request XML with the diff injected; `\-\-xml` is refused on a Gitea pull request, which has no request XML. A read, always live
+.SH OPTIONS
+.TP
+\fB\-\-xml\fR
+Render the OBS request XML with the diff injected, instead of the bare diff. Refused on a Gitea ref
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREFERENCE\fR>
+The pull\-request handle: `obs:<id>` or `gitea:<owner>/<repo>#<number>`
+.SH VERSION
+v0.2.3

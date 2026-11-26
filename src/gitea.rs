@@ -715,13 +715,18 @@ impl std::str::FromStr for GiteaMergeMethod {
 }
 
 /// The body of a review-event POST: the event, plus the comment
-/// when one was given. The body is omitted when empty: the server
-/// takes an event without one.
+/// when one was given, plus the head commit the review is pinned
+/// to when one was given. The body and the commit are omitted when
+/// empty: the server takes an event without either.
 #[derive(Serialize)]
 struct ReviewEventRequest {
     event: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<String>,
+    /// The head commit the review is recorded against: the review
+    /// is pinned to this commit server-side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_id: Option<String>,
 }
 
 /// The body of a review-request cancel DELETE: the users and teams
@@ -2788,6 +2793,36 @@ impl<'a> GiteaClient<'a> {
         parse_pull_request(&body, owner, repo, number)
     }
 
+    /// Read the unified diff of a pull request (`GET
+    /// /api/v1/repos/{owner}/{repo}/pulls/{number}.diff`): what
+    /// the pull request changes, as a unified diff. An agent reads
+    /// the diff to review a pull request before acting on it:
+    /// approving without seeing the change is not a review. The
+    /// diff is returned as the raw response body, unparsed: it is
+    /// caller-consumed text, not a structure the library acts on.
+    /// The `.diff` suffix selects the diff format server-side, so
+    /// the `application/xml` Accept of a text read does not change
+    /// what comes back.
+    pub fn pr_diff(&self, owner: &str, repo: &str, number: u64) -> Result<String, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_pr_number(number)?;
+        let url = build_url(
+            &self.base,
+            &[
+                "api",
+                "v1",
+                "repos",
+                owner,
+                repo,
+                "pulls",
+                &format!("{number}.diff"),
+            ],
+            &[],
+        );
+        self.http.get_with(&url, &self.credentials)
+    }
+
     /// List a repository's pull requests (`GET
     /// /api/v1/repos/{owner}/{repo}/pulls?state=…`): the PRs in
     /// the given wire state. Paginates internally and is bounded
@@ -2914,9 +2949,12 @@ impl<'a> GiteaClient<'a> {
 
     /// Submit a review event on a pull request (`POST
     /// /api/v1/repos/{owner}/{repo}/pulls/{number}/reviews`) and
-    /// return the created review. DryRun-guarded like `fork_repo`:
+    /// return the created review. With `commit_id` the review is
+    /// recorded against that head commit server-side; without it
+    /// the review carries no pin. DryRun-guarded like `fork_repo`:
     /// the guard runs before the POST, and the result is `None`
     /// in dry-run.
+    #[allow(clippy::too_many_arguments)]
     pub fn pr_review(
         &self,
         owner: &str,
@@ -2924,20 +2962,23 @@ impl<'a> GiteaClient<'a> {
         number: u64,
         event: GiteaReviewEvent,
         body: Option<&str>,
+        commit_id: Option<&str>,
         dry_run: &DryRun,
     ) -> Result<Option<GiteaReview>, GeectlError> {
         validate_gitea_name(owner, "owner")?;
         validate_gitea_name(repo, "repo")?;
         validate_pr_number(number)?;
-        if !dry_run.allow(&format!(
-            "{} pull request {owner}/{repo}#{number}",
-            event.plan_verb()
-        )) {
+        let mut plan = format!("{} pull request {owner}/{repo}#{number}", event.plan_verb());
+        if let Some(commit) = commit_id {
+            plan.push_str(&format!(" at {commit}"));
+        }
+        if !dry_run.allow(&plan) {
             return Ok(None);
         }
         let request = ReviewEventRequest {
             event: event.as_str(),
             body: body.map(str::to_string),
+            commit_id: commit_id.map(str::to_string),
         };
         let body = serde_json::to_string(&request).map_err(|err| {
             GeectlError::new(
@@ -7140,6 +7181,7 @@ mod tests {
                 122,
                 GiteaReviewEvent::Approve,
                 Some("Looks good."),
+                None,
                 &DryRun::new(false),
             )
             .unwrap()
@@ -7165,6 +7207,7 @@ mod tests {
                 122,
                 GiteaReviewEvent::Comment,
                 Some("One nit."),
+                None,
                 &DryRun::new(false),
             )
             .unwrap()
@@ -7190,6 +7233,7 @@ mod tests {
                 122,
                 GiteaReviewEvent::Approve,
                 None,
+                None,
                 &DryRun::new(false),
             )
             .unwrap();
@@ -7209,11 +7253,63 @@ mod tests {
                 122,
                 GiteaReviewEvent::Approve,
                 Some("Looks good."),
+                None,
                 &DryRun::new(true),
             )
             .unwrap();
         assert!(review.is_none());
         assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_review_with_commit_id_sends_it() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews",
+            &review_json("plusky", "APPROVED", "Looks good."),
+        );
+        let review = client(&http)
+            .pr_review(
+                "openSUSE",
+                "geectl",
+                122,
+                GiteaReviewEvent::Approve,
+                Some("Looks good."),
+                Some("e490820bfabf010f5f267335067a52757aca72af2f"),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(review.user.as_ref().unwrap().login, "plusky");
+        assert_eq!(review.state, "APPROVED");
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            r#"{"event":"APPROVED","body":"Looks good.","commit_id":"e490820bfabf010f5f267335067a52757aca72af2f"}"#
+        );
+    }
+
+    #[test]
+    fn pr_diff_returns_the_unified_diff() {
+        let diff = "diff --git a/foo.txt b/foo.txt\n--- a/foo.txt\n+++ b/foo.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122.diff",
+            diff,
+        );
+        let got = client(&http).pr_diff("openSUSE", "geectl", 122).unwrap();
+        assert_eq!(got, diff);
+    }
+
+    #[test]
+    fn pr_diff_missing_pr_is_a_server_error() {
+        let http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122.diff",
+            ErrorKind::ServerError,
+        );
+        let err = client(&http)
+            .pr_diff("openSUSE", "geectl", 122)
+            .expect_err("a missing PR must fail");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]

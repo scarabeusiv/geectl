@@ -842,6 +842,37 @@ impl<'a> PullRequestClient<'a> {
         }
     }
 
+    /// Read the diff of a pull request: the unified diff on both
+    /// arms — `request diff` on OBS, the Gitea `.diff` on a Gitea
+    /// pull request. With `xml` the OBS arm renders the request
+    /// XML with the diff injected, like `request diff --xml`;
+    /// `--xml` on a Gitea ref is refused, since a Gitea pull
+    /// request has no request XML. The diff is returned as the raw
+    /// response body, unparsed: it is caller-consumed text, not a
+    /// structure the library acts on.
+    pub fn diff(&self, reference: &PullRequestRef, xml: bool) -> Result<String, GeectlError> {
+        match reference {
+            PullRequestRef::Obs(id) => {
+                let obs = self.obs.ok_or_else(missing_obs_arm)?;
+                obs.request_diff(&id.to_string(), xml)
+            }
+            PullRequestRef::Gitea {
+                owner,
+                repo,
+                number,
+            } => {
+                if xml {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        "--xml does not apply to a Gitea pull request: a Gitea pull request has no request XML",
+                    ));
+                }
+                let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
+                gitea.pr_diff(owner, repo, *number)
+            }
+        }
+    }
+
     /// Search pull requests as the list shape. With no backend
     /// both arms run, OBS first then Gitea; a backend scopes the
     /// search to that arm. The OBS arm filters server-side (the
@@ -896,28 +927,54 @@ impl<'a> PullRequestClient<'a> {
     /// `Some` target acts on that target, `None` acts on the
     /// review asked of the acting user. A `Some` target on a
     /// Gitea ref is refused: a Gitea review is always acted on as
-    /// the token owner. Returns the recorded opinion, or `None`
-    /// in dry-run.
+    /// the token owner. With `commit` the approval is pinned to
+    /// that head commit (Gitea only): the review is recorded
+    /// against it server-side, and is refused when the head has
+    /// moved. The pin is best-effort: the head is read just before
+    /// the review posts, so a push landing between the read and
+    /// the post is not caught; on an OBS ref a commit is refused.
+    /// Returns the recorded opinion, or `None` in dry-run.
     pub fn approve(
         &self,
         reference: &PullRequestRef,
         target: Option<&ReviewTarget>,
         message: Option<&str>,
+        commit: Option<&str>,
         dry_run: &DryRun,
     ) -> Result<Option<ReviewOpinion>, GeectlError> {
-        self.set_review_state(reference, target, ReviewState::Accepted, message, dry_run)
+        self.set_review_state(
+            reference,
+            target,
+            ReviewState::Accepted,
+            message,
+            commit,
+            dry_run,
+        )
     }
 
     /// Ask for changes on a pull request, as `approve` but with
-    /// the review declined instead of accepted.
+    /// the review declined instead of accepted. The `commit` pin
+    /// behaves as in `approve`: the review is recorded against
+    /// that head commit on a Gitea ref, and is refused when the
+    /// head has moved. The pin is best-effort, as in `approve`:
+    /// a push landing between the head read and the review post
+    /// is not caught.
     pub fn request_changes(
         &self,
         reference: &PullRequestRef,
         target: Option<&ReviewTarget>,
         message: Option<&str>,
+        commit: Option<&str>,
         dry_run: &DryRun,
     ) -> Result<Option<ReviewOpinion>, GeectlError> {
-        self.set_review_state(reference, target, ReviewState::Declined, message, dry_run)
+        self.set_review_state(
+            reference,
+            target,
+            ReviewState::Declined,
+            message,
+            commit,
+            dry_run,
+        )
     }
 
     /// Comment on a pull request. `parent` threads the reply
@@ -1390,10 +1447,19 @@ impl<'a> PullRequestClient<'a> {
         target: Option<&ReviewTarget>,
         state: ReviewState,
         message: Option<&str>,
+        commit: Option<&str>,
         dry_run: &DryRun,
     ) -> Result<Option<ReviewOpinion>, GeectlError> {
         match reference {
             PullRequestRef::Obs(id) => {
+                if let Some(commit) = commit {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "--commit {commit} does not apply to a submit request: OBS reviews are not pinned to a commit"
+                        ),
+                    ));
+                }
                 let obs = self.obs.ok_or_else(missing_obs_arm)?;
                 let target = self.resolve_obs_target(obs, target)?;
                 obs.change_review_state(
@@ -1430,7 +1496,26 @@ impl<'a> PullRequestClient<'a> {
                         ));
                     }
                 };
-                let review = gitea.pr_review(owner, repo, *number, event, message, dry_run)?;
+                // Best-effort pin, not a guarantee: the head is read
+                // here and the review posts after it, so a push
+                // landing between the read and the post is not
+                // caught — the server records the commit_id it is
+                // given. Re-read the head after approving if the
+                // exact commit matters.
+                if let Some(commit) = commit {
+                    validate_commit_sha(commit)?;
+                    let head = gitea.pr_get(owner, repo, *number)?.head.sha;
+                    if head != commit {
+                        return Err(GeectlError::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "refusing to record the review on pull request {owner}/{repo}#{number}: --commit {commit} is not the current head {head} — re-read the diff and approve the new head"
+                            ),
+                        ));
+                    }
+                }
+                let review =
+                    gitea.pr_review(owner, repo, *number, event, message, commit, dry_run)?;
                 review
                     .map(|review| opinion_from_gitea_review(&review))
                     .transpose()
@@ -1459,6 +1544,26 @@ impl<'a> PullRequestClient<'a> {
             )),
         }
     }
+}
+
+/// A `--commit` pin must be a full commit SHA in lowercase: 40
+/// hexadecimal characters on a SHA-1 repo, 64 on a SHA-256 one.
+/// Server SHAs are lowercase and the head compare is
+/// case-sensitive, so an uppercase value can never match a head;
+/// it is refused as malformed instead of reported as a moved head.
+fn validate_commit_sha(commit: &str) -> Result<(), GeectlError> {
+    let hex = commit
+        .chars()
+        .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+    if hex && (commit.len() == 40 || commit.len() == 64) {
+        return Ok(());
+    }
+    Err(GeectlError::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "--commit {commit} is not a full commit SHA: expected 40 or 64 lowercase hexadecimal characters"
+        ),
+    ))
 }
 
 /// A review target on a Gitea ref is refused: a Gitea review is
@@ -2659,7 +2764,13 @@ mod tests {
         );
         let obs = obs_client(&http);
         let opinion = act_client(Some(&obs), None)
-            .approve(&obs_ref(), None, Some("Looks good."), &DryRun::new(false))
+            .approve(
+                &obs_ref(),
+                None,
+                Some("Looks good."),
+                None,
+                &DryRun::new(false),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(opinion.reviewer, "user scarabeus_iv");
@@ -2680,7 +2791,7 @@ mod tests {
         let obs = obs_client(&http);
         let dry = DryRun::new(true);
         let opinion = act_client(Some(&obs), None)
-            .approve(&obs_ref(), None, Some("Looks good."), &dry)
+            .approve(&obs_ref(), None, Some("Looks good."), None, &dry)
             .unwrap();
         assert!(opinion.is_none());
         assert!(http.post_calls().is_empty());
@@ -2696,7 +2807,13 @@ mod tests {
         );
         let obs = obs_client(&http);
         let opinion = act_client(Some(&obs), None)
-            .request_changes(&obs_ref(), None, Some("Needs work."), &DryRun::new(false))
+            .request_changes(
+                &obs_ref(),
+                None,
+                Some("Needs work."),
+                None,
+                &DryRun::new(false),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(opinion.state, OpinionState::ChangesRequested);
@@ -2712,7 +2829,7 @@ mod tests {
         let obs = obs_client(&http);
         let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
         let opinion = act_client(Some(&obs), None)
-            .approve(&obs_ref(), Some(&target), None, &DryRun::new(false))
+            .approve(&obs_ref(), Some(&target), None, None, &DryRun::new(false))
             .unwrap()
             .unwrap();
         assert_eq!(opinion.reviewer, "user Admin");
@@ -2727,7 +2844,13 @@ mod tests {
         );
         let gitea = gitea_client(&http);
         let opinion = act_client(None, Some(&gitea))
-            .approve(&gitea_ref(), None, Some("Looks good."), &DryRun::new(false))
+            .approve(
+                &gitea_ref(),
+                None,
+                Some("Looks good."),
+                None,
+                &DryRun::new(false),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(opinion.reviewer, "plusky");
@@ -2743,19 +2866,19 @@ mod tests {
         let gitea = gitea_client(&http);
         let target = ReviewTarget::new(Some("bob"), None, None, None).unwrap();
         let err = act_client(None, Some(&gitea))
-            .approve(&gitea_ref(), Some(&target), None, &DryRun::new(false))
+            .approve(&gitea_ref(), Some(&target), None, None, &DryRun::new(false))
             .expect_err("a target on a Gitea ref must fail");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(err.to_string().contains("--user bob"));
         let target = ReviewTarget::new(None, Some("reviewers"), None, None).unwrap();
         let err = act_client(None, Some(&gitea))
-            .approve(&gitea_ref(), Some(&target), None, &DryRun::new(false))
+            .approve(&gitea_ref(), Some(&target), None, None, &DryRun::new(false))
             .expect_err("a group target on a Gitea ref must fail");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(err.to_string().contains("--group reviewers"));
         let target = ReviewTarget::new(None, None, Some("openSUSE:Factory"), None).unwrap();
         let err = act_client(None, Some(&gitea))
-            .approve(&gitea_ref(), Some(&target), None, &DryRun::new(false))
+            .approve(&gitea_ref(), Some(&target), None, None, &DryRun::new(false))
             .expect_err("a project target on a Gitea ref must fail");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(err.to_string().contains("--project openSUSE:Factory"));
@@ -2769,10 +2892,213 @@ mod tests {
             by_package: Some("vim".to_string()),
         };
         let err = act_client(None, Some(&gitea))
-            .approve(&gitea_ref(), Some(&target), None, &DryRun::new(false))
+            .approve(&gitea_ref(), Some(&target), None, None, &DryRun::new(false))
             .expect_err("a package target on a Gitea ref must fail");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(err.to_string().contains("--package vim"));
+    }
+
+    const HEAD_SHA: &str = "e490820bfabf010f5f267335067a52757aca72af";
+    const OTHER_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// `PR_JSON` with the head commit replaced: the first
+    /// `"sha"` in the fixture is the head (the head object
+    /// precedes the base), so replacing one occurrence touches
+    /// the head only and the base keeps its SHA.
+    fn pr_json_with_head(head: &str) -> String {
+        PR_JSON.replacen(
+            "\"sha\": \"e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa\"",
+            &format!("\"sha\": \"{head}\""),
+            1,
+        )
+    }
+
+    #[test]
+    fn diff_obs_delegates_to_request_diff() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/1398977?cmd=diff",
+            "diff --git a/foo b/foo\n",
+        );
+        let obs = obs_client(&http);
+        let diff = PullRequestClient::new(Some(&obs), None)
+            .diff(&obs_ref(), false)
+            .unwrap();
+        assert_eq!(diff, "diff --git a/foo b/foo\n");
+    }
+
+    #[test]
+    fn diff_obs_xml_passes_view_xml() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/1398977?cmd=diff&view=xml",
+            "<request id=\"1398977\"></request>",
+        );
+        let obs = obs_client(&http);
+        let diff = PullRequestClient::new(Some(&obs), None)
+            .diff(&obs_ref(), true)
+            .unwrap();
+        assert_eq!(diff, "<request id=\"1398977\"></request>");
+    }
+
+    #[test]
+    fn diff_gitea_returns_the_unified_diff() {
+        let diff = "diff --git a/foo.txt b/foo.txt\n--- a/foo.txt\n+++ b/foo.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122.diff",
+            diff,
+        );
+        let gitea = gitea_client(&http);
+        let got = PullRequestClient::new(None, Some(&gitea))
+            .diff(&gitea_ref(), false)
+            .unwrap();
+        assert_eq!(got, diff);
+    }
+
+    #[test]
+    fn diff_gitea_with_xml_is_refused() {
+        let http = FakeHttp::new();
+        let gitea = gitea_client(&http);
+        let err = PullRequestClient::new(None, Some(&gitea))
+            .diff(&gitea_ref(), true)
+            .expect_err("--xml on a Gitea ref must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--xml"));
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn approve_gitea_with_matching_commit_posts_commit_id() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &pr_json_with_head(HEAD_SHA),
+            )
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews",
+                &review_json("plusky", "APPROVED"),
+            );
+        let gitea = gitea_client(&http);
+        let opinion = act_client(None, Some(&gitea))
+            .approve(
+                &gitea_ref(),
+                None,
+                Some("Looks good."),
+                Some(HEAD_SHA),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(opinion.reviewer, "plusky");
+        assert_eq!(opinion.state, OpinionState::Approved);
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            format!(
+                "{{\"event\":\"APPROVED\",\"body\":\"Looks good.\",\"commit_id\":\"{HEAD_SHA}\"}}"
+            )
+        );
+    }
+
+    #[test]
+    fn approve_gitea_with_stale_commit_is_refused() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+            &pr_json_with_head(HEAD_SHA),
+        );
+        let gitea = gitea_client(&http);
+        let err = act_client(None, Some(&gitea))
+            .approve(
+                &gitea_ref(),
+                None,
+                Some("Looks good."),
+                Some(OTHER_SHA),
+                &DryRun::new(false),
+            )
+            .expect_err("a stale commit must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains(OTHER_SHA));
+        assert!(err.to_string().contains(HEAD_SHA));
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn approve_gitea_with_malformed_commit_is_refused() {
+        let http = FakeHttp::new();
+        let gitea = gitea_client(&http);
+        let err = act_client(None, Some(&gitea))
+            .approve(
+                &gitea_ref(),
+                None,
+                None,
+                Some("not-a-sha"),
+                &DryRun::new(false),
+            )
+            .expect_err("a malformed commit must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not a full commit SHA"));
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn approve_gitea_with_uppercase_commit_is_refused() {
+        let http = FakeHttp::new();
+        let gitea = gitea_client(&http);
+        let err = act_client(None, Some(&gitea))
+            .approve(
+                &gitea_ref(),
+                None,
+                None,
+                Some("E490820BFABF010F5F267335067A52757ACA72AF"),
+                &DryRun::new(false),
+            )
+            .expect_err("an uppercase commit must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not a full commit SHA"));
+        assert!(err.to_string().contains("lowercase"));
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn approve_obs_with_commit_is_refused() {
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let err = act_client(Some(&obs), None)
+            .approve(&obs_ref(), None, None, Some(HEAD_SHA), &DryRun::new(false))
+            .expect_err("a commit on an OBS ref must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--commit"));
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn approve_gitea_with_commit_dry_run_reads_the_head_but_posts_nothing() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &pr_json_with_head(HEAD_SHA),
+            )
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews",
+                &review_json("plusky", "APPROVED"),
+            );
+        let gitea = gitea_client(&http);
+        let dry = DryRun::new(true);
+        let opinion = act_client(None, Some(&gitea))
+            .approve(
+                &gitea_ref(),
+                None,
+                Some("Looks good."),
+                Some(HEAD_SHA),
+                &dry,
+            )
+            .unwrap();
+        assert!(opinion.is_none());
+        assert!(http.post_calls().is_empty());
+        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(dry.plan().len(), 1);
+        assert!(dry.plan()[0].contains(HEAD_SHA));
     }
 
     #[test]
@@ -3282,7 +3608,13 @@ mod tests {
         let http = FakeHttp::new();
         let obs = ObsClient::with_credentials(&http, Credentials::None).unwrap();
         let err = act_client(Some(&obs), None)
-            .approve(&obs_ref(), None, Some("Looks good."), &DryRun::new(false))
+            .approve(
+                &obs_ref(),
+                None,
+                Some("Looks good."),
+                None,
+                &DryRun::new(false),
+            )
             .expect_err("an approve without credentials must fail closed");
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(err.to_string().contains("OBS username"));
@@ -3299,7 +3631,13 @@ mod tests {
         )
         .unwrap();
         let err = act_client(Some(&obs), None)
-            .approve(&obs_ref(), None, Some("Looks good."), &DryRun::new(false))
+            .approve(
+                &obs_ref(),
+                None,
+                Some("Looks good."),
+                None,
+                &DryRun::new(false),
+            )
             .expect_err("an approve with a token and no target must fail closed");
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(err.to_string().contains("OBS username"));

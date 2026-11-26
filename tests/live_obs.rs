@@ -2312,7 +2312,7 @@ fn live_pull_request_approve_round_trip() {
         .expect("ask Admin to review the request on the live instance");
     let reference = PullRequestRef::Obs(id.parse().expect("a filed request id is numeric"));
     let opinion = PullRequestClient::new(Some(&client), None)
-        .approve(&reference, Some(&target), Some("Looks good."), &dry)
+        .approve(&reference, Some(&target), Some("Looks good."), None, &dry)
         .expect("typed approve approves the request")
         .expect("a live approve returns the opinion");
     assert_eq!(opinion.reviewer, "user Admin");
@@ -2347,7 +2347,7 @@ fn live_pull_request_request_changes_round_trip() {
         .expect("ask Admin to review the request on the live instance");
     let reference = PullRequestRef::Obs(id.parse().expect("a filed request id is numeric"));
     let opinion = PullRequestClient::new(Some(&client), None)
-        .request_changes(&reference, Some(&target), Some("Needs work."), &dry)
+        .request_changes(&reference, Some(&target), Some("Needs work."), None, &dry)
         .expect("typed request_changes asks for changes on the request")
         .expect("a live request-changes returns the opinion");
     assert_eq!(opinion.reviewer, "user Admin");

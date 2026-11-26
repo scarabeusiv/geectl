@@ -79,6 +79,20 @@ pub enum PullRequestCommand {
         /// `gitea:<owner>/<repo>#<number>`.
         reference: String,
     },
+    /// Show the diff of a pull request: the unified diff, like
+    /// `request diff`. With `--xml` the OBS arm renders the
+    /// request XML with the diff injected; `--xml` is refused on
+    /// a Gitea pull request, which has no request XML. A read,
+    /// always live.
+    Diff {
+        /// The pull-request handle: `obs:<id>` or
+        /// `gitea:<owner>/<repo>#<number>`.
+        reference: String,
+        /// Render the OBS request XML with the diff injected,
+        /// instead of the bare diff. Refused on a Gitea ref.
+        #[arg(long)]
+        xml: bool,
+    },
     /// Search pull requests: OBS submit requests and Gitea pull
     /// requests as one list, OBS first then Gitea. With no
     /// `--backend` both arms run; `--backend` scopes to one.
@@ -223,6 +237,13 @@ pub struct ReviewActArgs {
     /// are taken literally: a message may open with a `- ` bullet.
     #[arg(long, allow_hyphen_values = true)]
     message: Option<String>,
+    /// Pin the review to this head commit (Gitea only): the
+    /// review is recorded against it server-side, and is refused
+    /// when the head has moved. Best-effort: the head is read
+    /// just before the review posts, so a push landing between
+    /// the read and the post is not caught. Refused on an OBS ref.
+    #[arg(long)]
+    commit: Option<String>,
     /// Act on the review asked of this user (OBS only).
     #[arg(long)]
     user: Option<String>,
@@ -378,14 +399,38 @@ pub fn run_pull_request(
                 }),
             }
         }
+        PullRequestCommand::Diff { reference, xml } => {
+            // The handle is parsed before any credential
+            // resolution, so an invalid handle fails as
+            // InvalidInput whether or not credentials are
+            // configured; the --xml refusal on a Gitea ref is
+            // decided the same way.
+            let reference: PullRequestRef = reference.parse()?;
+            if xml {
+                if let PullRequestRef::Gitea { .. } = &reference {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        "--xml does not apply to a Gitea pull request: a Gitea pull request has no request XML",
+                    ));
+                }
+            }
+            match &reference {
+                PullRequestRef::Obs(_) => with_obs(debug, true, |obs| {
+                    diff_with(&PullRequestClient::new(Some(obs), None), &reference, xml)
+                }),
+                PullRequestRef::Gitea { .. } => with_gitea(debug, |gitea| {
+                    diff_with(&PullRequestClient::new(None, Some(gitea)), &reference, xml)
+                }),
+            }
+        }
         PullRequestCommand::Approve(args) => review_act_with(
             args,
             debug,
             live,
             "approve",
             "approved",
-            |client, reference, target, message, dry_run| {
-                client.approve(reference, target, message, dry_run)
+            |client, reference, target, message, commit, dry_run| {
+                client.approve(reference, target, message, commit, dry_run)
             },
         ),
         PullRequestCommand::RequestChanges(args) => review_act_with(
@@ -394,8 +439,8 @@ pub fn run_pull_request(
             live,
             "request changes on",
             "requested changes on",
-            |client, reference, target, message, dry_run| {
-                client.request_changes(reference, target, message, dry_run)
+            |client, reference, target, message, commit, dry_run| {
+                client.request_changes(reference, target, message, commit, dry_run)
             },
         ),
         PullRequestCommand::Comment(args) => {
@@ -1288,6 +1333,7 @@ fn review_act_with(
         &PullRequestRef,
         Option<&ReviewTarget>,
         Option<&str>,
+        Option<&str>,
         &DryRun,
     ) -> Result<Option<ReviewOpinion>, GeectlError>,
 ) -> Result<(Value, String), GeectlError> {
@@ -1307,16 +1353,18 @@ fn review_act_with(
                 &reference,
                 target.as_ref(),
                 args.message.as_deref(),
+                args.commit.as_deref(),
                 &dry_run,
             )?;
             Ok((
-                review_act_payload(&reference, &opinion, &dry_run)?,
+                review_act_payload(&reference, &opinion, args.commit.as_deref(), &dry_run)?,
                 review_act_text(
                     present,
                     past,
                     &reference,
                     &opinion,
                     args.message.as_deref(),
+                    args.commit.as_deref(),
                     &dry_run,
                 ),
             ))
@@ -1328,16 +1376,18 @@ fn review_act_with(
                 &reference,
                 target.as_ref(),
                 args.message.as_deref(),
+                args.commit.as_deref(),
                 &dry_run,
             )?;
             Ok((
-                review_act_payload(&reference, &opinion, &dry_run)?,
+                review_act_payload(&reference, &opinion, args.commit.as_deref(), &dry_run)?,
                 review_act_text(
                     present,
                     past,
                     &reference,
                     &opinion,
                     args.message.as_deref(),
+                    args.commit.as_deref(),
                     &dry_run,
                 ),
             ))
@@ -1351,6 +1401,7 @@ fn review_act_with(
 fn review_act_payload(
     reference: &PullRequestRef,
     opinion: &Option<ReviewOpinion>,
+    commit: Option<&str>,
     dry_run: &DryRun,
 ) -> Result<Value, GeectlError> {
     let mut payload = json!({
@@ -1359,6 +1410,7 @@ fn review_act_payload(
             Some(opinion) => payload_json(opinion)?,
             None => Value::Null,
         },
+        "commit": commit,
         "dry_run": dry_run.enabled(),
     });
     add_plan(&mut payload, dry_run);
@@ -1374,6 +1426,7 @@ fn review_act_text(
     reference: &PullRequestRef,
     opinion: &Option<ReviewOpinion>,
     message: Option<&str>,
+    commit: Option<&str>,
     dry_run: &DryRun,
 ) -> String {
     let mut text = match (dry_run.enabled(), opinion) {
@@ -1385,6 +1438,9 @@ fn review_act_text(
         if !message.is_empty() {
             text.push_str(&format!(" — {message}"));
         }
+    }
+    if let Some(commit) = commit {
+        text.push_str(&format!(" at {commit}"));
     }
     text
 }
@@ -2459,6 +2515,33 @@ fn add_plan(payload: &mut Value, dry_run: &DryRun) {
 
 /// Show one pull request through the uniform client: the JSON
 /// payload is the unified shape, the text its human rendering.
+/// Read the diff of a pull request: a content command like
+/// `request diff` — the payload carries the reference, the diff
+/// and the xml flag, and the text rendering is the diff verbatim.
+/// The one exception is an empty diff, which renders an explicit
+/// line naming the pull request instead of empty stdout.
+fn diff_with(
+    client: &PullRequestClient,
+    reference: &PullRequestRef,
+    xml: bool,
+) -> Result<(Value, String), GeectlError> {
+    let diff = client.diff(reference, xml)?;
+    let payload = json!({
+        "reference": reference.to_string(),
+        "diff": diff,
+        "xml": xml,
+    });
+    Ok((payload, render_diff_text(reference, &diff)))
+}
+
+fn render_diff_text(reference: &PullRequestRef, diff: &str) -> String {
+    if diff.is_empty() {
+        format!("no diff for pull request {reference}")
+    } else {
+        diff.to_string()
+    }
+}
+
 fn show_with(
     client: &PullRequestClient,
     reference: &PullRequestRef,
@@ -3004,13 +3087,14 @@ mod tests {
         let reference = gitea_reference();
         let opinion = Some(fixture_opinion());
         let dry_run = DryRun::new(false);
-        let payload = review_act_payload(&reference, &opinion, &dry_run).unwrap();
+        let payload = review_act_payload(&reference, &opinion, None, &dry_run).unwrap();
         assert_eq!(payload["reference"], "gitea:openSUSE/geectl#122");
         assert_eq!(payload["review"]["reviewer"], "plusky");
         assert_eq!(payload["review"]["state"], "approved");
         assert_eq!(payload["review"]["comment"], "Looks good.");
         assert_eq!(payload["review"]["when"], "2026-11-22T19:52:58Z");
         assert_eq!(payload["dry_run"], false);
+        assert_eq!(payload["commit"], serde_json::Value::Null);
         assert!(payload.get("plan").is_none());
 
         let text = review_act_text(
@@ -3019,6 +3103,7 @@ mod tests {
             &reference,
             &opinion,
             Some("Looks good."),
+            None,
             &dry_run,
         );
         for expected in [
@@ -3039,7 +3124,7 @@ mod tests {
         let reference = gitea_reference();
         let dry_run = DryRun::new(true);
         dry_run.allow("approve pull request openSUSE/geectl#122");
-        let payload = review_act_payload(&reference, &None, &dry_run).unwrap();
+        let payload = review_act_payload(&reference, &None, None, &dry_run).unwrap();
         assert_eq!(payload["review"], serde_json::Value::Null);
         assert_eq!(payload["dry_run"], true);
         assert_eq!(
@@ -3053,6 +3138,7 @@ mod tests {
             &reference,
             &None,
             Some("Looks good."),
+            None,
             &dry_run,
         );
         assert_eq!(

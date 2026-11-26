@@ -311,9 +311,10 @@ without evaluating trust.
 ## `pull-request` — unified pull-request read and act
 
 - `geectl pull-request show <REFERENCE>` — Show one pull request: `obs:<id>` or `gitea:<owner>/<repo>#<number>`.
+- `geectl pull-request diff <REFERENCE>` — Show the diff of a pull request: the unified diff, like `request diff`; key flags: --xml
 - `geectl pull-request search` — Search pull requests: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea; key flags: --backend <BACKEND>, --state <STATE>, --creator <CREATOR>, --repo <REPO>
-- `geectl pull-request approve <REFERENCE>` — Approve a pull request as the review asked of the target: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea); key flags: --message <MESSAGE>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
-- `geectl pull-request request-changes <REFERENCE>` — Ask for changes on a pull request, as `approve` but with the review declined instead of accepted; key flags: --message <MESSAGE>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
+- `geectl pull-request approve <REFERENCE>` — Approve a pull request as the review asked of the target: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea); key flags: --message <MESSAGE>, --commit <COMMIT>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
+- `geectl pull-request request-changes <REFERENCE>` — Ask for changes on a pull request, as `approve` but with the review declined instead of accepted; key flags: --message <MESSAGE>, --commit <COMMIT>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
 - `geectl pull-request comment --body <BODY> <REFERENCE>` — Comment on a pull request; key flags: --parent <PARENT>
 - `geectl pull-request build-comment --project <PROJECT> --package <PACKAGE> <REFERENCE>` — Post the build-link comment on a Gitea pull request: the OBS build results for the test project and package as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; key flags: --project <PROJECT>, --package <PACKAGE>
 - `geectl pull-request comments <REFERENCE>` — List the comments on a pull request, oldest first.

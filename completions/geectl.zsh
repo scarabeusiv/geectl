@@ -2872,6 +2872,18 @@ _arguments "${_arguments_options[@]}" : \
 ':reference -- The pull-request handle\: `obs\:<id>` or `gitea\:<owner>/<repo>#<number>`:_default' \
 && ret=0
 ;;
+(diff)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--xml[Render the OBS request XML with the diff injected, instead of the bare diff. Refused on a Gitea ref]' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':reference -- The pull-request handle\: `obs\:<id>` or `gitea\:<owner>/<repo>#<number>`:_default' \
+&& ret=0
+;;
 (search)
 _arguments "${_arguments_options[@]}" : \
 '--backend=[Only this backend (\`obs\` or \`gitea\`). With no backend both arms run, OBS first then Gitea]:BACKEND:(obs gitea)' \
@@ -2889,6 +2901,7 @@ _arguments "${_arguments_options[@]}" : \
 (approve)
 _arguments "${_arguments_options[@]}" : \
 '--message=[The message left with the review. Values starting with \`-\` are taken literally\: a message may open with a \`- \` bullet]:MESSAGE:_default' \
+'--commit=[Pin the review to this head commit (Gitea only)\: the review is recorded against it server-side, and is refused when the head has moved. Best-effort\: the head is read just before the review posts, so a push landing between the read and the post is not caught. Refused on an OBS ref]:COMMIT:_default' \
 '--user=[Act on the review asked of this user (OBS only)]:USER:_default' \
 '--group=[Act on the review asked of this group (OBS only)]:GROUP:_default' \
 '--project=[Act on the review asked of this project (OBS only)]:PROJECT:_default' \
@@ -2905,6 +2918,7 @@ _arguments "${_arguments_options[@]}" : \
 (request-changes)
 _arguments "${_arguments_options[@]}" : \
 '--message=[The message left with the review. Values starting with \`-\` are taken literally\: a message may open with a \`- \` bullet]:MESSAGE:_default' \
+'--commit=[Pin the review to this head commit (Gitea only)\: the review is recorded against it server-side, and is refused when the head has moved. Best-effort\: the head is read just before the review posts, so a push landing between the read and the post is not caught. Refused on an OBS ref]:COMMIT:_default' \
 '--user=[Act on the review asked of this user (OBS only)]:USER:_default' \
 '--group=[Act on the review asked of this group (OBS only)]:GROUP:_default' \
 '--project=[Act on the review asked of this project (OBS only)]:PROJECT:_default' \
@@ -3056,6 +3070,10 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:geectl-pull-request-help-command-$line[1]:"
         case $line[1] in
             (show)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(diff)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -4221,6 +4239,10 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:geectl-help-pull-request-command-$line[1]:"
         case $line[1] in
             (show)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(diff)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -5694,6 +5716,7 @@ _geectl__subcmd__help__subcmd__pull_commands() {
 _geectl__subcmd__help__subcmd__pull-request_commands() {
     local commands; commands=(
 'show:Show one pull request\: \`obs\:<id>\` or \`gitea\:<owner>/<repo>#<number>\`' \
+'diff:Show the diff of a pull request\: the unified diff, like \`request diff\`. With \`--xml\` the OBS arm renders the request XML with the diff injected; \`--xml\` is refused on a Gitea pull request, which has no request XML. A read, always live' \
 'search:Search pull requests\: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea. With no \`--backend\` both arms run; \`--backend\` scopes to one' \
 'approve:Approve a pull request as the review asked of the target\: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea). Dry-run by default; mutates only with \`--live\`' \
 'request-changes:Ask for changes on a pull request, as \`approve\` but with the review declined instead of accepted. Dry-run by default; mutates only with \`--live\`' \
@@ -5738,6 +5761,11 @@ _geectl__subcmd__help__subcmd__pull-request__subcmd__comments_commands() {
 _geectl__subcmd__help__subcmd__pull-request__subcmd__decline_commands() {
     local commands; commands=()
     _describe -t commands 'geectl help pull-request decline commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__help__subcmd__pull-request__subcmd__diff_commands] )) ||
+_geectl__subcmd__help__subcmd__pull-request__subcmd__diff_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help pull-request diff commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help__subcmd__pull-request__subcmd__merge_commands] )) ||
 _geectl__subcmd__help__subcmd__pull-request__subcmd__merge_commands() {
@@ -6575,6 +6603,7 @@ _geectl__subcmd__pull_commands() {
 _geectl__subcmd__pull-request_commands() {
     local commands; commands=(
 'show:Show one pull request\: \`obs\:<id>\` or \`gitea\:<owner>/<repo>#<number>\`' \
+'diff:Show the diff of a pull request\: the unified diff, like \`request diff\`. With \`--xml\` the OBS arm renders the request XML with the diff injected; \`--xml\` is refused on a Gitea pull request, which has no request XML. A read, always live' \
 'search:Search pull requests\: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea. With no \`--backend\` both arms run; \`--backend\` scopes to one' \
 'approve:Approve a pull request as the review asked of the target\: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea). Dry-run by default; mutates only with \`--live\`' \
 'request-changes:Ask for changes on a pull request, as \`approve\` but with the review declined instead of accepted. Dry-run by default; mutates only with \`--live\`' \
@@ -6621,10 +6650,16 @@ _geectl__subcmd__pull-request__subcmd__decline_commands() {
     local commands; commands=()
     _describe -t commands 'geectl pull-request decline commands' commands "$@"
 }
+(( $+functions[_geectl__subcmd__pull-request__subcmd__diff_commands] )) ||
+_geectl__subcmd__pull-request__subcmd__diff_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl pull-request diff commands' commands "$@"
+}
 (( $+functions[_geectl__subcmd__pull-request__subcmd__help_commands] )) ||
 _geectl__subcmd__pull-request__subcmd__help_commands() {
     local commands; commands=(
 'show:Show one pull request\: \`obs\:<id>\` or \`gitea\:<owner>/<repo>#<number>\`' \
+'diff:Show the diff of a pull request\: the unified diff, like \`request diff\`. With \`--xml\` the OBS arm renders the request XML with the diff injected; \`--xml\` is refused on a Gitea pull request, which has no request XML. A read, always live' \
 'search:Search pull requests\: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea. With no \`--backend\` both arms run; \`--backend\` scopes to one' \
 'approve:Approve a pull request as the review asked of the target\: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea). Dry-run by default; mutates only with \`--live\`' \
 'request-changes:Ask for changes on a pull request, as \`approve\` but with the review declined instead of accepted. Dry-run by default; mutates only with \`--live\`' \
@@ -6670,6 +6705,11 @@ _geectl__subcmd__pull-request__subcmd__help__subcmd__comments_commands() {
 _geectl__subcmd__pull-request__subcmd__help__subcmd__decline_commands() {
     local commands; commands=()
     _describe -t commands 'geectl pull-request help decline commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__pull-request__subcmd__help__subcmd__diff_commands] )) ||
+_geectl__subcmd__pull-request__subcmd__help__subcmd__diff_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl pull-request help diff commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__pull-request__subcmd__help__subcmd__help_commands] )) ||
 _geectl__subcmd__pull-request__subcmd__help__subcmd__help_commands() {

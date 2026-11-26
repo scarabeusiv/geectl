@@ -1970,7 +1970,13 @@ fn gitea_pull_request_approve_round_trip() {
         number,
     };
     let opinion = PullRequestClient::new(None, Some(&reviewer_client))
-        .approve(&reference, None, Some("Looks good."), &DryRun::new(false))
+        .approve(
+            &reference,
+            None,
+            Some("Looks good."),
+            None,
+            &DryRun::new(false),
+        )
         .expect("typed approve approves the pull request")
         .expect("a live approve returns the opinion");
     assert_eq!(opinion.reviewer, reviewer);
@@ -2012,7 +2018,13 @@ fn gitea_pull_request_request_changes_round_trip() {
         number,
     };
     let opinion = PullRequestClient::new(None, Some(&reviewer_client))
-        .request_changes(&reference, None, Some("Needs work."), &DryRun::new(false))
+        .request_changes(
+            &reference,
+            None,
+            Some("Needs work."),
+            None,
+            &DryRun::new(false),
+        )
         .expect("typed request_changes asks for changes on the pull request")
         .expect("a live request-changes returns the opinion");
     assert_eq!(opinion.reviewer, reviewer);

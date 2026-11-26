@@ -6296,6 +6296,7 @@ fn pull_request_help_lists_the_subcommands() {
     let text = String::from_utf8_lossy(&out.stdout);
     for name in [
         "show",
+        "diff",
         "search",
         "approve",
         "request-changes",
@@ -6529,6 +6530,48 @@ fn pull_request_merge_obs_with_no_forward_is_invalid_input() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
     assert!(stderr.contains("--no-forward"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_diff_gitea_with_xml_is_invalid_input_without_credentials() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "diff", "gitea:openSUSE/geectl#122", "--xml"])
+        .output()
+        .unwrap();
+    // InvalidInput exits 2; --xml does not apply to a Gitea pull
+    // request, and the refusal precedes credential resolution, so
+    // it fires without a token where a plain diff would fail with
+    // ConfigError.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("--xml"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_approve_gitea_with_malformed_commit_is_invalid_input() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "pull-request",
+            "approve",
+            "gitea:openSUSE/geectl#122",
+            "--commit",
+            "not-a-sha",
+        ])
+        .env("GEECTL_GITEA_TOKEN", "tok-fake")
+        .output()
+        .unwrap();
+    // InvalidInput exits 2; a malformed --commit is refused
+    // before the head is read, so no server is contacted: the
+    // token is a dummy and the host is never reached.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("not a full commit SHA"), "stderr: {stderr}");
 }
 
 #[test]

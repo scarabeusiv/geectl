@@ -4,13 +4,16 @@
 .SH NAME
 geectl\-pull\-request\-request\-changes \- Ask for changes on a pull request, as `approve` but with the review declined instead of accepted. Dry\-run by default; mutates only with `\-\-live`
 .SH SYNOPSIS
-\fBgeectl pull\-request request\-changes\fR [\fB\-\-message\fR] [\fB\-\-user\fR] [\fB\-\-group\fR] [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
+\fBgeectl pull\-request request\-changes\fR [\fB\-\-message\fR] [\fB\-\-commit\fR] [\fB\-\-user\fR] [\fB\-\-group\fR] [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
 .SH DESCRIPTION
 Ask for changes on a pull request, as `approve` but with the review declined instead of accepted. Dry\-run by default; mutates only with `\-\-live`
 .SH OPTIONS
 .TP
 \fB\-\-message\fR \fI<MESSAGE>\fR
 The message left with the review. Values starting with `\-` are taken literally: a message may open with a `\- ` bullet
+.TP
+\fB\-\-commit\fR \fI<COMMIT>\fR
+Pin the review to this head commit (Gitea only): the review is recorded against it server\-side, and is refused when the head has moved. Best\-effort: the head is read just before the review posts, so a push landing between the read and the post is not caught. Refused on an OBS ref
 .TP
 \fB\-\-user\fR \fI<USER>\fR
 Act on the review asked of this user (OBS only)
