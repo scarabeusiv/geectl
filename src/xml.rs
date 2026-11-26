@@ -1385,45 +1385,47 @@ enum ModeledChildKind {
     Structured,
 }
 
-pub(crate) fn xml_reject_stray_text(inner: &str, element: &str) -> Result<(), GeectlError> {
+pub(crate) fn xml_reject_stray_text(
+    inner: &str,
+    element: &str,
+    subject: &str,
+) -> Result<(), GeectlError> {
     let stray_text = |at: usize| {
         GeectlError::new(
             ErrorKind::ServerError,
-            format!(
-                "unexpected OBS project meta response: stray text in <{element}> at offset {at}"
-            ),
+            format!("unexpected {subject}: stray text in <{element}> at offset {at}"),
         )
     };
     let cdata = |at: usize| {
         GeectlError::new(
             ErrorKind::ServerError,
-            format!(
-                "unexpected OBS project meta response: CDATA section in <{element}> at offset {at}"
-            ),
+            format!("unexpected {subject}: CDATA section in <{element}> at offset {at}"),
         )
     };
     let cdata_in_child = |child: &str, at: usize| {
         GeectlError::new(
             ErrorKind::ServerError,
-            format!("unexpected OBS project meta response: CDATA section in <{child}> in <{element}> at offset {at}"),
+            format!(
+                "unexpected {subject}: CDATA section in <{child}> in <{element}> at offset {at}"
+            ),
         )
     };
     let text_in_child = |child: &str, at: usize| {
         GeectlError::new(
             ErrorKind::ServerError,
-            format!("unexpected OBS project meta response: text in <{child}> in <{element}> at offset {at}"),
+            format!("unexpected {subject}: text in <{child}> in <{element}> at offset {at}"),
         )
     };
     let markup_in_child = |child: &str, at: usize| {
         GeectlError::new(
             ErrorKind::ServerError,
-            format!("unexpected OBS project meta response: markup in <{child}> in <{element}> at offset {at}"),
+            format!("unexpected {subject}: markup in <{child}> in <{element}> at offset {at}"),
         )
     };
     let hidden_modeled_tag = |tag: &str, at: usize| {
         GeectlError::new(
             ErrorKind::ServerError,
-            format!("unexpected OBS project meta response: hidden <{tag}> in <{element}> at offset {at}"),
+            format!("unexpected {subject}: hidden <{tag}> in <{element}> at offset {at}"),
         )
     };
     // The tags the typed parsers read out of this element, and
@@ -1453,6 +1455,16 @@ pub(crate) fn xml_reject_stray_text(inner: &str, element: &str) -> Result<(), Ge
             ("description", ModeledChildKind::Text),
             ("url", ModeledChildKind::Text),
             ("scmsync", ModeledChildKind::Text),
+        ],
+        "package" => &[
+            ("devel", ModeledChildKind::AttributeOnly),
+            ("person", ModeledChildKind::AttributeOnly),
+            ("group", ModeledChildKind::AttributeOnly),
+            ("title", ModeledChildKind::Text),
+            ("description", ModeledChildKind::Text),
+            ("url", ModeledChildKind::Text),
+            ("scmsync", ModeledChildKind::Text),
+            ("releasename", ModeledChildKind::Text),
         ],
         _ => &[],
     };
@@ -2385,39 +2397,79 @@ mod tests {
 
     #[test]
     fn xml_reject_stray_text_accepts_whitespace_children_and_comments() {
-        assert!(xml_reject_stray_text("", "repository").is_ok());
+        assert!(xml_reject_stray_text("", "repository", "OBS project meta response").is_ok());
         assert!(xml_reject_stray_text(
             "\n  <arch>x86_64</arch>\n  <path project=\"p\" repository=\"r\"/>\n",
-            "repository"
+            "repository",
+            "OBS project meta response"
         )
         .is_ok());
-        assert!(
-            xml_reject_stray_text("<!-- note --><arch>x86_64</arch><?pi data?>", "repository")
-                .is_ok()
-        );
+        assert!(xml_reject_stray_text(
+            "<!-- note --><arch>x86_64</arch><?pi data?>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_ok());
         // Text left after a whole child is still stray, CDATA or not.
-        assert!(xml_reject_stray_text("<arch><![CDATA[x]]></arch>]]>", "repository").is_err());
+        assert!(xml_reject_stray_text(
+            "<arch><![CDATA[x]]></arch>]]>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
     }
 
     #[test]
     fn xml_reject_stray_text_rejects_text_between_children() {
-        assert!(xml_reject_stray_text("stray<arch>x86_64</arch>", "repository").is_err());
-        assert!(xml_reject_stray_text("<arch>x86_64</arch>stray", "repository").is_err());
         assert!(xml_reject_stray_text(
-            "<arch>x86_64</arch> stray <path project=\"p\" repository=\"r\"/>",
-            "repository"
+            "stray<arch>x86_64</arch>",
+            "repository",
+            "OBS project meta response"
         )
         .is_err());
-        assert!(xml_reject_stray_text("   stray   ", "repository").is_err());
+        assert!(xml_reject_stray_text(
+            "<arch>x86_64</arch>stray",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<arch>x86_64</arch> stray <path project=\"p\" repository=\"r\"/>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(
+            xml_reject_stray_text("   stray   ", "repository", "OBS project meta response")
+                .is_err()
+        );
         // NBSP is character data, not whitespace: it is stray text.
-        assert!(xml_reject_stray_text("<arch>x86_64</arch>\u{a0}", "repository").is_err());
+        assert!(xml_reject_stray_text(
+            "<arch>x86_64</arch>\u{a0}",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
     }
 
     #[test]
     fn xml_reject_stray_text_rejects_any_cdata_section() {
-        assert!(xml_reject_stray_text("<![CDATA[stray]]>", "repository").is_err());
-        assert!(xml_reject_stray_text("<![CDATA[]]>", "repository").is_err());
-        assert!(xml_reject_stray_text("<arch>x86_64</arch><![CDATA[x]]>", "download").is_err());
+        assert!(xml_reject_stray_text(
+            "<![CDATA[stray]]>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(
+            xml_reject_stray_text("<![CDATA[]]>", "repository", "OBS project meta response")
+                .is_err()
+        );
+        assert!(xml_reject_stray_text(
+            "<arch>x86_64</arch><![CDATA[x]]>",
+            "download",
+            "OBS project meta response"
+        )
+        .is_err());
     }
 
     #[test]
@@ -2425,16 +2477,38 @@ mod tests {
         // The readers decode entities only, so a section here would read
         // as the literal wrapper. The `<![CDATA[x></arch>]]>` shape still
         // ends the child where the CDATA-aware walk says it ends.
-        assert!(xml_reject_stray_text("<arch><![CDATA[x86_64]]></arch>", "repository").is_err());
-        assert!(xml_reject_stray_text("<arch><![CDATA[x></arch>]]></arch>", "repository").is_err());
-        assert!(
-            xml_reject_stray_text("<archfilter><![CDATA[x86_64]]></archfilter>", "download")
-                .is_err()
-        );
-        assert!(xml_reject_stray_text("<pubkey><![CDATA[key]]></pubkey>", "download").is_err());
+        assert!(xml_reject_stray_text(
+            "<arch><![CDATA[x86_64]]></arch>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<arch><![CDATA[x></arch>]]></arch>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<archfilter><![CDATA[x86_64]]></archfilter>",
+            "download",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<pubkey><![CDATA[key]]></pubkey>",
+            "download",
+            "OBS project meta response"
+        )
+        .is_err());
         // A section inside a child no reader reads as a value is
         // skipped with the child.
-        assert!(xml_reject_stray_text("<status><![CDATA[x]]></status>", "repository").is_ok());
+        assert!(xml_reject_stray_text(
+            "<status><![CDATA[x]]></status>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -2445,25 +2519,62 @@ mod tests {
         // value — including a close-looking sequence inside the
         // comment or CDATA section, which the descendant readers
         // would also truncate on.
-        assert!(xml_reject_stray_text("<arch>x<!-- c --></arch>", "repository").is_err());
-        assert!(xml_reject_stray_text("<arch>x<!-- </arch> --></arch>", "repository").is_err());
-        assert!(xml_reject_stray_text("<arch><![CDATA[</arch>]]></arch>", "repository").is_err());
-        assert!(xml_reject_stray_text("<arch><b>x86_64</b></arch>", "repository").is_err());
-        assert!(xml_reject_stray_text("<arch>x<?pi data?></arch>", "repository").is_err());
         assert!(xml_reject_stray_text(
-            "<archfilter>x<!-- </archfilter> --></archfilter>",
-            "download"
+            "<arch>x<!-- c --></arch>",
+            "repository",
+            "OBS project meta response"
         )
         .is_err());
-        assert!(
-            xml_reject_stray_text("<pubkey>key<!-- </pubkey> --></pubkey>", "download").is_err()
-        );
+        assert!(xml_reject_stray_text(
+            "<arch>x<!-- </arch> --></arch>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<arch><![CDATA[</arch>]]></arch>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<arch><b>x86_64</b></arch>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<arch>x<?pi data?></arch>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<archfilter>x<!-- </archfilter> --></archfilter>",
+            "download",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<pubkey>key<!-- </pubkey> --></pubkey>",
+            "download",
+            "OBS project meta response"
+        )
+        .is_err());
         // Plain text with entities still parses: only literal
         // markup is rejected.
-        assert!(xml_reject_stray_text("<arch>x86_64</arch>", "repository").is_ok());
-        assert!(
-            xml_reject_stray_text("<archfilter>x86_64&amp;arm</archfilter>", "download").is_ok()
-        );
+        assert!(xml_reject_stray_text(
+            "<arch>x86_64</arch>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_ok());
+        assert!(xml_reject_stray_text(
+            "<archfilter>x86_64&amp;arm</archfilter>",
+            "download",
+            "OBS project meta response"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -2472,48 +2583,85 @@ mod tests {
         // hidden in a comment, a processing instruction, or another
         // child would still be read as a value: the gate rejects
         // any occurrence in skipped content, markup or not.
-        assert!(xml_reject_stray_text("<!-- <arch>x86_64</arch> -->", "repository").is_err());
-        assert!(xml_reject_stray_text("<foo><arch>x86_64</arch></foo>", "repository").is_err());
         assert!(xml_reject_stray_text(
-            "<path project=\"p\" repository=\"r\"><arch>x86_64</arch></path>",
-            "repository"
+            "<!-- <arch>x86_64</arch> -->",
+            "repository",
+            "OBS project meta response"
         )
         .is_err());
-        assert!(xml_reject_stray_text("<?pi <arch>x86_64</arch> ?>", "repository").is_err());
+        assert!(xml_reject_stray_text(
+            "<foo><arch>x86_64</arch></foo>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<path project=\"p\" repository=\"r\"><arch>x86_64</arch></path>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<?pi <arch>x86_64</arch> ?>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
         assert!(xml_reject_stray_text(
             "<download url=\"https://example.com\"><arch>x86_64</arch></download>",
-            "repository"
+            "repository",
+            "OBS project meta response"
         )
         .is_err());
         assert!(xml_reject_stray_text(
             "<!-- <download url=\"https://example.com\"/> -->",
-            "repository"
+            "repository",
+            "OBS project meta response"
         )
         .is_err());
         assert!(xml_reject_stray_text(
             "<foo><path project=\"p\" repository=\"r\"/></foo>",
-            "repository"
+            "repository",
+            "OBS project meta response"
         )
         .is_err());
-        assert!(
-            xml_reject_stray_text("<!-- <archfilter>x86_64</archfilter> -->", "download").is_err()
-        );
+        assert!(xml_reject_stray_text(
+            "<!-- <archfilter>x86_64</archfilter> -->",
+            "download",
+            "OBS project meta response"
+        )
+        .is_err());
         assert!(xml_reject_stray_text(
             "<master url=\"https://example.com\"><pubkey>key</pubkey></master>",
-            "download"
+            "download",
+            "OBS project meta response"
         )
         .is_err());
         assert!(xml_reject_stray_text(
             "<foo><master url=\"https://example.com\"/></foo>",
-            "download"
+            "download",
+            "OBS project meta response"
         )
         .is_err());
         // Skipped content without a modeled tag still parses: a
         // plain comment, and an unmodeled child carrying neither a
         // modeled tag nor a section the readers would find.
-        assert!(xml_reject_stray_text("<!-- note -->", "repository").is_ok());
-        assert!(xml_reject_stray_text("<foo><bar>x</bar></foo>", "repository").is_ok());
-        assert!(xml_reject_stray_text("<status><![CDATA[x]]></status>", "repository").is_ok());
+        assert!(
+            xml_reject_stray_text("<!-- note -->", "repository", "OBS project meta response")
+                .is_ok()
+        );
+        assert!(xml_reject_stray_text(
+            "<foo><bar>x</bar></foo>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_ok());
+        assert!(xml_reject_stray_text(
+            "<status><![CDATA[x]]></status>",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -2525,23 +2673,53 @@ mod tests {
         // in skipped content, markup or not.
         assert!(xml_reject_stray_text(
             "<!-- <repository name=\"hidden\"><arch>x86_64</arch></repository> -->",
-            "project"
+            "project",
+            "OBS project meta response"
         )
         .is_err());
-        assert!(
-            xml_reject_stray_text("<foo><repository name=\"hidden\"/></foo>", "project").is_err()
-        );
-        assert!(xml_reject_stray_text("<!-- <devel project=\"d:p\"/> -->", "project").is_err());
-        assert!(xml_reject_stray_text("<!-- <title>Hidden</title> -->", "project").is_err());
+        assert!(xml_reject_stray_text(
+            "<foo><repository name=\"hidden\"/></foo>",
+            "project",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<!-- <devel project=\"d:p\"/> -->",
+            "project",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<!-- <title>Hidden</title> -->",
+            "project",
+            "OBS project meta response"
+        )
+        .is_err());
         assert!(xml_reject_stray_text(
             "<!-- <person userid=\"x\" role=\"maintainer\"/> -->",
-            "project"
+            "project",
+            "OBS project meta response"
         )
         .is_err());
-        assert!(xml_reject_stray_text("<?pi <repository name=\"hidden\"/> ?>", "project").is_err());
+        assert!(xml_reject_stray_text(
+            "<?pi <repository name=\"hidden\"/> ?>",
+            "project",
+            "OBS project meta response"
+        )
+        .is_err());
         // Skipped content without a modeled tag still parses.
-        assert!(xml_reject_stray_text("<!-- note --><repository name=\"r\"/>", "project").is_ok());
-        assert!(xml_reject_stray_text("<foo><bar>x</bar></foo>", "project").is_ok());
+        assert!(xml_reject_stray_text(
+            "<!-- note --><repository name=\"r\"/>",
+            "project",
+            "OBS project meta response"
+        )
+        .is_ok());
+        assert!(xml_reject_stray_text(
+            "<foo><bar>x</bar></foo>",
+            "project",
+            "OBS project meta response"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -2550,55 +2728,107 @@ mod tests {
         // only), so a comment, processing instruction, nested tag,
         // or CDATA section inside a project text child would read
         // as the literal value.
-        assert!(xml_reject_stray_text("<title>See <b>x</b></title>", "project").is_err());
-        assert!(xml_reject_stray_text("<title><![CDATA[Foo]]></title>", "project").is_err());
-        assert!(xml_reject_stray_text("<title><![CDATA[</title>]]></title>", "project").is_err());
-        assert!(xml_reject_stray_text("<title>x<!-- </title> --></title>", "project").is_err());
-        assert!(
-            xml_reject_stray_text("<description>x<?pi data?></description>", "project").is_err()
-        );
+        assert!(xml_reject_stray_text(
+            "<title>See <b>x</b></title>",
+            "project",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<title><![CDATA[Foo]]></title>",
+            "project",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<title><![CDATA[</title>]]></title>",
+            "project",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<title>x<!-- </title> --></title>",
+            "project",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<description>x<?pi data?></description>",
+            "project",
+            "OBS project meta response"
+        )
+        .is_err());
         // Plain text with entities still parses: only literal
         // markup is rejected.
-        assert!(xml_reject_stray_text("<title>Foo &amp; Bar</title>", "project").is_ok());
-        assert!(xml_reject_stray_text("<description>plain text</description>", "project").is_ok());
+        assert!(xml_reject_stray_text(
+            "<title>Foo &amp; Bar</title>",
+            "project",
+            "OBS project meta response"
+        )
+        .is_ok());
+        assert!(xml_reject_stray_text(
+            "<description>plain text</description>",
+            "project",
+            "OBS project meta response"
+        )
+        .is_ok());
     }
 
     #[test]
     fn xml_reject_stray_text_accepts_comments_and_whitespace_at_project_level() {
-        assert!(xml_reject_stray_text("", "project").is_ok());
+        assert!(xml_reject_stray_text("", "project", "OBS project meta response").is_ok());
         assert!(xml_reject_stray_text(
             "\n  <title>Factory</title>\n  <!-- note -->\n  <repository name=\"standard\"/>\n",
-            "project"
+            "project",
+            "OBS project meta response"
         )
         .is_ok());
     }
 
     #[test]
     fn xml_reject_stray_text_errors_carry_the_offset_in_the_element() {
-        let err = xml_reject_stray_text("stray<arch>x86_64</arch>", "repository").unwrap_err();
+        let err = xml_reject_stray_text(
+            "stray<arch>x86_64</arch>",
+            "repository",
+            "OBS project meta response",
+        )
+        .unwrap_err();
         assert!(
             err.context
                 .contains("stray text in <repository> at offset 0"),
             "{}",
             err.context
         );
-        let err =
-            xml_reject_stray_text("<arch>x86_64</arch><![CDATA[x]]>", "repository").unwrap_err();
+        let err = xml_reject_stray_text(
+            "<arch>x86_64</arch><![CDATA[x]]>",
+            "repository",
+            "OBS project meta response",
+        )
+        .unwrap_err();
         assert!(
             err.context
                 .contains("CDATA section in <repository> at offset 19"),
             "{}",
             err.context
         );
-        let err =
-            xml_reject_stray_text("<arch><![CDATA[x86_64]]></arch>", "repository").unwrap_err();
+        let err = xml_reject_stray_text(
+            "<arch><![CDATA[x86_64]]></arch>",
+            "repository",
+            "OBS project meta response",
+        )
+        .unwrap_err();
         assert!(
             err.context
                 .contains("CDATA section in <arch> in <repository> at offset 6"),
             "{}",
             err.context
         );
-        let err = xml_reject_stray_text("<!-- never closed", "repository").unwrap_err();
+        let err = xml_reject_stray_text(
+            "<!-- never closed",
+            "repository",
+            "OBS project meta response",
+        )
+        .unwrap_err();
         assert!(
             err.context
                 .contains("unterminated content in <repository> at offset 0"),
@@ -2613,14 +2843,38 @@ mod tests {
         // `<!--->`) is not a terminator, it is an unterminated
         // comment: the search starts past the `!--` opener, as in
         // `xml_child_elements` and `xml_element_end`.
-        assert!(xml_reject_stray_text("<!-->", "repository").is_err());
-        assert!(xml_reject_stray_text("<!--->", "repository").is_err());
-        assert!(xml_reject_stray_text("<arch>x86_64</arch><!-->", "repository").is_err());
-        assert!(xml_reject_stray_text("<!-- never closed", "repository").is_err());
-        assert!(xml_reject_stray_text("<?pi never closed", "repository").is_err());
-        assert!(xml_reject_stray_text("<arch>x86_64</arch", "repository").is_err());
-        assert!(xml_reject_stray_text("</arch>", "repository").is_err());
-        assert!(xml_reject_stray_text("<></>", "repository").is_err());
+        assert!(xml_reject_stray_text("<!-->", "repository", "OBS project meta response").is_err());
+        assert!(
+            xml_reject_stray_text("<!--->", "repository", "OBS project meta response").is_err()
+        );
+        assert!(xml_reject_stray_text(
+            "<arch>x86_64</arch><!-->",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<!-- never closed",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<?pi never closed",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<arch>x86_64</arch",
+            "repository",
+            "OBS project meta response"
+        )
+        .is_err());
+        assert!(
+            xml_reject_stray_text("</arch>", "repository", "OBS project meta response").is_err()
+        );
+        assert!(xml_reject_stray_text("<></>", "repository", "OBS project meta response").is_err());
     }
 
     #[test]
@@ -2736,58 +2990,73 @@ mod tests {
         // it, at every level the gate covers.
         assert!(xml_reject_stray_text(
             "<path project=\"a\" repository=\"b\">junk</path>",
-            "repository"
+            "repository",
+            "OBS project meta response"
         )
         .is_err());
         assert!(xml_reject_stray_text(
             "<releasetarget project=\"a\" repository=\"b\">junk</releasetarget>",
-            "repository"
+            "repository",
+            "OBS project meta response"
         )
         .is_err());
         assert!(xml_reject_stray_text(
             "<hostsystem project=\"a\" repository=\"b\">junk</hostsystem>",
-            "repository"
+            "repository",
+            "OBS project meta response"
         )
         .is_err());
         assert!(xml_reject_stray_text(
             "<master url=\"https://example.com\">junk</master>",
-            "download"
+            "download",
+            "OBS project meta response"
         )
         .is_err());
-        assert!(xml_reject_stray_text("<devel project=\"a\">junk</devel>", "project").is_err());
+        assert!(xml_reject_stray_text(
+            "<devel project=\"a\">junk</devel>",
+            "project",
+            "OBS project meta response"
+        )
+        .is_err());
         assert!(xml_reject_stray_text(
             "<person userid=\"alice\" role=\"maintainer\">junk</person>",
-            "project"
+            "project",
+            "OBS project meta response"
         )
         .is_err());
         assert!(xml_reject_stray_text(
             "<group groupid=\"g\" role=\"maintainer\">junk</group>",
-            "project"
+            "project",
+            "OBS project meta response"
         )
         .is_err());
         // Whitespace alone inside one is not text.
         assert!(xml_reject_stray_text(
             "<path project=\"a\" repository=\"b\">  \n </path>",
-            "repository"
+            "repository",
+            "OBS project meta response"
         )
         .is_ok());
         // A CDATA section or a nested element inside one is rejected
         // the same way.
         assert!(xml_reject_stray_text(
             "<path project=\"a\" repository=\"b\"><![CDATA[junk]]></path>",
-            "repository"
+            "repository",
+            "OBS project meta response"
         )
         .is_err());
         assert!(xml_reject_stray_text(
             "<path project=\"a\" repository=\"b\"><b>junk</b></path>",
-            "repository"
+            "repository",
+            "OBS project meta response"
         )
         .is_err());
         // A modeled tag hidden in a comment inside one is still
         // rejected.
         assert!(xml_reject_stray_text(
             "<path project=\"a\" repository=\"b\"><!-- <arch>x</arch> --></path>",
-            "repository"
+            "repository",
+            "OBS project meta response"
         )
         .is_err());
     }
@@ -2799,7 +3068,8 @@ mod tests {
         // child's tag span past its own name.
         assert!(xml_reject_stray_text(
             "<title foo='<repository name=\"x\"/>'>t</title>",
-            "project"
+            "project",
+            "OBS project meta response"
         )
         .is_err());
     }

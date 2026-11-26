@@ -1488,7 +1488,7 @@ pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
     // in skipped content at the project level would still be read
     // by the descendant readers below, so the gate runs before any
     // of them.
-    xml_reject_stray_text(inner, "project")?;
+    xml_reject_stray_text(inner, "project", "OBS project meta response")?;
     let name = tag_attr(&open_tag, "name").ok_or_else(malformed)?;
     let devel = {
         let mut found = None;
@@ -1514,7 +1514,7 @@ pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
     let mut repositories = Vec::new();
     for (element, repo_inner) in elements(inner, "repository")? {
         // The typed model drops this content, so the parse fails closed on it.
-        xml_reject_stray_text(&repo_inner, "repository")?;
+        xml_reject_stray_text(&repo_inner, "repository", "OBS project meta response")?;
         let repo_name = tag_attr(&element, "name").ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ServerError,
@@ -1547,7 +1547,7 @@ pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
         let mut downloads = Vec::new();
         for (download_tag, download_inner) in elements(&repo_inner, "download")? {
             // Same fail-closed rule inside `<download>`.
-            xml_reject_stray_text(&download_inner, "download")?;
+            xml_reject_stray_text(&download_inner, "download", "OBS project meta response")?;
             let url = match quoted_attr_value(&download_tag, "url") {
                 Some(url) if !url.is_empty() => url,
                 Some(_) => {
@@ -1715,6 +1715,11 @@ pub fn parse_package_meta(body: &str) -> Result<PackageMeta, GeectlError> {
         )
     };
     let (open_tag, inner) = meta_envelope(body, "package")?;
+    // The same fail-closed rule as the project parser: a modeled
+    // tag hidden in skipped content at the package level would
+    // still be read by the descendant readers below, so the gate
+    // runs before any of them.
+    xml_reject_stray_text(inner, "package", "OBS package meta response")?;
     let name = tag_attr(&open_tag, "name").ok_or_else(malformed)?;
     let project = tag_attr(&open_tag, "project").ok_or_else(malformed)?;
     let devel = {
@@ -13941,5 +13946,43 @@ mod tests {
         let meta =
             parse_package_meta("<package name=\"foo\" project=\"p\"><devel/></package>").unwrap();
         assert_eq!(meta.devel, None);
+    }
+
+    #[test]
+    fn package_meta_rejects_stray_text_cdata_and_a_commented_devel() {
+        // The package inner is gated like the project inner: stray
+        // text and CDATA sections are rejected, and a `<devel>`
+        // hidden in a comment is rejected instead of being found by
+        // the descendant readers.
+        for (body, fragment) in [
+            (
+                "<package name=\"foo\" project=\"p\">junk<title>t</title></package>",
+                "stray text in <package>",
+            ),
+            (
+                "<package name=\"foo\" project=\"p\"><![CDATA[junk]]></package>",
+                "CDATA section in <package>",
+            ),
+            (
+                "<package name=\"foo\" project=\"p\"><!-- <devel project=\"a\"/> --></package>",
+                "hidden <devel> in <package>",
+            ),
+        ] {
+            let err = parse_package_meta(body).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError);
+            assert!(
+                err.context.contains("unexpected OBS package meta response"),
+                "{body}: {}",
+                err.context
+            );
+            assert!(err.context.contains(fragment), "{body}: {}", err.context);
+        }
+        // Unmodeled settings outside the typed model still parse:
+        // the gate skips them whole.
+        let meta = parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><title>t</title><lock><enable/></lock></package>",
+        )
+        .unwrap();
+        assert_eq!(meta.title.as_deref(), Some("t"));
     }
 }

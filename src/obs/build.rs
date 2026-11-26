@@ -1988,12 +1988,12 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
     // The same fail-closed rule at the project level as the project
     // meta parser: a modeled tag hidden in skipped content is
     // rejected here, not silently dropped.
-    xml_reject_stray_text(inner, "project")?;
+    xml_reject_stray_text(inner, "project", "OBS project meta response")?;
     let mut repositories = Vec::new();
     for element in xml_child_elements(inner, "repository")? {
         let (tag, content) = xml_split_element(element, "repository");
         // The typed model drops this content, so the parse fails closed on it.
-        xml_reject_stray_text(content, "repository")?;
+        xml_reject_stray_text(content, "repository", "OBS project meta response")?;
         let name = xml_attr_non_blank(tag, "name").ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ServerError,
@@ -2033,7 +2033,7 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
         for download in xml_elements(content, "download")? {
             let (download_tag, download_inner) = xml_split_element(download, "download");
             // Same fail-closed rule inside `<download>`.
-            xml_reject_stray_text(download_inner, "download")?;
+            xml_reject_stray_text(download_inner, "download", "OBS project meta response")?;
             let url = match xml_attr(download_tag, "url") {
                 Some(url) if !url.is_empty() => url,
                 Some(_) => {
