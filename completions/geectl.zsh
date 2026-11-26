@@ -4931,7 +4931,7 @@ _geectl__subcmd__config_commands() {
     local commands; commands=(
 'show:Show the effective config\: endpoint URLs with their source, and credential status (never a secret value)' \
 'init:Write the config template (endpoints only). Refuses if the file already exists' \
-'import-oscrc:Import one instance mapping from an oscrc file (one-time migration). Reads the oscrc file once, on explicit request — geectl never reads it at runtime — and writes only the alias to apiurl mapping into the config \`\[instances\]\` table. The password is never stored and never printed\: set it with the printed \`GEECTL_OBS_PASSWORD_<ALIAS>\` variable yourself. Dry-run is the default (only the plan is printed); \`--live\` writes the config' \
+'import-oscrc:Import one instance mapping from an oscrc file (one-time migration). Reads the oscrc file once, on explicit request — geectl never reads it at runtime — and writes only the alias to apiurl mapping into the config \`\[instances\]\` table. The password is never stored and never printed\: set it with the printed \`GEECTL_OBS_PASSWORD_<ALIAS>\` variable yourself. The username is not written into the config either\: it stays in the environment as \`GEECTL_OBS_USERNAME_<ALIAS>\`. Dry-run is the default (only the plan is printed); \`--live\` writes the config' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl config commands' commands "$@"
@@ -4941,7 +4941,7 @@ _geectl__subcmd__config__subcmd__help_commands() {
     local commands; commands=(
 'show:Show the effective config\: endpoint URLs with their source, and credential status (never a secret value)' \
 'init:Write the config template (endpoints only). Refuses if the file already exists' \
-'import-oscrc:Import one instance mapping from an oscrc file (one-time migration). Reads the oscrc file once, on explicit request — geectl never reads it at runtime — and writes only the alias to apiurl mapping into the config \`\[instances\]\` table. The password is never stored and never printed\: set it with the printed \`GEECTL_OBS_PASSWORD_<ALIAS>\` variable yourself. Dry-run is the default (only the plan is printed); \`--live\` writes the config' \
+'import-oscrc:Import one instance mapping from an oscrc file (one-time migration). Reads the oscrc file once, on explicit request — geectl never reads it at runtime — and writes only the alias to apiurl mapping into the config \`\[instances\]\` table. The password is never stored and never printed\: set it with the printed \`GEECTL_OBS_PASSWORD_<ALIAS>\` variable yourself. The username is not written into the config either\: it stays in the environment as \`GEECTL_OBS_USERNAME_<ALIAS>\`. Dry-run is the default (only the plan is printed); \`--live\` writes the config' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl config help commands' commands "$@"
@@ -5434,7 +5434,7 @@ _geectl__subcmd__help__subcmd__config_commands() {
     local commands; commands=(
 'show:Show the effective config\: endpoint URLs with their source, and credential status (never a secret value)' \
 'init:Write the config template (endpoints only). Refuses if the file already exists' \
-'import-oscrc:Import one instance mapping from an oscrc file (one-time migration). Reads the oscrc file once, on explicit request — geectl never reads it at runtime — and writes only the alias to apiurl mapping into the config \`\[instances\]\` table. The password is never stored and never printed\: set it with the printed \`GEECTL_OBS_PASSWORD_<ALIAS>\` variable yourself. Dry-run is the default (only the plan is printed); \`--live\` writes the config' \
+'import-oscrc:Import one instance mapping from an oscrc file (one-time migration). Reads the oscrc file once, on explicit request — geectl never reads it at runtime — and writes only the alias to apiurl mapping into the config \`\[instances\]\` table. The password is never stored and never printed\: set it with the printed \`GEECTL_OBS_PASSWORD_<ALIAS>\` variable yourself. The username is not written into the config either\: it stays in the environment as \`GEECTL_OBS_USERNAME_<ALIAS>\`. Dry-run is the default (only the plan is printed); \`--live\` writes the config' \
     )
     _describe -t commands 'geectl help config commands' commands "$@"
 }

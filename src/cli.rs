@@ -225,7 +225,9 @@ pub enum ConfigCommand {
     /// geectl never reads it at runtime — and writes only the alias
     /// to apiurl mapping into the config `[instances]` table. The
     /// password is never stored and never printed: set it with the
-    /// printed `GEECTL_OBS_PASSWORD_<ALIAS>` variable yourself.
+    /// printed `GEECTL_OBS_PASSWORD_<ALIAS>` variable yourself. The
+    /// username is not written into the config either: it stays in
+    /// the environment as `GEECTL_OBS_USERNAME_<ALIAS>`.
     /// Dry-run is the default (only the plan is printed); `--live`
     /// writes the config.
     ImportOscrc {

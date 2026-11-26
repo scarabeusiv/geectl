@@ -2,11 +2,11 @@
 .el .ds Aq '
 .TH geectl-config-import-oscrc 1  "geectl-config-import-oscrc 0.2.2" 
 .SH NAME
-geectl\-config\-import\-oscrc \- Import one instance mapping from an oscrc file (one\-time migration). Reads the oscrc file once, on explicit request — geectl never reads it at runtime — and writes only the alias to apiurl mapping into the config `[instances]` table. The password is never stored and never printed: set it with the printed `GEECTL_OBS_PASSWORD_<ALIAS>` variable yourself. Dry\-run is the default (only the plan is printed); `\-\-live` writes the config
+geectl\-config\-import\-oscrc \- Import one instance mapping from an oscrc file (one\-time migration). Reads the oscrc file once, on explicit request — geectl never reads it at runtime — and writes only the alias to apiurl mapping into the config `[instances]` table. The password is never stored and never printed: set it with the printed `GEECTL_OBS_PASSWORD_<ALIAS>` variable yourself. The username is not written into the config either: it stays in the environment as `GEECTL_OBS_USERNAME_<ALIAS>`. Dry\-run is the default (only the plan is printed); `\-\-live` writes the config
 .SH SYNOPSIS
 \fBgeectl config import\-oscrc\fR [\fB\-\-oscrc\fR] [\fB\-\-apiurl\fR] [\fB\-\-alias\fR] [\fB\-\-force\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Import one instance mapping from an oscrc file (one\-time migration). Reads the oscrc file once, on explicit request — geectl never reads it at runtime — and writes only the alias to apiurl mapping into the config `[instances]` table. The password is never stored and never printed: set it with the printed `GEECTL_OBS_PASSWORD_<ALIAS>` variable yourself. Dry\-run is the default (only the plan is printed); `\-\-live` writes the config
+Import one instance mapping from an oscrc file (one\-time migration). Reads the oscrc file once, on explicit request — geectl never reads it at runtime — and writes only the alias to apiurl mapping into the config `[instances]` table. The password is never stored and never printed: set it with the printed `GEECTL_OBS_PASSWORD_<ALIAS>` variable yourself. The username is not written into the config either: it stays in the environment as `GEECTL_OBS_USERNAME_<ALIAS>`. Dry\-run is the default (only the plan is printed); `\-\-live` writes the config
 .SH OPTIONS
 .TP
 \fB\-\-oscrc\fR \fI<OSCRC>\fR
