@@ -895,10 +895,11 @@ fn git_network(
     args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Result<String, GeectlError> {
-    // The sharing command is owned here: the combined environment
+    // The ssh command is owned here: the combined environment
     // borrows it, so it outlives the git run below.
-    let multiplex = ssh_multiplex_command();
-    let env = network_git_env(extra_env, multiplex.as_deref());
+    ensure_ssh_dir();
+    let command = ssh_network_command();
+    let env = network_git_env(extra_env, Some(&command));
     let output = run_git_inner(dir, &[], subcommand, args, &env, git_network_timeout())?;
     if output.success {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -951,7 +952,19 @@ fn network_git_env<'a>(
 // for a crash or a kill.
 //
 // Unix only: the Windows ssh has no multiplexing, so there the
-// network operations run exactly as before.
+// network operations run with a plain ssh command instead —
+// which still provisions the forge host key (below).
+//
+// Host key provisioning for the first SSH use.
+//
+// Every network git operation runs ssh with
+// `StrictHostKeyChecking=accept-new`: the first connection to the
+// forge stores its host key in the user's known hosts, and a later
+// connection refuses a changed key and fails the operation. The
+// `.ssh` directory is created first when it is missing: ssh does
+// not create it, and without it the key is accepted for the
+// current connection only. The `-o` on geectl's own command line
+// wins over the user's ssh config for these operations.
 
 /// The control directory leaf: short, because the socket path must
 /// fit the unix socket limit — 104 characters on macOS, 108 on
@@ -1021,7 +1034,7 @@ fn ssh_multiplex_command_for(dir: &Path) -> String {
     }
     quoted.push(quote);
     format!(
-        "ssh -o ControlMaster=auto -o ControlPath={quoted} -o ControlPersist={}",
+        "ssh -o ControlMaster=auto -o ControlPath={quoted} -o ControlPersist={} -o StrictHostKeyChecking=accept-new",
         PRECOMMIT_TIMEOUT_SECS
     )
 }
@@ -1047,6 +1060,64 @@ fn ssh_multiplex_command() -> Option<String> {
         }
     }
     Some(ssh_multiplex_command_for(&dir))
+}
+
+/// The ssh command for a network git operation when connection
+/// sharing is unavailable: a plain ssh that still provisions the
+/// forge host key on first use.
+const SSH_PLAIN_COMMAND: &str = "ssh -o StrictHostKeyChecking=accept-new";
+
+/// The `GIT_SSH_COMMAND` for a network git operation: the sharing
+/// command when available, else a plain ssh. Split out of
+/// `ssh_network_command` so the fallback is testable without
+/// creating the control directory.
+fn ssh_network_command_with(multiplex: Option<String>) -> String {
+    multiplex.unwrap_or_else(|| SSH_PLAIN_COMMAND.to_string())
+}
+
+/// The `GIT_SSH_COMMAND` for a network git operation. Sharing is
+/// best-effort; the host-key provisioning is not — every network
+/// operation runs ssh with `StrictHostKeyChecking=accept-new`,
+/// whether the connection is shared or not.
+fn ssh_network_command() -> String {
+    ssh_network_command_with(ssh_multiplex_command())
+}
+
+/// Ensure the user's `.ssh` directory exists so ssh can store a
+/// provisioned host key. Best-effort: a directory that cannot be
+/// created leaves the operation to ssh's own behaviour. Split out
+/// of `ensure_ssh_dir` so the path is testable without touching
+/// the real home.
+fn ensure_ssh_dir_for(home: &Path) {
+    let dir = home.join(".ssh");
+    if dir.is_dir() {
+        return;
+    }
+    if std::fs::create_dir(&dir).is_err() {
+        return;
+    }
+    // Only the directory this call created gets its mode set; an
+    // existing directory keeps its own permissions.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// Ensure the user's `.ssh` directory exists: ssh does not create
+/// it, and without it a host key provisioned on first use is
+/// accepted for the current connection only. Best-effort
+/// throughout: no home directory, or a directory that cannot be
+/// created, leaves the operation to ssh's own behaviour.
+fn ensure_ssh_dir() {
+    let home_var = std::env::var("HOME").ok();
+    let userprofile_var = std::env::var("USERPROFILE").ok();
+    let Some(home) = crate::config::home_dir(home_var.as_deref(), userprofile_var.as_deref())
+    else {
+        return;
+    };
+    ensure_ssh_dir_for(Path::new(home));
 }
 
 /// Close the ssh master connections this invocation opened and
@@ -10569,7 +10640,7 @@ mod tests {
         assert_eq!(
             command,
             format!(
-                "ssh -o ControlMaster=auto -o ControlPath={quote}/tmp/a dir/with spaces/%C{quote} -o ControlPersist={PRECOMMIT_TIMEOUT_SECS}"
+                "ssh -o ControlMaster=auto -o ControlPath={quote}/tmp/a dir/with spaces/%C{quote} -o ControlPersist={PRECOMMIT_TIMEOUT_SECS} -o StrictHostKeyChecking=accept-new"
             )
         );
     }
@@ -10589,7 +10660,7 @@ mod tests {
         assert_eq!(
             command,
             format!(
-                "ssh -o ControlMaster=auto -o ControlPath={quote}/tmp/\\$(echo pwned)\\`id\\`\\\"a\\\\b!c/%C{quote} -o ControlPersist={PRECOMMIT_TIMEOUT_SECS}"
+                "ssh -o ControlMaster=auto -o ControlPath={quote}/tmp/\\$(echo pwned)\\`id\\`\\\"a\\\\b!c/%C{quote} -o ControlPersist={PRECOMMIT_TIMEOUT_SECS} -o StrictHostKeyChecking=accept-new"
             )
         );
     }
@@ -10602,6 +10673,35 @@ mod tests {
         assert_eq!(env[1], ("GIT_SSH_COMMAND", "ssh -o ControlMaster=auto"));
         let env = network_git_env(&caller, None);
         assert_eq!(env, caller);
+    }
+
+    #[test]
+    fn ssh_network_command_falls_back_to_plain_ssh_without_sharing() {
+        assert_eq!(
+            ssh_network_command_with(None),
+            "ssh -o StrictHostKeyChecking=accept-new"
+        );
+        assert_eq!(
+            ssh_network_command_with(Some("ssh -o ControlMaster=auto".to_string())),
+            "ssh -o ControlMaster=auto"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_ssh_dir_for_creates_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDirGuard::new("ssh-home");
+        ensure_ssh_dir_for(&home.path);
+        let dir = home.path.join(".ssh");
+        assert!(dir.is_dir());
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // A second call is a no-op and keeps the mode.
+        ensure_ssh_dir_for(&home.path);
+        assert!(dir.is_dir());
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[test]
