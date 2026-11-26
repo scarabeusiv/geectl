@@ -298,6 +298,9 @@ _geectl() {
             geectl__subcmd__changelog,help)
                 cmd="geectl__subcmd__changelog__subcmd__help"
                 ;;
+            geectl__subcmd__changelog,identity)
+                cmd="geectl__subcmd__changelog__subcmd__identity"
+                ;;
             geectl__subcmd__changelog,validate)
                 cmd="geectl__subcmd__changelog__subcmd__validate"
                 ;;
@@ -306,6 +309,9 @@ _geectl() {
                 ;;
             geectl__subcmd__changelog__subcmd__help,help)
                 cmd="geectl__subcmd__changelog__subcmd__help__subcmd__help"
+                ;;
+            geectl__subcmd__changelog__subcmd__help,identity)
+                cmd="geectl__subcmd__changelog__subcmd__help__subcmd__identity"
                 ;;
             geectl__subcmd__changelog__subcmd__help,validate)
                 cmd="geectl__subcmd__changelog__subcmd__help__subcmd__validate"
@@ -591,6 +597,9 @@ _geectl() {
                 ;;
             geectl__subcmd__help__subcmd__changelog,generate)
                 cmd="geectl__subcmd__help__subcmd__changelog__subcmd__generate"
+                ;;
+            geectl__subcmd__help__subcmd__changelog,identity)
+                cmd="geectl__subcmd__help__subcmd__changelog__subcmd__identity"
                 ;;
             geectl__subcmd__help__subcmd__changelog,validate)
                 cmd="geectl__subcmd__help__subcmd__changelog__subcmd__validate"
@@ -3070,7 +3079,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__changelog)
-            opts="-h --format --debug --debug-body --live --help validate generate help"
+            opts="-h --format --debug --debug-body --live --help validate generate identity help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3126,7 +3135,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__changelog__subcmd__help)
-            opts="validate generate help"
+            opts="validate generate identity help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3167,6 +3176,20 @@ _geectl() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        geectl__subcmd__changelog__subcmd__help__subcmd__identity)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         geectl__subcmd__changelog__subcmd__help__subcmd__validate)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
@@ -3174,6 +3197,24 @@ _geectl() {
                 return 0
             fi
             case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__changelog__subcmd__identity)
+            opts="-h --format --debug --debug-body --live --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -W "json text" -- "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -4430,7 +4471,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__help__subcmd__changelog)
-            opts="validate generate"
+            opts="validate generate identity"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4444,6 +4485,20 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__help__subcmd__changelog__subcmd__generate)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__help__subcmd__changelog__subcmd__identity)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
