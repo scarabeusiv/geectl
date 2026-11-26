@@ -302,7 +302,8 @@ no `<scmsync>`, resolves the devel project unless `--no-devel-project` is
 given, forks the repo, and wires the OBS fork to the fork's scmsync URL.
 Then it copies the source project's repositories into the fork's test
 project, the server-resolved target: all of them, verbatim, skipping
-any the target already carries — the server adds no repositories on
+any the target already carries; a repository already there but differing
+from the source is replaced. The server adds no repositories on
 `cmd=fork`, and a source project with no repositories copies nothing.
 A copy failure fails the branch loudly.
 The scmsync URL carries the fork branch (`url#branch`); when the branch is
