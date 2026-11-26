@@ -494,7 +494,10 @@ impl ObsClient<'_> {
     /// package, a package that is not publicly readable without
     /// credentials — defers the check in dry-run: the plan must
     /// not fail on a read it cannot make. Live still fails on the
-    /// read error.
+    /// read error. A stored `_service` that cannot be parsed fails
+    /// the validation closed with [`ErrorKind::ServerError`] before
+    /// any POST when live; in dry-run the failed validation is
+    /// deferred and the plan is recorded without the name check.
     ///
     /// The `_project` package is rejected: the server's `runservice`
     /// behaviour on a project's own services is untested.
