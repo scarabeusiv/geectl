@@ -711,11 +711,11 @@ impl PullRequestSummary {
 /// the unified states; with none given each arm applies its own
 /// default (new/review/declined on OBS, open on Gitea). The
 /// creator filters by author. The reviewer filters by review
-/// requested of that login; it needs the Gitea backend — the
-/// OBS arm has no reviewer filter. Only the token owner's login
-/// is accepted: the server filters review requests for the
-/// authenticated user only, and the search answer carries no
-/// requested-reviewer info, so the filter is server-side only.
+/// requested of that login: on Gitea only the token owner's
+/// login (the server filters review requests for the
+/// authenticated user only), on OBS an open review addressed to
+/// the login. The search answer carries no requested-reviewer
+/// info, so the filter is server-side only.
 /// The repo scopes the Gitea arm to one repo
 /// (`owner`/`repo`); a repo-scoped search needs the Gitea
 /// backend — the OBS arm has no repo to scope to.
@@ -930,9 +930,9 @@ impl<'a> PullRequestClient<'a> {
     /// Search pull requests as the list shape. With no backend
     /// both arms run, OBS first then Gitea; a backend scopes the
     /// search to that arm. Both arms filter server-side (the
-    /// state mapping and the creator); the reviewer filters
-    /// server-side on the Gitea arm only (`review_requested`,
-    /// token owner only) and needs the Gitea backend. A
+    /// state mapping, the creator, and the reviewer:
+    /// `review_requested` on Gitea, token owner only; an open
+    /// review addressed to the login on OBS). A
     /// reviewer-scoped search runs the global search even with
     /// a repo given, since the repo-scoped list has no reviewer
     /// filter. The Gitea arm filters client-side to the exact
