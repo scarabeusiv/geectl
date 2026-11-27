@@ -61,6 +61,7 @@ use crate::auth::Credentials;
 use crate::debug::strip_terminal_controls;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
+use crate::text::decode_legacy_text;
 use crate::xml::find_attr;
 use crate::xml::find_tag_end;
 use crate::xml::scan_tag;
@@ -3097,7 +3098,7 @@ impl<'a> ObsClient<'a> {
     /// at revision `rev` (`?rev=N` for a number, `?rev=<srcmd5>` for
     /// the revision carrying that hash — the backend resolves the
     /// hash). A public read: no credentials. A missing file is an
-    /// error, never an empty string.
+    /// error, never an empty string. A `.changes` file transcodes instead of failing on legacy bytes; any other file stays strict.
     pub fn cat(
         &self,
         project: &str,
@@ -3136,7 +3137,15 @@ impl<'a> ObsClient<'a> {
             &["public", "source", project, package, file],
             &query,
         );
-        self.http.get_with(&url, &Credentials::None)
+        if file
+            .get(file.len().saturating_sub(".changes".len())..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".changes"))
+        {
+            let bytes = self.http.get_bytes(&url, &Credentials::None)?;
+            Ok(decode_legacy_text(&bytes))
+        } else {
+            self.http.get_with(&url, &Credentials::None)
+        }
     }
 
     /// Read file `file` of package `package` in project `project`
@@ -11085,8 +11094,7 @@ mod tests {
 
     #[test]
     fn cat_bytes_reads_raw_bytes_without_credentials() {
-        // A legacy-encoded `.changes` file: `cat` would error on
-        // the non-UTF-8 bytes, `cat_bytes` returns them as-is.
+        // A legacy-encoded `.changes` file: `cat` transcodes it, `cat_bytes` returns the bytes as-is.
         let http = FakeHttp::new().with_get_bytes(
             "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.changes",
             b"Fix the th\xe9\n",
@@ -11106,6 +11114,80 @@ mod tests {
                 false
             )]
         );
+    }
+
+    #[test]
+    fn cat_transcodes_a_legacy_changes_file() {
+        // A `.changes` file in a legacy encoding reads as the characters it holds, like the disk read.
+        let http = FakeHttp::new().with_get_bytes(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.changes",
+            b"Fix the th\xe9\n",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client
+                .cat("openSUSE:Factory", "foo", "foo.changes", None)
+                .unwrap(),
+            "Fix the th\u{e9}\n"
+        );
+        assert_eq!(
+            http.get_bytes_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.changes"
+                    .to_string(),
+                false
+            )]
+        );
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn cat_transcodes_an_uppercase_changes_suffix() {
+        // A `.CHANGES` upload is the same file: the suffix match is case-insensitive.
+        let http = FakeHttp::new().with_get_bytes(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.CHANGES",
+            b"Fix the th\xe9\n",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client
+                .cat("openSUSE:Factory", "foo", "foo.CHANGES", None)
+                .unwrap(),
+            "Fix the th\u{e9}\n"
+        );
+        assert_eq!(
+            http.get_bytes_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.CHANGES"
+                    .to_string(),
+                false
+            )]
+        );
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn cat_reads_other_files_with_the_strict_read() {
+        // A `.spec` file stays on the strict read: only `.changes` files transcode.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
+            "Name: foo\nVersion: 1.0\n",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client
+                .cat("openSUSE:Factory", "foo", "foo.spec", None)
+                .unwrap(),
+            "Name: foo\nVersion: 1.0\n"
+        );
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec".to_string(),
+                false
+            )]
+        );
+        assert!(http.get_bytes_calls().is_empty());
     }
 
     #[test]

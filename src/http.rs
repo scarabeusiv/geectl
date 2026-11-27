@@ -49,6 +49,7 @@
 use crate::auth::{validate_basic, validate_bearer_token, AuthProvider, Credentials};
 use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
+use crate::text::decode_mixed_utf8;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
@@ -288,6 +289,23 @@ fn download_io_error(phase: DownloadIoPhase, path: &Path, e: &std::io::Error) ->
 pub trait HttpClient: Sync {
     fn get(&self, url: &str) -> Result<String, GeectlError>;
     fn get_with(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError>;
+    /// GET a URL and return the response body transcoded to UTF-8
+    /// instead of failing the call: the transcoding counterpart
+    /// of [`HttpClient::get_with`]. Only callers whose body is not
+    /// machine-read use it — a build log, which routinely carries
+    /// Latin-1 changelog lines and binary test output, so one bad
+    /// byte must not fail the whole read. Valid UTF-8 passes
+    /// through byte-identical; invalid runs decode as
+    /// Windows-1252 (see [`decode_mixed_utf8`]). API XML/JSON
+    /// bodies stay strict, so a corrupt document still fails
+    /// instead of parsing as mojibake. Same transport guard, same
+    /// retry policy, same body cap as `get_with`. The default
+    /// implementation decodes [`HttpClient::get_bytes`];
+    /// [`UreqClient`] overrides it so the read still asks for XML
+    /// and still reports the response body on the debug channel.
+    fn get_transcoded(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
+        Ok(decode_mixed_utf8(&self.get_bytes(url, credentials)?))
+    }
     /// GET a URL and return the raw response bytes. The byte
     /// counterpart of [`HttpClient::get_with`]: same transport guard,
     /// same retry policy, same body cap — but no UTF-8 check, so it
@@ -2028,6 +2046,19 @@ fn read_body_bytes_capped(reader: impl Read) -> Result<Vec<u8>, GeectlError> {
     Ok(bytes)
 }
 
+/// Read a response body with a cap, transcoding it to UTF-8:
+/// valid UTF-8 passes through, invalid runs decode as
+/// Windows-1252 (see [`decode_mixed_utf8`]) instead of failing
+/// the call. Only the build-log read uses it (see
+/// [`HttpClient::get_transcoded`]): a log routinely carries bytes
+/// that are not valid UTF-8, and one bad byte must not fail the
+/// whole read. The cap is the same as `read_body_bytes_capped`,
+/// so an over-cap body still fails.
+fn read_response_body_transcoded(reader: impl Read) -> Result<String, GeectlError> {
+    let bytes = read_body_bytes_capped(reader)?;
+    Ok(decode_mixed_utf8(&bytes))
+}
+
 /// What to do with a non-2xx status. `Return` ends the call with this
 /// error; `Retry` records it and retries (transient only).
 enum StatusAction {
@@ -2235,6 +2266,23 @@ impl HttpClient for UreqClient {
             true,
             |body, _attempt| {
                 let text = self.read_response_body(body.into_reader(), "GET", url)?;
+                self.debug_body("response", "GET", url, &text);
+                Ok(text)
+            },
+        )
+    }
+
+    fn get_transcoded(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
+        // The endpoint selection for this read: public or
+        // authenticated, reported once per call, not per attempt.
+        self.debug_endpoint(url, credentials);
+        self.get_with_body(
+            url,
+            credentials,
+            Some("application/xml"),
+            true,
+            |body, _attempt| {
+                let text = read_response_body_transcoded(body.into_reader())?;
                 self.debug_body("response", "GET", url, &text);
                 Ok(text)
             },
@@ -2931,6 +2979,68 @@ mod tests {
             .read_response_body(std::io::Cursor::new(data), "GET", "https://example.com/x")
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn get_transcoded_returns_real_chars_for_non_utf8_body() {
+        // A build log routinely carries bytes that are not valid
+        // UTF-8 (a Latin-1 changelog line, binary test output):
+        // the read transcodes the bad bytes to the characters
+        // they are instead of failing the call. The strict read
+        // still fails on the same body (see
+        // `in_cap_invalid_utf8_is_server_error`).
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
+            .to_vec();
+        response.extend_from_slice(b"Tom\xe1s Chv\xe1tal\n");
+        let server = LoopbackServer::serve_raw(response);
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let body = client
+            .get_transcoded(&server.url(), &Credentials::None)
+            .unwrap();
+        assert_eq!(body, "Tom\u{e1}s Chv\u{e1}tal\n");
+        let request = server.request().expect("a request arrived");
+        // The transcoded read asks for XML like the strict read:
+        // the log endpoint answers the same either way.
+        let headers = match request.split_once("\r\n\r\n") {
+            Some((headers, _)) => headers,
+            None => &request,
+        };
+        let accept = headers
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("accept:"))
+            .map(|l| l["accept:".len()..].trim().to_string());
+        assert_eq!(accept.as_deref(), Some("application/xml"));
+    }
+
+    #[test]
+    fn get_transcoded_passes_valid_utf8_through_unchanged() {
+        // Well-formed input is a no-op: the transcoding never
+        // rewrites bytes that are already valid UTF-8.
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
+            .to_vec();
+        response.extend_from_slice("Tomáš Chvátal\n".as_bytes());
+        let server = LoopbackServer::serve_raw(response);
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let body = client
+            .get_transcoded(&server.url(), &Credentials::None)
+            .unwrap();
+        assert_eq!(body, "Tomáš Chvátal\n");
+    }
+
+    #[test]
+    fn get_transcoded_decodes_windows_1252_punctuation() {
+        // Bytes in the 0x80-0x9F range are Windows-1252
+        // punctuation, not Latin-1 controls: a curly quote stays
+        // a curly quote.
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
+            .to_vec();
+        response.extend_from_slice(b"\x93quote\x94");
+        let server = LoopbackServer::serve_raw(response);
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let body = client
+            .get_transcoded(&server.url(), &Credentials::None)
+            .unwrap();
+        assert_eq!(body, "\u{201c}quote\u{201d}");
     }
 
     #[test]

@@ -38,6 +38,7 @@
 //! - [`xml`]: the minimal XML document editor for the small documents
 //!   geectl rewrites in place (a package `_meta`, a `_link`) —
 //!   internal only, so XML never leaves the library.
+//! - [`text`]: mixed-encoding text decoding — valid UTF-8 with legacy-encoded runs, transcoded.
 //! - [`gitea`]: the Gitea operations for git-backed packages — repo
 //!   read, fork, repo delete — plus the `branch` composite (Gitea
 //!   fork + OBS `cmd=fork`) behind the uniform flow. Internal
@@ -90,4 +91,5 @@ pub mod pull_request;
 pub mod url;
 pub mod working_copy;
 
+pub(crate) mod text;
 pub(crate) mod xml;
