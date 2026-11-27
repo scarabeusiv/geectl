@@ -134,19 +134,19 @@ directory's `.env` only.
 
 ## Top level
 
-- `geectl remote` — Remote reads and mutations: inspect what the distribution holds, and change it.
-- `geectl request` — Read and act on OBS submit requests, and file new ones.
-- `geectl branch` — Branch, copy, and link packages.
-- `geectl build` — Build-status commands: results, logs, histories, binaries, buildconfig.
+- `geectl remote` — OBS only. Remote reads and mutations: inspect what the distribution holds, and change it.
+- `geectl request` — OBS only. Read and act on OBS submit requests, and file new ones.
+- `geectl branch` — OBS only. Branch, copy, and link packages.
+- `geectl build` — OBS only. Build-status commands: results, logs, histories, binaries, buildconfig.
 - `geectl local-build` — Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, wipe a build root, prune the cache, manage the daily periodic cleanup, enter the preserved build root, and read the log of the last local build.
-- `geectl maintenance` — Maintenance operations: maintained-instances listing and maintenance branching.
-- `geectl service` — Service reads and trigger: list a package's services, their run state, and trigger a server-side run.
+- `geectl maintenance` — OBS only. Maintenance operations: maintained-instances listing and maintenance branching.
+- `geectl service` — OBS only. Service reads and trigger: list a package's services, their run state, and trigger a server-side run.
 - `geectl gitea` — Gitea operations: repository and branch reads and mutations on the configured instance.
 - `geectl pull-request` — Read and act on pull requests: OBS submit requests and Gitea pull requests as one surface.
 - `geectl person` — Search for a person: the OBS projects naming the login and the Gitea users matching the keyword, as one operation.
 - `geectl meta` — Set the meta of an OBS project, an OBS package, or a Gitea repository as one operation: the target selects the backend.
 - `geectl changelog` — Validate and generate `.changes` entries in a package directory, pre-file, and print the resolved entry author.
-- `geectl prjconf` — Read, validate and clean a project's prjconf.
+- `geectl prjconf` — OBS only. Read, validate and clean a project's prjconf.
 - `geectl version` — Print version information as the result payload.
 - `geectl config` — Inspect or initialise the config file.
 - `geectl config show` — Show the effective config: endpoint URLs with their source, the changelog identity with its source (`config` or `none`), and credential status (never a secret value).
@@ -179,7 +179,7 @@ directory's `.env` only.
 - `geectl remote owners-for-binary <BINARY>` — Show the owners of a binary package; key flags: --verbose
 - `geectl remote owners-for-package <PACKAGE>` — Show the owners of a package by name alone, in the owner root projects; key flags: --verbose
 - `geectl remote maintainers <PROJECT> <PACKAGE>` — Show the maintainers of a package.
-- `geectl remote whois [LOGIN]` — Show a user's full name, email, and account state.
+- `geectl remote whois [LOGIN]` — Show a user's full name, email, and account state (also available as `remote whoami`): any login is accepted, or the authenticated user with no login.
 - `geectl remote link-target <PROJECT> <PACKAGE>` — Show the link target of a package, when it is a link.
 - `geectl remote project-diff <OLD> <NEW>` — Diff two projects, package by package; key flags: --include <INCLUDE>, --exclude <EXCLUDE>, --annotate-requests
 - `geectl remote diff-packages <OLD_PROJECT> <OLD_PACKAGE> <NEW_PROJECT> <NEW_PACKAGE>` — Diff two packages, file by file.
@@ -314,7 +314,7 @@ without evaluating trust.
 - `geectl gitea repo-get <OWNER> <REPO>` — Show a repository: owner, default branch, privacy, clone URLs, and the token owner's permissions.
 - `geectl gitea repo-list` — List repositories: the token owner's own repos, one user's repos with `--owner`, one organization's with `--org`, or both (the user's first, then the organization's); key flags: --owner <OWNER>, --org <ORG>
 - `geectl gitea repo-search <QUERY>` — Search repositories across the instance by keyword: the keyword matches the name and the description. The Gitea counterpart of `remote search-packages` / `remote search-projects`.
-- `geectl gitea whoami` — Show the token owner: the login, full name, and email the configured Gitea token belongs to.
+- `geectl gitea whoami` — Show the token owner: the login, full name, and email the configured Gitea token belongs to (also available as `gitea whois`): token-owner-only — no login is accepted, the token decides.
 - `geectl gitea repo-create <NAME>` — Create a repository under the token owner's account; key flags: --private, --description <DESCRIPTION>, --default-branch <DEFAULT_BRANCH>
 - `geectl gitea repo-delete <OWNER> <REPO>` — Delete a repository; key flags: --force
 - `geectl gitea repo-fork <OWNER> <REPO>` — Fork a repository into the token owner's account (or an organization with `--organization`); key flags: --new-name <NEW_NAME>, --organization <ORGANIZATION>
@@ -325,6 +325,7 @@ without evaluating trust.
 - `geectl gitea commit-statuses <OWNER> <REPO> <SHA>` — List a commit's statuses: the CI states reported for that commit.
 - `geectl gitea maintainers <OWNER> <REPO>` — Show the maintainers recorded in a git project's `_maintainership.json`: the project maintainers and the per-package maintainers.
 - `geectl gitea cleanup-forks` — List obsolete Gitea forks and their OBS home test projects, and delete them; key flags: --user <USER>
+- `geectl gitea build-comment --project <PROJECT> --package <PACKAGE> <REFERENCE>` — Post the build-link comment on a Gitea pull request: the OBS build results for the test project and package as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; key flags: --project <PROJECT>, --package <PACKAGE>
 
 ## `pull-request` — unified pull-request read and act
 
@@ -334,7 +335,6 @@ without evaluating trust.
 - `geectl pull-request approve <REFERENCE>` — Approve a pull request as the review asked of the target: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea); key flags: --message <MESSAGE>, --commit <COMMIT>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
 - `geectl pull-request request-changes <REFERENCE>` — Ask for changes on a pull request, as `approve` but with the review declined instead of accepted; key flags: --message <MESSAGE>, --commit <COMMIT>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
 - `geectl pull-request comment --body <BODY> <REFERENCE>` — Comment on a pull request; key flags: --parent <PARENT>
-- `geectl pull-request build-comment --project <PROJECT> --package <PACKAGE> <REFERENCE>` — Post the build-link comment on a Gitea pull request: the OBS build results for the test project and package as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; key flags: --project <PROJECT>, --package <PACKAGE>
 - `geectl pull-request comments <REFERENCE>` — List the comments on a pull request, oldest first; a comment on a diff carries its target, file, and line.
 - `geectl pull-request cancel-review-request <REFERENCE>` — Cancel pending review requests on a pull request; key flags: --reviewer <REVIEWER>, --all, --exclude <EXCLUDE>
 - `geectl pull-request merge <REFERENCE>` — Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent, or to openSUSE:Factory when the target has no link and the Factory package records it as its devel; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless `--no-forward` is given. After the merge lands, the branch home the pull request came from is cleaned up like the OBS arm's, and merges done outside geectl are left for `gitea cleanup-forks`. The OBS arm checks the hop after accepting while the Gitea arm preflights it, because the Gitea merge is irreversible while the accept flow's forward is retryable; key flags: --message <MESSAGE>, --method <METHOD>, --force, --forward-message <FORWARD_MESSAGE>, --no-forward- `geectl pull-request decline <REFERENCE>` — Decline a pull request; key flags: --message <MESSAGE>

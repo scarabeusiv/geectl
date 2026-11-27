@@ -93,7 +93,7 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Remote reads and mutations: inspect what the
+    /// OBS only. Remote reads and mutations: inspect what the
     /// distribution holds, and change it.
     Remote {
         #[command(subcommand)]
@@ -104,14 +104,14 @@ pub enum Command {
         #[command(subcommand)]
         command: Box<cli_request::RequestCommand>,
     },
-    /// Branch, copy, and link packages.
+    /// OBS only. Branch, copy, and link packages.
     Branch {
         #[command(subcommand)]
         // Boxed: the eleven branch subcommands make BranchCommand far
         // larger than the other variants (clippy::large_enum_variant).
         command: Box<cli_branch::BranchCommand>,
     },
-    /// Build-status commands: results, logs, histories, binaries, buildconfig.
+    /// OBS only. Build-status commands: results, logs, histories, binaries, buildconfig.
     Build {
         #[command(subcommand)]
         command: cli_build::BuildCommand,
@@ -125,13 +125,13 @@ pub enum Command {
         #[command(subcommand)]
         command: cli_local_build::LocalBuildCommand,
     },
-    /// Maintenance operations: maintained-instances listing and
+    /// OBS only. Maintenance operations: maintained-instances listing and
     /// maintenance branching.
     Maintenance {
         #[command(subcommand)]
         command: maintenance::MaintenanceCommand,
     },
-    /// Service reads and trigger: list a package's services, their
+    /// OBS only. Service reads and trigger: list a package's services, their
     /// run state, and trigger a server-side run.
     Service {
         #[command(subcommand)]
@@ -221,7 +221,7 @@ pub enum Command {
     Pull,
     /// Stage the resolved files and continue a stopped rebase.
     Resolve,
-    /// Read, validate and clean a project's prjconf.
+    /// OBS only. Read, validate and clean a project's prjconf.
     Prjconf {
         #[command(subcommand)]
         command: cli_prjconf::PrjconfCommand,

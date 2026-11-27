@@ -23,6 +23,45 @@ The library modules:
 | `xml` | Minimal XML document editing for the small documents rewritten in place (`_meta`, `_link`). |
 
 
+## CLI topology
+
+The CLI is one operation surface over OBS and Gitea, with no
+primary/secondary split — but the nouns are not symmetric, and
+that is the design, not an accident:
+
+- The generic nouns are OBS operations: `remote`, `request`,
+  `branch`, `build`, `service`, `maintenance`, `prjconf`. They
+  speak OBS only; top-level help says so on each group.
+- `gitea` is the one backend-named group: the Gitea operations
+  (repo/branch reads and mutations, fork, repo create/delete).
+- `pull-request`, `person`, and `meta` are the unified groups:
+  one leaf over both backends, with the handle (`obs:<id>` /
+  `gitea:<owner>/<repo>#<number>`) or the target
+  (`--project`/`--package` vs `--repo`) selecting the backend.
+- `local-build` and `changelog` are backend-neutral local
+  operations. The working-copy leaves (`checkout`, `update`,
+  `status`, `diff`, `add`, `rm`, `addremove`, `commit`, `pull`,
+  `resolve`) operate on the checkout in the current directory;
+  their coordinates are the OBS project/package names even for
+  a git-backed checkout, because the OBS identity names the
+  package on either backend.
+
+The paired leaves keep their per-backend names, except the
+identity read: `remote whois` and `gitea whoami` answer the
+same question from opposite sides (who is this login / who
+owns this token), so each carries the other's name as an alias
+(`remote whoami`, `gitea whois`). The alias is not symmetric
+in scope: `remote whois` accepts any login (and reads the
+authenticated user with no login), while `gitea whoami` answers
+only for the token owner. The other pairs keep their
+names: `remote list-packages` vs `gitea repo-list`,
+`remote create-package` vs `gitea repo-create`,
+`remote search-packages` vs `gitea repo-search`, and
+`remote maintainers` vs `gitea maintainers` read different
+things (an OBS project listing vs a Gitea repo listing;
+`gitea maintainers` reads the repo's `_maintainership.json`),
+so a shared name would hide the difference.
+
 ## The error store (`src/error.rs`)
 
 Every error geectl can produce is defined in one place: `ErrorKind`, with

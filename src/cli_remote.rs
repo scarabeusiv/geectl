@@ -471,7 +471,10 @@ pub enum RemoteCommand {
         package: String,
     },
     /// Show a user's full name, email, and account state.
-    /// Without a login, the authenticated user.
+    /// Without a login, the authenticated user; any login is
+    /// accepted. `whoami` is an alias: with no login, the same
+    /// identity read as `gitea whoami`.
+    #[command(visible_alias = "whoami")]
     Whois {
         /// The login name to look up; without one, the
         /// authenticated user.
@@ -4959,6 +4962,16 @@ mod tests {
             _ => panic!("wrong variant"),
         }
         match parse(&["geectl", "remote", "whois"]) {
+            RemoteCommand::Whois { login } => assert_eq!(login, None),
+            _ => panic!("wrong variant"),
+        }
+        match parse(&["geectl", "remote", "whoami", "alice"]) {
+            RemoteCommand::Whois { login } => {
+                assert_eq!(login.as_deref(), Some("alice"));
+            }
+            _ => panic!("wrong variant"),
+        }
+        match parse(&["geectl", "remote", "whoami"]) {
             RemoteCommand::Whois { login } => assert_eq!(login, None),
             _ => panic!("wrong variant"),
         }

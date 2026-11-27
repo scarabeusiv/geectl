@@ -1151,7 +1151,7 @@ impl<'a> PullRequestClient<'a> {
     ) -> Result<Option<ReviewComment>, GeectlError> {
         match reference {
             PullRequestRef::Obs(id) => Err(GeectlError::new(
-                ErrorKind::InvalidInput,
+                ErrorKind::UnsupportedFlagForBackend,
                 format!(
                     "build-comment posts the build link on a Gitea pull request; {id} is an OBS submit request"
                 ),
@@ -3741,7 +3741,7 @@ mod tests {
                 &DryRun::new(false),
             )
             .expect_err("an OBS ref takes no build-link comment");
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.kind(), ErrorKind::UnsupportedFlagForBackend);
         assert!(err.to_string().contains("OBS submit request"));
     }
 
