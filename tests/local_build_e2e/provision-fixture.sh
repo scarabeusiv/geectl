@@ -127,7 +127,7 @@ curl --fail-with-body -sS "${auth[@]}" -X PUT -H 'Content-Type: application/octe
 #     daemon retries on its own schedule.
 # The daemon scans at most 10s after the scheduler registers the
 # repository, and the first metadata fetch takes minutes at most.
-DOD_RECHECK_TIMEOUT_SECONDS="${FIXTURE_DOD_RECHECK_TIMEOUT_SECONDS:-600}"
+DOD_RECHECK_TIMEOUT_SECONDS="${FIXTURE_DOD_RECHECK_TIMEOUT_SECONDS:-1200}"
 dod_cookie="/srv/obs/build/$PROJECT/$REPO/$ARCH/:full/doddata.cookie"
 compose_file="$REPO_ROOT/tests/live/docker-compose.yml"
 created_at="$(date +%s)"

@@ -4,10 +4,26 @@
 # This is the live proof for the local-build vertical (see
 # docs/local-build-design.md): the per-PR suite proves the logic with a
 # stub podman, this job proves the real engine, image, and cache end to
-# end. It gates PRs: it is a required status check. When it regresses,
-# it blocks the merge until fixed. It runs
+# end. It gates PRs: each leg is a required status check. When a leg
+# regresses, it blocks the merge until fixed. It runs
 # on every pull request, weekly (Mondays 06:00 UTC, the same slot as
 # the freshness workflow and the live job), and on demand.
+#
+# The job is a matrix of container shapes (rootless, the default, and
+# privileged, the `--privileged` opt-in) by platform (Ubuntu, macOS,
+# Windows). Each leg provisions the same local OBS instance and builds
+# the same fixture package, so a shape or platform regression shows
+# per leg. macOS tests rootless only: geectl refuses `--privileged`
+# on macOS, so there is no privileged leg there. The privileged shape
+# bind-mounts the host build root, and on macOS that root sits on the
+# podman machine's virtiofs share, where rpm's 0200 placeholder files
+# fail to install. That is host/container behaviour, not the
+# privilege itself.
+#
+# macOS runs on `macos-15-intel`, not `macos-latest`: the OBS
+# instance's images are amd64-only, and the arm64 runner cannot run
+# them (Ruby segfaults under qemu emulation). The Intel runner runs
+# them natively. Revisit when the OBS images are multi-arch.
 #
 # The build runs against a local OBS instance, not api.opensuse.org:
 # the job provisions the same temporary instance the live job uses
@@ -47,14 +63,42 @@ concurrency:
 
 jobs:
   local-build-e2e:
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+    strategy:
+      # One leg failing must not cancel the others: every leg
+      # reports, so a shape or platform regression is visible
+      # per leg instead of hidden behind a cancelled run.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15-intel, windows-2025]
+        shape: [rootless, privileged]
+        exclude:
+          # macOS tests rootless only: geectl refuses `--privileged`
+          # on macOS, so the privileged leg does not exist there.
+          - os: macos-15-intel
+            shape: privileged
+        include:
+          # The compose command per platform: Ubuntu and Windows
+          # run the OBS instance on the preinstalled Docker;
+          # macOS has no Docker, so the instance runs on podman
+          # compose (with the docker-compose provider installed
+          # below).
+          - os: ubuntu-latest
+            compose: "docker compose"
+          - os: macos-15-intel
+            compose: "podman compose"
+          - os: windows-2025
+            compose: "docker compose"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      # Windows defaults to PowerShell; the provision scripts and
+      # the steps below are bash, so every `run:` step uses bash
+      # on all three platforms (Git Bash on Windows).
+      run:
+        shell: bash
     env:
-      # Pin the compose command: the fixture prefers `podman compose`
-      # when present, and the runner image ships Podman but no
-      # standalone compose-provider binary — pin here rather than
-      # depending on the runner image's toolset.
-      COMPOSE: "docker compose"
+      COMPOSE: ${{ matrix.compose }}
+      GEECTL_LOCAL_BUILD_E2E_SHAPE: ${{ matrix.shape }}
     steps:
       # Pinned to the v7 tag's commit so the action cannot move under us;
       # Dependabot tracks SHA pins and proposes updates.
@@ -83,7 +127,12 @@ jobs:
       # also guarantees a current Buildx/BuildKit — the v2 cache API
       # needs Buildx >= 0.21 / BuildKit >= 0.20). Pinned to the v4
       # tag's commit; Dependabot tracks SHA pins and proposes updates.
+      # Ubuntu only: the BuildKit cache is used only when the
+      # frontend is built with docker buildx there; macOS builds
+      # it with podman compose and Windows with docker compose,
+      # both uncached.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: matrix.os == 'ubuntu-latest'
       # Expose the GitHub Actions runtime (ACTIONS_CACHE_URL /
       # ACTIONS_RUNTIME_TOKEN) to the following steps: BuildKit's
       # `type=gha` cache backend reads them from the environment, and
@@ -91,15 +140,95 @@ jobs:
       # the frontend build silently skips both the cache import and
       # the cache export (no error, no cache). Pinned to the v4 tag's
       # commit; Dependabot tracks SHA pins and proposes updates.
+      # Ubuntu only, with the Buildx step above.
       - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4
-      # Podman only: the engine runs inside the build container,
-      # so the host needs no `build` script.
-      - name: Install podman
+        if: matrix.os == 'ubuntu-latest'
+      # Podman, per platform: the engine runs inside the build
+      # container, so the host needs podman and a running machine
+      # where the host cannot run containers natively.
+      - name: Install podman (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y podman
           podman --version
+      - name: Install podman (macOS)
+        if: matrix.os == 'macos-15-intel'
+        run: |
+          set -euo pipefail
+          # Homebrew ships no podman bottle for Intel macOS 15, so
+          # install the pinned upstream package instead (the same
+          # 5.8.10 winget installs on Windows). The package puts
+          # the binary in /opt/podman/bin, which is not on PATH in
+          # this step.
+          # docker-compose is the compose provider `podman compose`
+          # needs to parse the file (see COMPOSE above).
+          brew install docker-compose
+          curl -fsSL -o /tmp/podman.pkg https://github.com/containers/podman/releases/download/v5.8.10/podman-installer-macos-amd64.pkg
+          sudo installer -pkg /tmp/podman.pkg -target /
+          echo "/opt/podman/bin" >> "$GITHUB_PATH"
+          export PATH="/opt/podman/bin:$PATH"
+          podman --version
+          docker-compose --version
+      - name: Install podman (Windows)
+        if: matrix.os == 'windows-2025'
+        run: |
+          set -euo pipefail
+          winget install --id RedHat.Podman --exact --silent --accept-source-agreements --accept-package-agreements
+          # $GITHUB_PATH takes effect only in later steps, so add
+          # the install directory to this step's PATH too.
+          echo "C:/Program Files/RedHat/Podman" >> "$GITHUB_PATH"
+          export PATH="$PATH:/c/Program Files/RedHat/Podman"
+          podman --version
+      # The OBS source checkout (see the next step) must sit on a
+      # case-sensitive filesystem: the obs-build submodule holds
+      # both a `build` file and a `Build/` directory, which cannot
+      # coexist on a case-insensitive one. Ubuntu's filesystem is
+      # case-sensitive already, so only macOS and Windows prepare
+      # one here. The source directory is set before the podman
+      # machine starts, so the machine's share includes it.
+      - name: Prepare case-sensitive OBS source (macOS)
+        if: matrix.os == 'macos-15-intel'
+        run: |
+          set -euo pipefail
+          # A case-sensitive APFS disk image, mounted under $HOME so
+          # the podman machine's virtiofs share (the home directory)
+          # carries it into the VM. The runner is discarded after
+          # the job, so no detach step is needed.
+          hdiutil create -size 4g -fs "Case-sensitive APFS" -volname obssrc "$HOME/obssrc.dmg"
+          hdiutil attach "$HOME/obssrc.dmg" -mountpoint "$HOME/obssrc"
+          echo "OBS_SOURCE_DIR=$HOME/obssrc/obs" >> "$GITHUB_ENV"
+      - name: Prepare case-sensitive OBS source (Windows)
+        if: matrix.os == 'windows-2025'
+        run: |
+          set -euo pipefail
+          # Case sensitivity is inherited by subdirectories, so
+          # enabling it on the parent makes the clone provision.sh
+          # creates inside it case-sensitive too.
+          obs_case="$(cygpath -m "$GITHUB_WORKSPACE")/obs-case"
+          mkdir -p "$obs_case"
+          fsutil file setCaseSensitiveInfo "$(cygpath -w "$obs_case")" enable
+          echo "OBS_SOURCE_DIR=$obs_case/obs" >> "$GITHUB_ENV"
+      # The podman machine (macOS and Windows only; Ubuntu runs
+      # podman natively on the host). Two CPUs and 4 GiB: the
+      # engine installs a full base system inside the machine.
+      - name: Start podman machine
+        if: matrix.os != 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          podman machine init --cpus 2 --memory 4096
+          if [ "$RUNNER_OS" = Windows ]; then
+            # Windows runs a Windows-containers Docker daemon that
+            # races podman for the default Docker API pipe, so point
+            # the Docker client at the podman machine explicitly.
+            # The machine runs rootful so the BuildKit container the
+            # frontend build creates can set up its cgroup.
+            podman machine set --rootful
+            echo "DOCKER_HOST=npipe:////./pipe/podman-machine-default" >> "$GITHUB_ENV"
+          fi
+          podman machine start
+          podman info
       # The fixture repository's arch, derived once so the cache key,
       # the link into the backend in tests/live/provision.sh and
       # the fixture script all agree on it.
@@ -121,7 +250,10 @@ jobs:
           set -euo pipefail
           dod_url="$(sed -n 's/.*<download [^>]*url="\([^"]*\)".*/\1/p' tests/local_build_e2e/provision-fixture.sh | head -1)"
           repomd_url="${dod_url:-https://download.opensuse.org/tumbleweed/repo/oss/}repodata/repomd.xml"
-          if repomd_sha="$(curl -fsSL --max-time 60 "$repomd_url" | sha256sum | cut -d' ' -f1)"; then
+          # macOS ships no sha256sum; shasum is the same hash.
+          hash_cmd="sha256sum"
+          command -v sha256sum >/dev/null 2>&1 || hash_cmd="shasum -a 256"
+          if repomd_sha="$(curl -fsSL --max-time 60 "$repomd_url" | $hash_cmd | cut -d' ' -f1)"; then
             echo "repomd-ok=true" >> "$GITHUB_OUTPUT"
             echo "key-suffix=$repomd_sha" >> "$GITHUB_OUTPUT"
           else
@@ -151,8 +283,10 @@ jobs:
         env:
           # Enables the BuildKit GitHub Actions cache for the frontend
           # image build (see tests/live/docker-compose.cache.yml).
+          # Ubuntu only: macOS builds the frontend with podman
+          # compose and Windows with docker compose, both uncached.
           # Local runs leave it unset and build uncached, as before.
-          LIVE_CACHE: "1"
+          LIVE_CACHE: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
           # Enables download-on-demand in the development backend
           # (see tests/live/provision.sh): without it the scheduler
           # never writes a doddata entry and the fixture repository
