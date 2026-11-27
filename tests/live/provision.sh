@@ -167,7 +167,36 @@ if [ ! -d "$OBS_SOURCE_DIR/src/api" ]; then
         exit 1
     fi
     echo "Cloning OBS source (depth 1) into $OBS_SOURCE_DIR ..."
-    git clone --depth 1 --single-branch "$OBS_REPO" "$OBS_SOURCE_DIR"
+    # Windows cannot check out the whole OBS tree: it holds files
+    # with `:` (and `?`) in their names under dist/t, src/api/test
+    # and src/backend/t, which NTFS forbids, so a full checkout
+    # fails. Check out only what provisioning needs: the API and
+    # backend sources, the backend start script, the API schemas
+    # the `public/schema` symlink points at, and the root
+    # `.ruby-version` the API's own symlink points at. The test
+    # fixtures and test data stay out; the backend and frontend
+    # never read them.
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            # Limit the checkout by pathspec instead of sparse
+            # checkout: on the Windows runner's git the sparse
+            # patterns are accepted (`sparse-checkout list` shows
+            # them, core.sparseCheckout is true) but the checkout
+            # still materialises the whole tree, including the
+            # NTFS-illegal names. A pathspec checkout never visits
+            # the excluded paths at all. src/api/spec stays out
+            # too: its VCR cassette paths exceed the Windows
+            # 260-character limit, and the server never reads
+            # them. Long paths are enabled as well, so a long path
+            # anywhere else does not fail the checkout.
+            git -c core.longpaths=true clone --depth 1 --single-branch --no-checkout "$OBS_REPO" "$OBS_SOURCE_DIR"
+            git -c core.longpaths=true -C "$OBS_SOURCE_DIR" checkout HEAD -- . \
+                ':!src/api/test' ':!src/backend/t' ':!dist' ':!src/api/spec'
+            ;;
+        *)
+            git clone --depth 1 --single-branch "$OBS_REPO" "$OBS_SOURCE_DIR"
+            ;;
+    esac
 else
     echo "Using existing OBS source at $OBS_SOURCE_DIR"
 fi
