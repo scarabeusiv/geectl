@@ -9447,7 +9447,10 @@ mod tests {
     fn is_transport_cap_error_matches_the_cap_message_only() {
         let cap = GeectlError::new(
             ErrorKind::ServerError,
-            format!("response body exceeds the {}-byte limit", crate::http::MAX_BODY_BYTES),
+            format!(
+                "response body exceeds the {}-byte limit",
+                crate::http::MAX_BODY_BYTES
+            ),
         );
         assert!(is_transport_cap_error(&cap));
         let other = GeectlError::new(ErrorKind::ServerError, "status 500 from the server");
