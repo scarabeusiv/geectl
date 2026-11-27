@@ -11406,15 +11406,17 @@ fn config_import_oscrc_existing_alias_refuses_and_force_replaces() {
     assert!(!after.contains("other.example.com"), "{after}");
 }
 
-/// The version bump regenerates the man pages: a bump must leave no
-/// stale version anywhere, including the `.TH` headers under man/.
-/// Release run 45789359871 failed `post-release-bump` because the
-/// bump never regenerated them, so 165 pages still stamped 0.2.2.
-/// Runs the real script on a scratch worktree of this repo and
-/// asserts the bump succeeds and the pages carry the new version.
+/// The version bump regenerates the man pages and moves the OBS
+/// `_service` names: a bump must leave no stale version anywhere,
+/// including the `.TH` headers under man/ and the tar_scm revision
+/// and cargo srcdirs under packaging/obs/. Release run 45789359871
+/// failed `post-release-bump` because the bump never regenerated
+/// them, so 165 pages still stamped 0.2.2. Runs the real script on a
+/// scratch worktree of this repo and asserts the bump succeeds and
+/// the pages and the `_service` carry the new version.
 #[test]
 #[cfg(unix)]
-fn bump_version_regenerates_man_pages() {
+fn bump_version_regenerates_assets() {
     let current = env!("CARGO_PKG_VERSION");
     let mut parts: Vec<u64> = current
         .split('.')
@@ -11472,6 +11474,17 @@ fn bump_version_regenerates_man_pages() {
     assert!(
         stale.is_empty(),
         "man pages still stamp {current}: {stale:?}"
+    );
+    let service = fs::read_to_string(dir.0.join("packaging/obs/_service"))
+        .expect("read packaging/obs/_service");
+    assert!(
+        service.contains(&format!("<param name=\"revision\">v{next}</param>")),
+        "_service tar_scm revision carries {next}"
+    );
+    assert_eq!(
+        service.matches(&format!("geectl-{next}.tar.zst")).count(),
+        2,
+        "_service srcdirs carry {next}"
     );
     let out = git(&["worktree", "remove", "--force", wt]);
     assert!(

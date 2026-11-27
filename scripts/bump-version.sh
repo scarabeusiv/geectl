@@ -3,14 +3,17 @@
 #
 # Usage: scripts/bump-version.sh X.Y.Z
 #
-# The version surfaces in this repo are three: the [package] version
-# in Cargo.toml, the geectl entry in Cargo.lock, and the man pages
-# under man/, which stamp the version in their `.TH` header
-# (README.md and docs/ carry no version string — verified by grepping
-# for the current version before writing this script). The script
-# rewrites the two manifest surfaces and regenerates the pages, then
-# verifies the result, so a half-applied bump fails here rather than
-# riding along in a version-bump PR.
+# The version surfaces in this repo are four: the [package] version
+# in Cargo.toml, the geectl entry in Cargo.lock, the man pages
+# under man/, which stamp the version in their `.TH` header, and the
+# OBS package `_service` under packaging/obs/, which names the release
+# tag in the tar_scm revision and the release tarball in the
+# cargo_vendor/cargo_audit srcdirs (README.md and docs/ carry no
+# version string — verified by grepping for the current version before
+# writing this script). The script rewrites the manifest surfaces, the
+# `_service` names, and regenerates the pages, then verifies the
+# result, so a half-applied bump fails here rather than riding along
+# in a version-bump PR.
 set -euo pipefail
 
 # No leading zeros: Cargo rejects them, and only after the tree is edited.
@@ -53,6 +56,7 @@ cleanup() {
     # not in the index (no Cargo.lock yet, say) restores neither.
     git checkout -- Cargo.toml 2>/dev/null || true
     git checkout -- Cargo.lock 2>/dev/null || true
+    git checkout -- packaging/obs/_service 2>/dev/null || true
     # The regenerated pages are restored the same way. The tree was
     # clean at entry (see the precondition above), so any untracked
     # file under man/ was created by this run and is removed with it.
@@ -125,6 +129,24 @@ if [ "$toml_diff" != "$(printf '1\t1')" ] || [ "$lock_diff" != "$(printf '1\t1')
   exit 1
 fi
 
+# The OBS `_service` names the release tag and the release tarball,
+# so it is a version surface too — rewritten, never edited by hand:
+# the tar_scm revision and both srcdirs move to the new version.
+# Its current version is read from the file itself, not from the
+# manifest: the packaged release can lag the tree, so the manifest's
+# old version is the wrong key. (The stale-version check below cannot see the srcdir
+# form: the version there is followed by `.tar.zst`, which the check's
+# ERE requires to be a non-dot; the verification after the man pages
+# covers it explicitly.)
+service_old=$(sed -n 's/.*<param name="revision">v\([0-9][0-9.]*\)<\/param>.*/\1/p' packaging/obs/_service)
+if ! [[ "$service_old" =~ $semver ]]; then
+  echo "no X.Y.Z tar_scm revision found in packaging/obs/_service (got '$service_old')" >&2
+  exit 1
+fi
+service_old_re=${service_old//./\\.}
+subst "s|<param name=\"revision\">v$service_old_re</param>|<param name=\"revision\">v$new</param>|" packaging/obs/_service
+subst "s|geectl-$service_old_re\\.tar\\.zst|geectl-$new.tar.zst|g" packaging/obs/_service
+
 # The man pages stamp the version in their `.TH` header, so they are
 # a version surface too — regenerated, never edited: the generator is
 # the single source of truth for their content (the assets-drift job
@@ -151,6 +173,16 @@ if [ "$manifest" != "$new" ] || [ "$locked" != "$new" ]; then
   echo "version mismatch after bump: Cargo.toml=$manifest Cargo.lock=$locked (expected $new)" >&2
   exit 1
 fi
+# The `_service` must name the new tag and the new tarball in both
+# srcdirs; the stale check below cannot see the srcdir form (see
+# above), so this check is the one that covers it.
+service_revision=$(sed -n 's/.*<param name="revision">\(v[^<]*\)<\/param>.*/\1/p' packaging/obs/_service)
+service_srcdirs=$(grep -c "<param name=\"srcdir\">geectl-$new.tar.zst</param>" packaging/obs/_service || true)
+if [ "$service_revision" != "v$new" ] || [ "$service_srcdirs" != "2" ]; then
+  echo "version mismatch in packaging/obs/_service: revision=$service_revision srcdirs=$service_srcdirs (expected v$new and 2)" >&2
+  exit 1
+fi
+
 # git grep exits 1 on no match (clean) and 0 on a match (stale), but
 # 2-plus on a real error (bad pathspec, corrupt index): only exit 1
 # is tolerated, anything else fails loudly.

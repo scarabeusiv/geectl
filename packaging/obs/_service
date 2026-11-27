@@ -1,0 +1,28 @@
+<!-- Source of truth for the home:scarabeus_iv/geectl OBS package _service file: upload this file with geectl remote upload-file (live; from packaging/obs/_service) to home:scarabeus_iv geectl _service. The cargo_vendor/cargo_audit srcdir names the release tarball, never a bare directory: obs-service-cargo rejects a directory that does not exist in the package sources (Unsupported format found). scripts/bump-version.sh keeps the versioned names in sync. The pinned release lags the manifest version by design: the bump script moves it straight to the next bump target. -->
+<services>
+    <service name="tar_scm" mode="disabled">
+        <param name="url">https://github.com/scarabeusiv/geectl</param>
+        <param name="scm">git</param>
+        <param name="exclude">.git</param>
+        <param name="revision">v0.2.2</param>
+        <param name="versionformat">@PARENT_TAG@</param>
+        <param name="versionrewrite-pattern">v(.*)</param>
+    </service>
+    <service name="set_version" mode="disabled">
+        <param name="basename">geectl</param>
+    </service>
+    <service name="recompress" mode="disabled">
+        <param name="file">*.tar</param>
+        <param name="compression">zst</param>
+    </service>
+    <service name="cargo_vendor" mode="disabled">
+        <param name="srcdir">geectl-0.2.2.tar.zst</param>
+        <param name="compression">zst</param>
+        <param name="update">false</param>
+        <param name="filter">true</param>
+        <param name="versioned-dirs">false</param>
+    </service>
+    <service name="cargo_audit" mode="disabled">
+        <param name="srcdir">geectl-0.2.2.tar.zst</param>
+    </service>
+</services>
