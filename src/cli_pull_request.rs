@@ -382,9 +382,9 @@ pub struct SearchArgs {
     #[arg(long)]
     creator: Option<String>,
     /// Only pull requests with review requested of this login.
-    /// Requires `--backend gitea`. Only the token owner's login:
-    /// the server filters review requests for the authenticated
-    /// user only.
+    /// On Gitea only the token owner's login: the server filters
+    /// review requests for the authenticated user only; on OBS
+    /// an open review addressed to the login.
     #[arg(long)]
     reviewer: Option<String>,
     /// Only pull requests in this Gitea repo (`owner/repo`).
@@ -426,7 +426,7 @@ pub fn run_pull_request(
             if xml {
                 if let PullRequestRef::Gitea { .. } = &reference {
                     return Err(GeectlError::new(
-                        ErrorKind::InvalidInput,
+                        ErrorKind::UnsupportedFlagForBackend,
                         "--xml does not apply to a Gitea pull request: a Gitea pull request has no request XML",
                     ));
                 }
@@ -621,7 +621,7 @@ pub fn run_pull_request(
                 PullRequestRef::Obs(_) => {
                     if let Some(method) = method {
                         return Err(GeectlError::new(
-                            ErrorKind::InvalidInput,
+                            ErrorKind::UnsupportedFlagForBackend,
                             format!(
                                 "--method {} does not apply to an OBS submit request: OBS has no merge style",
                                 method.as_str()
@@ -630,7 +630,7 @@ pub fn run_pull_request(
                     }
                     if args.no_forward {
                         return Err(GeectlError::new(
-                            ErrorKind::InvalidInput,
+                            ErrorKind::UnsupportedFlagForBackend,
                             "--no-forward does not apply to an OBS submit request: the merge always forwards after accepting",
                         ));
                     }
@@ -638,7 +638,7 @@ pub fn run_pull_request(
                 PullRequestRef::Gitea { .. } => {
                     if args.force {
                         return Err(GeectlError::new(
-                            ErrorKind::InvalidInput,
+                            ErrorKind::UnsupportedFlagForBackend,
                             "--force does not apply to a Gitea pull request: the merge API takes no force flag",
                         ));
                     }
@@ -1071,37 +1071,37 @@ fn obs_submit_target(
 fn refuse_gitea_flags(args: &SubmitArgs) -> Result<(), GeectlError> {
     if args.repo.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--repo does not apply to an OBS-native checkout: an OBS submit request targets a project, not a Gitea repo",
         ));
     }
     if args.head.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--head does not apply to an OBS-native checkout: the request files the checkout as it stands",
         ));
     }
     if args.base.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--base does not apply to an OBS-native checkout: the target is --target-project",
         ));
     }
     if args.title.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--title does not apply to an OBS-native checkout: the request takes --description",
         ));
     }
     if args.body.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--body does not apply to an OBS-native checkout: the request takes --description",
         ));
     }
     if args.draft {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--draft does not apply to an OBS-native checkout: OBS has no draft requests",
         ));
     }
@@ -1321,37 +1321,37 @@ fn resolve_git_submit_target(
 fn refuse_obs_flags(args: &SubmitArgs) -> Result<(), GeectlError> {
     if args.target_project.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--target-project does not apply to a git-backed checkout: the pull request goes to --repo",
         ));
     }
     if args.target_package.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--target-package does not apply to a git-backed checkout: the pull request files the whole branch",
         ));
     }
     if args.description.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--description does not apply to a git-backed checkout: the pull request takes --title and --body",
         ));
     }
     if args.changes_entry.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--changes-entry does not apply to a git-backed checkout: OBS-only",
         ));
     }
     if !args.cve.is_empty() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--cve does not apply to a git-backed checkout: OBS-only",
         ));
     }
     if args.without_cleanup {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--without-cleanup does not apply to a git-backed checkout: OBS-only",
         ));
     }
@@ -1396,6 +1396,21 @@ fn review_act_with(
     ) -> Result<Option<ReviewOpinion>, GeectlError>,
 ) -> Result<(Value, String), GeectlError> {
     let reference: PullRequestRef = args.reference.parse()?;
+    // A `--commit` pin is Gitea-only (see
+    // `PullRequestClient::commit_pin_supported`): refuse it on an
+    // OBS ref before any credential resolution, like the merge
+    // leaf refuses its backend-only options — the library refuses
+    // again, as enforcement.
+    if let Some(commit) = args.commit.as_deref() {
+        if !PullRequestClient::commit_pin_supported(&reference) {
+            return Err(GeectlError::new(
+                ErrorKind::UnsupportedFlagForBackend,
+                format!(
+                    "--commit {commit} does not apply to a submit request: OBS reviews are not pinned to a commit"
+                ),
+            ));
+        }
+    }
     let target = review_target(
         args.user.as_deref(),
         args.group.as_deref(),

@@ -6474,25 +6474,28 @@ fn pull_request_merge_gitea_without_credentials_fails_with_config_error() {
 }
 
 #[test]
-fn pull_request_merge_obs_with_a_method_is_invalid_input() {
+fn pull_request_merge_obs_with_a_method_is_unsupported_flag() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["pull-request", "merge", "obs:123", "--method", "squash"])
         .output()
         .unwrap();
-    // InvalidInput exits 2; --method does not apply to OBS.
+    // UnsupportedFlagForBackend exits 38; --method does not apply to OBS.
     // The refusal precedes credential resolution, so the dry-run
     // credential warning never appears; the assertions are
     // substrings, not a JSON parse.
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(38));
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("unsupported_flag_for_backend"),
+        "stderr: {stderr}"
+    );
     assert!(stderr.contains("--method squash"), "stderr: {stderr}");
 }
 
 #[test]
-fn pull_request_merge_gitea_with_force_is_invalid_input_without_credentials() {
+fn pull_request_merge_gitea_with_force_is_unsupported_flag_without_credentials() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args([
@@ -6503,50 +6506,59 @@ fn pull_request_merge_gitea_with_force_is_invalid_input_without_credentials() {
         ])
         .output()
         .unwrap();
-    // InvalidInput exits 2; --force does not apply to Gitea, and
+    // UnsupportedFlagForBackend exits 38; --force does not apply to Gitea, and
     // the refusal precedes credential resolution, so it fires
     // without a token where a plain merge would fail with
     // ConfigError.
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(38));
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("unsupported_flag_for_backend"),
+        "stderr: {stderr}"
+    );
     assert!(stderr.contains("--force"), "stderr: {stderr}");
 }
 
 #[test]
-fn pull_request_merge_obs_with_no_forward_is_invalid_input() {
+fn pull_request_merge_obs_with_no_forward_is_unsupported_flag() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["pull-request", "merge", "obs:123", "--no-forward"])
         .output()
         .unwrap();
-    // InvalidInput exits 2; --no-forward does not apply to OBS.
+    // UnsupportedFlagForBackend exits 38; --no-forward does not apply to OBS.
     // The refusal precedes credential resolution, so the dry-run
     // credential warning never appears; the assertions are
     // substrings, not a JSON parse.
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(38));
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("unsupported_flag_for_backend"),
+        "stderr: {stderr}"
+    );
     assert!(stderr.contains("--no-forward"), "stderr: {stderr}");
 }
 
 #[test]
-fn pull_request_diff_gitea_with_xml_is_invalid_input_without_credentials() {
+fn pull_request_diff_gitea_with_xml_is_unsupported_flag_without_credentials() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["pull-request", "diff", "gitea:openSUSE/geectl#122", "--xml"])
         .output()
         .unwrap();
-    // InvalidInput exits 2; --xml does not apply to a Gitea pull
+    // UnsupportedFlagForBackend exits 38; --xml does not apply to a Gitea pull
     // request, and the refusal precedes credential resolution, so
     // it fires without a token where a plain diff would fail with
     // ConfigError.
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(38));
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("unsupported_flag_for_backend"),
+        "stderr: {stderr}"
+    );
     assert!(stderr.contains("--xml"), "stderr: {stderr}");
 }
 
@@ -8182,7 +8194,7 @@ fn pull_request_submit_gitea_instance_flag_unknown_alias_names_the_known_aliases
 }
 
 #[test]
-fn pull_request_submit_obs_with_repo_is_invalid_input() {
+fn pull_request_submit_obs_with_repo_is_unsupported_flag() {
     let dir = TempDir::new();
     let checkout = obs_submit_checkout(&dir, "https://api.opensuse.org");
     let out = geectl_isolated(&dir)
@@ -8201,18 +8213,21 @@ fn pull_request_submit_obs_with_repo_is_invalid_input() {
         ])
         .output()
         .unwrap();
-    // InvalidInput exits 2; --repo does not apply to an
+    // UnsupportedFlagForBackend exits 38; --repo does not apply to an
     // OBS-native checkout. The refusal precedes credential
     // resolution and any network read, so no fixture is needed.
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(38));
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("unsupported_flag_for_backend"),
+        "stderr: {stderr}"
+    );
     assert!(stderr.contains("--repo"), "stderr: {stderr}");
 }
 
 #[test]
-fn pull_request_submit_gitea_with_target_project_is_invalid_input() {
+fn pull_request_submit_gitea_with_target_project_is_unsupported_flag() {
     let dir = TempDir::new();
     let checkout = git_submit_checkout(&dir);
     let out = geectl_isolated(&dir)
@@ -8229,14 +8244,43 @@ fn pull_request_submit_gitea_with_target_project_is_invalid_input() {
         ])
         .output()
         .unwrap();
-    // InvalidInput exits 2; --target-project does not apply to a
+    // UnsupportedFlagForBackend exits 38; --target-project does not apply to a
     // git-backed checkout. The refusal precedes credential
     // resolution, so it fires without a token.
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(38));
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("unsupported_flag_for_backend"),
+        "stderr: {stderr}"
+    );
     assert!(stderr.contains("--target-project"), "stderr: {stderr}");
+}
+
+/// A submit invocation that must fail with UnsupportedFlagForBackend
+/// (exit 38): the args, and the substring the error must name. Every
+/// case runs without credentials and without a fixture: the refusal
+/// precedes credential resolution and any network read.
+fn assert_submit_unsupported_flag(
+    dir: &TempDir,
+    checkout: &std::path::Path,
+    args: &[&str],
+    needle: &str,
+) {
+    let out = geectl_isolated(dir)
+        .current_dir(checkout)
+        .args(["pull-request", "submit"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(38), "args: {args:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unsupported_flag_for_backend"),
+        "args: {args:?} stderr: {stderr}"
+    );
+    assert!(stderr.contains(needle), "args: {args:?} stderr: {stderr}");
 }
 
 /// A submit invocation that must fail with InvalidInput (exit 2):
@@ -8263,6 +8307,31 @@ fn assert_submit_invalid_input(
         "args: {args:?} stderr: {stderr}"
     );
     assert!(stderr.contains(needle), "args: {args:?} stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_approve_commit_pin_on_obs_refuses_before_credentials() {
+    // A --commit pin is Gitea-only: the refusal precedes credential
+    // resolution, so no token is needed.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "pull-request",
+            "approve",
+            "obs:123",
+            "--commit",
+            "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(38));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unsupported_flag_for_backend"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("--commit"), "stderr: {stderr}");
 }
 
 #[test]
@@ -8315,7 +8384,7 @@ fn pull_request_submit_gitea_missing_required_flags_are_invalid_input() {
 }
 
 #[test]
-fn pull_request_submit_obs_foreign_flags_are_invalid_input() {
+fn pull_request_submit_obs_foreign_flags_are_unsupported_flag() {
     let dir = TempDir::new();
     let checkout = obs_submit_checkout(&dir, "https://api.opensuse.org");
     let base = [
@@ -8336,15 +8405,15 @@ fn pull_request_submit_obs_foreign_flags_are_invalid_input() {
         let mut args: Vec<&str> = base.to_vec();
         args.push(flag);
         args.push(value);
-        assert_submit_invalid_input(&dir, &checkout, &args, flag);
+        assert_submit_unsupported_flag(&dir, &checkout, &args, flag);
     }
     let mut args: Vec<&str> = base.to_vec();
     args.push("--draft");
-    assert_submit_invalid_input(&dir, &checkout, &args, "--draft");
+    assert_submit_unsupported_flag(&dir, &checkout, &args, "--draft");
 }
 
 #[test]
-fn pull_request_submit_gitea_foreign_flags_are_invalid_input() {
+fn pull_request_submit_gitea_foreign_flags_are_unsupported_flag() {
     let dir = TempDir::new();
     let checkout = git_submit_checkout(&dir);
     let base = ["--base", "main", "--title", "Update foo"];
@@ -8358,11 +8427,11 @@ fn pull_request_submit_gitea_foreign_flags_are_invalid_input() {
         let mut args: Vec<&str> = base.to_vec();
         args.push(flag);
         args.push(value);
-        assert_submit_invalid_input(&dir, &checkout, &args, flag);
+        assert_submit_unsupported_flag(&dir, &checkout, &args, flag);
     }
     let mut args: Vec<&str> = base.to_vec();
     args.push("--without-cleanup");
-    assert_submit_invalid_input(&dir, &checkout, &args, "--without-cleanup");
+    assert_submit_unsupported_flag(&dir, &checkout, &args, "--without-cleanup");
 }
 
 #[test]

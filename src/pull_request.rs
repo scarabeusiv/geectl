@@ -716,11 +716,11 @@ impl PullRequestSummary {
 /// the unified states; with none given each arm applies its own
 /// default (new/review/declined on OBS, open on Gitea). The
 /// creator filters by author. The reviewer filters by review
-/// requested of that login; it needs the Gitea backend — the
-/// OBS arm has no reviewer filter. Only the token owner's login
-/// is accepted: the server filters review requests for the
-/// authenticated user only, and the search answer carries no
-/// requested-reviewer info, so the filter is server-side only.
+/// requested of that login: on Gitea only the token owner's
+/// login (the server filters review requests for the
+/// authenticated user only), on OBS an open review addressed to
+/// the login. The search answer carries no requested-reviewer
+/// info, so the filter is server-side only.
 /// The repo scopes the Gitea arm to one repo
 /// (`owner`/`repo`); a repo-scoped search needs the Gitea
 /// backend — the OBS arm has no repo to scope to.
@@ -733,9 +733,9 @@ pub struct PullRequestSearch {
     /// Only pull requests by this author, when set.
     pub creator: Option<String>,
     /// Only pull requests with review requested of this login,
-    /// when set; needs the Gitea backend. Only the token owner's
-    /// login: the server filters review requests for the
-    /// authenticated user only.
+    /// when set. On Gitea only the token owner's login: the
+    /// server filters review requests for the authenticated user
+    /// only; on OBS an open review addressed to the login.
     pub reviewer: Option<String>,
     /// Only this Gitea repo, when set; needs the Gitea backend.
     pub repo: Option<(String, String)>,
@@ -748,14 +748,8 @@ impl PullRequestSearch {
     pub fn validate(&self) -> Result<(), GeectlError> {
         if self.repo.is_some() && self.backend != Some(PullRequestBackend::Gitea) {
             return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
+                ErrorKind::UnsupportedFlagForBackend,
                 "a repo-scoped search needs backend gitea: the OBS arm has no repo to scope to",
-            ));
-        }
-        if self.reviewer.is_some() && self.backend != Some(PullRequestBackend::Gitea) {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                "a reviewer-scoped search needs backend gitea: the OBS arm has no reviewer filter",
             ));
         }
         Ok(())
@@ -898,7 +892,7 @@ impl<'a> PullRequestClient<'a> {
             } => {
                 if xml {
                     return Err(GeectlError::new(
-                        ErrorKind::InvalidInput,
+                        ErrorKind::UnsupportedFlagForBackend,
                         "--xml does not apply to a Gitea pull request: a Gitea pull request has no request XML",
                     ));
                 }
@@ -911,19 +905,17 @@ impl<'a> PullRequestClient<'a> {
     /// Search pull requests as the list shape. With no backend
     /// both arms run, OBS first then Gitea; a backend scopes the
     /// search to that arm. Both arms filter server-side (the
-    /// state mapping and the creator); the reviewer filters
-    /// server-side on the Gitea arm only (`review_requested`,
-    /// token owner only) and needs the Gitea backend. A
-    /// reviewer-scoped search runs the global search even with
-    /// a repo given, since the repo-scoped list has no reviewer
-    /// filter. The Gitea arm filters client-side to the exact
-    /// states, creator, and repo as a backstop, since the
-    /// repo-scoped list has no author filter, the search
-    /// endpoint has no repo scope, and the wire states do not
-    /// map one-to-one to the unified states. A repo-scoped
-    /// search needs the Gitea backend; without it the search
-    /// fails as invalid input instead of returning unscoped OBS
-    /// hits.
+    /// state mapping, the creator, and the reviewer:
+    /// `review_requested` on Gitea, token owner only; open
+    /// reviews on OBS). A reviewer-scoped search runs the global
+    /// search even with a repo given, since the repo-scoped list
+    /// has no reviewer filter. The Gitea arm filters client-side
+    /// to the exact states, creator, and repo as a backstop,
+    /// since the repo-scoped list has no author filter, the
+    /// search endpoint has no repo scope, and the wire states do
+    /// not map one-to-one to the unified states. A repo-scoped
+    /// search needs the Gitea backend; without it the search is
+    /// refused instead of returning unscoped OBS hits.
     pub fn search(
         &self,
         query: &PullRequestSearch,
@@ -938,6 +930,9 @@ impl<'a> PullRequestClient<'a> {
             }
             if let Some(creator) = &query.creator {
                 search = search.creators(vec![creator.clone()]);
+            }
+            if let Some(reviewer) = &query.reviewer {
+                search = search.reviewers(vec![reviewer.clone()]);
             }
             for request in &obs.search_requests(&search)? {
                 summaries.push(PullRequestSummary::from_obs(request)?);
@@ -967,6 +962,16 @@ impl<'a> PullRequestClient<'a> {
         Ok(summaries)
     }
 
+    /// Whether a `--commit` pin is supported for this handle: the
+    /// recorded limitation a queue can ask about before approving
+    /// with one, instead of hitting the runtime refusal. Gitea
+    /// only: a Gitea review is recorded against the head commit
+    /// server-side. OBS reviews carry no revision, so a pin on an
+    /// OBS ref is refused.
+    pub fn commit_pin_supported(reference: &PullRequestRef) -> bool {
+        matches!(reference, PullRequestRef::Gitea { .. })
+    }
+
     /// Approve a pull request as the review asked of `target`:
     /// `Some` target acts on that target, `None` acts on the
     /// review asked of the acting user. A `Some` target on a
@@ -977,6 +982,8 @@ impl<'a> PullRequestClient<'a> {
     /// moved. The pin is best-effort: the head is read just before
     /// the review posts, so a push landing between the read and
     /// the post is not caught; on an OBS ref a commit is refused.
+    /// Whether a pin is supported for a handle is
+    /// [`commit_pin_supported`](Self::commit_pin_supported).
     /// Returns the recorded opinion, or `None` in dry-run.
     pub fn approve(
         &self,
@@ -1097,7 +1104,7 @@ impl<'a> PullRequestClient<'a> {
             } => {
                 if let Some(parent) = parent {
                     return Err(GeectlError::new(
-                        ErrorKind::InvalidInput,
+                        ErrorKind::UnsupportedFlagForBackend,
                         format!(
                             "--parent {parent} does not apply to a Gitea pull request: issue comments do not thread"
                         ),
@@ -1290,7 +1297,7 @@ impl<'a> PullRequestClient<'a> {
             PullRequestRef::Obs(id) => {
                 if let Some(method) = method {
                     return Err(GeectlError::new(
-                        ErrorKind::InvalidInput,
+                        ErrorKind::UnsupportedFlagForBackend,
                         format!(
                             "--method {} does not apply to an OBS submit request: OBS has no merge style",
                             method.as_str()
@@ -1308,7 +1315,7 @@ impl<'a> PullRequestClient<'a> {
             } => {
                 if force {
                     return Err(GeectlError::new(
-                        ErrorKind::InvalidInput,
+                        ErrorKind::UnsupportedFlagForBackend,
                         "--force does not apply to a Gitea pull request: the merge API takes no force flag",
                     ));
                 }
@@ -1510,7 +1517,7 @@ impl<'a> PullRequestClient<'a> {
             PullRequestRef::Obs(id) => {
                 if let Some(commit) = commit {
                     return Err(GeectlError::new(
-                        ErrorKind::InvalidInput,
+                        ErrorKind::UnsupportedFlagForBackend,
                         format!(
                             "--commit {commit} does not apply to a submit request: OBS reviews are not pinned to a commit"
                         ),
@@ -1632,7 +1639,7 @@ fn refuse_gitea_target(target: Option<&ReviewTarget>) -> Result<(), GeectlError>
     };
     if let Some(user) = &target.by_user {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             format!(
                 "--user {user} does not apply to a Gitea pull request: a Gitea review is acted on as the token owner"
             ),
@@ -1640,7 +1647,7 @@ fn refuse_gitea_target(target: Option<&ReviewTarget>) -> Result<(), GeectlError>
     }
     if let Some(group) = &target.by_group {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             format!(
                 "--group {group} does not apply to a Gitea pull request: a Gitea review is acted on as the token owner"
             ),
@@ -1648,7 +1655,7 @@ fn refuse_gitea_target(target: Option<&ReviewTarget>) -> Result<(), GeectlError>
     }
     if let Some(project) = &target.by_project {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             format!(
                 "--project {project} does not apply to a Gitea pull request: a Gitea review is acted on as the token owner"
             ),
@@ -1656,7 +1663,7 @@ fn refuse_gitea_target(target: Option<&ReviewTarget>) -> Result<(), GeectlError>
     }
     if let Some(package) = &target.by_package {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             format!(
                 "--package {package} does not apply to a Gitea pull request: a Gitea review is acted on as the token owner"
             ),
@@ -2812,7 +2819,7 @@ mod tests {
             let err = client
                 .search(&query)
                 .expect_err("a repo-scoped search without the Gitea backend must fail");
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert_eq!(err.kind(), ErrorKind::UnsupportedFlagForBackend);
         }
     }
 
@@ -2898,29 +2905,51 @@ mod tests {
     }
 
     #[test]
-    fn search_reviewer_scoped_search_needs_the_gitea_backend() {
-        // A reviewer scopes the Gitea arm only: with no backend,
-        // or with the OBS backend, the reviewer filter would be
-        // silently ignored on the OBS arm, so the search fails as
-        // invalid input instead. No HTTP call runs: the fake has
-        // no canned responses, so any arm running would fail with
-        // a network error, not the invalid-input error asserted
-        // here.
-        let http = FakeHttp::new();
+    fn search_obs_scopes_reviewer_server_side() {
+        // The reviewer reaches the OBS search as an open review
+        // addressed to the login; with no explicit states the
+        // default narrows to the states a request can still be
+        // reviewed in.
+        let collection = format!("<collection matches=\"1\">\n{REQUEST_XML}\n</collection>");
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/request?match=review%5B%40by_user%3D%27plusky%27%20and%20%40state%3D%27new%27%5D%20and%20state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%5D",
+            &collection,
+        );
         let obs = obs_client(&http);
-        let gitea = gitea_client(&http);
-        let client = PullRequestClient::new(Some(&obs), Some(&gitea));
-        for backend in [None, Some(PullRequestBackend::Obs)] {
+        let client = PullRequestClient::new(Some(&obs), None);
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Obs),
+            reviewer: Some("plusky".to_string()),
+            ..Default::default()
+        };
+        let summaries = client.search(&query).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].reference, PullRequestRef::Obs(123));
+    }
+
+    #[test]
+    fn search_reviewer_is_accepted_on_both_arms() {
+        // The reviewer filter is no longer Gitea-only: OBS
+        // supports it server-side (an open review addressed to the
+        // login), so it validates unscoped and on either arm.
+        for backend in [
+            None,
+            Some(PullRequestBackend::Obs),
+            Some(PullRequestBackend::Gitea),
+        ] {
             let query = PullRequestSearch {
                 backend,
-                reviewer: Some("scarabeus_iv".to_string()),
+                reviewer: Some("plusky".to_string()),
                 ..Default::default()
             };
-            let err = client
-                .search(&query)
-                .expect_err("a reviewer-scoped search without the Gitea backend must fail");
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(query.validate().is_ok());
         }
+    }
+
+    #[test]
+    fn commit_pin_supported_is_gitea_only() {
+        assert!(!PullRequestClient::commit_pin_supported(&obs_ref()));
+        assert!(PullRequestClient::commit_pin_supported(&gitea_ref()));
     }
 
     #[test]
@@ -3194,19 +3223,19 @@ mod tests {
         let err = act_client(None, Some(&gitea))
             .approve(&gitea_ref(), Some(&target), None, None, &DryRun::new(false))
             .expect_err("a target on a Gitea ref must fail");
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.kind(), ErrorKind::UnsupportedFlagForBackend);
         assert!(err.to_string().contains("--user bob"));
         let target = ReviewTarget::new(None, Some("reviewers"), None, None).unwrap();
         let err = act_client(None, Some(&gitea))
             .approve(&gitea_ref(), Some(&target), None, None, &DryRun::new(false))
             .expect_err("a group target on a Gitea ref must fail");
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.kind(), ErrorKind::UnsupportedFlagForBackend);
         assert!(err.to_string().contains("--group reviewers"));
         let target = ReviewTarget::new(None, None, Some("openSUSE:Factory"), None).unwrap();
         let err = act_client(None, Some(&gitea))
             .approve(&gitea_ref(), Some(&target), None, None, &DryRun::new(false))
             .expect_err("a project target on a Gitea ref must fail");
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.kind(), ErrorKind::UnsupportedFlagForBackend);
         assert!(err.to_string().contains("--project openSUSE:Factory"));
         // `ReviewTarget::new` refuses a package without its project,
         // so a package-only target is built literally: the only way
@@ -3220,7 +3249,7 @@ mod tests {
         let err = act_client(None, Some(&gitea))
             .approve(&gitea_ref(), Some(&target), None, None, &DryRun::new(false))
             .expect_err("a package target on a Gitea ref must fail");
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.kind(), ErrorKind::UnsupportedFlagForBackend);
         assert!(err.to_string().contains("--package vim"));
     }
 
@@ -3286,7 +3315,7 @@ mod tests {
         let err = PullRequestClient::new(None, Some(&gitea))
             .diff(&gitea_ref(), true)
             .expect_err("--xml on a Gitea ref must fail");
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.kind(), ErrorKind::UnsupportedFlagForBackend);
         assert!(err.to_string().contains("--xml"));
         assert!(http.get_calls().is_empty());
     }
@@ -3393,7 +3422,7 @@ mod tests {
         let err = act_client(Some(&obs), None)
             .approve(&obs_ref(), None, None, Some(HEAD_SHA), &DryRun::new(false))
             .expect_err("a commit on an OBS ref must fail");
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.kind(), ErrorKind::UnsupportedFlagForBackend);
         assert!(err.to_string().contains("--commit"));
         assert!(http.post_calls().is_empty());
     }
@@ -3587,7 +3616,7 @@ mod tests {
         let err = act_client(None, Some(&gitea))
             .comment(&gitea_ref(), "A reply.", Some("7"), &DryRun::new(false))
             .expect_err("a parent on a Gitea ref must fail");
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.kind(), ErrorKind::UnsupportedFlagForBackend);
         assert!(err.to_string().contains("--parent 7"));
     }
 
@@ -4162,7 +4191,7 @@ please fix this</comment></comments>"#,
                 &DryRun::new(false),
             )
             .expect_err("a merge method on an OBS ref must fail");
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.kind(), ErrorKind::UnsupportedFlagForBackend);
         assert!(err.to_string().contains("--method squash"));
         assert!(http.post_calls().is_empty());
     }
@@ -4237,7 +4266,7 @@ please fix this</comment></comments>"#,
         let err = act_client(None, Some(&gitea))
             .merge(&gitea_ref(), None, None, true, &DryRun::new(false))
             .expect_err("force on a Gitea ref must fail");
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.kind(), ErrorKind::UnsupportedFlagForBackend);
         assert!(err.to_string().contains("--force"));
         assert!(http.post_calls().is_empty());
     }

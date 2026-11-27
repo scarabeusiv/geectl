@@ -32,6 +32,13 @@ pub enum ErrorKind {
     ResultLimitExceeded,
     /// The caller's input is invalid (bad package/project name, bad flag).
     InvalidInput,
+    /// A flag the target backend does not support: a per-arm flag
+    /// passed to the other arm (an OBS-only flag on a Gitea ref, or
+    /// the reverse). A distinct, actionable state: the flag names
+    /// the backend it belongs to, so the caller drops it or scopes
+    /// the call to that backend — not a malformed value, which
+    /// stays `InvalidInput`.
+    UnsupportedFlagForBackend,
     /// A resource with that name already exists (a fork, a repo). A
     /// distinct, actionable state: reuse the existing resource, or
     /// pick another name — not an invalid input and not a server
@@ -118,6 +125,7 @@ impl ErrorKind {
             ErrorKind::ServerError => "server_error",
             ErrorKind::ResultLimitExceeded => "result_limit_exceeded",
             ErrorKind::InvalidInput => "invalid_input",
+            ErrorKind::UnsupportedFlagForBackend => "unsupported_flag_for_backend",
             ErrorKind::AlreadyExists => "already_exists",
             ErrorKind::Timeout => "timeout",
             ErrorKind::NetworkError => "network_error",
@@ -159,6 +167,7 @@ impl ErrorKind {
                 "the search returned more results than the server allows"
             }
             ErrorKind::InvalidInput => "the input is invalid",
+            ErrorKind::UnsupportedFlagForBackend => "the flag is not supported on this backend",
             ErrorKind::AlreadyExists => "the resource already exists",
             ErrorKind::Timeout => "the request timed out",
             ErrorKind::NetworkError => "a network error occurred",
@@ -206,6 +215,9 @@ impl ErrorKind {
                 "narrow the search (fewer states, a project or package filter), or fetch ids only via the /search/.../id endpoint"
             }
             ErrorKind::InvalidInput => "fix the input and retry; see --help for the expected form",
+            ErrorKind::UnsupportedFlagForBackend => {
+                "drop the flag, or scope the call to the backend that supports it"
+            }
             ErrorKind::AlreadyExists => {
                 "reuse the existing resource, or pick another name and retry"
             }
@@ -287,6 +299,7 @@ impl ErrorKind {
         match self {
             ErrorKind::InternalError => 1,
             ErrorKind::InvalidInput => 2,
+            ErrorKind::UnsupportedFlagForBackend => 38,
             ErrorKind::NotFound => 3,
             ErrorKind::AuthFailed => 4,
             ErrorKind::Timeout => 5,
@@ -333,6 +346,7 @@ impl ErrorKind {
             ErrorKind::ServerError,
             ErrorKind::ResultLimitExceeded,
             ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             ErrorKind::AlreadyExists,
             ErrorKind::Timeout,
             ErrorKind::NetworkError,
