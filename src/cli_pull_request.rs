@@ -50,7 +50,8 @@ use crate::config::{self, DEFAULT_GITEA_URL};
 use crate::debug::{strip_terminal_controls, strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{
-    parse_gitea_repo, validate_gitea_base, GiteaClient, GiteaMergeMethod, PrCreateOptions,
+    parse_gitea_repo, parse_scmsync_url, validate_gitea_base, GiteaClient, GiteaMergeMethod,
+    PrCreateOptions,
 };
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::local_build::LocalBuild;
@@ -153,14 +154,14 @@ pub enum PullRequestCommand {
     /// checkout's backend decides; the other arm's flags are
     /// refused. Dry-run by default; mutates only with `--live`.
     Submit(SubmitArgs),
-    /// Clean the local build roots for the submit request filed
-    /// from the working copy in the current directory, when that
-    /// request is accepted. The request id was recorded by
-    /// `submit` in the checkout; the leaf reads the request state
-    /// once and wipes the roots only on `accepted`. A request in
-    /// any other state, and a checkout with nothing recorded,
-    /// delete nothing. Dry-run by default; mutates only with
-    /// `--live`.
+    /// Clean the local build roots for the submit request or pull
+    /// request filed from the working copy in the current
+    /// directory, when that request is accepted (OBS) or merged
+    /// (Gitea). The reference was recorded by `submit` in the
+    /// checkout; the leaf reads the state once and wipes the
+    /// roots only on `accepted`/`merged`. A request in any other
+    /// state, and a checkout with nothing recorded, delete
+    /// nothing. Dry-run by default; mutates only with `--live`.
     Cleanup,
 }
 
@@ -871,6 +872,7 @@ fn submit(
             )?;
             let client = PullRequestClient::new(None, Some(&gitea)).with_debug(debug.clone());
             let submitted = client.submit(&target, &dry_run)?;
+            record_submitted_pull_request(&wc.root, &submitted);
             Ok((
                 submit_payload(&submitted, &dry_run)?,
                 submit_text(&target, &submitted, &dry_run),
@@ -1897,6 +1899,24 @@ fn record_submitted_request(root: &std::path::Path, submitted: &Option<Submitted
     }
 }
 
+/// Record a filed Gitea pull request in the checkout at `root`,
+/// for `pull-request cleanup` to watch. Only the Gitea arm files
+/// a pull request: an OBS submit request, or a dry run that filed
+/// nothing, records nothing. A record that fails to write is a
+/// warning, not a failed filing: the pull request was filed, only
+/// the bookkeeping failed.
+fn record_submitted_pull_request(root: &std::path::Path, submitted: &Option<Submitted>) {
+    let Some(Submitted { reference, .. }) = submitted else {
+        return;
+    };
+    if !matches!(reference, PullRequestRef::Gitea { .. }) {
+        return;
+    }
+    if let Err(err) = working_copy::record_submitted_pull_request(root, reference) {
+        eprintln!("warning: filed {reference} but could not record it in the checkout: {err}");
+    }
+}
+
 /// One build root's cleanup outcome: wiped live, planned in
 /// dry-run, pending while the request is not accepted, or refused
 /// with the reason.
@@ -1908,11 +1928,12 @@ struct CleanupRootOutcome {
     refused: Option<String>,
 }
 
-/// Clean the local build roots for the submit request recorded in
-/// the working copy in the current directory, when that request is
-/// accepted. The checkout opens first (a local read, no
-/// credentials); the request state is read once, live only — a dry
-/// run plans from the local record alone, with no server read.
+/// Clean the local build roots for the submit request or pull
+/// request recorded in the working copy in the current directory,
+/// when that request is accepted (OBS) or merged (Gitea). The
+/// checkout opens first (a local read, no credentials); the state
+/// is read once, live only — a dry run plans from the local record
+/// alone, with no server read.
 fn cleanup(
     debug: &Debug,
     live: bool,
@@ -1924,15 +1945,37 @@ fn cleanup(
     } else {
         working_copy::open_read(&current_dir()?)
     }?;
-    let Some(id) = working_copy::submitted_request(&wc.root)? else {
+    if let Some(id) = working_copy::submitted_request(&wc.root)? {
+        return with_obs(debug, live, instance, |obs| {
+            let path = config::config_path()?;
+            let file_config = config::load_config_at(&path)?;
+            let effective = config::effective_config(&file_config)?;
+            cleanup_with(obs, &effective.config, &wc, id, &dry_run)
+        });
+    }
+    let Some(reference) = working_copy::submitted_pull_request(&wc.root)? else {
         return cleanup_result(&wc.project, &wc.package, None, None, &[], false, &dry_run);
     };
-    with_obs(debug, live, instance, |obs| {
-        let path = config::config_path()?;
-        let file_config = config::load_config_at(&path)?;
-        let effective = config::effective_config(&file_config)?;
-        cleanup_with(obs, &effective.config, &wc, id, &dry_run)
-    })
+    match &reference {
+        PullRequestRef::Obs(id) => with_obs(debug, live, instance, |obs| {
+            let path = config::config_path()?;
+            let file_config = config::load_config_at(&path)?;
+            let effective = config::effective_config(&file_config)?;
+            cleanup_with(obs, &effective.config, &wc, *id, &dry_run)
+        }),
+        PullRequestRef::Gitea { .. } => with_gitea(debug, instance, |gitea| {
+            let path = config::config_path()?;
+            let file_config = config::load_config_at(&path)?;
+            let effective = config::effective_config(&file_config)?;
+            // The wipe is local: the OBS client only supplies the
+            // local-build vertical, so it needs no credentials.
+            let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+            let base = config::obs_base_url(instance, &file_config)?;
+            let obs = ObsClient::with_base(&http, &base)?;
+            let client = PullRequestClient::new(None, Some(gitea));
+            cleanup_with_gitea(&obs, &client, &effective.config, &wc, &reference, &dry_run)
+        }),
+    }
 }
 
 /// The cleanup body over an already-built client: the state gate
@@ -1965,7 +2008,7 @@ fn cleanup_with(
         return cleanup_result(
             &wc.project,
             &wc.package,
-            Some(id),
+            Some(PullRequestRef::Obs(id)),
             None,
             &planned,
             false,
@@ -2008,7 +2051,7 @@ fn cleanup_with(
         return cleanup_result(
             &wc.project,
             &wc.package,
-            Some(id),
+            Some(PullRequestRef::Obs(id)),
             Some(state.as_str()),
             &pending,
             false,
@@ -2060,8 +2103,144 @@ fn cleanup_with(
     cleanup_result(
         &wc.project,
         &wc.package,
-        Some(id),
+        Some(PullRequestRef::Obs(id)),
         Some(state.as_str()),
+        &outcomes,
+        record_cleared,
+        dry_run,
+    )
+}
+
+/// The cleanup body for a recorded Gitea pull request, over an
+/// already-built client: the state gate and the wipe. The pull
+/// request must be merged: a closed-but-unmerged pull request
+/// keeps its roots like a request still in review, and the record
+/// stays. Separated from `cleanup` so tests can drive it with a
+/// canned pull-request read.
+fn cleanup_with_gitea(
+    obs: &ObsClient,
+    client: &PullRequestClient,
+    effective_config: &config::Config,
+    wc: &working_copy::WorkingCopy,
+    reference: &PullRequestRef,
+    dry_run: &DryRun,
+) -> Result<(Value, String), GeectlError> {
+    let vertical = LocalBuild::from_config(obs, effective_config)?;
+    let roots = vertical.roots_for_package(&wc.project, &wc.package)?;
+    if dry_run.enabled() {
+        // The plan from the local record alone: the state is
+        // unknown until the live check, so the roots plan as
+        // pending wipes, and nothing is read from the server.
+        let mut planned = Vec::new();
+        for root in &roots {
+            let outcome = vertical.wipe_named_root(root, true)?;
+            planned.push(CleanupRootOutcome {
+                root: root.clone(),
+                entries: outcome.entries,
+                bytes: outcome.bytes,
+                status: "planned",
+                refused: None,
+            });
+        }
+        return cleanup_result(
+            &wc.project,
+            &wc.package,
+            Some(reference.clone()),
+            None,
+            &planned,
+            false,
+            dry_run,
+        );
+    }
+    let pr = client.show(reference)?;
+    // The recorded pull request must be the one filed from this
+    // checkout: a stale or hand-edited record pointing at a
+    // foreign merged pull request would otherwise wipe this
+    // checkout's build roots. The pull request head names the
+    // repo it was filed from — the fork — while the target names
+    // the parent it goes to, so the target never names this
+    // checkout in the fork-to-parent flow: refuse when the head
+    // is not the repo this checkout syncs from. A deleted fork
+    // leaves the head repo empty on the server; then the record
+    // alone is the evidence, like a checkout with no recorded
+    // scmsync URL, which predates that record and is cleaned on
+    // the record alone.
+    if let Some(scmsync) = &wc.scmsync_url {
+        let parsed = parse_scmsync_url(scmsync)?;
+        let scmsync_repo = format!("{}/{}", parsed.owner, parsed.repo);
+        if !pr.source.repository.is_empty() && pr.source.repository != scmsync_repo {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "recorded pull request {reference} was not filed from {}/{}; refusing to wipe its build roots",
+                    wc.project, wc.package
+                ),
+            ));
+        }
+    }
+    let status = pr.status;
+    if status != PullRequestStatus::Merged {
+        let mut pending = Vec::new();
+        for root in &roots {
+            pending.push(CleanupRootOutcome {
+                root: root.clone(),
+                entries: 0,
+                bytes: 0,
+                status: "pending",
+                refused: None,
+            });
+        }
+        return cleanup_result(
+            &wc.project,
+            &wc.package,
+            Some(reference.clone()),
+            Some(status.as_str()),
+            &pending,
+            false,
+            dry_run,
+        );
+    }
+    // Merged: wipe live, collecting refusals instead of stopping
+    // at the first one. The record is cleared only when every
+    // matching root is gone, so a partial cleanup retries on the
+    // next run.
+    let mut outcomes = Vec::new();
+    let mut refused = false;
+    for root in &roots {
+        match vertical.wipe_named_root(root, false) {
+            Ok(outcome) => outcomes.push(CleanupRootOutcome {
+                root: root.clone(),
+                entries: outcome.entries,
+                bytes: outcome.bytes,
+                status: "wiped",
+                refused: None,
+            }),
+            Err(err) => {
+                refused = true;
+                outcomes.push(CleanupRootOutcome {
+                    root: root.clone(),
+                    entries: 0,
+                    bytes: 0,
+                    status: "refused",
+                    refused: Some(err.to_string()),
+                });
+            }
+        }
+    }
+    let mut record_cleared = false;
+    if !refused {
+        match working_copy::clear_submitted_pull_request(&wc.root) {
+            Ok(()) => record_cleared = true,
+            Err(err) => eprintln!(
+                "warning: cleaned the build roots for {reference} but could not clear the recorded pull request: {err}"
+            ),
+        }
+    }
+    cleanup_result(
+        &wc.project,
+        &wc.package,
+        Some(reference.clone()),
+        Some(status.as_str()),
         &outcomes,
         record_cleared,
         dry_run,
@@ -2075,7 +2254,7 @@ fn cleanup_with(
 fn cleanup_result(
     project: &str,
     package: &str,
-    recorded: Option<u64>,
+    recorded: Option<PullRequestRef>,
     state: Option<&str>,
     roots: &[CleanupRootOutcome],
     record_cleared: bool,
@@ -2084,8 +2263,8 @@ fn cleanup_result(
     let mut payload = json!({
         "project": project,
         "package": package,
-        "recorded": match recorded {
-            Some(id) => payload_json(&PullRequestRef::Obs(id))?,
+        "recorded": match &recorded {
+            Some(reference) => payload_json(reference)?,
             None => Value::Null,
         },
         "state": state,
@@ -2103,8 +2282,8 @@ fn cleanup_result(
         "dry_run": dry_run.enabled(),
     });
     add_plan(&mut payload, dry_run);
-    let mut text = match recorded {
-        Some(id) => format!("project: {project} package: {package} request: obs:{id}"),
+    let mut text = match &recorded {
+        Some(reference) => format!("project: {project} package: {package} request: {reference}"),
         None => format!("project: {project} package: {package} request: none recorded"),
     };
     if let Some(state) = state {
@@ -3369,6 +3548,34 @@ mod tests {
     }
 
     #[test]
+    fn record_submitted_pull_request_records_gitea_and_ignores_obs() {
+        let (_dir, wc) = git_parts_checkout(None);
+        record_submitted_pull_request(&wc.root, &Some(gitea_submitted_fixture()));
+        let reference = PullRequestRef::Gitea {
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            number: 7,
+        };
+        assert_eq!(
+            working_copy::submitted_pull_request(&wc.root).unwrap(),
+            Some(reference.clone())
+        );
+        // An OBS submit request is not a pull request: the
+        // earlier record stands.
+        record_submitted_pull_request(&wc.root, &Some(obs_submitted_fixture()));
+        assert_eq!(
+            working_copy::submitted_pull_request(&wc.root).unwrap(),
+            Some(reference.clone())
+        );
+        // A dry run that filed nothing records nothing.
+        record_submitted_pull_request(&wc.root, &None);
+        assert_eq!(
+            working_copy::submitted_pull_request(&wc.root).unwrap(),
+            Some(reference)
+        );
+    }
+
+    #[test]
     fn cleanup_result_json_and_text_agree() {
         let dry_run = DryRun::new(false);
         let (payload, text) =
@@ -3391,7 +3598,7 @@ mod tests {
         let (payload, text) = cleanup_result(
             "home:alice",
             "foo",
-            Some(1398492),
+            Some(PullRequestRef::Obs(1398492)),
             Some("review"),
             std::slice::from_ref(&pending),
             false,
@@ -3417,7 +3624,7 @@ mod tests {
         let (payload, text) = cleanup_result(
             "home:alice",
             "foo",
-            Some(1398492),
+            Some(PullRequestRef::Obs(1398492)),
             Some("accepted"),
             std::slice::from_ref(&wiped),
             true,
@@ -3584,6 +3791,302 @@ mod tests {
         assert_eq!(
             working_copy::submitted_request(&wc.root).unwrap(),
             Some(1398492)
+        );
+    }
+
+    /// The Gitea pull request the cleanup tests read: number 122
+    /// in `openSUSE/geectl`, filed from the fork
+    /// `scarabeus_iv/foo` the fixture checkout syncs from — the
+    /// shape the submit path files: the head is the fork, the
+    /// base the parent — in the given state.
+    fn cleanup_pr_json(state: &str, merged: bool) -> String {
+        PR_JSON
+            .replace("\"state\": \"open\"", &format!("\"state\": \"{state}\""))
+            .replace("\"merged\": false", &format!("\"merged\": {merged}"))
+            .replace("scarabeusiv/geectl", "scarabeus_iv/foo")
+    }
+
+    /// The same pull request with the fork deleted after the
+    /// merge: the head repo is gone, so the head endpoint carries
+    /// no repository and the guard falls back to the record.
+    fn cleanup_pr_json_deleted_fork() -> String {
+        cleanup_pr_json("closed", true).replace(
+            "\"repo\": {\"full_name\": \"scarabeus_iv/foo\"}",
+            "\"repo\": null",
+        )
+    }
+
+    /// A fixture checkout whose scmsync URL names the given repo.
+    fn gitea_parts_checkout(url: &str) -> (tempfile::TempDir, working_copy::WorkingCopy) {
+        let (dir, _wc) = git_parts_checkout(None);
+        let root = dir.path();
+        assert!(std::process::Command::new("git")
+            .current_dir(root)
+            .args(["config", "--local", "geectl.scmsync-url", url])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let wc = working_copy::open(root).unwrap();
+        (dir, wc)
+    }
+
+    /// The recorded reference names the repo the pull request
+    /// was filed into — the parent — as `submit` records it, not
+    /// the fork it was filed from.
+    fn cleanup_gitea_reference() -> PullRequestRef {
+        PullRequestRef::Gitea {
+            owner: "openSUSE".to_string(),
+            repo: "geectl".to_string(),
+            number: 122,
+        }
+    }
+
+    #[test]
+    fn cleanup_with_gitea_wipes_roots_and_clears_the_record_on_merge() {
+        let (_dir, wc) = gitea_parts_checkout("https://src.opensuse.org/scarabeus_iv/foo");
+        let reference = cleanup_gitea_reference();
+        working_copy::record_submitted_pull_request(&wc.root, &reference).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = cleanup_root(cache.path());
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &cleanup_pr_json("closed", true),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = GiteaClient::new(
+            &http,
+            Credentials::Bearer {
+                token: "test-token".to_string(),
+            },
+        )
+        .unwrap();
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let cfg = config::Config {
+            build_cache_dir: Some(cache.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let dry_run = DryRun::new(false);
+        let (payload, text) =
+            cleanup_with_gitea(&obs, &client, &cfg, &wc, &reference, &dry_run).unwrap();
+        assert_eq!(payload["state"], "merged");
+        assert_eq!(payload["recorded"], "gitea:openSUSE/geectl#122");
+        assert_eq!(payload["roots"][0]["status"], "wiped");
+        assert_eq!(payload["record_cleared"], true);
+        assert!(text.contains("wiped"));
+        assert!(!root.join("stale-output").exists());
+        assert_eq!(
+            working_copy::submitted_pull_request(&wc.root).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn cleanup_with_gitea_wipes_without_a_scmsync_url() {
+        let (_dir, wc) = git_parts_checkout(None);
+        let reference = cleanup_gitea_reference();
+        working_copy::record_submitted_pull_request(&wc.root, &reference).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = cleanup_root(cache.path());
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &cleanup_pr_json("closed", true),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = GiteaClient::new(
+            &http,
+            Credentials::Bearer {
+                token: "test-token".to_string(),
+            },
+        )
+        .unwrap();
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let cfg = config::Config {
+            build_cache_dir: Some(cache.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let dry_run = DryRun::new(false);
+        let (payload, _) =
+            cleanup_with_gitea(&obs, &client, &cfg, &wc, &reference, &dry_run).unwrap();
+        assert_eq!(payload["roots"][0]["status"], "wiped");
+        assert_eq!(payload["record_cleared"], true);
+        assert!(!root.join("stale-output").exists());
+    }
+
+    #[test]
+    fn cleanup_with_gitea_keeps_roots_and_the_record_while_open() {
+        let (_dir, wc) = gitea_parts_checkout("https://src.opensuse.org/scarabeus_iv/foo");
+        let reference = cleanup_gitea_reference();
+        working_copy::record_submitted_pull_request(&wc.root, &reference).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = cleanup_root(cache.path());
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &cleanup_pr_json("open", false),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = GiteaClient::new(
+            &http,
+            Credentials::Bearer {
+                token: "test-token".to_string(),
+            },
+        )
+        .unwrap();
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let cfg = config::Config {
+            build_cache_dir: Some(cache.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let dry_run = DryRun::new(false);
+        let (payload, text) =
+            cleanup_with_gitea(&obs, &client, &cfg, &wc, &reference, &dry_run).unwrap();
+        assert_eq!(payload["state"], "open");
+        assert_eq!(payload["roots"][0]["status"], "pending");
+        assert_eq!(payload["record_cleared"], false);
+        assert!(text.contains("pending"));
+        assert!(root.join("stale-output").exists());
+        assert_eq!(
+            working_copy::submitted_pull_request(&wc.root).unwrap(),
+            Some(reference)
+        );
+    }
+
+    #[test]
+    fn cleanup_with_gitea_refuses_a_foreign_merged_pull_request() {
+        let (_dir, wc) = gitea_parts_checkout("https://src.opensuse.org/someone/else");
+        let reference = cleanup_gitea_reference();
+        working_copy::record_submitted_pull_request(&wc.root, &reference).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = cleanup_root(cache.path());
+        // Merged, but filed from another checkout: the wipe must
+        // not happen and the record must stay.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &cleanup_pr_json("closed", true),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = GiteaClient::new(
+            &http,
+            Credentials::Bearer {
+                token: "test-token".to_string(),
+            },
+        )
+        .unwrap();
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let cfg = config::Config {
+            build_cache_dir: Some(cache.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let dry_run = DryRun::new(false);
+        let err = cleanup_with_gitea(&obs, &client, &cfg, &wc, &reference, &dry_run).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not filed from home:alice/foo"));
+        assert!(root.join("stale-output").exists());
+        assert_eq!(
+            working_copy::submitted_pull_request(&wc.root).unwrap(),
+            Some(reference)
+        );
+    }
+
+    #[test]
+    fn cleanup_with_gitea_wipes_when_the_fork_is_deleted_after_merge() {
+        let (_dir, wc) = gitea_parts_checkout("https://src.opensuse.org/scarabeus_iv/foo");
+        let reference = cleanup_gitea_reference();
+        working_copy::record_submitted_pull_request(&wc.root, &reference).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = cleanup_root(cache.path());
+        // Merged, but the fork is gone: the head repo reads as
+        // null, so the guard cannot compare it with the scmsync
+        // repo and falls back to the record alone.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &cleanup_pr_json_deleted_fork(),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = GiteaClient::new(
+            &http,
+            Credentials::Bearer {
+                token: "test-token".to_string(),
+            },
+        )
+        .unwrap();
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let cfg = config::Config {
+            build_cache_dir: Some(cache.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let dry_run = DryRun::new(false);
+        let (payload, _) =
+            cleanup_with_gitea(&obs, &client, &cfg, &wc, &reference, &dry_run).unwrap();
+        assert_eq!(payload["state"], "merged");
+        assert_eq!(payload["roots"][0]["status"], "wiped");
+        assert_eq!(payload["record_cleared"], true);
+        assert!(!root.join("stale-output").exists());
+        assert_eq!(
+            working_copy::submitted_pull_request(&wc.root).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn cleanup_with_gitea_plans_from_the_local_record_in_dry_run() {
+        let (_dir, wc) = gitea_parts_checkout("https://src.opensuse.org/scarabeus_iv/foo");
+        let reference = cleanup_gitea_reference();
+        working_copy::record_submitted_pull_request(&wc.root, &reference).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = cleanup_root(cache.path());
+        // No canned reads: a dry run must not touch the server.
+        let http = FakeHttp::new();
+        let gitea = GiteaClient::new(
+            &http,
+            Credentials::Bearer {
+                token: "test-token".to_string(),
+            },
+        )
+        .unwrap();
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let cfg = config::Config {
+            build_cache_dir: Some(cache.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let dry_run = DryRun::new(true);
+        let (payload, text) =
+            cleanup_with_gitea(&obs, &client, &cfg, &wc, &reference, &dry_run).unwrap();
+        assert_eq!(payload["state"], serde_json::Value::Null);
+        assert_eq!(payload["roots"][0]["status"], "planned");
+        assert_eq!(payload["dry_run"], true);
+        assert!(text.contains("would wipe"));
+        assert!(text.contains("request state not read in dry-run"));
+        assert!(root.join("stale-output").exists());
+        assert_eq!(
+            working_copy::submitted_pull_request(&wc.root).unwrap(),
+            Some(reference)
         );
     }
 

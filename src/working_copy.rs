@@ -36,6 +36,7 @@ use crate::obs::{
     valid_obs_filename, CommitFileEntry, CommitFilelistOptions, DirectoryListing, DryRun,
     ObsClient, RevisionSpec, ServiceCode,
 };
+use crate::pull_request::PullRequestRef;
 use crate::xml::XmlDoc;
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
@@ -1642,6 +1643,51 @@ pub fn clear_submitted_request(dir: &Path) -> Result<(), GeectlError> {
         dir,
         "config",
         &["--local", "--unset", "geectl.submitted-request"],
+        &[],
+    )?;
+    if success || stderr.trim().is_empty() {
+        Ok(())
+    } else {
+        Err(git_error("config", stderr.as_bytes()))
+    }
+}
+
+/// Record the pull request filed from the checkout in `dir`: the
+/// Gitea handle from `pull-request submit`, under
+/// `geectl.submitted-pull-request`. A later filing overwrites the
+/// earlier handle: only the live pull request can trigger cleanup.
+pub fn record_submitted_pull_request(
+    dir: &Path,
+    reference: &PullRequestRef,
+) -> Result<(), GeectlError> {
+    git_config_set(dir, "submitted-pull-request", &reference.to_string())
+}
+
+/// The pull request recorded for the checkout in `dir`, if
+/// `pull-request submit` filed one from it. `Ok(None)` when
+/// nothing was recorded. A recorded value that is not a
+/// pull-request handle is an error: the record is geectl's own,
+/// so a corrupt value means the checkout record is broken, not
+/// something to silently ignore.
+pub fn submitted_pull_request(dir: &Path) -> Result<Option<PullRequestRef>, GeectlError> {
+    let Some(value) = git_config_get(dir, "submitted-pull-request")? else {
+        return Ok(None);
+    };
+    value.parse::<PullRequestRef>().map(Some).map_err(|_| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("geectl.submitted-pull-request value {value:?} is not a pull-request handle"),
+        )
+    })
+}
+
+/// Clear the recorded pull request for the checkout in `dir`,
+/// once its roots are cleaned. A missing key is already clear.
+pub fn clear_submitted_pull_request(dir: &Path) -> Result<(), GeectlError> {
+    let (success, _stdout, stderr) = git_status(
+        dir,
+        "config",
+        &["--local", "--unset", "geectl.submitted-pull-request"],
         &[],
     )?;
     if success || stderr.trim().is_empty() {
@@ -16324,5 +16370,42 @@ mod tests {
         git(&dir.path, "init", &["--quiet"], &[]).unwrap();
         git_config_set(&dir.path, "submitted-request", "not-a-number").unwrap();
         assert!(submitted_request(&dir.path).is_err());
+    }
+
+    #[test]
+    fn submitted_pull_request_round_trip() {
+        let dir = TempDirGuard::new("submitted-pull-request");
+        git(&dir.path, "init", &["--quiet"], &[]).unwrap();
+        assert_eq!(submitted_pull_request(&dir.path).unwrap(), None);
+        let reference = PullRequestRef::Gitea {
+            owner: "openSUSE".to_string(),
+            repo: "geectl".to_string(),
+            number: 122,
+        };
+        record_submitted_pull_request(&dir.path, &reference).unwrap();
+        assert_eq!(
+            submitted_pull_request(&dir.path).unwrap(),
+            Some(reference.clone())
+        );
+        // A later filing overwrites the earlier handle.
+        let later = PullRequestRef::Gitea {
+            owner: "openSUSE".to_string(),
+            repo: "geectl".to_string(),
+            number: 123,
+        };
+        record_submitted_pull_request(&dir.path, &later).unwrap();
+        assert_eq!(submitted_pull_request(&dir.path).unwrap(), Some(later));
+        clear_submitted_pull_request(&dir.path).unwrap();
+        assert_eq!(submitted_pull_request(&dir.path).unwrap(), None);
+        // Clearing an already-clear record is a no-op.
+        clear_submitted_pull_request(&dir.path).unwrap();
+    }
+
+    #[test]
+    fn submitted_pull_request_corrupt_value_errors() {
+        let dir = TempDirGuard::new("submitted-pull-request-corrupt");
+        git(&dir.path, "init", &["--quiet"], &[]).unwrap();
+        git_config_set(&dir.path, "submitted-pull-request", "not-a-handle").unwrap();
+        assert!(submitted_pull_request(&dir.path).is_err());
     }
 }
