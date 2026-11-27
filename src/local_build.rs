@@ -45,7 +45,7 @@
 //! to end.
 //!
 //! Known limits, recorded here rather than hidden:
-//! - The library transport caps response bodies at 10 MiB, so a dep
+//! - The library transport caps response bodies at 100 MiB, so a dep
 //!   RPM over the cap fails closed with a structured error: streaming
 //!   downloads are not supported yet. Small dep sets build end to end.
 
@@ -3780,7 +3780,7 @@ impl<'a> LocalBuild<'a> {
         }
     }
 
-    /// Download one dep RPM. A dep over the transport's 10 MiB body
+    /// Download one dep RPM. A dep over the transport's 100 MiB body
     /// cap streams to a temp file in the cache directory instead of
     /// failing: the bytes never sit in memory at once, and the
     /// streamed file is verified before it lands in the cache (see
@@ -4053,7 +4053,7 @@ impl<'a> LocalBuild<'a> {
 
     /// Download one dep RPM from its mirror URL, streaming
     /// straight to a temp file — the bytes are never held in memory
-    /// whole, and a file over the transport's 10 MiB body cap is
+    /// whole, and a file over the transport's 100 MiB body cap is
     /// not downloaded twice. The streamed file is hdrmd5-verified
     /// against the expected buildinfo digest before it is
     /// returned, so a stale mirror file reads as a mirror failure
@@ -4435,7 +4435,7 @@ impl<'a> LocalBuild<'a> {
 }
 
 /// Whether `e` is the transport's over-cap rejection: the response
-/// body exceeded the 10 MiB read cap (`MAX_BODY_BYTES` in
+/// body exceeded the 100 MiB read cap (`MAX_BODY_BYTES` in
 /// `src/http.rs`, whose message reads "response body exceeds the
 /// N-byte limit"). The match is on the message because the
 /// transport reports the cap as a plain `ServerError`; it is the
@@ -9447,7 +9447,7 @@ mod tests {
     fn is_transport_cap_error_matches_the_cap_message_only() {
         let cap = GeectlError::new(
             ErrorKind::ServerError,
-            "response body exceeds the 10485760-byte limit",
+            format!("response body exceeds the {}-byte limit", crate::http::MAX_BODY_BYTES),
         );
         assert!(is_transport_cap_error(&cap));
         let other = GeectlError::new(ErrorKind::ServerError, "status 500 from the server");
@@ -15445,7 +15445,7 @@ exit 0
 
         #[test]
         fn ensure_cached_streams_an_over_cap_dep_to_disk() {
-            // A dep RPM over the transport's 10 MiB body cap streams
+            // A dep RPM over the transport's 100 MiB body cap streams
             // to disk instead of failing: the direct download hits
             // the cap, the stream writes the file, the hdrmd5
             // verifies, and the cache holds the whole file — with no

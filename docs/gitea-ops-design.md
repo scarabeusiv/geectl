@@ -403,7 +403,7 @@ image, keeping the harness working. Only the fields each operation needs
 are modelled, and public signatures carry typed values only: owners and
 repos as validated names, pull request numbers as `u64`. The `HttpClient`
 trait is reused as-is (`get_with`, `post_json_with`, `patch_json_with`,
-`delete`); transport is the `HttpClient` trait only. The 10 MiB read cap
+`delete`); transport is the `HttpClient` trait only. The 100 MiB read cap
 applies the same way; a Gitea response over it is the same structured
 error as on the OBS side.
 

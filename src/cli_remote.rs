@@ -124,7 +124,7 @@ pub enum RemoteCommand {
     /// of `cat`: the library streams the file to disk instead of
     /// reading it as a UTF-8 string, so a binary file (a source
     /// tarball) downloads instead of failing the UTF-8 check, and a
-    /// file larger than the transport's 10 MiB body cap downloads
+    /// file larger than the transport's 100 MiB body cap downloads
     /// instead of failing. A read: `--live` is ignored, like `cat`.
     Download {
         /// The project the package lives in.

@@ -911,7 +911,7 @@ pub fn run_build(
         } => {
             if all {
                 // One list call plus one streaming download per
-                // file: the streamed download has no 10 MiB cap.
+                // file: the streamed download has no 100 MiB cap.
                 // A file already in the output directory is
                 // skipped and reported, never re-downloaded and
                 // never deleted — a second run into the same

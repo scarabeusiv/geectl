@@ -3660,8 +3660,8 @@ impl<'a> ObsClient<'a> {
     /// Download one built file (`filename`) for `package` in
     /// `repository`/`arch`: the raw bytes. Use it for a binary RPM or
     /// a build artifact by name (`rpmlint.log`). The download is
-    /// capped at 10 MiB by the transport's body limit, like every
-    /// read: a file larger than 10 MiB is an error, not a truncated
+    /// capped at 100 MiB by the transport's body limit, like every
+    /// read: a file larger than 100 MiB is an error, not a truncated
     /// download. Requires OBS credentials. A 404 is an error
     /// (the file does not exist).
     pub fn download_binary(
@@ -3691,7 +3691,7 @@ impl<'a> ObsClient<'a> {
     /// Download one built file (`filename`) for `package` in
     /// `repository`/`arch`, streaming the body to `dest` instead of
     /// buffering it: the byte-download counterpart of
-    /// [`ObsClient::download_binary`], without the transport's 10 MiB
+    /// [`ObsClient::download_binary`], without the transport's 100 MiB
     /// body cap. Same validation and credentials; the file is created
     /// exclusively, and a failure mid-stream leaves a partial file
     /// for the caller to delete. Returns the bytes written.

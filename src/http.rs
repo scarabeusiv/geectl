@@ -61,9 +61,9 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// single attempt end to end (DNS, connect, TLS, headers, body), so a
 /// slow drip that keeps resetting the per-read timeout still ends.
 pub const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
-/// Maximum response body accepted: 10 MiB. A body over this fails with
+/// Maximum response body accepted: 100 MiB. A body over this fails with
 /// `ServerError` instead of growing the process without bound.
-pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
 /// Maximum number of redirects a mirror download follows: the
 /// download mirror answers one redirect to its backing store, and a
 /// chain longer than this is a loop or a misconfiguration, never a
@@ -2610,6 +2610,16 @@ mod tests {
         let data = vec![b'a'; MAX_BODY_BYTES + 1];
         let err = read_body_bytes_capped(std::io::Cursor::new(data)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn body_cap_is_100_mib() {
+        // The cap covers the largest build-results matrix in the
+        // distribution (openSUSE:Factory, ~32 MiB) with headroom,
+        // and large devel projects (devel:languages:python:backports,
+        // ~15 MiB). A smaller cap fails those reads; a larger one
+        // only grows what a hostile server can make geectl hold.
+        assert_eq!(MAX_BODY_BYTES, 100 * 1024 * 1024);
     }
 
     #[test]

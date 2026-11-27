@@ -3020,7 +3020,7 @@ impl<'a> ObsClient<'a> {
     /// (`GET /public/source/<project>/<package>/<file>`), streaming
     /// the body to `dest` instead of buffering it: the binary
     /// counterpart of [`ObsClient::cat`], without the transport's
-    /// 10 MiB body cap and without the UTF-8 check, so a source
+    /// 100 MiB body cap and without the UTF-8 check, so a source
     /// tarball downloads instead of failing. Same validation and
     /// `?rev=` forms as `cat`: a revision number or a srcmd5
     /// ([`RevisionSpec`]), passed verbatim. A public read: no
@@ -11100,7 +11100,7 @@ mod tests {
 
     #[test]
     fn download_source_to_file_streams_a_body_over_the_cap_to_disk() {
-        // A body over the transport's 10 MiB cap streams to disk
+        // A body over the transport's 100 MiB cap streams to disk
         // instead of failing: the point of the streamed download.
         let bytes = vec![b'a'; crate::http::MAX_BODY_BYTES + 1];
         let http = FakeHttp::new().with_get_to_file(

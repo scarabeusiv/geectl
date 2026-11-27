@@ -183,7 +183,7 @@ impl FakeHttp {
     /// rejection: the response body exceeds the `MAX_BODY_BYTES`
     /// limit. Models a body the real transport refuses, so a caller
     /// that falls back to streaming can be tested without serving a
-    /// 10 MiB body.
+    /// 100 MiB body.
     pub(crate) fn with_get_bytes_cap_error(self, url: &str) -> Self {
         self.get_bytes_cap_errors
             .lock()
