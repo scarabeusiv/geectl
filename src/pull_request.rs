@@ -1160,17 +1160,36 @@ impl<'a> PullRequestClient<'a> {
         match reference {
             PullRequestRef::Obs(id) => {
                 let obs = self.obs.ok_or_else(missing_obs_arm)?;
-                obs.add_comment(&id.to_string(), body, parent, dry_run)?;
                 if dry_run.enabled() {
+                    obs.add_comment(&id.to_string(), body, parent, dry_run)?;
                     return Ok(None);
                 }
-                // The POST answers only a status, no id: re-read
-                // the comments and take the newest one by the
-                // acting user with this text — the server appends
-                // in order, so the newest match is the one just
-                // posted. add_comment required credentials; with
-                // a username the acting user is known here, with
-                // an API token the match is by body alone.
+                // The POST answers only a status, no id: the posted
+                // comment is identified by re-reading the list. The
+                // list is read once before the post, and the match
+                // takes the newest comment with this text whose id
+                // is above every id in that baseline — OBS assigns
+                // comment ids in creation order, so the match is the
+                // comment this post created, not an identical body
+                // posted earlier. The baseline read fails closed
+                // before the post: without it the re-read cannot
+                // tell the new comment from an old duplicate.
+                // add_comment required credentials; with a username
+                // the acting user is known here, with an API token
+                // the match is by body alone. The one case this
+                // cannot tell apart is a same-body comment by the
+                // same author landing between the two reads; that
+                // window is the post itself.
+                let baseline = obs.list_comments(&id.to_string()).map_err(|err| {
+                    GeectlError::new(
+                        ErrorKind::ServerError,
+                        format!(
+                            "read of the comments on submit request {id} before commenting failed: {err}"
+                        ),
+                    )
+                })?;
+                let baseline = baseline.iter().map(|comment| comment.id).max();
+                obs.add_comment(&id.to_string(), body, parent, dry_run)?;
                 let author = obs.credentials().username();
                 let comments = obs.list_comments(&id.to_string()).map_err(|err| {
                     GeectlError::new(
@@ -1186,6 +1205,7 @@ impl<'a> PullRequestClient<'a> {
                     .find(|comment| {
                         comment.body == body
                             && author.is_none_or(|author| comment.who == author)
+                            && baseline.is_none_or(|baseline| comment.id > baseline)
                     })
                     .map(|comment| ReviewComment {
                         id: comment.id,
@@ -1205,10 +1225,10 @@ impl<'a> PullRequestClient<'a> {
                             ErrorKind::ServerError,
                             match author {
                                 Some(author) => format!(
-                                    "re-read of the comments on submit request {id} after commenting found no comment by {author} with the posted text"
+                                    "re-read of the comments on submit request {id} after commenting found no new comment by {author} with the posted text"
                                 ),
                                 None => format!(
-                                    "re-read of the comments on submit request {id} after commenting found no comment with the posted text"
+                                    "re-read of the comments on submit request {id} after commenting found no new comment with the posted text"
                                 ),
                             },
                         )
@@ -4658,9 +4678,9 @@ mod tests {
                 "https://api.opensuse.org/comments/request/1398977",
                 "<status code=\"ok\" />",
             )
-            .with_get(
+            .with_get_sequence(
                 "https://api.opensuse.org/comments/request/1398977",
-                &comments_xml(),
+                &["<comments></comments>", &comments_xml()],
             );
         let obs = obs_client(&http);
         let comment = act_client(Some(&obs), None)
@@ -4680,9 +4700,12 @@ mod tests {
                 "https://api.opensuse.org/comments/request/1398977",
                 "<status code=\"ok\" />",
             )
-            .with_get(
+            .with_get_sequence(
                 "https://api.opensuse.org/comments/request/1398977",
-                r#"<comments><comment id="7" who="scarabeus_iv" when="2026-11-22T19:52:58Z">Something else.</comment></comments>"#,
+                &[
+                    "<comments></comments>",
+                    r#"<comments><comment id="7" who="scarabeus_iv" when="2026-11-22T19:52:58Z">Something else.</comment></comments>"#,
+                ],
             );
         let obs = obs_client(&http);
         let err = act_client(Some(&obs), None)
@@ -4691,19 +4714,25 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::ServerError);
         assert!(err
             .to_string()
-            .contains("found no comment by scarabeus_iv with the posted text"));
+            .contains("found no new comment by scarabeus_iv with the posted text"));
     }
 
     #[test]
-    fn comment_obs_re_read_with_a_duplicate_takes_the_newest() {
+    fn comment_obs_re_read_ignores_a_duplicate_older_than_the_baseline() {
+        // The baseline read already carries the older duplicate
+        // (id 7); the re-read adds the new comment (id 9). The
+        // match takes the new one, not the older duplicate.
         let http = FakeHttp::new()
             .with_post(
                 "https://api.opensuse.org/comments/request/1398977",
                 "<status code=\"ok\" />",
             )
-            .with_get(
+            .with_get_sequence(
                 "https://api.opensuse.org/comments/request/1398977",
-                r#"<comments><comment id="7" who="scarabeus_iv" when="2026-11-22T19:52:58Z">Looks good.</comment><comment id="9" who="scarabeus_iv" when="2026-11-22T19:53:58Z">Looks good.</comment></comments>"#,
+                &[
+                    r#"<comments><comment id="7" who="scarabeus_iv" when="2026-11-22T19:52:58Z">Looks good.</comment></comments>"#,
+                    r#"<comments><comment id="7" who="scarabeus_iv" when="2026-11-22T19:52:58Z">Looks good.</comment><comment id="9" who="scarabeus_iv" when="2026-11-22T19:53:58Z">Looks good.</comment></comments>"#,
+                ],
             );
         let obs = obs_client(&http);
         let comment = act_client(Some(&obs), None)
@@ -4725,9 +4754,12 @@ mod tests {
                 "https://api.opensuse.org/comments/request/1398977",
                 "<status code=\"ok\" />",
             )
-            .with_get(
+            .with_get_sequence(
                 "https://api.opensuse.org/comments/request/1398977",
-                r#"<comments><comment id="7" who="someone_else" when="2026-11-22T19:52:58Z">Looks good.</comment></comments>"#,
+                &[
+                    "<comments></comments>",
+                    r#"<comments><comment id="7" who="someone_else" when="2026-11-22T19:52:58Z">Looks good.</comment></comments>"#,
+                ],
             );
         let obs = ObsClient::with_credentials(
             &http,
@@ -4752,9 +4784,12 @@ mod tests {
                 "https://api.opensuse.org/comments/request/1398977",
                 "<status code=\"ok\" />",
             )
-            .with_get(
+            .with_get_sequence(
                 "https://api.opensuse.org/comments/request/1398977",
-                r#"<comments><comment id="7" who="someone_else" when="2026-11-22T19:52:58Z">Something else.</comment></comments>"#,
+                &[
+                    "<comments></comments>",
+                    r#"<comments><comment id="7" who="someone_else" when="2026-11-22T19:52:58Z">Something else.</comment></comments>"#,
+                ],
             );
         let obs = ObsClient::with_credentials(
             &http,
@@ -4769,7 +4804,58 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::ServerError);
         assert!(err
             .to_string()
-            .contains("found no comment with the posted text"));
+            .contains("found no new comment with the posted text"));
+    }
+
+    #[test]
+    fn comment_obs_re_read_with_only_an_older_match_is_a_server_error() {
+        // The only matching comment predates the post: the baseline
+        // already carries it (id 9) and the re-read adds nothing new.
+        // The old newest-match read would have returned it; the
+        // baseline match refuses it.
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/comments/request/1398977",
+                "<status code=\"ok\" />",
+            )
+            .with_get_sequence(
+                "https://api.opensuse.org/comments/request/1398977",
+                &[
+                    r#"<comments><comment id="9" who="scarabeus_iv" when="2026-11-22T19:53:58Z">Looks good.</comment></comments>"#,
+                    r#"<comments><comment id="9" who="scarabeus_iv" when="2026-11-22T19:53:58Z">Looks good.</comment></comments>"#,
+                ],
+            );
+        let obs = obs_client(&http);
+        let err = act_client(Some(&obs), None)
+            .comment(&obs_ref(), "Looks good.", None, &DryRun::new(false))
+            .expect_err("a re-read with only an older match must fail");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err
+            .to_string()
+            .contains("found no new comment by scarabeus_iv with the posted text"));
+    }
+
+    #[test]
+    fn comment_obs_baseline_read_failure_fails_before_posting() {
+        // The baseline read cannot be parsed, so the post never runs:
+        // without the baseline the re-read could not tell the new
+        // comment from an old duplicate.
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/comments/request/1398977",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/comments/request/1398977",
+                "not xml",
+            );
+        let obs = obs_client(&http);
+        let err = act_client(Some(&obs), None)
+            .comment(&obs_ref(), "Looks good.", None, &DryRun::new(false))
+            .expect_err("a failed baseline read must fail");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.to_string().contains("before commenting failed"));
+        assert!(http.post_calls().is_empty());
     }
 
     #[test]
