@@ -5316,6 +5316,15 @@ fn which(path: &Path) -> Option<PathBuf> {
         if candidate.is_file() {
             return Some(candidate);
         }
+        // Windows executables carry a `.exe` suffix: `podman` on
+        // PATH is `podman.exe`, and joining the bare name never
+        // matches it.
+        if cfg!(windows) {
+            let exe = dir.join(path.with_extension("exe"));
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
     }
     None
 }
