@@ -6128,7 +6128,7 @@ _geectl__subcmd__help__subcmd__pull-request__subcmd__withdraw_commands() {
 _geectl__subcmd__help__subcmd__remote_commands() {
     local commands; commands=(
 'cat:Print a source file to standard output. Text only\: the library reads the file as a UTF-8 string, so a binary file fails the call with a server error ("response body is not valid UTF-8") instead of printing bytes' \
-'download:Download a source file to a local path. The binary counterpart of \`cat\`\: the library streams the file to disk instead of reading it as a UTF-8 string, so a binary file (a source tarball) downloads instead of failing the UTF-8 check, and a file larger than the transport'\''s 10 MiB body cap downloads instead of failing. A read\: \`--live\` is ignored, like \`cat\`' \
+'download:Download a source file to a local path. The binary counterpart of \`cat\`\: the library streams the file to disk instead of reading it as a UTF-8 string, so a binary file (a source tarball) downloads instead of failing the UTF-8 check, and a file larger than the transport'\''s 100 MiB body cap downloads instead of failing. A read\: \`--live\` is ignored, like \`cat\`' \
 'list-files:List the files of a package' \
 'list-packages:List the packages of a project' \
 'list-projects:List the top-level projects on the instance' \
@@ -7136,7 +7136,7 @@ _geectl__subcmd__pull-request__subcmd__withdraw_commands() {
 _geectl__subcmd__remote_commands() {
     local commands; commands=(
 'cat:Print a source file to standard output. Text only\: the library reads the file as a UTF-8 string, so a binary file fails the call with a server error ("response body is not valid UTF-8") instead of printing bytes' \
-'download:Download a source file to a local path. The binary counterpart of \`cat\`\: the library streams the file to disk instead of reading it as a UTF-8 string, so a binary file (a source tarball) downloads instead of failing the UTF-8 check, and a file larger than the transport'\''s 10 MiB body cap downloads instead of failing. A read\: \`--live\` is ignored, like \`cat\`' \
+'download:Download a source file to a local path. The binary counterpart of \`cat\`\: the library streams the file to disk instead of reading it as a UTF-8 string, so a binary file (a source tarball) downloads instead of failing the UTF-8 check, and a file larger than the transport'\''s 100 MiB body cap downloads instead of failing. A read\: \`--live\` is ignored, like \`cat\`' \
 'list-files:List the files of a package' \
 'list-packages:List the packages of a project' \
 'list-projects:List the top-level projects on the instance' \
@@ -7273,7 +7273,7 @@ _geectl__subcmd__remote__subcmd__download_commands() {
 _geectl__subcmd__remote__subcmd__help_commands() {
     local commands; commands=(
 'cat:Print a source file to standard output. Text only\: the library reads the file as a UTF-8 string, so a binary file fails the call with a server error ("response body is not valid UTF-8") instead of printing bytes' \
-'download:Download a source file to a local path. The binary counterpart of \`cat\`\: the library streams the file to disk instead of reading it as a UTF-8 string, so a binary file (a source tarball) downloads instead of failing the UTF-8 check, and a file larger than the transport'\''s 10 MiB body cap downloads instead of failing. A read\: \`--live\` is ignored, like \`cat\`' \
+'download:Download a source file to a local path. The binary counterpart of \`cat\`\: the library streams the file to disk instead of reading it as a UTF-8 string, so a binary file (a source tarball) downloads instead of failing the UTF-8 check, and a file larger than the transport'\''s 100 MiB body cap downloads instead of failing. A read\: \`--live\` is ignored, like \`cat\`' \
 'list-files:List the files of a package' \
 'list-packages:List the packages of a project' \
 'list-projects:List the top-level projects on the instance' \
