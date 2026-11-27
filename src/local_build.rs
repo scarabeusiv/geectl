@@ -73,6 +73,7 @@ use std::time::UNIX_EPOCH;
 
 use fs2::FileExt;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::auth::{split_api_url, Credentials};
 use crate::config::Config;
@@ -4671,8 +4672,6 @@ impl BuildContainer {
         // shape mounts no root: the engine builds in the
         // in-container root (see `engine_root`), and the results
         // are copied out to the host root.
-        check_mount_source(&vertical.cache_dir)?;
-        check_mount_source(workdir)?;
         let podman = which(&vertical.podman).ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ImageUnavailable,
@@ -4688,27 +4687,12 @@ impl BuildContainer {
             .saturating_duration_since(std::time::Instant::now())
             .as_secs()
             .max(1);
-        let mut mounts: Vec<String> = vec![
-            format!(
-                "type=bind,src={},target={}",
-                vertical.cache_dir.display(),
-                vertical.cache_dir.display()
-            ),
-            format!(
-                "type=bind,src={},target={}",
-                workdir.display(),
-                workdir.display()
-            ),
+        let mut mounts: Vec<(PathBuf, PathBuf)> = vec![
+            (vertical.cache_dir.clone(), vertical.cache_dir.clone()),
+            (workdir.to_path_buf(), workdir.to_path_buf()),
         ];
-        if privileged {
-            check_mount_source(root)?;
-            if !root.starts_with(&vertical.cache_dir) && root != workdir {
-                mounts.push(format!(
-                    "type=bind,src={},target={}",
-                    root.display(),
-                    root.display()
-                ));
-            }
+        if privileged && !root.starts_with(&vertical.cache_dir) && root != workdir {
+            mounts.push((root.to_path_buf(), root.to_path_buf()));
         }
         // The engine mounts dev, proc, and sys inside the build
         // root, and the default cap set denies those mounts, so
@@ -4724,8 +4708,8 @@ impl BuildContainer {
         let mut cmd = Command::new(&podman);
         cmd.arg("run");
         cmd.args(run_args);
-        for mount in &mounts {
-            cmd.args(["--mount", mount]);
+        for (src, target) in &mounts {
+            cmd.args(bind_mount_args(src, target)?);
         }
         cmd.args([
             "-w",
@@ -7973,7 +7957,7 @@ impl<'a> LocalBuild<'a> {
             });
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-        check_mount_source(&source_dir)?;
+        mount_source(&self.cache_dir, &source_dir)?;
         let image = self.resolve_image(false, timeout_secs, deadline)?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let container =
@@ -8106,7 +8090,7 @@ impl<'a> LocalBuild<'a> {
                 plan: None,
             });
         }
-        check_mount_source(&source_dir).inspect_err(|_| {
+        mount_source(&self.cache_dir, &source_dir).inspect_err(|_| {
             remove_stash(&stash, &self.debug);
         })?;
         let image = self
@@ -8257,7 +8241,7 @@ impl<'a> LocalBuild<'a> {
                 "precommit budget exhausted before pre_checkin.sh; the services ran, the script did not",
             ));
         }
-        check_mount_source(source_dir)?;
+        mount_source(&self.cache_dir, source_dir)?;
         let image = self.resolve_image(false, remaining.as_secs(), deadline)?;
         self.debug.emit(&format!(
             "precommit image: {} digest {}",
@@ -8329,8 +8313,9 @@ const SERVICE_CONTAINER_PIDS_LIMIT: &str = "1024";
 /// a service run with a project known. No CPU cap
 /// is set: the wall-clock timeout already bounds CPU time, and a
 /// fixed CPU count does not scale portably across hosts.
-/// A `,` in the source path is refused: the `--mount` form
-/// splits on `,` with no escape, so the mount cannot carry it.
+/// A `,` in the source path mounts through a stable symlink
+/// instead (see `mount_source`): the `--mount` form splits on
+/// `,` with no escape, so the mount cannot carry the raw path.
 struct ServiceContainer {
     podman: PathBuf,
     name: String,
@@ -8357,14 +8342,31 @@ fn service_install_argv(packages: &[String]) -> Vec<String> {
     argv
 }
 
-/// A source directory the `--mount` form can carry: it holds
-/// no `,`, which splits the comma-separated value with no
-/// escape — podman refuses the fragment as an invalid mount
-/// option. Refusing here names the path instead of letting
-/// the container fail to start. Shared by the service and build
-/// containers.
-fn check_mount_source(source_dir: &Path) -> Result<(), GeectlError> {
-    if source_dir.to_string_lossy().contains(',') {
+/// The mount source for a source directory: the directory itself,
+/// unless it holds a `,`, which splits the comma-separated
+/// `--mount` value with no escape. A comma path mounts through a
+/// stable symlink instead: the link lives under
+/// `<cache>/mount-links/` — inside the cache dir so podman can
+/// see it on every host, including a Mac podman machine, which
+/// shares the home directory but not the temp dir — and is named
+/// by the sha256 of the canonical path, so the same directory
+/// always mounts through the same link and two directories never
+/// share one. The link is created when missing and replaced when
+/// it points anywhere else. The symlink mount covers macOS/Linux
+/// only: on Windows a comma path is refused, as before — every
+/// Windows path carries a drive colon, so neither mount form
+/// carries it anyway.
+fn mount_source(cache_dir: &Path, source_dir: &Path) -> Result<PathBuf, GeectlError> {
+    if !source_dir.to_string_lossy().contains(',') {
+        return Ok(source_dir.to_path_buf());
+    }
+    #[cfg(unix)]
+    {
+        mount_source_symlink(cache_dir, source_dir)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cache_dir;
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
             format!(
@@ -8373,7 +8375,134 @@ fn check_mount_source(source_dir: &Path) -> Result<(), GeectlError> {
             ),
         ));
     }
-    Ok(())
+}
+
+/// The symlink half of [`mount_source`], on a host that has
+/// symlinks: the stable link for a comma path, under
+/// `<cache>/mount-links/`, named by the sha256 of the canonical
+/// path. A link whose target is the cache dir itself would carry
+/// the comma too, so a comma in the cache dir is refused naming
+/// it — there is no comma-free mount path for that directory.
+#[cfg(unix)]
+fn mount_source_symlink(cache_dir: &Path, source_dir: &Path) -> Result<PathBuf, GeectlError> {
+    let canonical = fs::canonicalize(source_dir)
+        .or_else(|_| std::path::absolute(source_dir))
+        .map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot resolve source directory {}: {e}",
+                    source_dir.display()
+                ),
+            )
+        })?;
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    let name: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let link = cache_dir.join("mount-links").join(name);
+    if link.to_string_lossy().contains(',') {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "source directory {} contains a ',' and the cache directory {} does too, so no comma-free mount path exists for it",
+                source_dir.display(),
+                cache_dir.display()
+            ),
+        ));
+    }
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!(
+                    "cannot create the mount-link directory {}: {e}",
+                    parent.display()
+                ),
+            )
+        })?;
+    }
+    if let Ok(metadata) = fs::symlink_metadata(&link) {
+        let points_at_canonical = metadata.file_type().is_symlink()
+            && fs::read_link(&link)
+                .map(|target| target == canonical)
+                .unwrap_or(false);
+        if points_at_canonical {
+            return Ok(link);
+        }
+        fs::remove_file(&link).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot replace the mount link {}: {e}", link.display()),
+            )
+        })?;
+    }
+    match std::os::unix::fs::symlink(&canonical, &link) {
+        Ok(()) => Ok(link),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A concurrent first use created the link first: take
+            // it when it points at the same directory, and refuse
+            // when it points anywhere else.
+            if fs::read_link(&link)
+                .map(|target| target == canonical)
+                .unwrap_or(false)
+            {
+                Ok(link)
+            } else {
+                Err(GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!(
+                        "the mount link {} points at another directory, not {}",
+                        link.display(),
+                        source_dir.display()
+                    ),
+                ))
+            }
+        }
+        Err(e) => Err(GeectlError::new(
+            ErrorKind::InternalError,
+            format!(
+                "cannot create the mount link {} for {}: {e}",
+                link.display(),
+                source_dir.display()
+            ),
+        )),
+    }
+}
+
+/// One bind mount for a `podman run` line: the `--mount` form or
+/// the `-v` form. `--mount` splits its value on `,`, so a path
+/// with a `,` rides as `-v` instead — `-v` splits on `:` and
+/// tolerates commas; a path with both `,` and `:` rides on
+/// neither, and is refused naming both. The build container
+/// mounts at the host paths, so its mounts keep the real paths
+/// as both ends — only the form changes.
+fn bind_mount_args(src: &Path, target: &Path) -> Result<Vec<String>, GeectlError> {
+    let has_comma = src.to_string_lossy().contains(',') || target.to_string_lossy().contains(',');
+    let has_colon = src.to_string_lossy().contains(':') || target.to_string_lossy().contains(':');
+    if has_comma && has_colon {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "mount paths {} and {} contain both ',' and ':'; neither the --mount form nor -v carries both",
+                src.display(),
+                target.display()
+            ),
+        ));
+    }
+    if has_comma {
+        Ok(vec![
+            "-v".to_string(),
+            format!("{}:{}", src.display(), target.display()),
+        ])
+    } else {
+        Ok(vec![
+            "--mount".to_string(),
+            format!(
+                "type=bind,src={},target={}",
+                src.display(),
+                target.display()
+            ),
+        ])
+    }
 }
 
 impl ServiceContainer {
@@ -8386,7 +8515,8 @@ impl ServiceContainer {
     ) -> Result<Self, GeectlError> {
         // Checked at the entry points before any image work; kept
         // here so a future caller cannot build the mount unchecked.
-        check_mount_source(source_dir)?;
+        // A comma path mounts through its stable symlink.
+        let mount_src = mount_source(&vertical.cache_dir, source_dir)?;
         let podman = which(&vertical.podman).ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ImageUnavailable,
@@ -8443,7 +8573,7 @@ impl ServiceContainer {
             "-e",
             &osc_version,
             "--mount",
-            &format!("type=bind,src={},target=/work", source_dir.display()),
+            &format!("type=bind,src={},target=/work", mount_src.display()),
             "-w",
             "/work",
             image,
@@ -10911,6 +11041,66 @@ exit 0
             assert!(!dir.path().join("cache").join("build-roots").exists());
             assert!(setup.http.get_calls().is_empty());
             assert!(setup.http.get_bytes_calls().is_empty());
+        }
+
+        #[test]
+        fn build_container_mount_uses_v_for_a_comma_workdir() {
+            // A comma in the workdir switches that mount to -v,
+            // which splits on `:` and tolerates commas; the cache
+            // mount stays on --mount.
+            let dir = TempDir::new();
+            let (podman, call_log, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), podman);
+            let workdir = dir.path().join("wo,rkdir");
+            fs::create_dir_all(&workdir).unwrap();
+            let root = dir.path().join("root");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let _container =
+                BuildContainer::start(&vertical, &workdir, &root, false, deadline).unwrap();
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            let run_line = log
+                .lines()
+                .find(|l| l.starts_with("run "))
+                .expect("no run call in log");
+            assert!(
+                run_line.contains(&format!("-v {}:{}", workdir.display(), workdir.display())),
+                "run line carries no -v mount for the comma workdir: {run_line}"
+            );
+            assert!(
+                !run_line.contains(&format!(
+                    "src={},target={}",
+                    workdir.display(),
+                    workdir.display()
+                )),
+                "run line still mounts the comma workdir with --mount: {run_line}"
+            );
+        }
+
+        #[test]
+        fn build_container_mount_refuses_a_comma_and_colon_workdir() {
+            // Neither mount form carries both characters, so the
+            // run is refused before any podman call, naming both.
+            let dir = TempDir::new();
+            let (podman, call_log, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), podman);
+            let workdir = dir.path().join("wo,:rkdir");
+            fs::create_dir_all(&workdir).unwrap();
+            let root = dir.path().join("root");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let err = BuildContainer::start(&vertical, &workdir, &root, false, deadline)
+                .map(|_| ())
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.context.contains("both"));
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            assert!(
+                !log.lines().any(|l| l.starts_with("run ")),
+                "podman ran before the refusal: {log}"
+            );
         }
 
         #[test]
@@ -20268,6 +20458,63 @@ exit 0
         }
 
         #[test]
+        fn mount_source_returns_a_comma_free_path_unchanged() {
+            let dir = TempDir::new();
+            let src = dir.path().join("plain");
+            assert_eq!(mount_source(dir.path(), &src).unwrap(), src);
+        }
+
+        #[test]
+        fn mount_source_links_a_comma_path_stably() {
+            let dir = TempDir::new();
+            let cache = dir.path().join("cache");
+            let src = dir.path().join("so,urce");
+            fs::create_dir_all(&src).unwrap();
+            let first = mount_source(&cache, &src).unwrap();
+            assert_ne!(first, src);
+            assert!(!first.to_string_lossy().contains(','));
+            assert_eq!(
+                fs::read_link(&first).unwrap(),
+                fs::canonicalize(&src).unwrap()
+            );
+            // The same directory always mounts through the same
+            // link, and a different comma directory gets its own.
+            assert_eq!(mount_source(&cache, &src).unwrap(), first);
+            let other = dir.path().join("an,other");
+            fs::create_dir_all(&other).unwrap();
+            assert_ne!(mount_source(&cache, &other).unwrap(), first);
+        }
+
+        #[test]
+        fn bind_mount_args_choose_the_form_by_characters() {
+            let plain = Path::new("/a/b");
+            assert_eq!(
+                bind_mount_args(plain, plain).unwrap(),
+                vec![
+                    "--mount".to_string(),
+                    "type=bind,src=/a/b,target=/a/b".to_string(),
+                ]
+            );
+            let comma = Path::new("/a,b");
+            assert_eq!(
+                bind_mount_args(comma, comma).unwrap(),
+                vec!["-v".to_string(), "/a,b:/a,b".to_string(),]
+            );
+            let colon = Path::new("/a:b");
+            assert_eq!(
+                bind_mount_args(colon, colon).unwrap(),
+                vec![
+                    "--mount".to_string(),
+                    "type=bind,src=/a:b,target=/a:b".to_string(),
+                ]
+            );
+            let both = Path::new("/a,:b");
+            let err = bind_mount_args(both, both).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.context.contains("both"));
+        }
+
+        #[test]
         fn service_container_mount_survives_a_colon_in_the_source_path() {
             // The `--mount` form carries the path as one value, so
             // a `:` in the source path cannot split the mount.
@@ -20315,11 +20562,11 @@ exit 0
         }
 
         #[test]
-        fn service_container_mount_refuses_a_comma_in_the_source_path() {
+        fn service_container_mount_symlinks_a_comma_in_the_source_path() {
             // The `--mount` value is comma-separated with no
             // escape: a `,` in the source path splits the mount
-            // and podman refuses the fragment. The run is refused
-            // before any podman call, naming the path.
+            // and podman refuses the fragment. The run mounts the
+            // path through its stable symlink instead, so it runs.
             let dir = TempDir::new();
             let src = dir.path().join("so,urce");
             fs::create_dir_all(&src).unwrap();
@@ -20328,27 +20575,71 @@ exit 0
                 "<services><service name=\"alpha\"/></services>",
             )
             .unwrap();
-            fs::write(src.join("_service:alpha:old"), "stale").unwrap();
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
             let vertical = vertical(&client, dir.path(), podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
-            let err = vertical.service_run(&req).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
-            assert!(
-                err.context.contains(&src.display().to_string()),
-                "refusal names no path: {err}"
-            );
+            let record = vertical.service_run(&req).unwrap();
+            assert_eq!(record.ran.len(), 1);
             let log = fs::read_to_string(&call_log).unwrap_or_default();
-            assert!(
-                !log.lines()
-                    .any(|l| l.starts_with("run ") || l.starts_with("image ")),
-                "podman ran before the refusal: {log}"
+            let run_line = log.lines().find(|l| l.starts_with("run "));
+            let Some(run_line) = run_line else {
+                panic!("no run call in log: {log}");
+            };
+            // The mount carries the stable link, not the raw comma
+            // path — and still the --mount form, no -v.
+            let link = mount_source(&vertical.cache_dir, &src).unwrap();
+            assert_ne!(link, src);
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                fs::canonicalize(&src).unwrap()
             );
             assert!(
-                !src.join(".geectl-service-old").exists(),
-                "refusal left the moved-aside stash behind"
+                run_line.contains(&format!(
+                    "--mount type=bind,src={},target=/work",
+                    link.display()
+                )),
+                "run line carries no symlinked --mount form: {run_line}"
+            );
+            assert!(
+                !run_line.contains(" -v "),
+                "run line uses the -v string form: {run_line}"
+            );
+        }
+
+        #[test]
+        fn service_container_mount_symlinks_a_comma_and_colon_in_the_source_path() {
+            // The link carries neither character, so a path with
+            // both runs too — the service container's target is
+            // fixed, so the link is the whole answer.
+            let dir = TempDir::new();
+            let src = dir.path().join("so,:urce");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let record = vertical.service_run(&req).unwrap();
+            assert_eq!(record.ran.len(), 1);
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            let run_line = log.lines().find(|l| l.starts_with("run "));
+            let Some(run_line) = run_line else {
+                panic!("no run call in log: {log}");
+            };
+            let link = mount_source(&vertical.cache_dir, &src).unwrap();
+            assert!(
+                run_line.contains(&format!(
+                    "--mount type=bind,src={},target=/work",
+                    link.display()
+                )),
+                "run line carries no symlinked --mount form: {run_line}"
             );
         }
 
@@ -20640,9 +20931,9 @@ exit 0
         }
 
         #[test]
-        fn precheckin_refuses_a_comma_in_the_source_path() {
-            // The mount refusal fires before the image resolve:
-            // a comma path fails here, not in the container.
+        fn precheckin_symlinks_a_comma_in_the_source_path() {
+            // A comma path mounts through its stable symlink, so
+            // the script runs instead of refusing.
             let dir = TempDir::new();
             let src = dir.path().join("so,urce");
             fs::create_dir_all(&src).unwrap();
@@ -20652,16 +20943,21 @@ exit 0
             let client = client_with(&http);
             let vertical = vertical(&client, dir.path(), podman);
             let deadline = std::time::Instant::now() + Duration::from_secs(3600);
-            let err = vertical.run_precheckin(&src, deadline, false).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
-            assert!(
-                err.context.contains(&src.display().to_string()),
-                "refusal names no path: {err}"
-            );
+            let outcome = vertical.run_precheckin(&src, deadline, false).unwrap();
+            assert!(outcome.ran);
+            assert_eq!(outcome.exit_code, Some(0));
             let log = fs::read_to_string(&call_log).unwrap_or_default();
+            let run_line = log.lines().find(|l| l.starts_with("run "));
+            let Some(run_line) = run_line else {
+                panic!("no run call in log: {log}");
+            };
+            let link = mount_source(&vertical.cache_dir, &src).unwrap();
             assert!(
-                !log.lines().any(|l| l.starts_with("image ")),
-                "podman ran before the refusal: {log}"
+                run_line.contains(&format!(
+                    "--mount type=bind,src={},target=/work",
+                    link.display()
+                )),
+                "run line carries no symlinked --mount form: {run_line}"
             );
         }
 
@@ -20685,9 +20981,9 @@ exit 0
         }
 
         #[test]
-        fn spec_cleaner_refuses_a_comma_in_the_source_path() {
-            // The mount refusal fires before the image resolve:
-            // a comma path fails here, not in the container.
+        fn spec_cleaner_symlinks_a_comma_in_the_source_path() {
+            // A comma path mounts through its stable symlink, so
+            // the cleaner runs instead of refusing.
             let dir = TempDir::new();
             let src = dir.path().join("so,urce");
             fs::create_dir_all(&src).unwrap();
@@ -20696,18 +20992,22 @@ exit 0
             let http = FakeHttp::new();
             let client = client_with(&http);
             let vertical = vertical(&client, dir.path(), podman);
-            let err = vertical
+            let result = vertical
                 .spec_cleaner(&src, Path::new("foo.spec"), &[], 3600, false)
-                .unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
-            assert!(
-                err.context.contains(&src.display().to_string()),
-                "refusal names no path: {err}"
-            );
+                .unwrap();
+            assert_eq!(result.exit_code, 0);
             let log = fs::read_to_string(&call_log).unwrap_or_default();
+            let run_line = log.lines().find(|l| l.starts_with("run "));
+            let Some(run_line) = run_line else {
+                panic!("no run call in log: {log}");
+            };
+            let link = mount_source(&vertical.cache_dir, &src).unwrap();
             assert!(
-                !log.lines().any(|l| l.starts_with("image ")),
-                "podman ran before the refusal: {log}"
+                run_line.contains(&format!(
+                    "--mount type=bind,src={},target=/work",
+                    link.display()
+                )),
+                "run line carries no symlinked --mount form: {run_line}"
             );
         }
 
