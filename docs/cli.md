@@ -349,7 +349,7 @@ without evaluating trust.
 
 ## `meta` — unified meta write
 
-- `geectl meta set` — Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL. The target selects the backend: `--project` (with `--package` for a package) writes OBS meta, `--repo` writes Gitea repo settings. A mutation: dry-run is the default (only the plan is printed); `--live` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field; key flags: --project <PROJECT>, --package <PACKAGE>, --repo <REPO>, --description <DESCRIPTION>, --url <URL>
+- `geectl meta set` — Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL. The target selects the backend: `--project` (with `--package` for a package) writes OBS meta, `--repo` writes Gitea repo settings. A mutation: dry-run is the default (only the plan is printed); `--live` performs the write. Only the given fields change; the rest of the meta is kept as it is. Clear a field with `--clear description` / `--clear url` instead of setting it; key flags: --project <PROJECT>, --package <PACKAGE>, --repo <REPO>, --description <DESCRIPTION>, --url <URL>, --clear <CLEAR>
 
 ## `changelog` — `.changes` validation and generation
 

@@ -17,9 +17,10 @@
 //! Gitea rename, privacy change, or default-branch change is not
 //! a meta field at all: they stay out of this operation by scope —
 //! the convergent field set is description + URL. A field this
-//! operation does not set is never
-//! touched on either backend, and there is no flag to clear a
-//! field.
+//! operation does not set is never touched on either backend.
+//! `--clear` clears a field instead of setting it: on OBS the
+//! merged meta drops the value, on Gitea the edit sends an empty
+//! string, which the server clears.
 //!
 //! The client holds the two backends side by side, like
 //! `PullRequestClient`: each arm is present only when its client
@@ -103,7 +104,9 @@ impl MetaTarget {
 
 /// The fields a meta write sets: the description and the URL. An
 /// absent field keeps the current value on either backend; on
-/// Gitea an absent field is not sent at all.
+/// Gitea an absent field is not sent at all. A field can be cleared
+/// instead of set: on OBS the merged meta drops the value, on
+/// Gitea the edit sends an empty string, which the server clears.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetaFields {
     /// A short description; omitted when unset.
@@ -111,35 +114,51 @@ pub struct MetaFields {
     /// A URL with more information about the target; the Gitea
     /// `website` on the Gitea arm.
     pub url: Option<String>,
+    /// Clear the description; refused together with `--description`.
+    pub clear_description: bool,
+    /// Clear the URL; refused together with `--url`.
+    pub clear_url: bool,
 }
 
 impl MetaFields {
-    /// True when at least one field is set: a write with nothing
-    /// to write is a no-op, refused before any call.
+    /// True when at least one field is set or cleared: a write
+    /// with nothing to write is a no-op, refused before any call.
     pub fn has_fields(&self) -> bool {
-        self.description.is_some() || self.url.is_some()
+        self.description.is_some() || self.url.is_some() || self.clear_description || self.clear_url
     }
 
-    /// Validate the fields: at least one set, and no field empty
-    /// — there is no flag to clear a field, so an empty value is
-    /// an input error, not a clear.
+    /// Validate the fields: at least one set or cleared, no field
+    /// empty, and no field both set and cleared — an empty value is
+    /// an input error, not a clear; `--clear` is the clear.
     pub fn validate(&self) -> Result<(), GeectlError> {
         if !self.has_fields() {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
-                "meta set needs at least one of --description, --url",
+                "meta set needs at least one of --description, --url, --clear",
+            ));
+        }
+        if self.description.is_some() && self.clear_description {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "--description and --clear description conflict: pass one, not both",
+            ));
+        }
+        if self.url.is_some() && self.clear_url {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "--url and --clear url conflict: pass one, not both",
             ));
         }
         if self.description.as_deref() == Some("") {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
-                "--description must not be empty: there is no flag to clear a field",
+                "--description must not be empty: use --clear description to clear it",
             ));
         }
         if self.url.as_deref() == Some("") {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
-                "--url must not be empty: there is no flag to clear a field",
+                "--url must not be empty: use --clear url to clear it",
             ));
         }
         Ok(())
@@ -153,8 +172,14 @@ impl MetaFields {
         if let Some(description) = &self.description {
             fields.push(format!("description: {description}"));
         }
+        if self.clear_description {
+            fields.push("clear description".to_string());
+        }
         if let Some(url) = &self.url {
             fields.push(format!("url: {url}"));
+        }
+        if self.clear_url {
+            fields.push("clear url".to_string());
         }
         fields
     }
@@ -286,10 +311,18 @@ impl<'a> MetaClient<'a> {
                 let options = RepoEditOptions {
                     description: fields.description.clone(),
                     website: fields.url.clone(),
+                    clear_description: fields.clear_description,
+                    clear_website: fields.clear_url,
                 };
                 let edited = gitea.repo_edit(owner, repo, &options, dry_run)?;
+                // The result carries the cleared value as absent, so
+                // both arms report a clear the same way (null, not
+                // an empty string).
                 let (description, url) = match edited {
-                    Some(repository) => (repository.description, repository.website),
+                    Some(repository) => (
+                        repository.description.filter(|d| !d.is_empty()),
+                        repository.website.filter(|w| !w.is_empty()),
+                    ),
                     None => (fields.description.clone(), fields.url.clone()),
                 };
                 Ok(SetMeta {
@@ -372,8 +405,14 @@ fn merge_project_meta(current: &ProjectMeta, fields: &MetaFields) -> ProjectMeta
     if let Some(description) = &fields.description {
         merged.description = Some(description.clone());
     }
+    if fields.clear_description {
+        merged.description = None;
+    }
     if let Some(url) = &fields.url {
         merged.url = Some(url.clone());
+    }
+    if fields.clear_url {
+        merged.url = None;
     }
     merged
 }
@@ -385,8 +424,14 @@ fn merge_package_meta(current: &PackageMeta, fields: &MetaFields) -> PackageMeta
     if let Some(description) = &fields.description {
         merged.description = Some(description.clone());
     }
+    if fields.clear_description {
+        merged.description = None;
+    }
     if let Some(url) = &fields.url {
         merged.url = Some(url.clone());
+    }
+    if fields.clear_url {
+        merged.url = None;
     }
     merged
 }
@@ -435,7 +480,51 @@ mod tests {
         MetaFields {
             description: description.map(str::to_string),
             url: url.map(str::to_string),
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn validate_accepts_a_clear_only() {
+        let fields = MetaFields {
+            clear_description: true,
+            ..Default::default()
+        };
+        assert!(fields.validate().is_ok());
+        assert!(fields.has_fields());
+        assert_eq!(fields.field_list(), vec!["clear description".to_string()]);
+    }
+
+    #[test]
+    fn validate_refuses_set_and_clear_of_the_same_field() {
+        let fields = MetaFields {
+            description: Some("x".to_string()),
+            clear_description: true,
+            ..Default::default()
+        };
+        let err = fields.validate().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err
+            .to_string()
+            .contains("--description and --clear description conflict"));
+        let fields = MetaFields {
+            url: Some("https://example.com".to_string()),
+            clear_url: true,
+            ..Default::default()
+        };
+        let err = fields.validate().unwrap_err();
+        assert!(err.to_string().contains("--url and --clear url conflict"));
+    }
+
+    #[test]
+    fn validate_refuses_an_empty_value_with_the_clear_pointer() {
+        let fields = MetaFields {
+            description: Some(String::new()),
+            ..Default::default()
+        };
+        let err = fields.validate().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--clear description"));
     }
 
     #[test]
@@ -489,6 +578,43 @@ mod tests {
         assert!(rendered.contains("<lock><enable/></lock>"));
         assert!(rendered.contains("<person userid=\"alice\" role=\"maintainer\"/>"));
         assert!(rendered.contains("<repository name=\"openSUSE_Tumbleweed\">"));
+    }
+
+    #[test]
+    fn obs_project_arm_clears_description_and_keeps_the_rest() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                PROJECT_META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let obs = obs_client(&http);
+        let client = MetaClient::new(Some(&obs), None);
+        let target = MetaTarget::ObsProject {
+            project: "home:scarabeus_iv".to_string(),
+        };
+        let set = client
+            .set_meta(
+                &target,
+                &MetaFields {
+                    clear_description: true,
+                    ..Default::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap();
+        assert_eq!(set.description, None);
+        assert_eq!(set.url, None);
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        let rendered = &puts[0].1;
+        assert!(!rendered.contains("<description>"));
+        assert!(rendered.contains("<title>Old title</title>"));
+        assert!(rendered.contains("<lock><enable/></lock>"));
+        assert!(rendered.contains("<person userid=\"alice\" role=\"maintainer\"/>"));
     }
 
     #[test]
@@ -899,6 +1025,69 @@ mod tests {
                 true
             )]
         );
+    }
+
+    #[test]
+    fn gitea_arm_clears_description_with_an_empty_string() {
+        let http = FakeHttp::new().with_patch(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json("", "https://example.com/systemd"),
+        );
+        let gitea = gitea_client(&http);
+        let client = MetaClient::new(None, Some(&gitea));
+        let target = MetaTarget::GiteaRepo {
+            owner: "pool".to_string(),
+            repo: "systemd".to_string(),
+        };
+        let set = client
+            .set_meta(
+                &target,
+                &MetaFields {
+                    clear_description: true,
+                    ..Default::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap();
+        assert_eq!(set.backend, MetaBackend::Gitea);
+        assert_eq!(set.description, None);
+        assert_eq!(set.url.as_deref(), Some("https://example.com/systemd"));
+        assert_eq!(
+            http.patch_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd".to_string(),
+                r#"{"description":""}"#.to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn gitea_arm_refuses_an_ignored_clear() {
+        // The server echoed the old description after the clear:
+        // the verification in `repo_edit` fails the write instead
+        // of reporting the clear.
+        let http = FakeHttp::new().with_patch(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json("old description", "https://example.com/systemd"),
+        );
+        let gitea = gitea_client(&http);
+        let client = MetaClient::new(None, Some(&gitea));
+        let target = MetaTarget::GiteaRepo {
+            owner: "pool".to_string(),
+            repo: "systemd".to_string(),
+        };
+        let err = client
+            .set_meta(
+                &target,
+                &MetaFields {
+                    clear_description: true,
+                    ..Default::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]

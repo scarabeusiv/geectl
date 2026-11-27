@@ -12,8 +12,9 @@
 //! `--repo` writes Gitea repo settings — and the fields are the
 //! same on either arm: `--description` and `--url` (the repository
 //! website on the Gitea arm). Only the given fields change; the
-//! rest of the meta is kept as it is. There is no flag to clear a
-//! field, and no flag names a field the other backend cannot set:
+//! rest of the meta is kept as it is. `--clear description` /
+//! `--clear url` clears a field instead of setting it, and no flag
+//! names a field the other backend cannot set:
 //! the OBS title, scmsync, devel project, and persons stay on
 //! `remote set-project-meta` / `remote set-package-meta`.
 //!
@@ -60,9 +61,19 @@ pub enum MetaCommand {
     /// writes OBS meta, `--repo` writes Gitea repo settings. A
     /// mutation: dry-run is the default (only the plan is
     /// printed); `--live` performs the write. Only the given
-    /// fields change; the rest of the meta is kept as it is. There
-    /// is no flag to clear a field.
+    /// fields change; the rest of the meta is kept as it is.
+    /// `--clear description` / `--clear url` clears a field
+    /// instead of setting it.
     Set(SetMetaArgs),
+}
+
+/// A field `meta set --clear` can clear. A closed enum: clap
+/// rejects any other spelling at parse time, and the mapping
+/// below cannot silently drop an unknown value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ClearField {
+    Description,
+    Url,
 }
 
 /// Arguments for `meta set`.
@@ -85,6 +96,11 @@ pub struct SetMetaArgs {
     /// Gitea arm.
     #[arg(long)]
     url: Option<String>,
+    /// Clear a field instead of setting it: `description` or
+    /// `url`. Repeatable; refused together with setting the same
+    /// field.
+    #[arg(long, value_enum)]
+    clear: Vec<ClearField>,
 }
 
 /// Run a `meta` command, returning the JSON payload and its text
@@ -106,6 +122,8 @@ pub fn run_meta(
             let fields = MetaFields {
                 description: args.description.clone(),
                 url: args.url.clone(),
+                clear_description: args.clear.contains(&ClearField::Description),
+                clear_url: args.clear.contains(&ClearField::Url),
             };
             fields.validate()?;
             let field_list = fields.field_list();
@@ -368,6 +386,27 @@ mod tests {
     }
 
     #[test]
+    fn meta_set_parses_clear_flags() {
+        let MetaCommand::Set(args) = parse(&[
+            "set",
+            "--project",
+            "home:scarabeus_iv",
+            "--clear",
+            "description",
+            "--clear",
+            "url",
+        ]);
+        assert_eq!(args.clear, vec![ClearField::Description, ClearField::Url]);
+        assert_eq!(args.description, None);
+    }
+
+    #[test]
+    fn meta_set_refuses_an_unknown_clear_field() {
+        let err = parse_err(&["set", "--project", "home:scarabeus_iv", "--clear", "title"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
     fn meta_set_refuses_project_with_repo() {
         let err = parse_err(&[
             "set",
@@ -401,6 +440,7 @@ mod tests {
             repo: None,
             description: Some("New description".to_string()),
             url: None,
+            clear: vec![],
         };
         let err = set_meta_target(&args).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -417,6 +457,7 @@ mod tests {
             repo: Some("pool".to_string()),
             description: Some("New description".to_string()),
             url: None,
+            clear: vec![],
         };
         let err = set_meta_target(&args).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);

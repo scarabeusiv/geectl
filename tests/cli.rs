@@ -6346,7 +6346,14 @@ fn meta_set_help_names_the_target_and_field_flags() {
     let out = geectl().args(["meta", "set", "--help"]).output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    for flag in ["--project", "--package", "--repo", "--description", "--url"] {
+    for flag in [
+        "--project",
+        "--package",
+        "--repo",
+        "--description",
+        "--url",
+        "--clear",
+    ] {
         assert!(text.contains(flag), "meta set --help misses {flag}");
     }
 }
@@ -9967,6 +9974,34 @@ fn copy_package_to_apiurl_same_instance_refuses() {
         "{}",
         value["error"]["context"]
     );
+}
+
+#[test]
+fn meta_set_clear_description_dry_run_plans_without_credentials() {
+    // A dry-run OBS clear plans without credentials, like any
+    // dry-run meta write.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "meta",
+            "set",
+            "--project",
+            "home:foo",
+            "--clear",
+            "description",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["fields"], serde_json::json!(["clear description"]));
+    assert_eq!(value["description"], serde_json::Value::Null);
 }
 
 #[test]
