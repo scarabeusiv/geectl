@@ -3082,7 +3082,7 @@ _arguments "${_arguments_options[@]}" : \
 (search)
 _arguments "${_arguments_options[@]}" : \
 '--backend=[Only this backend (\`obs\` or \`gitea\`). With no backend both arms run, OBS first then Gitea]:BACKEND:(obs gitea)' \
-'*--state=[Only pull requests in these unified states. With none given each arm applies its own default (new/review/declined on OBS, open on Gitea). OBS has no closed state\: \`--state closed\` reads OBS declined requests, which report as \`declined\`]:STATE:(open merged declined withdrawn closed superseded deleted)' \
+'*--state=[Only pull requests in these unified states. With none given each arm applies its own default (new/review/declined on OBS, open on Gitea). A state an arm in scope cannot produce is refused\: \`closed\` is never produced by OBS, and no Gitea pull request can ever be \`declined\`, \`withdrawn\`, \`superseded\`, or \`deleted\` — scope the search with \`--backend\` to use those]:STATE:(open merged declined withdrawn closed superseded deleted)' \
 '--creator=[Only pull requests by this author]:CREATOR:_default' \
 '--reviewer=[Only pull requests with review requested of this login. Requires \`--backend gitea\`. Only the token owner'\''s login\: the server filters review requests for the authenticated user only]:REVIEWER:_default' \
 '--repo=[Only pull requests in this Gitea repo (\`owner/repo\`). Requires \`--backend gitea\`]:REPO:_default' \

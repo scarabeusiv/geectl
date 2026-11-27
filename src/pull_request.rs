@@ -760,6 +760,41 @@ impl PullRequestSearch {
                 "a reviewer-scoped search needs backend gitea: the OBS arm has no reviewer filter",
             ));
         }
+        // A state filter only reads as the states it names when
+        // every arm in scope can produce them: a state an in-scope
+        // arm cannot produce would return arm-skewed results
+        // instead of the filter — OBS has no closed state (its
+        // declined requests read as declined), and no Gitea pull
+        // request can ever be declined, withdrawn, superseded, or
+        // deleted. Reject the filter and name the backend to scope
+        // to, instead of running it.
+        if self.states.contains(&PullRequestStatus::Closed)
+            && (self.backend.is_none() || self.backend == Some(PullRequestBackend::Obs))
+        {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "--state closed is never produced by OBS: OBS has no closed state; its declined requests read as declined — scope the search with --backend gitea",
+            ));
+        }
+        for state in [
+            PullRequestStatus::Declined,
+            PullRequestStatus::Withdrawn,
+            PullRequestStatus::Superseded,
+            PullRequestStatus::Deleted,
+        ] {
+            if self.states.contains(&state)
+                && (self.backend.is_none() || self.backend == Some(PullRequestBackend::Gitea))
+            {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "--state {} is never produced by Gitea: no Gitea pull request can ever be {} — scope the search with --backend obs",
+                        state.as_str(),
+                        state.as_str(),
+                    ),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -2477,7 +2512,10 @@ fn resolve_cancel(
 /// `declined` (a closed PR reads as declined on OBS, which has no
 /// `closed` state of its own), the rest read as themselves.
 /// `None` is the search default — new/review/declined — so an
-/// empty filter leaves the search unset.
+/// empty filter leaves the search unset. A closed filter never
+/// reaches this mapping through search: `PullRequestSearch::validate`
+/// rejects it when the OBS arm is in scope, so the search never
+/// returns declined items for a closed query.
 fn obs_states_for(states: &[PullRequestStatus]) -> Option<Vec<RequestState>> {
     if states.is_empty() {
         return None;
@@ -3226,25 +3264,37 @@ mod tests {
     }
 
     #[test]
-    fn search_closed_reads_obs_declined() {
-        // OBS has no closed state: `--state closed` reads OBS
-        // declined requests, which report as `declined` — an OBS
-        // search never returns a summary with status `closed`.
-        let collection = format!("<collection matches=\"1\">\n{DELETE_REQUEST_XML}\n</collection>");
-        let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27declined%27%5D",
-            &collection,
-        );
+    fn search_closed_is_refused_when_obs_in_scope() {
+        // OBS has no closed state: a closed filter with the OBS arm
+        // in scope used to read OBS declined requests, which report
+        // as `declined` — the filter never round-tripped. The search
+        // fails as invalid input instead, and names the backend to
+        // scope to. No HTTP call runs: the fake has no canned
+        // responses, so any arm running would fail with a network
+        // error, not the invalid-input error asserted here.
+        let http = FakeHttp::new();
         let obs = obs_client(&http);
-        let client = PullRequestClient::new(Some(&obs), None);
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(Some(&obs), Some(&gitea));
+        for backend in [None, Some(PullRequestBackend::Obs)] {
+            let query = PullRequestSearch {
+                backend,
+                states: vec![PullRequestStatus::Closed],
+                ..Default::default()
+            };
+            let err = client
+                .search(&query)
+                .expect_err("a closed search with the OBS arm in scope must fail");
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("--state closed"));
+        }
+        // Scoped to Gitea, the same filter is fine.
         let query = PullRequestSearch {
-            backend: Some(PullRequestBackend::Obs),
+            backend: Some(PullRequestBackend::Gitea),
             states: vec![PullRequestStatus::Closed],
             ..Default::default()
         };
-        let summaries = client.search(&query).unwrap();
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].status, PullRequestStatus::Declined);
+        assert!(query.validate().is_ok());
     }
 
     #[test]
@@ -5709,5 +5759,66 @@ please fix this</comment></comments>"#,
     fn commit_pin_supported_is_gitea_only() {
         assert!(!PullRequestClient::commit_pin_supported(&obs_ref()));
         assert!(PullRequestClient::commit_pin_supported(&gitea_ref()));
+    }
+
+    #[test]
+    fn search_states_a_gitea_arm_cannot_produce_are_refused() {
+        // No Gitea pull request can ever be declined, withdrawn,
+        // superseded, or deleted: a filter naming one with the
+        // Gitea arm in scope fails as invalid input instead of
+        // silently returning nothing from that arm.
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(Some(&obs), Some(&gitea));
+        for state in [
+            PullRequestStatus::Declined,
+            PullRequestStatus::Withdrawn,
+            PullRequestStatus::Superseded,
+            PullRequestStatus::Deleted,
+        ] {
+            for backend in [None, Some(PullRequestBackend::Gitea)] {
+                let query = PullRequestSearch {
+                    backend,
+                    states: vec![state],
+                    ..Default::default()
+                };
+                let err = client
+                    .search(&query)
+                    .expect_err("a state the Gitea arm cannot produce must fail with it in scope");
+                assert_eq!(err.kind(), ErrorKind::InvalidInput);
+                assert!(err.to_string().contains(state.as_str()));
+            }
+            // Scoped to OBS, the same state is fine.
+            let query = PullRequestSearch {
+                backend: Some(PullRequestBackend::Obs),
+                states: vec![state],
+                ..Default::default()
+            };
+            assert!(query.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn search_states_both_arms_can_produce_are_accepted() {
+        for states in [
+            vec![],
+            vec![PullRequestStatus::Open],
+            vec![PullRequestStatus::Merged],
+            vec![PullRequestStatus::Open, PullRequestStatus::Merged],
+        ] {
+            for backend in [
+                None,
+                Some(PullRequestBackend::Obs),
+                Some(PullRequestBackend::Gitea),
+            ] {
+                let query = PullRequestSearch {
+                    backend,
+                    states: states.clone(),
+                    ..Default::default()
+                };
+                assert!(query.validate().is_ok());
+            }
+        }
     }
 }

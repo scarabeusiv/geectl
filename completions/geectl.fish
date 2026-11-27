@@ -1773,7 +1773,7 @@ complete -c geectl -n "__fish_geectl_using_subcommand pull-request; and __fish_s
 complete -c geectl -n "__fish_geectl_using_subcommand pull-request; and __fish_seen_subcommand_from diff" -s h -l help -d 'Print help'
 complete -c geectl -n "__fish_geectl_using_subcommand pull-request; and __fish_seen_subcommand_from search" -l backend -d 'Only this backend (`obs` or `gitea`). With no backend both arms run, OBS first then Gitea' -r -f -a "obs\t''
 gitea\t''"
-complete -c geectl -n "__fish_geectl_using_subcommand pull-request; and __fish_seen_subcommand_from search" -l state -d 'Only pull requests in these unified states. With none given each arm applies its own default (new/review/declined on OBS, open on Gitea). OBS has no closed state: `--state closed` reads OBS declined requests, which report as `declined`' -r -f -a "open\t''
+complete -c geectl -n "__fish_geectl_using_subcommand pull-request; and __fish_seen_subcommand_from search" -l state -d 'Only pull requests in these unified states. With none given each arm applies its own default (new/review/declined on OBS, open on Gitea). A state an arm in scope cannot produce is refused: `closed` is never produced by OBS, and no Gitea pull request can ever be `declined`, `withdrawn`, `superseded`, or `deleted` — scope the search with `--backend` to use those' -r -f -a "open\t''
 merged\t''
 declined\t''
 withdrawn\t''

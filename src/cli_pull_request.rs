@@ -371,9 +371,11 @@ pub struct SearchArgs {
     backend: Option<String>,
     /// Only pull requests in these unified states. With none given
     /// each arm applies its own default (new/review/declined on
-    /// OBS, open on Gitea). OBS has no closed state: `--state
-    /// closed` reads OBS declined requests, which report as
-    /// `declined`.
+    /// OBS, open on Gitea). A state an arm in scope cannot produce
+    /// is refused: `closed` is never produced by OBS, and no Gitea
+    /// pull request can ever be `declined`, `withdrawn`,
+    /// `superseded`, or `deleted` — scope the search with
+    /// `--backend` to use those.
     #[arg(long, value_parser = [
         "open", "merged", "declined", "withdrawn", "closed", "superseded", "deleted",
     ])]

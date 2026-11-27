@@ -6599,6 +6599,42 @@ fn pull_request_approve_obs_with_commit_is_invalid_input() {
 }
 
 #[test]
+fn pull_request_search_with_closed_state_is_invalid_input() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "search", "--state", "closed"])
+        .output()
+        .unwrap();
+    // InvalidInput exits 2; a closed filter with the OBS arm in
+    // scope is refused before credential resolution, so it fires
+    // without credentials where a plain search would fail with
+    // ConfigError.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("--state closed"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_search_with_declined_state_is_invalid_input() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "search", "--state", "declined"])
+        .output()
+        .unwrap();
+    // InvalidInput exits 2; a declined filter with the Gitea arm
+    // in scope is refused before credential resolution, so it fires
+    // without credentials where a plain search would fail with
+    // ConfigError.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("--state declined"), "stderr: {stderr}");
+}
+
+#[test]
 fn pull_request_merge_gitea_dry_run_prints_forward_plan() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
