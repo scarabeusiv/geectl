@@ -367,16 +367,16 @@ pub enum RequestCommand {
     },
     /// File a change-devel request: change a package's devel project.
     FileChangeDevel {
-        /// The project the package lives in.
+        /// The project holding the new devel package.
         #[arg(long)]
         source_project: String,
-        /// The package whose devel project changes.
+        /// The new devel package.
         #[arg(long)]
         source_package: String,
-        /// The project that becomes the devel project.
+        /// The project holding the package whose devel changes.
         #[arg(long)]
         target_project: String,
-        /// The package in the devel project.
+        /// The package whose devel changes.
         #[arg(long)]
         target_package: String,
         /// The request description. Values starting with `-` are
@@ -3987,22 +3987,22 @@ mod tests {
         assert_eq!(
             file_change_devel_text(
                 Some("123"),
-                "home:alice:branches:test",
-                "foo",
                 "devel:languages:python",
+                "foo",
+                "home:alice:branches:test",
                 "foo"
             ),
-            "filed change-devel request 123 for home:alice:branches:test/foo to devel:languages:python/foo"
+            "filed change-devel request 123 for devel:languages:python/foo to home:alice:branches:test/foo"
         );
         assert_eq!(
             file_change_devel_text(
                 None,
-                "home:alice:branches:test",
-                "foo",
                 "devel:languages:python",
+                "foo",
+                "home:alice:branches:test",
                 "foo"
             ),
-            "dry-run: would file change-devel request for home:alice:branches:test/foo to devel:languages:python/foo"
+            "dry-run: would file change-devel request for devel:languages:python/foo to home:alice:branches:test/foo"
         );
         assert_eq!(
             file_delete_text(Some("123"), "openSUSE:Factory/foo", None),
