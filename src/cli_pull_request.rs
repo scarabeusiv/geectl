@@ -159,7 +159,10 @@ pub enum PullRequestCommand {
     /// directory: an OBS submit request from an OBS-native
     /// checkout, a Gitea pull request from a git-backed one. The
     /// checkout's backend decides; the other arm's flags are
-    /// refused. Dry-run by default; mutates only with `--live`.
+    /// refused, except the submission text: `--title`/`--body`
+    /// work on both arms, and on OBS they compose `--description`
+    /// (the title as the headline, the body after a blank line).
+    /// Dry-run by default; mutates only with `--live`.
     Submit(SubmitArgs),
     /// Clean the local build roots for the submit request filed
     /// from the working copy in the current directory, when that
@@ -173,10 +176,15 @@ pub enum PullRequestCommand {
 }
 
 /// Arguments for `pull-request submit`: the OBS arm's flags and
-/// the Gitea arm's flags in one set, each arm taking its own.
-/// The required flags are enforced per arm, after the checkout's
-/// backend is known: `--target-project`, `--description` and
-/// `--changes-entry` on OBS; `--base` and `--title` on Gitea.
+/// the Gitea arm's flags in one set, each arm taking its own —
+/// except the submission text, which is one pair on both arms:
+/// `--title`/`--body` is the pull request title and body on
+/// Gitea, and on OBS it composes `--description` (the title as
+/// the headline, the body after a blank line). The required flags
+/// are enforced per arm, after the checkout's backend is known:
+/// `--target-project` and `--changes-entry` on OBS, plus
+/// `--description` or `--title`/`--body`; `--base` and `--title`
+/// on Gitea.
 #[derive(Debug, Args)]
 pub struct SubmitArgs {
     /// The project the request targets: the devel project, or
@@ -189,9 +197,11 @@ pub struct SubmitArgs {
     #[arg(long)]
     target_package: Option<String>,
     /// The request description: one headline, then `- ` lines for
-    /// staging, needs, and rebuilds. OBS only; required there.
-    /// Values starting with `-` are taken literally: a description
-    /// may open with a `- ` bullet.
+    /// staging, needs, and rebuilds. OBS only; required there
+    /// unless `--title` is given (the two are spellings of the
+    /// same text — pass one, not both). Values starting with `-`
+    /// are taken literally: a description may open with a `- `
+    /// bullet.
     #[arg(long, allow_hyphen_values = true)]
     description: Option<String>,
     /// The one `.changes` entry for this submission. It must name
@@ -223,12 +233,17 @@ pub struct SubmitArgs {
     /// branch does not take pull requests.
     #[arg(long)]
     base: Option<String>,
-    /// The pull request title. Gitea only; required there. Values
-    /// starting with `-` are taken literally.
+    /// The submission title. On Gitea the pull request title,
+    /// required there; on OBS the headline of the request
+    /// description, in place of `--description`. Values starting
+    /// with `-` are taken literally.
     #[arg(long, allow_hyphen_values = true)]
     title: Option<String>,
-    /// The pull request body. Gitea only. Values starting with `-`
-    /// are taken literally: the body may open with a `- ` bullet.
+    /// The submission body. On Gitea the pull request body; on
+    /// OBS the text after the headline in the request
+    /// description, in place of `--description` together with
+    /// `--title`. Values starting with `-` are taken literally:
+    /// the body may open with a `- ` bullet.
     #[arg(long, allow_hyphen_values = true)]
     body: Option<String>,
     /// Open the pull request as a draft. Gitea only.
@@ -1035,12 +1050,32 @@ fn obs_submit_target(
             "--target-project is required to file an OBS submit request",
         )
     })?;
-    let description = args.description.as_deref().ok_or_else(|| {
-        GeectlError::new(
+    // The submission text has two spellings: the OBS
+    // `--description`, or the shared `--title`/`--body` pair,
+    // which composes it (the title as the headline, the body
+    // after a blank line). One spelling, not both; a body
+    // without a title is not a spelling at all.
+    if args.description.is_some() && (args.title.is_some() || args.body.is_some()) {
+        return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "--description is required to file an OBS submit request",
-        )
-    })?;
+            "pass --description or --title/--body, not both: they are two spellings of the submission text",
+        ));
+    }
+    let description = match args.description.as_deref() {
+        Some(description) => description.to_string(),
+        None => {
+            let title = args.title.as_deref().ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "--description or --title is required to file an OBS submit request",
+                )
+            })?;
+            match args.body.as_deref() {
+                Some(body) => format!("{title}\n\n{body}"),
+                None => title.to_string(),
+            }
+        }
+    };
     let changes_entry = args.changes_entry.as_deref().ok_or_else(|| {
         GeectlError::new(
             ErrorKind::InvalidInput,
@@ -1056,7 +1091,7 @@ fn obs_submit_target(
         &wc.package,
         target_project,
         args.target_package.as_deref().unwrap_or(&wc.package),
-        description,
+        &description,
         changes_entry,
         &cves,
     )?;
@@ -1085,18 +1120,6 @@ fn refuse_gitea_flags(args: &SubmitArgs) -> Result<(), GeectlError> {
         return Err(GeectlError::new(
             ErrorKind::UnsupportedFlagForBackend,
             "--base does not apply to an OBS-native checkout: the target is --target-project",
-        ));
-    }
-    if args.title.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::UnsupportedFlagForBackend,
-            "--title does not apply to an OBS-native checkout: the request takes --description",
-        ));
-    }
-    if args.body.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::UnsupportedFlagForBackend,
-            "--body does not apply to an OBS-native checkout: the request takes --description",
         ));
     }
     if args.draft {
@@ -4189,6 +4212,70 @@ mod tests {
             body: None,
             draft: false,
         }
+    }
+
+    fn obs_submit_args() -> SubmitArgs {
+        SubmitArgs {
+            target_project: Some("home:devel".to_string()),
+            target_package: None,
+            description: None,
+            changes_entry: Some("- Update to 1.1.".to_string()),
+            cve: Vec::new(),
+            without_cleanup: false,
+            repo: None,
+            head: None,
+            base: None,
+            title: None,
+            body: None,
+            draft: false,
+        }
+    }
+
+    fn obs_checkout() -> working_copy::WorkingCopy {
+        working_copy::WorkingCopy {
+            root: std::path::PathBuf::from("/tmp"),
+            project: "home:alice".to_string(),
+            package: "foo".to_string(),
+            apiurl: "https://api.opensuse.org".to_string(),
+            backend: working_copy::Backend::Obs,
+            base_rev: "1".to_string(),
+            base_srcmd5: String::new(),
+            mtimes: Vec::new(),
+            scmsync_url: None,
+            scmsync_branch: None,
+        }
+    }
+
+    #[test]
+    fn obs_submit_target_derives_the_description_from_title_and_body() {
+        let wc = obs_checkout();
+        let mut args = obs_submit_args();
+        args.title = Some("Update foo".to_string());
+        args.body = Some("The body.".to_string());
+        let SubmitTarget::Obs(payload) = obs_submit_target(&args, &wc).unwrap() else {
+            panic!("an OBS checkout files an OBS target");
+        };
+        assert_eq!(payload.description(), "Update foo\n\nThe body.");
+        // A title alone is the whole description.
+        let mut args = obs_submit_args();
+        args.title = Some("Update foo".to_string());
+        let SubmitTarget::Obs(payload) = obs_submit_target(&args, &wc).unwrap() else {
+            panic!("an OBS checkout files an OBS target");
+        };
+        assert_eq!(payload.description(), "Update foo");
+        // Two spellings at once are refused; a body without a
+        // title is not a spelling at all.
+        let mut args = obs_submit_args();
+        args.description = Some("Update foo".to_string());
+        args.title = Some("Update foo".to_string());
+        let err = obs_submit_target(&args, &wc).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not both"));
+        let mut args = obs_submit_args();
+        args.body = Some("The body.".to_string());
+        let err = obs_submit_target(&args, &wc).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--description or --title"));
     }
 
     /// A git-backed checkout for the submit-parts tests: a repo

@@ -7945,6 +7945,52 @@ fn pull_request_submit_obs_dry_run_prints_plan() {
 }
 
 #[test]
+fn pull_request_submit_obs_title_and_body_file_the_description() {
+    let dir = TempDir::new();
+    let addr = serve_once(
+        "<directory name=\"foo\" rev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" vrev=\"1\">\
+        <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />
+        </directory>",
+    );
+    let checkout = obs_submit_checkout(&dir, &format!("http://{addr}"));
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "pull-request",
+            "submit",
+            "--target-project",
+            "home:devel",
+            "--title",
+            "Update foo",
+            "--body",
+            "The body.",
+            "--changes-entry",
+            "- Update to 1.1.",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    // The shared --title/--body pair files on OBS too: the title
+    // is the description headline, the body follows it (the
+    // derivation itself is covered by the obs_submit_target unit
+    // test); the dry-run plan is the same as the --description
+    // spelling's.
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["reference"], serde_json::Value::Null);
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: file submit request for foo to home:devel"
+    );
+}
+
+#[test]
 fn pull_request_submit_obs_text_dry_run_prints_plan() {
     let dir = TempDir::new();
     let addr = serve_once(
@@ -8399,8 +8445,6 @@ fn pull_request_submit_obs_foreign_flags_are_unsupported_flag() {
         ("--repo", "owner/repo"),
         ("--head", "feature"),
         ("--base", "main"),
-        ("--title", "Update foo"),
-        ("--body", "The body."),
     ] {
         let mut args: Vec<&str> = base.to_vec();
         args.push(flag);
