@@ -2623,6 +2623,16 @@ mod tests {
     }
 
     #[test]
+    fn body_the_size_of_a_large_matrix_is_accepted() {
+        // A body the size of a large build-results matrix
+        // (devel:languages:python:backports, ~15 MiB) is accepted:
+        // it exceeded the old 10 MiB cap, so those reads failed.
+        let data = vec![b'a'; 15 * 1024 * 1024];
+        let body = read_body_bytes_capped(std::io::Cursor::new(data)).unwrap();
+        assert_eq!(body.len(), 15 * 1024 * 1024);
+    }
+
+    #[test]
     fn get_to_file_streams_a_body_over_the_cap_to_disk() {
         // A body over the cap streams to disk through `get_to_file`:
         // the bytes land whole, and the returned count is the file's
