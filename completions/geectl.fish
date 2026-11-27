@@ -1393,7 +1393,7 @@ manualrun\t''
 precommit\t''
 localrun\t''
 disabledrun\t''"
-complete -c geectl -n "__fish_geectl_using_subcommand local-build; and __fish_seen_subcommand_from service-run" -l service -d 'Run only this service, with the run mode forced as its mode' -r
+complete -c geectl -n "__fish_geectl_using_subcommand local-build; and __fish_seen_subcommand_from service-run" -l service -d 'Run only this service: it must be defined in the `_service` file and selected by the run mode — naming a service selects it, it does not force its mode' -r
 complete -c geectl -n "__fish_geectl_using_subcommand local-build; and __fish_seen_subcommand_from service-run" -l project -d 'The OBS project the services validate against: in a git checkout it names the parent project, in an OBS checkout it defaults to the checkout\'s project, and a value that disagrees with the checkout refuses' -r
 complete -c geectl -n "__fish_geectl_using_subcommand local-build; and __fish_seen_subcommand_from service-run" -l timeout-secs -d 'Timeout in seconds for the whole run' -r
 complete -c geectl -n "__fish_geectl_using_subcommand local-build; and __fish_seen_subcommand_from service-run" -l format -d 'Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json`' -r -f -a "json\t''

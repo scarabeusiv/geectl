@@ -596,8 +596,12 @@ pub struct ServiceRunRequest {
     pub source_dir: PathBuf,
     /// The mode filter.
     pub mode: ServiceRunMode,
-    /// Run only this service, with its stored mode forced to the
-    /// run mode. `None` runs every service the mode selects.
+    /// Run only this service: it must be defined in the
+    /// `_service` file, and its stored mode must be one the run
+    /// mode selects. Naming a service selects it; it does not
+    /// force its mode — like the server trigger, which fails
+    /// closed on an undefined name. `None` runs every service the
+    /// mode selects.
     pub service: Option<String>,
     /// The OBS project the services validate against, from
     /// `--project`: in a git checkout it names the parent
@@ -8529,10 +8533,14 @@ fn read_local_services(source_dir: &Path) -> Result<Vec<ServiceDef>, GeectlError
 }
 
 /// Select the services a run executes, in file order. A
-/// single-service run executes only that service: when the file
-/// defines it, with its parameters and the run mode forced as its
-/// mode; when it does not, with no parameters and the run mode as
-/// its mode. Any other run filters the file's services by the run
+/// single-service run executes only that service: it must be
+/// defined in the file, with its parameters and its stored mode —
+/// naming a service selects it, it does not force its mode, so
+/// the mode filter applies to the named service exactly as to
+/// every other service. An undefined name fails closed, like the
+/// server trigger; a named service the mode would not select
+/// refuses instead of running under a forced mode or running
+/// nothing. Any other run filters the file's services by the run
 /// mode.
 fn select_services(
     definitions: &[ServiceDef],
@@ -8547,18 +8555,30 @@ fn select_services(
                 format!("invalid service name {name:?}: at least 3 characters, no '/'",),
             ));
         }
-        let effective_mode = callmode.unwrap_or_default().to_string();
-        if let Some(def) = definitions.iter().find(|d| d.name == name) {
-            return Ok(vec![SelectedService {
-                name: def.name.clone(),
-                effective_mode,
-                params: def.params.clone(),
-            }]);
+        let Some(def) = definitions.iter().find(|d| d.name == name) else {
+            return Err(GeectlError::new(
+                ErrorKind::NotFound,
+                format!("service {name} is not defined in the _service file"),
+            ));
+        };
+        if !service_selected(&def.mode, callmode) {
+            let stored = if def.mode.is_empty() {
+                "no stored mode".to_string()
+            } else {
+                format!("stored mode {:?}", def.mode)
+            };
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "service {name} has {stored} and a `{}` does not select it: the mode filter applies to the named service too",
+                    mode.command_name()
+                ),
+            ));
         }
         return Ok(vec![SelectedService {
-            name: name.to_string(),
-            effective_mode,
-            params: Vec::new(),
+            name: def.name.clone(),
+            effective_mode: def.mode.clone(),
+            params: def.params.clone(),
         }]);
     }
     Ok(definitions
@@ -19658,7 +19678,7 @@ exit 0
         }
 
         #[test]
-        fn select_services_filters_by_mode_and_forces_single() {
+        fn select_services_filters_by_mode_and_selects_single() {
             let defs = service_defs();
             let names = |services: Vec<SelectedService>| {
                 services.into_iter().map(|s| s.name).collect::<Vec<_>>()
@@ -19683,20 +19703,31 @@ exit 0
                 names(select_services(&defs, ServiceRunMode::LocalRun, None).unwrap()),
                 vec!["plain", "trylocalsvc", "serversvc"]
             );
-            // A single-service run forces the run mode, keeping the
-            // stored parameters: a manual service runs under a
-            // plain `run` when named.
-            let single = select_services(&defs, ServiceRunMode::Run, Some("manualsvc")).unwrap();
+            // A single-service run keeps the stored mode: a
+            // manual service runs under `manualrun` when named,
+            // with its stored mode, not the run mode forced.
+            let single =
+                select_services(&defs, ServiceRunMode::ManualRun, Some("manualsvc")).unwrap();
             assert_eq!(single.len(), 1);
             assert_eq!(single[0].name, "manualsvc");
-            assert_eq!(single[0].effective_mode, "");
-            // A service the file does not define runs with no
-            // parameters and the run mode as its mode.
-            let single = select_services(&defs, ServiceRunMode::ManualRun, Some("newsvc")).unwrap();
-            assert_eq!(single.len(), 1);
-            assert_eq!(single[0].name, "newsvc");
             assert_eq!(single[0].effective_mode, "manual");
-            assert!(single[0].params.is_empty());
+            // The mode filter applies to the named service too: a
+            // manual service under a plain `run` refuses instead
+            // of running under a forced mode.
+            let err = select_services(&defs, ServiceRunMode::Run, Some("manualsvc")).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("does not select it"), "got: {err}");
+            assert!(
+                err.to_string().contains("a `run` does not select it"),
+                "got: {err}"
+            );
+            // A service the file does not define fails closed,
+            // like the server trigger — no synthesis with empty
+            // parameters.
+            let err =
+                select_services(&defs, ServiceRunMode::ManualRun, Some("newsvc")).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotFound);
+            assert!(err.to_string().contains("not defined"), "got: {err}");
             // A short or slash-carrying name is a caller error.
             assert!(
                 select_services(&defs, ServiceRunMode::Run, Some("ab"))

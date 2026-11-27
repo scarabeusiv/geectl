@@ -2336,7 +2336,7 @@ _arguments "${_arguments_options[@]}" : \
             (service-run)
 _arguments "${_arguments_options[@]}" : \
 '--mode=[The run mode\: run, manualrun, precommit, localrun, disabledrun. \`precommit\` selects only the trylocal/localonly services; it is not the precommit gate and does not run \`pre_checkin.sh\` — use the \`precommit\` leaf for the gate]:MODE:(run manualrun precommit localrun disabledrun)' \
-'--service=[Run only this service, with the run mode forced as its mode]:SERVICE:_default' \
+'--service=[Run only this service\: it must be defined in the \`_service\` file and selected by the run mode — naming a service selects it, it does not force its mode]:SERVICE:_default' \
 '--project=[The OBS project the services validate against\: in a git checkout it names the parent project, in an OBS checkout it defaults to the checkout'\''s project, and a value that disagrees with the checkout refuses]:PROJECT:_default' \
 '--timeout-secs=[Timeout in seconds for the whole run]:TIMEOUT_SECS:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \

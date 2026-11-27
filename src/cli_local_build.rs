@@ -74,8 +74,9 @@ pub enum LocalBuildCommand {
             value_parser = ["run", "manualrun", "precommit", "localrun", "disabledrun"]
         )]
         mode: String,
-        /// Run only this service, with the run mode forced as its
-        /// mode.
+        /// Run only this service: it must be defined in the
+        /// `_service` file and selected by the run mode — naming
+        /// a service selects it, it does not force its mode.
         #[arg(long)]
         service: Option<String>,
         /// The OBS project the services validate against: in a
