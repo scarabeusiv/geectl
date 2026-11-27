@@ -93,9 +93,11 @@ pub enum ChangelogCommand {
         #[arg(short, long)]
         message: Vec<String>,
         /// Prepend the draft into the package's `.changes` file
-        /// instead of printing it. The whole file is normalized
-        /// on write: trailing ASCII whitespace stripped, CRLF→LF,
-        /// legacy encodings transcoded to UTF-8, a BOM stripped.
+        /// instead of printing it. The global `--live` counts as
+        /// `--write`, so a live `generate` rewrites the file too.
+        /// The whole file is normalized on write: trailing ASCII
+        /// whitespace stripped, CRLF→LF, legacy encodings
+        /// transcoded to UTF-8, a BOM stripped.
         /// The write is atomic and refuses a symlink destination,
         /// an unreadable file, or bytes no known encoding decodes.
         /// A file decoded from a guessed single-byte encoding is
@@ -125,9 +127,9 @@ pub fn run_changelog(
     live: bool,
     instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
-    // `changelog` performs no OBS mutation: `--live` is ignored, like
-    // `cat`. `--write` is the explicit local-write flag.
-    let _ = live;
+    // `changelog` performs no OBS mutation. `--write` is the
+    // explicit local-write flag for `generate`; `--live` counts as
+    // `--write` there, so the global confirmation works too.
     match command {
         ChangelogCommand::Validate {
             dir,
@@ -150,6 +152,7 @@ pub fn run_changelog(
             message,
             write,
         } => {
+            let write = write || live;
             // `--author` wins over the whole chain; without it the
             // author resolves through the identity chain (#405).
             let author = match author {

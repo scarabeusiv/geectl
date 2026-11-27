@@ -18,11 +18,11 @@
 //! command prints the plan only (the library dry run) and touches
 //! nothing. With it, the run executes in the container. A failing
 //! service or a failing `pre_checkin.sh` fails the command with a
-//! non-zero exit. One leaf is excepted: `prune` deletes only with
-//! its own `--apply` flag — the plan is the default, and the global
-//! `--live` does not gate it — because the scheduled task runs
-//! exactly `prune --apply` and the leaf's confirmation is the flag
-//! itself.
+//! non-zero exit. One leaf takes its confirmation from its own
+//! `--apply` flag as well as the global `--live`: `prune` deletes
+//! with either — the plan is the default — because the scheduled
+//! task runs exactly `prune --apply` and the leaf's confirmation
+//! is the flag itself.
 //!
 //! Two mutations no flag names still go through the dry-run guard
 //! (`DryRun::allow`): the first live `build` records the
@@ -226,9 +226,9 @@ pub enum LocalBuildCommand {
         root: Option<PathBuf>,
     },
     /// Print the eviction plan (what would be evicted, in order,
-    /// with bytes); delete only with `--apply`. The plan is the
-    /// default: the leaf's own `--apply` is the confirmation, so
-    /// the scheduled
+    /// with bytes); delete only with `--apply` or `--live`. The plan
+    /// is the default: the leaf's own `--apply` is the confirmation,
+    /// so the scheduled
     /// task runs exactly `prune --apply`.
     Prune {
         /// Delete what the plan lists.
@@ -597,15 +597,12 @@ pub fn run_local_build(
             Ok((payload, text))
         }
         LocalBuildCommand::Prune { apply } => {
-            // The leaf's own --apply is the confirmation, not the
-            // global --live: the scheduled task runs exactly
-            // `prune --apply`, and the plan is the default. A
-            // `--live` without `--apply` says so in text, so it
-            // never looks like a deletion that did not happen.
-            // `--apply` is the confirmation, not the global
-            // `--live` — but the deletion still goes through the
-            // dry-run guard, so a plan run records the
-            // would-delete instead of deleting.
+            // `--apply` is the leaf's own confirmation, and `--live`
+            // counts as `--apply`: the scheduled task runs exactly
+            // `prune --apply`, and the plan is the default. The
+            // deletion still goes through the dry-run guard, so a
+            // plan run records the would-delete instead of deleting.
+            let apply = apply || live;
             let dry_run = DryRun::new(!apply);
             let report = if dry_run.allow("delete the local build cache") {
                 vertical.prune_apply()?
@@ -613,11 +610,7 @@ pub fn run_local_build(
                 vertical.prune_plan()?
             };
             let header = format!("cache: {}", vertical.cache_dir().display());
-            let mut text = with_header(&header, render_prune(&report, apply));
-            if let Some(note) = prune_live_note(live, apply) {
-                text.push('\n');
-                text.push_str(note);
-            }
+            let text = with_header(&header, render_prune(&report, apply));
             let payload = json!({
                 "cache_dir": vertical.cache_dir(),
                 "dry_run": !apply,
@@ -990,18 +983,6 @@ fn render_wipe(outcome: &WipeOutcome) -> String {
             outcome.bytes,
             outcome.root.display()
         )
-    }
-}
-
-/// The note appended to prune text when `--live` is passed
-/// without `--apply`: `--live` never deletes here, so a plan that
-/// follows it must say so instead of looking like a deletion that
-/// did not happen.
-fn prune_live_note(live: bool, apply: bool) -> Option<&'static str> {
-    if live && !apply {
-        Some("note: --live does not delete here; use --apply to delete")
-    } else {
-        None
     }
 }
 
@@ -1898,17 +1879,6 @@ mod tests {
              eviction: sccache /cache/sccache/bar (3072 bytes, lru)\n\
              eviction shortfall: 512 bytes"
         );
-    }
-
-    #[test]
-    fn prune_live_note_names_apply_only_without_it() {
-        assert_eq!(
-            prune_live_note(true, false),
-            Some("note: --live does not delete here; use --apply to delete")
-        );
-        assert_eq!(prune_live_note(true, true), None);
-        assert_eq!(prune_live_note(false, false), None);
-        assert_eq!(prune_live_note(false, true), None);
     }
 
     #[test]

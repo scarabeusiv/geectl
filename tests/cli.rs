@@ -9970,25 +9970,34 @@ fn copy_package_to_apiurl_same_instance_refuses() {
 }
 
 #[test]
-fn request_supersede_without_live_refuses() {
-    // The library's raw supersede has no dry-run, so without --live
-    // the command refuses and points at the dry-runnable flow.
+fn request_supersede_without_live_prints_the_plan() {
+    // Without --live the supersede prints its plan like every
+    // mutation: no client is built, so no credentials or network
+    // are needed.
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["request", "supersede", "123", "124"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
-    assert_eq!(value["error"]["code"], "invalid_input");
     assert!(
-        value["error"]["context"]
-            .as_str()
-            .unwrap()
-            .contains("request refile --supersede"),
-        "stderr: {stderr}"
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["old_id"], 123);
+    assert_eq!(value["new_id"], 124);
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: supersede request 123 with 124"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("[dry-run] would: supersede request 123 with 124"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -10790,6 +10799,41 @@ fn changelog_generate_hotfix_message_write_prepends_and_validates() {
         .output()
         .unwrap();
     assert!(out.status.success());
+}
+
+#[test]
+fn changelog_generate_live_counts_as_write() {
+    // The global --live counts as --write for generate: a live
+    // run without --write still prepends the entry.
+    let dir = TempDir::new();
+    let pkg = changelog_fixture(&dir, "- Update to 2.0", true);
+    let before = fs::read_to_string(pkg.join("foo.changes")).unwrap();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "changelog", "generate"])
+        .arg(&pkg)
+        .args([
+            "--author",
+            "Jane Packager <jane@example.com>",
+            "-m",
+            "fix bug123",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = fs::read_to_string(pkg.join("foo.changes")).unwrap();
+    assert!(after.ends_with(&before));
+    let written = parse_changes(&after);
+    let first = written.entries.first().expect("a written entry");
+    let bullets: Vec<String> = first
+        .bullets()
+        .into_iter()
+        .map(|(_, text, _)| text)
+        .collect();
+    assert_eq!(bullets, vec!["- fix bug123"]);
 }
 
 #[test]

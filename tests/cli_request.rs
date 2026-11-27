@@ -1300,6 +1300,26 @@ fn request_refile_maintenance_incident_dry_run_returns_a_null_id() {
 }
 
 #[test]
+fn request_supersede_dry_run_validates_ids_before_planning() {
+    // A malformed, zero, or identical pair must fail in dry-run
+    // too: the plan would otherwise print success for a supersede
+    // the live call refuses.
+    let dir = TempDir::new();
+    for (old_id, new_id) in [("abc", "43"), ("0", "43"), ("42", "0"), ("42", "42")] {
+        let out = geectl_isolated(&dir)
+            .args(["request", "supersede", old_id, new_id])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "ids: {old_id} {new_id}");
+        assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("would: supersede"),
+            "ids: {old_id} {new_id}"
+        );
+    }
+}
+
+#[test]
 fn request_supersede_without_credentials_fails_with_config_error() {
     // With --live the no-dry-run guard passes and the library fails
     // closed: a supersede needs OBS Basic credentials. Without

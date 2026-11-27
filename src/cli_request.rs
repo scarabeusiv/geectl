@@ -19,10 +19,7 @@
 //! `try-change-state` reports `changed` as the would-change answer:
 //! true only when the request exists and is in another state — a
 //! request already in the target state reports `false`, and a
-//! request that does not exist is `not_found`. The one exception is
-//! `request supersede`: the library's raw supersede has no dry-run,
-//! so without `--live` that command refuses — `request refile
-//! --supersede` is the dry-runnable supersede flow.
+//! request that does not exist is `not_found`.
 //!
 //! Credentials in dry-run: this group swallows a half-configured
 //! credential pair in dry-run (the plan prints without credentials;
@@ -69,6 +66,7 @@ use crate::config;
 use crate::debug::{strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{HttpClient, Timeout, UreqClient};
+use crate::obs::request::validate_supersede_ids;
 use crate::obs::{
     AcceptCleanup, AcceptInfo, AddRolePayload, ChangeDevelPayload, CleanupStep, CveId,
     DeletePayload, DeleteTarget, DryRun, FiledRequest, ForwardActionResult, ForwardResult,
@@ -341,9 +339,9 @@ pub enum RequestCommand {
         #[arg(long)]
         supersede: String,
     },
-    /// Supersede one request with another existing one. A mutation
-    /// that needs `--live`; the dry-runnable supersede flow is
-    /// `request refile --supersede`.
+    /// Supersede one request with another existing one. A mutation:
+    /// dry-run is the default (only the plan is printed); `--live`
+    /// performs it.
     Supersede {
         /// The open request being superseded.
         old_id: String,
@@ -905,10 +903,26 @@ pub fn run(
             supersede,
         } => file_maintenance_incident(debug, live, instance, &incident, Some(&supersede)),
         RequestCommand::Supersede { old_id, new_id } => {
-            if !live {
-                return Err(GeectlError::new(
-                    ErrorKind::InvalidInput,
-                    "request supersede has no dry-run: pass --live to perform it, or use `request refile --supersede` for the dry-runnable supersede flow",
+            // The ids are validated before the dry-run branch: a
+            // malformed, zero, or identical pair must fail here,
+            // not plan success and fail only live.
+            validate_supersede_ids(&old_id, &new_id)?;
+            // The library's raw supersede has no dry-run of its own,
+            // so the CLI records the plan here: without `--live` the
+            // plan prints and no client is built, so no credentials
+            // are needed and no network happens.
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            if dry_run.enabled() {
+                dry_run.note(&format!("would: supersede request {old_id} with {new_id}"));
+                let mut payload = json!({
+                    "old_id": request_id_json(&old_id),
+                    "new_id": request_id_json(&new_id),
+                    "dry_run": true,
+                });
+                add_plan(&mut payload, &dry_run);
+                return Ok((
+                    payload,
+                    format!("dry-run: would supersede request {old_id} with {new_id}"),
                 ));
             }
             with_client(debug, true, instance, |client| {
