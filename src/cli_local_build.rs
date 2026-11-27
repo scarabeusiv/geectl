@@ -464,13 +464,12 @@ pub fn run_local_build(
         } => {
             // One invocation does the whole loop: the run-mode
             // service run fetches the sources, the precommit gate
-            // runs the precommit-mode services and pre_checkin.sh,
-            // then the engine builds. A failing pre-step fails the
-            // command before the build runs. The run-mode step
-            // already covers trylocal/localonly services, so the
-            // precommit step runs them a second time; services
-            // regenerate their outputs, so the repeat is a second
-            // run of the same generation, not a second effect.
+            // runs pre_checkin.sh, then the engine builds. A
+            // failing pre-step fails the command before the build
+            // runs. The run-mode step already covers
+            // trylocal/localonly services, so the gate skips them
+            // (see `skip_services`): the union runs once, and the
+            // record names the skipped services.
             // The request is built and validated first: a bad
             // coordinate (project, repo, arch, timeout) fails
             // before any service runs or script executes — the
@@ -528,6 +527,7 @@ pub fn run_local_build(
                 timeout_secs,
                 deadline,
                 !live,
+                true,
             )?;
             let record = vertical.build_with_deadline(&build_req, deadline)?;
             let mut header = format!(
@@ -816,6 +816,13 @@ fn render_service_run(record: &ServiceRunRecord) -> String {
 /// not evaluated on a dry run.
 fn render_precommit(record: &PrecommitRecord) -> String {
     let mut text = render_service_run(&record.services);
+    if !record.services_skipped.is_empty() {
+        text.push('\n');
+        text.push_str(&format!(
+            "services skipped (already ran in the run-mode step): {}",
+            record.services_skipped.join(", ")
+        ));
+    }
     let line = if record.dry_run {
         "pre_checkin.sh: not evaluated (dry run)".to_string()
     } else if record.pre_checkin.ran {
@@ -2132,6 +2139,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
             },
+            services_skipped: vec![],
             dry_run: true,
         };
         let text = render_precommit(&record);
@@ -2152,6 +2160,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
             },
+            services_skipped: vec![],
             dry_run: false,
         };
         let text = render_precommit(&record);
@@ -2167,11 +2176,32 @@ mod tests {
                 plan: None,
             },
             pre_checkin: PrecheckinOutcome {
+                ran: true,
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            services_skipped: vec!["beta".to_string()],
+            dry_run: false,
+        };
+        assert!(render_precommit(&record)
+            .contains("services skipped (already ran in the run-mode step): beta"));
+        let record = PrecommitRecord {
+            services: ServiceRunRecord {
+                mode: "precommit".to_string(),
+                project: None,
+                ran: vec![],
+                image_digest: None,
+                dry_run: false,
+                plan: None,
+            },
+            pre_checkin: PrecheckinOutcome {
                 ran: false,
                 exit_code: None,
                 stdout: String::new(),
                 stderr: String::new(),
             },
+            services_skipped: vec![],
             dry_run: false,
         };
         assert!(render_precommit(&record).contains("pre_checkin.sh: not present"));

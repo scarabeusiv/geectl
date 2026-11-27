@@ -780,6 +780,13 @@ pub struct PrecheckinOutcome {
 pub struct PrecommitRecord {
     pub services: ServiceRunRecord,
     pub pre_checkin: PrecheckinOutcome,
+    /// Precommit-mode services the gate did not re-run because the
+    /// caller already ran them in an earlier run-mode step: the
+    /// run-mode selection covers `trylocal`/`localonly`, so the
+    /// build leaf's gate skips them instead of running the union
+    /// twice. Empty on a standalone gate run.
+    #[serde(default)]
+    pub services_skipped: Vec<String>,
     /// True for a dry run: nothing was touched.
     pub dry_run: bool,
 }
@@ -7783,7 +7790,7 @@ impl<'a> LocalBuild<'a> {
             ));
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-        self.precommit_with_deadline(source_dir, project, timeout_secs, deadline, dry_run)
+        self.precommit_with_deadline(source_dir, project, timeout_secs, deadline, dry_run, false)
     }
 
     /// The precommit gate against a fixed deadline: the caller
@@ -7792,7 +7799,11 @@ impl<'a> LocalBuild<'a> {
     /// build, so a slow service run leaves less time for the
     /// script instead of the gate taking a fresh full timeout.
     /// `timeout_secs` is the whole-run budget the
-    /// exhausted-budget message names.
+    /// exhausted-budget message names. `skip_services` runs the
+    /// gate after an earlier run-mode service run: the run-mode
+    /// selection already covers `trylocal`/`localonly`, so the
+    /// gate runs no service twice — it records the skipped names
+    /// in `services_skipped` and runs only `pre_checkin.sh`.
     pub fn precommit_with_deadline(
         &self,
         source_dir: &Path,
@@ -7800,6 +7811,7 @@ impl<'a> LocalBuild<'a> {
         timeout_secs: u64,
         deadline: std::time::Instant,
         dry_run: bool,
+        skip_services: bool,
     ) -> Result<PrecommitRecord, GeectlError> {
         if timeout_secs == 0 {
             return Err(GeectlError::new(
@@ -7807,21 +7819,60 @@ impl<'a> LocalBuild<'a> {
                 "precommit timeout must be greater than 0 seconds",
             ));
         }
-        let req = ServiceRunRequest {
-            source_dir: source_dir.to_path_buf(),
-            mode: ServiceRunMode::Precommit,
-            service: None,
-            project: project.map(str::to_string),
-            timeout_secs,
-            dry_run,
+        let (services, services_skipped) = if skip_services {
+            // The run-mode step already ran these services: the
+            // selection still reads, so the record names what was
+            // skipped instead of silently dropping the step. The
+            // project resolves first, like a real run — a bad
+            // project refuses before any service work.
+            let source_dir = std::path::absolute(source_dir).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "cannot resolve source directory {}: {e}",
+                        source_dir.display()
+                    ),
+                )
+            })?;
+            let context = resolve_service_context(&source_dir, project)?;
+            let definitions = read_local_services(&source_dir)?;
+            let skipped = select_services(&definitions, ServiceRunMode::Precommit, None)?
+                .into_iter()
+                .map(|service| service.name)
+                .collect::<Vec<_>>();
+            let services = ServiceRunRecord {
+                mode: ServiceRunMode::Precommit.command_name().to_string(),
+                project: context.project,
+                ran: Vec::new(),
+                image_digest: None,
+                dry_run,
+                plan: if dry_run {
+                    Some(ServiceRunPlan {
+                        image: DEFAULT_IMAGE.to_string(),
+                        services: Vec::new(),
+                    })
+                } else {
+                    None
+                },
+            };
+            (services, skipped)
+        } else {
+            let req = ServiceRunRequest {
+                source_dir: source_dir.to_path_buf(),
+                mode: ServiceRunMode::Precommit,
+                service: None,
+                project: project.map(str::to_string),
+                timeout_secs,
+                dry_run,
+            };
+            (self.service_run_with_deadline(&req, deadline)?, Vec::new())
         };
-        let services = self.service_run_with_deadline(&req, deadline)?;
-        let source_dir = std::path::absolute(&req.source_dir).map_err(|e| {
+        let source_dir = std::path::absolute(source_dir).map_err(|e| {
             GeectlError::new(
                 ErrorKind::InvalidInput,
                 format!(
                     "cannot resolve source directory {}: {e}",
-                    req.source_dir.display()
+                    source_dir.display()
                 ),
             )
         })?;
@@ -7829,6 +7880,7 @@ impl<'a> LocalBuild<'a> {
         Ok(PrecommitRecord {
             services,
             pre_checkin,
+            services_skipped,
             dry_run,
         })
     }
@@ -14775,7 +14827,7 @@ exit 0
             let started = std::time::Instant::now();
             let err = (|| -> Result<BuildRecord, GeectlError> {
                 vertical.service_run_with_deadline(&service_req, deadline)?;
-                vertical.precommit_with_deadline(&src, None, 10, deadline, false)?;
+                vertical.precommit_with_deadline(&src, None, 10, deadline, false, false)?;
                 vertical.build_with_deadline(&build_req, deadline)
             })()
             .unwrap_err();
@@ -14817,7 +14869,7 @@ exit 0
             let started = std::time::Instant::now();
             let err = (|| -> Result<BuildRecord, GeectlError> {
                 vertical.service_run_with_deadline(&service_req, deadline)?;
-                vertical.precommit_with_deadline(&src, None, 10, deadline, false)?;
+                vertical.precommit_with_deadline(&src, None, 10, deadline, false, false)?;
                 vertical.build_with_deadline(&build_req, deadline)
             })()
             .unwrap_err();
@@ -20535,6 +20587,41 @@ exit 0
             assert!(src.join("beta.out").exists());
             assert!(!src.join("_service:alpha:alpha.out").exists());
             assert!(!src.join("gamma.out").exists());
+        }
+
+        #[test]
+        fn precommit_with_deadline_skips_services_after_a_run_mode_step() {
+            // The build leaf's gate: the run-mode step already ran
+            // the trylocal service, so the gate runs only
+            // pre_checkin.sh — the union runs once — and the
+            // record names the skipped service.
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/><service name=\"beta\" mode=\"trylocal\"/><service name=\"gamma\" mode=\"manual\"/></services>",
+            )
+            .unwrap();
+            write_script(
+                &src.join("pre_checkin.sh"),
+                "#!/bin/sh\necho ran > pre_checkin.marker\n",
+            );
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), podman);
+            let deadline = std::time::Instant::now() + Duration::from_secs(3600);
+            let record = vertical
+                .precommit_with_deadline(&src, None, 3600, deadline, false, true)
+                .unwrap();
+            assert!(record.services.ran.is_empty());
+            assert_eq!(record.services_skipped, vec!["beta".to_string()]);
+            assert!(record.pre_checkin.ran);
+            assert_eq!(record.pre_checkin.exit_code, Some(0));
+            assert!(src.join("pre_checkin.marker").exists());
+            // The skipped service did not re-run: no output file.
+            assert!(!src.join("beta.out").exists());
         }
 
         #[test]
