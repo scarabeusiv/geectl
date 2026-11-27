@@ -683,7 +683,9 @@ impl PullRequestSummary {
 
     /// Read a global-search item as the list shape. The search
     /// answer carries no head/base endpoints, so both read empty;
-    /// the repo comes from the item's `repository` block.
+    /// the repo comes from the item's `repository` block. The
+    /// search reads a surviving item back for its endpoints, so
+    /// this shape is the filter input, never the returned summary.
     pub fn from_gitea_issue(issue: &GiteaIssue) -> Result<Self, GeectlError> {
         let (owner, repo) = issue.repository.full_name.split_once('/').ok_or_else(|| {
             GeectlError::new(
@@ -920,7 +922,10 @@ impl<'a> PullRequestClient<'a> {
     /// states, creator, and repo as a backstop, since the
     /// repo-scoped list has no author filter, the search
     /// endpoint has no repo scope, and the wire states do not
-    /// map one-to-one to the unified states. A repo-scoped
+    /// map one-to-one to the unified states. The global
+    /// search reads each surviving pull request back for its
+    /// endpoints, since the search answer carries no head/base.
+    /// A repo-scoped
     /// search needs the Gitea backend; without it the search
     /// fails as invalid input instead of returning unscoped OBS
     /// hits.
@@ -955,11 +960,36 @@ impl<'a> PullRequestClient<'a> {
                     .iter()
                     .map(|pr| PullRequestSummary::from_gitea(owner, repo, pr))
                     .collect::<Result<Vec<_>, _>>()?,
-                _ => gitea
-                    .pr_search_scoped(wire, query.creator.as_deref(), query.reviewer.as_deref())?
-                    .iter()
-                    .map(PullRequestSummary::from_gitea_issue)
-                    .collect::<Result<Vec<_>, _>>()?,
+                _ => {
+                    let mut items = Vec::new();
+                    for issue in &gitea.pr_search_scoped(
+                        wire,
+                        query.creator.as_deref(),
+                        query.reviewer.as_deref(),
+                    )? {
+                        let summary = PullRequestSummary::from_gitea_issue(issue)?;
+                        if !matches_query(&summary, query) {
+                            continue;
+                        }
+                        // The search answer carries no head/base
+                        // endpoints, so the pull request is read
+                        // back to populate its source and target,
+                        // like the repo-scoped list answers them.
+                        // The filter above runs first, so a dropped
+                        // item costs no read.
+                        let PullRequestRef::Gitea {
+                            owner,
+                            repo,
+                            number,
+                        } = summary.reference
+                        else {
+                            unreachable!("a Gitea issue-search item always builds a Gitea ref");
+                        };
+                        let pr = gitea.pr_get(&owner, &repo, number)?;
+                        items.push(PullRequestSummary::from_gitea(&owner, &repo, &pr)?);
+                    }
+                    items
+                }
             };
             items.retain(|summary| matches_query(summary, query));
             summaries.extend(items);
@@ -2599,15 +2629,28 @@ mod tests {
 
     #[test]
     fn search_gitea_searches_globally_and_filters_states() {
-        let http = FakeHttp::new().with_get(
-            "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=all&page=1&limit=50",
-            &format!(
-                "[{}, {}, {}]",
-                issue_json(122, "open", false, "scarabeusiv"),
-                issue_json(123, "closed", true, "scarabeusiv"),
-                issue_json(124, "closed", false, "scarabeusiv"),
-            ),
-        );
+        let merged_123 = PR_JSON
+            .replace("\"number\": 122", "\"number\": 123")
+            .replace("\"state\": \"open\"", "\"state\": \"closed\"")
+            .replace("\"merged\": false", "\"merged\": true");
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=all&page=1&limit=50",
+                &format!(
+                    "[{}, {}, {}]",
+                    issue_json(122, "open", false, "scarabeusiv"),
+                    issue_json(123, "closed", true, "scarabeusiv"),
+                    issue_json(124, "closed", false, "scarabeusiv"),
+                ),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                PR_JSON,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/123",
+                &merged_123,
+            );
         let gitea = gitea_client(&http);
         let client = PullRequestClient::new(None, Some(&gitea));
         let query = PullRequestSearch {
@@ -2628,8 +2671,18 @@ mod tests {
                 number: 123,
             }
         );
-        // The search answer carries no endpoints.
-        assert_eq!(summaries[0].source.repository, "");
+        // The surviving items are read back, so both carry the
+        // endpoints the repo-scoped list answers; the dropped
+        // closed-unmerged item costs no read.
+        assert_eq!(summaries[0].source.repository, "scarabeusiv/geectl");
+        assert_eq!(
+            summaries[0].source.branch.as_deref(),
+            Some("change-review-state")
+        );
+        assert_eq!(summaries[0].target.repository, "openSUSE/geectl");
+        assert_eq!(summaries[0].target.branch.as_deref(), Some("main"));
+        assert_eq!(summaries[1].source.repository, "scarabeusiv/geectl");
+        assert_eq!(summaries[1].target.repository, "openSUSE/geectl");
     }
 
     #[test]
@@ -2637,10 +2690,18 @@ mod tests {
         // The Gitea side of the closed asymmetry: `--state closed`
         // queries the closed wire state and the summaries report
         // as `closed`, unlike the OBS arm, which reports declined.
-        let http = FakeHttp::new().with_get(
-            "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=closed&page=1&limit=50",
-            &format!("[{}]", issue_json(124, "closed", false, "scarabeusiv")),
-        );
+        let closed_124 = PR_JSON
+            .replace("\"number\": 122", "\"number\": 124")
+            .replace("\"state\": \"open\"", "\"state\": \"closed\"");
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=closed&page=1&limit=50",
+                &format!("[{}]", issue_json(124, "closed", false, "scarabeusiv")),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/124",
+                &closed_124,
+            );
         let gitea = gitea_client(&http);
         let client = PullRequestClient::new(None, Some(&gitea));
         let query = PullRequestSearch {
@@ -2651,6 +2712,7 @@ mod tests {
         let summaries = client.search(&query).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].status, PullRequestStatus::Closed);
+        assert_eq!(summaries[0].source.repository, "scarabeusiv/geectl");
     }
 
     #[test]
@@ -2661,14 +2723,22 @@ mod tests {
         // author's pull request too, so the client-side retain
         // is what drops it: an older server silently ignoring
         // `created_by` still answers only the creator.
-        let http = FakeHttp::new().with_get(
-            "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&created_by=plusky&page=1&limit=50",
-            &format!(
-                "[{}, {}]",
-                issue_json(123, "open", false, "plusky"),
-                issue_json(124, "open", false, "scarabeusiv"),
-            ),
-        );
+        let plusky_123 = PR_JSON
+            .replace("\"number\": 122", "\"number\": 123")
+            .replace("\"login\": \"scarabeusiv\"", "\"login\": \"plusky\"");
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&created_by=plusky&page=1&limit=50",
+                &format!(
+                    "[{}, {}]",
+                    issue_json(123, "open", false, "plusky"),
+                    issue_json(124, "open", false, "scarabeusiv"),
+                ),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/123",
+                &plusky_123,
+            );
         let gitea = gitea_client(&http);
         let client = PullRequestClient::new(None, Some(&gitea));
         let query = PullRequestSearch {
@@ -2726,6 +2796,10 @@ mod tests {
             .with_get(
                 "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&page=1&limit=50",
                 &format!("[{}]", issue_json(122, "open", false, "scarabeusiv")),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                PR_JSON,
             );
         let obs = obs_client(&http);
         let gitea = gitea_client(&http);
@@ -2761,10 +2835,15 @@ mod tests {
         assert_eq!(client.search(&query).unwrap().len(), 1);
 
         // Gitea only, no OBS arm at all.
-        let http = FakeHttp::new().with_get(
-            "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&page=1&limit=50",
-            &format!("[{}]", issue_json(122, "open", false, "scarabeusiv")),
-        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&page=1&limit=50",
+                &format!("[{}]", issue_json(122, "open", false, "scarabeusiv")),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                PR_JSON,
+            );
         let gitea = gitea_client(&http);
         let client = PullRequestClient::new(None, Some(&gitea));
         let query = PullRequestSearch {
@@ -2824,6 +2903,7 @@ mod tests {
         // that sent the wrong parameter would answer nothing. The
         // answer carries pull requests whose review was requested
         // of the token owner, whatever their author.
+        let plusky_122 = PR_JSON.replace("\"login\": \"scarabeusiv\"", "\"login\": \"plusky\"");
         let http = FakeHttp::new()
             .with_get(
                 "https://src.opensuse.org/api/v1/user",
@@ -2832,6 +2912,10 @@ mod tests {
             .with_get(
                 "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&review_requested=true&page=1&limit=50",
                 &format!("[{}]", issue_json(122, "open", false, "plusky")),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &plusky_122,
             );
         let gitea = gitea_client(&http);
         let client = PullRequestClient::new(None, Some(&gitea));
@@ -2859,6 +2943,12 @@ mod tests {
             .with_get(
                 "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&created_by=plusky&review_requested=true&page=1&limit=50",
                 &format!("[{}]", issue_json(123, "open", false, "plusky")),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/123",
+                &PR_JSON
+                    .replace("\"number\": 122", "\"number\": 123")
+                    .replace("\"login\": \"scarabeusiv\"", "\"login\": \"plusky\""),
             );
         let gitea = gitea_client(&http);
         let client = PullRequestClient::new(None, Some(&gitea));
@@ -2942,6 +3032,10 @@ mod tests {
                     issue_json(122, "open", false, "plusky"),
                     issue_json_in(123, "open", false, "plusky", "openSUSE/other"),
                 ),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &PR_JSON.replace("\"login\": \"scarabeusiv\"", "\"login\": \"plusky\""),
             );
         let gitea = gitea_client(&http);
         let client = PullRequestClient::new(None, Some(&gitea));
