@@ -47,9 +47,10 @@
 //! remember to check the status.
 
 use crate::auth::{validate_basic, validate_bearer_token, AuthProvider, Credentials};
-use crate::debug::Debug;
+use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::text::decode_mixed_utf8;
+use crate::xml::{scan_tag, xml_unescape, XmlDoc};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
@@ -289,20 +290,7 @@ fn download_io_error(phase: DownloadIoPhase, path: &Path, e: &std::io::Error) ->
 pub trait HttpClient: Sync {
     fn get(&self, url: &str) -> Result<String, GeectlError>;
     fn get_with(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError>;
-    /// GET a URL and return the response body transcoded to UTF-8
-    /// instead of failing the call: the transcoding counterpart
-    /// of [`HttpClient::get_with`]. Only callers whose body is not
-    /// machine-read use it — a build log, which routinely carries
-    /// Latin-1 changelog lines and binary test output, so one bad
-    /// byte must not fail the whole read. Valid UTF-8 passes
-    /// through byte-identical; invalid runs decode as
-    /// Windows-1252 (see [`decode_mixed_utf8`]). API XML/JSON
-    /// bodies stay strict, so a corrupt document still fails
-    /// instead of parsing as mojibake. Same transport guard, same
-    /// retry policy, same body cap as `get_with`. The default
-    /// implementation decodes [`HttpClient::get_bytes`];
-    /// [`UreqClient`] overrides it so the read still asks for XML
-    /// and still reports the response body on the debug channel.
+    /// GET a URL and return the response body transcoded to UTF-8 instead of failing the call: the transcoding counterpart of [`HttpClient::get_with`], for bodies that are not machine-read (a build log), where one bad byte must not fail the whole read.
     fn get_transcoded(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
         Ok(decode_mixed_utf8(&self.get_bytes(url, credentials)?))
     }
@@ -2046,14 +2034,7 @@ fn read_body_bytes_capped(reader: impl Read) -> Result<Vec<u8>, GeectlError> {
     Ok(bytes)
 }
 
-/// Read a response body with a cap, transcoding it to UTF-8:
-/// valid UTF-8 passes through, invalid runs decode as
-/// Windows-1252 (see [`decode_mixed_utf8`]) instead of failing
-/// the call. Only the build-log read uses it (see
-/// [`HttpClient::get_transcoded`]): a log routinely carries bytes
-/// that are not valid UTF-8, and one bad byte must not fail the
-/// whole read. The cap is the same as `read_body_bytes_capped`,
-/// so an over-cap body still fails.
+/// Read a response body with a cap, transcoding it to UTF-8 (see [`decode_mixed_utf8`]): only the build-log read uses it, and the cap is the same as `read_body_bytes_capped`, so an over-cap body still fails.
 fn read_response_body_transcoded(reader: impl Read) -> Result<String, GeectlError> {
     let bytes = read_body_bytes_capped(reader)?;
     Ok(decode_mixed_utf8(&bytes))
@@ -2071,15 +2052,18 @@ enum StatusAction {
 /// (other 4xx) is returned immediately as `InvalidInput` with the
 /// right exit code, instead of collapsing into `ServerError`. 407 is
 /// an auth failure and 410 is a not-found, like 401/403 and 404.
-fn status_action(code: u16, safe_url: &str) -> StatusAction {
+/// `summary` is the server's own diagnosis from the error body (see [`status_summary`]): when present it is appended to the code, so the error names the cause instead of only the URL and status.
+fn status_action(code: u16, safe_url: &str, summary: Option<&str>) -> StatusAction {
+    // The server's diagnosis, when the error body carried one.
+    let suffix = summary.map(|s| format!(": {s}")).unwrap_or_default();
     match code {
         404 => StatusAction::Return(GeectlError::new(
             ErrorKind::NotFound,
-            format!("{safe_url} returned 404"),
+            format!("{safe_url} returned 404{suffix}"),
         )),
         401 | 403 | 407 => StatusAction::Return(GeectlError::new(
             ErrorKind::AuthFailed,
-            format!("{safe_url} returned {code}"),
+            format!("{safe_url} returned {code}{suffix}"),
         )),
         // 409 is a conflict with existing state: the resource the
         // caller tried to create already exists (a fork, a repo).
@@ -2089,37 +2073,37 @@ fn status_action(code: u16, safe_url: &str) -> StatusAction {
         // its target only on AlreadyExists).
         409 => StatusAction::Return(GeectlError::new(
             ErrorKind::AlreadyExists,
-            format!("{safe_url} returned 409"),
+            format!("{safe_url} returned 409{suffix}"),
         )),
         // 408 is the server timing out on the request: retry it as a
         // timeout, not as a caller error.
         408 => StatusAction::Retry(GeectlError::new(
             ErrorKind::Timeout,
-            format!("{safe_url} returned 408"),
+            format!("{safe_url} returned 408{suffix}"),
         )),
         // 410 means the resource is gone for good: the same terminal
         // answer as 404, not a caller error to fix and retry.
         410 => StatusAction::Return(GeectlError::new(
             ErrorKind::NotFound,
-            format!("{safe_url} returned 410"),
+            format!("{safe_url} returned 410{suffix}"),
         )),
         // 429 and 5xx are transient: the server is telling us to wait,
         // or is itself at fault. Retry; if retries run out the caller
         // sees ServerError.
         429 | 500..=599 => StatusAction::Retry(GeectlError::new(
             ErrorKind::ServerError,
-            format!("{safe_url} returned {code}"),
+            format!("{safe_url} returned {code}{suffix}"),
         )),
         // Any other 4xx is the caller's fault: wrong name, wrong flag,
         // wrong method — 409 is handled above, as AlreadyExists.
         // Retrying would not help.
         400..=499 => StatusAction::Return(GeectlError::new(
             ErrorKind::InvalidInput,
-            format!("{safe_url} returned {code}"),
+            format!("{safe_url} returned {code}{suffix}"),
         )),
         _ => StatusAction::Return(GeectlError::new(
             ErrorKind::ServerError,
-            format!("{safe_url} returned {code}"),
+            format!("{safe_url} returned {code}{suffix}"),
         )),
     }
 }
@@ -2131,13 +2115,43 @@ fn status_action(code: u16, safe_url: &str) -> StatusAction {
 /// substring search for that attribute form.
 const SEARCH_RESULT_LIMIT_CODE: &str = "code=\"search_results_exceed_configured_limit\"";
 
+/// The longest `<summary>` kept in an error: a diagnosis, not the body.
+const STATUS_SUMMARY_MAX_CHARS: usize = 1024;
+
+/// The `<summary>` text of an OBS `<status>` error body, if the body parses as one: the root must be a `<status>` element with a `code` attribute and a direct `<summary>` child, and the text is XML-unescaped, stripped of terminal controls, collapsed to one line, and capped.
+fn status_summary(body: &str) -> Option<String> {
+    let doc = XmlDoc::parse(body).ok()?;
+    if doc.root_name() != "status" {
+        return None;
+    }
+    if !doc.root_attr("code").is_some_and(|code| !code.is_empty()) {
+        return None;
+    }
+    let raw = doc.child("summary")?;
+    let (tag_end, self_closing) = scan_tag(&raw, 0)?;
+    if self_closing {
+        return None;
+    }
+    let close = raw.rfind("</summary>")?;
+    let inner = &raw[tag_end..close];
+    if inner.contains('<') {
+        return None;
+    }
+    let summary = strip_terminal_controls(&xml_unescape(inner));
+    let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    let summary: String = summary.chars().take(STATUS_SUMMARY_MAX_CHARS).collect();
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary)
+    }
+}
+
 /// Map a non-2xx status with its response body to an error and a
 /// retry decision. A 403 whose body carries the search result-limit
 /// code is a result-limit refusal, not an auth failure: the caller
 /// narrows the search instead of checking credentials. Any other
-/// status, or a 403 without the marker, maps exactly as
-/// [`status_action`] maps it — the body never changes another
-/// mapping.
+/// status maps as [`status_action`] maps it, with the body's `<summary>` appended when the body parses as an OBS `<status>` document (see [`status_summary`]) — so the error names the cause the server gave, not just the URL and status. A 403 without the marker still maps as an auth failure, summary or not: the marker is the only body-driven mapping change, and the limit refusal keeps its code-only message.
 fn status_action_with_body(code: u16, safe_url: &str, body: &str) -> StatusAction {
     if code == 403 && body.contains(SEARCH_RESULT_LIMIT_CODE) {
         return StatusAction::Return(GeectlError::new(
@@ -2145,7 +2159,7 @@ fn status_action_with_body(code: u16, safe_url: &str, body: &str) -> StatusActio
             format!("{safe_url} returned 403"),
         ));
     }
-    status_action(code, safe_url)
+    status_action(code, safe_url, status_summary(body).as_deref())
 }
 
 /// Read an error response body for the status mapping: capped like
@@ -2273,8 +2287,7 @@ impl HttpClient for UreqClient {
     }
 
     fn get_transcoded(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
-        // The endpoint selection for this read: public or
-        // authenticated, reported once per call, not per attempt.
+        // The endpoint selection for this read: public or authenticated, reported once per call, not per attempt.
         self.debug_endpoint(url, credentials);
         self.get_with_body(
             url,
@@ -2983,12 +2996,7 @@ mod tests {
 
     #[test]
     fn get_transcoded_returns_real_chars_for_non_utf8_body() {
-        // A build log routinely carries bytes that are not valid
-        // UTF-8 (a Latin-1 changelog line, binary test output):
-        // the read transcodes the bad bytes to the characters
-        // they are instead of failing the call. The strict read
-        // still fails on the same body (see
-        // `in_cap_invalid_utf8_is_server_error`).
+        // A build log carrying non-UTF-8 bytes reads instead of failing: the bad bytes transcode to the characters they are.
         let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
             .to_vec();
         response.extend_from_slice(b"Tom\xe1s Chv\xe1tal\n");
@@ -2999,8 +3007,7 @@ mod tests {
             .unwrap();
         assert_eq!(body, "Tom\u{e1}s Chv\u{e1}tal\n");
         let request = server.request().expect("a request arrived");
-        // The transcoded read asks for XML like the strict read:
-        // the log endpoint answers the same either way.
+        // The transcoded read asks for XML like the strict read: the log endpoint answers the same either way.
         let headers = match request.split_once("\r\n\r\n") {
             Some((headers, _)) => headers,
             None => &request,
@@ -3014,8 +3021,7 @@ mod tests {
 
     #[test]
     fn get_transcoded_passes_valid_utf8_through_unchanged() {
-        // Well-formed input is a no-op: the transcoding never
-        // rewrites bytes that are already valid UTF-8.
+        // Well-formed input is a no-op: the transcoding never rewrites bytes that are already valid UTF-8.
         let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
             .to_vec();
         response.extend_from_slice("Tomáš Chvátal\n".as_bytes());
@@ -3029,9 +3035,7 @@ mod tests {
 
     #[test]
     fn get_transcoded_decodes_windows_1252_punctuation() {
-        // Bytes in the 0x80-0x9F range are Windows-1252
-        // punctuation, not Latin-1 controls: a curly quote stays
-        // a curly quote.
+        // Bytes in the 0x80-0x9F range are Windows-1252 punctuation, not Latin-1 controls: a curly quote stays a curly quote.
         let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
             .to_vec();
         response.extend_from_slice(b"\x93quote\x94");
@@ -3064,50 +3068,50 @@ mod tests {
     fn status_codes_map_to_the_right_action() {
         // Not-found and auth failures return immediately.
         assert!(
-            matches!(status_action(404, "u"), StatusAction::Return(e) if e.kind() == ErrorKind::NotFound)
+            matches!(status_action(404, "u", None), StatusAction::Return(e) if e.kind() == ErrorKind::NotFound)
         );
         assert!(
-            matches!(status_action(401, "u"), StatusAction::Return(e) if e.kind() == ErrorKind::AuthFailed)
+            matches!(status_action(401, "u", None), StatusAction::Return(e) if e.kind() == ErrorKind::AuthFailed)
         );
         assert!(
-            matches!(status_action(403, "u"), StatusAction::Return(e) if e.kind() == ErrorKind::AuthFailed)
+            matches!(status_action(403, "u", None), StatusAction::Return(e) if e.kind() == ErrorKind::AuthFailed)
         );
         // 407 is an auth failure; 410 is gone (not-found); 408 retries.
         assert!(
-            matches!(status_action(407, "u"), StatusAction::Return(e) if e.kind() == ErrorKind::AuthFailed)
+            matches!(status_action(407, "u", None), StatusAction::Return(e) if e.kind() == ErrorKind::AuthFailed)
         );
         assert!(
-            matches!(status_action(410, "u"), StatusAction::Return(e) if e.kind() == ErrorKind::NotFound)
+            matches!(status_action(410, "u", None), StatusAction::Return(e) if e.kind() == ErrorKind::NotFound)
         );
         assert!(
-            matches!(status_action(408, "u"), StatusAction::Retry(e) if e.kind() == ErrorKind::Timeout)
+            matches!(status_action(408, "u", None), StatusAction::Retry(e) if e.kind() == ErrorKind::Timeout)
         );
         // Other 4xx are the caller's fault: InvalidInput, no retry.
         assert!(
-            matches!(status_action(400, "u"), StatusAction::Return(e) if e.kind() == ErrorKind::InvalidInput)
+            matches!(status_action(400, "u", None), StatusAction::Return(e) if e.kind() == ErrorKind::InvalidInput)
         );
         assert!(
-            matches!(status_action(405, "u"), StatusAction::Return(e) if e.kind() == ErrorKind::InvalidInput)
+            matches!(status_action(405, "u", None), StatusAction::Return(e) if e.kind() == ErrorKind::InvalidInput)
         );
         assert!(
-            matches!(status_action(422, "u"), StatusAction::Return(e) if e.kind() == ErrorKind::InvalidInput)
+            matches!(status_action(422, "u", None), StatusAction::Return(e) if e.kind() == ErrorKind::InvalidInput)
         );
         // 409 is a conflict with existing state, not a caller
         // fault: AlreadyExists, so a caller can match it
         // specifically instead of treating every InvalidInput as
         // a conflict.
         assert!(
-            matches!(status_action(409, "u"), StatusAction::Return(e) if e.kind() == ErrorKind::AlreadyExists)
+            matches!(status_action(409, "u", None), StatusAction::Return(e) if e.kind() == ErrorKind::AlreadyExists)
         );
         // 429 and 5xx are transient: retry as ServerError.
         assert!(
-            matches!(status_action(429, "u"), StatusAction::Retry(e) if e.kind() == ErrorKind::ServerError)
+            matches!(status_action(429, "u", None), StatusAction::Retry(e) if e.kind() == ErrorKind::ServerError)
         );
         assert!(
-            matches!(status_action(500, "u"), StatusAction::Retry(e) if e.kind() == ErrorKind::ServerError)
+            matches!(status_action(500, "u", None), StatusAction::Retry(e) if e.kind() == ErrorKind::ServerError)
         );
         assert!(
-            matches!(status_action(503, "u"), StatusAction::Retry(e) if e.kind() == ErrorKind::ServerError)
+            matches!(status_action(503, "u", None), StatusAction::Retry(e) if e.kind() == ErrorKind::ServerError)
         );
     }
 
@@ -3145,6 +3149,150 @@ mod tests {
             status_action_with_body(500, "u", limit_body),
             StatusAction::Retry(e) if e.kind() == ErrorKind::ServerError
         ));
+    }
+
+    #[test]
+    fn non_2xx_error_names_the_status_summary() {
+        // A 404 whose body names the cause reads with the cause, not just the code.
+        let body = "<status code=\"404\"><summary>repository 'openSUSE:Factory/standard' has no architecture 'aarch64'</summary><details>not found</details></status>";
+        match status_action_with_body(404, "u", body) {
+            StatusAction::Return(err) => {
+                assert_eq!(err.kind(), ErrorKind::NotFound);
+                assert_eq!(
+                    err.context,
+                    "u returned 404: repository 'openSUSE:Factory/standard' has no architecture 'aarch64'"
+                );
+            }
+            StatusAction::Retry(_) => panic!("a 404 must return, not retry"),
+        }
+    }
+
+    #[test]
+    fn non_2xx_error_without_a_summary_keeps_the_code_only_message() {
+        // A body that is not an OBS <status> document, and an empty summary, leave the message exactly as before.
+        match status_action_with_body(404, "u", "plain text, no status element") {
+            StatusAction::Return(err) => {
+                assert_eq!(err.kind(), ErrorKind::NotFound);
+                assert_eq!(err.context, "u returned 404");
+            }
+            StatusAction::Retry(_) => panic!("a 404 must return, not retry"),
+        }
+        match status_action_with_body(
+            404,
+            "u",
+            "<status code=\"404\"><summary>  </summary></status>",
+        ) {
+            StatusAction::Return(err) => assert_eq!(err.context, "u returned 404"),
+            StatusAction::Retry(_) => panic!("a 404 must return, not retry"),
+        }
+    }
+
+    #[test]
+    fn result_limit_403_keeps_the_code_only_message() {
+        // The search-limit marker still wins over the summary: the limit refusal names the limit, not the body's summary.
+        match status_action_with_body(403, "u", SEARCH_RESULT_LIMIT_BODY) {
+            StatusAction::Return(err) => {
+                assert_eq!(err.kind(), ErrorKind::ResultLimitExceeded);
+                assert_eq!(err.context, "u returned 403");
+            }
+            StatusAction::Retry(_) => panic!("a 403 must return, not retry"),
+        }
+    }
+
+    #[test]
+    fn status_summary_unescapes_entities() {
+        // The summary is XML text: entities unescape like any other server text.
+        assert_eq!(
+            status_summary("<status code=\"400\"><summary>a &amp; b &lt;c&gt;</summary></status>")
+                .as_deref(),
+            Some("a & b <c>")
+        );
+    }
+
+    #[test]
+    fn status_summary_strips_controls_and_collapses_to_one_line() {
+        let body = "<status code=\"400\"><summary>bad \u{1b}[2J input&#27;[1m line\nnext</summary></status>";
+        assert_eq!(
+            status_summary(body).as_deref(),
+            Some("bad [2J input[1m line next")
+        );
+    }
+
+    #[test]
+    fn status_summary_caps_an_oversized_summary() {
+        let long = "x".repeat(10_000);
+        let body = format!("<status code=\"500\"><summary>{long}</summary></status>");
+        let summary = status_summary(&body).expect("a summary is present");
+        assert_eq!(summary.chars().count(), STATUS_SUMMARY_MAX_CHARS);
+        assert!(summary.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn status_summary_rejects_a_statusfoo_element() {
+        assert_eq!(
+            status_summary("<statusfoo code=\"404\"><summary>nope</summary></statusfoo>"),
+            None
+        );
+    }
+
+    #[test]
+    fn status_summary_rejects_a_summary_outside_the_status_element() {
+        assert_eq!(
+            status_summary("<status code=\"404\"></status><summary>outside</summary>"),
+            None
+        );
+    }
+
+    #[test]
+    fn status_summary_rejects_mismatched_and_missing_closes() {
+        assert_eq!(
+            status_summary("<status code=\"404\"><summary>no close</status>"),
+            None
+        );
+        assert_eq!(
+            status_summary("<status code=\"404\"><summary>unclosed"),
+            None
+        );
+    }
+
+    #[test]
+    fn status_summary_ignores_a_summary_in_a_comment_or_cdata() {
+        assert_eq!(
+            status_summary("<status code=\"404\"><!-- <summary>hidden</summary> --></status>"),
+            None
+        );
+        assert_eq!(
+            status_summary("<status code=\"404\"><![CDATA[<summary>hidden</summary>]]></status>"),
+            None
+        );
+        assert_eq!(
+            status_summary("<status code=\"404\"><summary><![CDATA[text]]></summary></status>"),
+            None
+        );
+    }
+
+    #[test]
+    fn status_summary_requires_a_status_code() {
+        assert_eq!(
+            status_summary("<status><summary>no code</summary></status>"),
+            None
+        );
+    }
+
+    #[test]
+    fn get_404_with_status_summary_names_the_cause() {
+        let server = LoopbackServer::serve_status(
+            "<status code=\"404\"><summary>repository 'openSUSE:Factory/standard' has no architecture 'aarch64'</summary></status>",
+            404,
+        );
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let err = client.get(&server.url()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(
+            err.context.contains("has no architecture 'aarch64'"),
+            "context: {}",
+            err.context
+        );
     }
 
     // --- Authenticated-request tests (loopback server, fixture creds) ---
