@@ -6,16 +6,18 @@
 //! backends, with a unified status ([`PullRequestStatus`]). This module
 //! carries the handle, the shapes, and the status mappings.
 
+use crate::auth::Credentials;
 use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{
-    validate_gitea_name, GiteaClient, GiteaComment, GiteaIssue, GiteaMergeMethod, GiteaPullRequest,
-    GiteaPullRequestRef, GiteaPullRequestState, GiteaReview, GiteaReviewEvent, PrCreateOptions,
+    parse_scmsync_url, validate_gitea_name, GiteaClient, GiteaComment, GiteaIssue,
+    GiteaMergeMethod, GiteaPullRequest, GiteaPullRequestRef, GiteaPullRequestState, GiteaReview,
+    GiteaReviewEvent, PrCreateOptions, ScmsyncUrl,
 };
 use crate::http::HttpClient;
 use crate::obs::request::{
-    validate_request_id, Request, RequestAction, RequestSearch, RequestState, ReviewState,
-    ReviewTarget,
+    validate_request_id, AcceptCleanup, AcceptCleanupOutcome, ForwardActionResult, ForwardResult,
+    Request, RequestAction, RequestSearch, RequestState, ReviewState, ReviewTarget,
 };
 use crate::obs::{DryRun, InstanceBuildResults, ObsClient, SrFiling, SrPayload};
 use serde::{Deserialize, Serialize};
@@ -1278,6 +1280,11 @@ impl<'a> PullRequestClient<'a> {
     /// `force` accepts past open reviews on OBS and is refused on
     /// a Gitea ref: the merge API takes no force flag. Returns the
     /// unified status after the merge, or `None` in dry-run.
+    ///
+    /// This is the bare accept/merge: it forwards nothing and
+    /// cleans up nothing. [`merge_with_forward`](Self::merge_with_forward)
+    /// is the full verb — the forward and the branch-home cleanup
+    /// with it.
     pub fn merge(
         &self,
         reference: &PullRequestRef,
@@ -1317,6 +1324,447 @@ impl<'a> PullRequestClient<'a> {
                 self.status_after_act(reference, dry_run)
             }
         }
+    }
+
+    /// Merge a pull request with the forward and the branch-home
+    /// cleanup: the full verb the CLI performs, for library
+    /// consumers that must not silently drop either. On OBS the
+    /// merge accepts, then cleans up the branch homes it merged
+    /// and forwards the accepted request to its link parent; on
+    /// Gitea the forward is resolved and validated before the
+    /// merge lands (a missing OBS credential, an ambiguous or
+    /// unforwardable package, or a refused hop fails with the pull
+    /// request still open), then the merge lands, the branch home
+    /// is cleaned up, and the merged pull request is forwarded to
+    /// its link parent. `options.forward` is the `--no-forward`
+    /// switch (Gitea only; the OBS arm refuses it off and always
+    /// forwards): with it off there is no preflight and no
+    /// forward. A forward that
+    /// fails after the merge landed is an error naming the landed
+    /// merge: the merge stands, nothing is declined, and the
+    /// forward stays retryable by a direct submit from the devel
+    /// project. A cleanup that cannot run is never an error: it is
+    /// reported in the outcome. In dry-run nothing merges, so
+    /// nothing is forwarded either — the outcome records the
+    /// forward as planned.
+    pub fn merge_with_forward(
+        &self,
+        reference: &PullRequestRef,
+        options: &MergeOptions<'_>,
+        dry_run: &DryRun,
+    ) -> Result<MergeOutcome, GeectlError> {
+        match reference {
+            PullRequestRef::Obs(id) => {
+                if let Some(method) = options.method {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "--method {} does not apply to an OBS submit request: OBS has no merge style",
+                            method.as_str()
+                        ),
+                    ));
+                }
+                if !options.forward {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        "--no-forward does not apply to an OBS submit request: the merge always forwards after accepting",
+                    ));
+                }
+                let obs = self.obs.ok_or_else(missing_obs_arm)?;
+                let status =
+                    self.merge(reference, options.comment, None, options.force, dry_run)?;
+                // The cleanup runs with its own dry-run mode so its
+                // plan lines stay with the cleanup outcome, like
+                // the accept-time cleanup's — never in the merge's
+                // own plan.
+                let cleanup_dry_run = DryRun::new(dry_run.enabled()).with_debug(self.debug.clone());
+                let cleanup = match obs.cleanup_accepted_request(&id.to_string(), &cleanup_dry_run)
+                {
+                    Ok(cleanup) => MergeCleanupOutcome::Obs(cleanup),
+                    Err(err) => MergeCleanupOutcome::NotRun {
+                        error: err.to_string(),
+                    },
+                };
+                let cleanup_plan = cleanup_dry_run.plan();
+                // The forward is unconditional on this arm:
+                // `forward=false` is refused above, so the only
+                // question left is dry-run or live.
+                let forward = if dry_run.enabled() {
+                    MergeForwardOutcome::Planned {
+                        preflight_skipped: false,
+                    }
+                } else {
+                    obs.forward_request(&id.to_string(), options.forward_message, dry_run)
+                        .map(MergeForwardOutcome::Obs)
+                        .map_err(|err| {
+                            GeectlError::new(
+                                err.kind(),
+                                format!("merged request {id}, but the forward failed: {err}"),
+                            )
+                        })?
+                };
+                Ok(MergeOutcome {
+                    status,
+                    forward,
+                    cleanup,
+                    cleanup_plan,
+                })
+            }
+            PullRequestRef::Gitea {
+                owner,
+                repo,
+                number,
+            } => {
+                // The force refusal runs before the preflight, like
+                // the CLI's: a refused merge does no forward reads.
+                if options.force {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        "--force does not apply to a Gitea pull request: the merge API takes no force flag",
+                    ));
+                }
+                // OBS credentials first: without them there is
+                // nothing to verify the forward against, and the
+                // Gitea reads must not run either — a
+                // credential-less dry-run plans the forward
+                // unverified. Live, the resolution fails fast on
+                // missing credentials, so a live merge never
+                // reaches the skip below.
+                let mut preflight_skipped = false;
+                if options.forward {
+                    match self.obs {
+                        Some(obs) if obs_ready(obs) => {
+                            self.preflight_gitea_forward(
+                                owner,
+                                repo,
+                                *number,
+                                options.forward_message,
+                            )?;
+                        }
+                        _ => {
+                            if dry_run.enabled() {
+                                self.debug.emit("decision: skipping the forward preflight: no OBS credentials in dry-run, so the forward is planned unverified");
+                                preflight_skipped = true;
+                            } else {
+                                return Err(GeectlError::new(
+                                    ErrorKind::ConfigError,
+                                    "cannot merge a Gitea pull request without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE]): the forward cannot be validated before the merge",
+                                ));
+                            }
+                        }
+                    }
+                }
+                let status =
+                    self.merge(reference, options.comment, options.method, false, dry_run)?;
+                let cleanup_dry_run = DryRun::new(dry_run.enabled()).with_debug(self.debug.clone());
+                let cleanup = self.merge_gitea_cleanup(reference, &cleanup_dry_run);
+                let cleanup_plan = cleanup_dry_run.plan();
+                let forward = if !options.forward {
+                    MergeForwardOutcome::NotRequested
+                } else if dry_run.enabled() {
+                    MergeForwardOutcome::Planned { preflight_skipped }
+                } else {
+                    self.forward_gitea(owner, repo, *number, options.forward_message)
+                        .map(MergeForwardOutcome::Gitea)
+                        .map_err(|err| {
+                            GeectlError::new(
+                                err.kind(),
+                                format!("merged {reference}, but the forward failed: {err}"),
+                            )
+                        })?
+                };
+                Ok(MergeOutcome {
+                    status,
+                    forward,
+                    cleanup,
+                    cleanup_plan,
+                })
+            }
+        }
+    }
+
+    /// Resolve and validate both arms of the Gitea forward before
+    /// the merge lands: the pull request and its repo on Gitea,
+    /// then the OBS package synced from the base repo and branch
+    /// and its hop to the link parent. The hop is verified by
+    /// running the forward itself in dry-run: it resolves and
+    /// validates everything the live forward would, and files
+    /// nothing. A failure here — a missing credential, an
+    /// ambiguous package, a refused hop — aborts before the merge,
+    /// with the pull request still open.
+    fn preflight_gitea_forward(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        forward_message: Option<&str>,
+    ) -> Result<(), GeectlError> {
+        let obs = self.obs.ok_or_else(missing_obs_arm)?;
+        let inputs = self.gitea_forward_inputs(owner, repo, number, forward_message)?;
+        let dry_run = DryRun::new(true).with_debug(self.debug.clone());
+        let package = resolve_forward_package(
+            obs,
+            &inputs.repo_url,
+            &inputs.base_owner,
+            &inputs.base_repo,
+            &inputs.base_branch,
+            &inputs.default_branch,
+        )?;
+        if let Some((project, package)) = package {
+            obs.forward_package(
+                &project,
+                &package,
+                &inputs.description,
+                &inputs.changes_entry,
+                &dry_run,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Forward a merged Gitea pull request: resolve the OBS package
+    /// synced from the base repo and branch, and forward that
+    /// package to its link parent. The pull request and repo come
+    /// from [`gitea_forward_inputs`](Self::gitea_forward_inputs),
+    /// shared with the preflight, so the forward cannot disagree
+    /// with what was validated before the merge.
+    fn forward_gitea(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        forward_message: Option<&str>,
+    ) -> Result<ForwardActionResult, GeectlError> {
+        let obs = self.obs.ok_or_else(missing_obs_arm)?;
+        let inputs = self.gitea_forward_inputs(owner, repo, number, forward_message)?;
+        let dry_run = DryRun::new(false).with_debug(self.debug.clone());
+        let package = resolve_forward_package(
+            obs,
+            &inputs.repo_url,
+            &inputs.base_owner,
+            &inputs.base_repo,
+            &inputs.base_branch,
+            &inputs.default_branch,
+        )?;
+        match package {
+            Some((project, package)) => obs.forward_package(
+                &project,
+                &package,
+                &inputs.description,
+                &inputs.changes_entry,
+                &dry_run,
+            ),
+            None => Ok(ForwardActionResult::Skipped {
+                source: format!(
+                    "{}/{}#{}",
+                    inputs.base_owner, inputs.base_repo, inputs.base_branch
+                ),
+                reason: format!(
+                    "no OBS package is synced from {}#{}",
+                    inputs.repo_url, inputs.base_branch
+                ),
+            }),
+        }
+    }
+
+    /// Run the merge-time branch cleanup for the Gitea arm: resolve
+    /// the OBS package synced from the merged pull request's head
+    /// (the fork), then clean up that branch home through the
+    /// shared per-source helper. The merge stands regardless: a
+    /// cleanup that cannot run at all (no OBS credentials, the
+    /// fork deleted, the head repo unreadable, an ambiguous sync)
+    /// is reported as not run, never an error from this call —
+    /// like the OBS arm's cleanup. A pull request whose head syncs
+    /// no OBS package (not a geectl branch) has nothing to clean
+    /// up: empty outcomes, the payload records the empty result.
+    fn merge_gitea_cleanup(
+        &self,
+        reference: &PullRequestRef,
+        dry_run: &DryRun,
+    ) -> MergeCleanupOutcome {
+        let not_run = |err: GeectlError| MergeCleanupOutcome::NotRun {
+            error: err.to_string(),
+        };
+        // OBS credentials first: without them there is nothing to
+        // resolve against, and the Gitea reads must not run either
+        // — a credential-less dry-run plans without a server.
+        // Live, the merge already landed, so missing credentials
+        // report instead of failing: the merge stands either way.
+        let obs = match self.obs {
+            Some(obs) => obs,
+            None => return not_run(missing_obs_arm()),
+        };
+        if !obs_ready(obs) {
+            self.debug.emit("decision: skipping the merge-time branch cleanup: no OBS credentials in dry-run, so the home package cannot be resolved");
+            return not_run(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot clean up the branch home without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        let (owner, repo, number) = match reference {
+            PullRequestRef::Gitea {
+                owner,
+                repo,
+                number,
+            } => (owner, repo, *number),
+            PullRequestRef::Obs(_) => {
+                return not_run(GeectlError::new(
+                    ErrorKind::InternalError,
+                    "merge_gitea_cleanup called on an OBS reference",
+                ));
+            }
+        };
+        let head = match self.gitea_merge_head_inputs(owner, repo, number) {
+            Ok(Some(head)) => head,
+            Ok(None) => {
+                self.debug.emit("decision: skipping the merge-time branch cleanup: the merged pull request's head repo is gone, so no branch home can be resolved");
+                return MergeCleanupOutcome::Gitea {
+                    reference: reference.to_string(),
+                    outcomes: Vec::new(),
+                };
+            }
+            Err(err) => return not_run(err),
+        };
+        let outcome = match resolve_forward_package(
+            obs,
+            &head.repo_url,
+            &head.owner,
+            &head.repo,
+            &head.branch,
+            &head.default_branch,
+        ) {
+            Ok(Some((project, package))) => {
+                Some(obs.cleanup_branch_source(&project, &package, dry_run))
+            }
+            Ok(None) => {
+                self.debug.emit(&format!(
+                    "decision: skipping the merge-time branch cleanup: no OBS package is synced from {}#{}",
+                    head.repo_url, head.branch
+                ));
+                None
+            }
+            Err(err) => return not_run(err),
+        };
+        MergeCleanupOutcome::Gitea {
+            reference: reference.to_string(),
+            outcomes: outcome.into_iter().collect(),
+        }
+    }
+
+    /// The Gitea side of the forward, resolved once and shared by
+    /// the preflight and the forward itself, so the two cannot
+    /// disagree on what the merge targeted: the merged pull
+    /// request's base repo and branch, the repo's clone URL and
+    /// default branch, and the forward description and `.changes`
+    /// entry carried from the pull request's text — or the `-m` /
+    /// `--forward-message` override for the `.changes` entry.
+    fn gitea_forward_inputs(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        forward_message: Option<&str>,
+    ) -> Result<GiteaForwardInputs, GeectlError> {
+        let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
+        let reference = PullRequestRef::Gitea {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+        };
+        let pr = gitea.pr_get(owner, repo, number)?;
+        let repo = gitea.repo_get(owner, repo)?;
+        let base_repo = pr.base.repo.as_ref().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("the merged pull request {reference} names no base repository"),
+            )
+        })?;
+        let (base_owner, base_repo_name) =
+            parse_gitea_full_name(&base_repo.full_name, &reference.to_string())?;
+        let base_branch = pr.base.branch.clone();
+        let repo_url = repo
+            .clone_url
+            .strip_suffix(".git")
+            .unwrap_or(&repo.clone_url);
+        // The forward description and `.changes` entry carry the
+        // pull request's text: the body when it has one, else the
+        // title, else the forward line alone. An explicit `-m`
+        // override replaces the `.changes` entry only: the
+        // description still carries the pull request's text.
+        let forward_line = format!(
+            "Forwarded Gitea pull request {base_owner}/{base_repo_name}#{number} from {}",
+            pr.user.login
+        );
+        let body = pr.body.as_deref().unwrap_or("").trim();
+        let title = pr.title.trim();
+        let description = if !body.is_empty() {
+            format!("{forward_line}\n\n{body}")
+        } else if !title.is_empty() {
+            format!("{forward_line}\n\n{title}")
+        } else {
+            forward_line.clone()
+        };
+        let changes_entry = match forward_message {
+            Some(entry) => entry.to_string(),
+            None if !body.is_empty() => body.to_string(),
+            None if !title.is_empty() => title.to_string(),
+            None => forward_line,
+        };
+        Ok(GiteaForwardInputs {
+            base_owner,
+            base_repo: base_repo_name,
+            base_branch,
+            default_branch: repo.default_branch,
+            repo_url: repo_url.to_string(),
+            description,
+            changes_entry,
+        })
+    }
+
+    /// The head side of a merged Gitea pull request: the fork repo
+    /// and branch, and the repo's clone URL and default branch —
+    /// the coordinates the merge-time cleanup resolves the branch
+    /// home from, through the same scmsync lookup the forward uses
+    /// for the base side. `None` when the fork the branch lived in
+    /// is deleted — the pull request keeps its head label, but
+    /// there is no repo to resolve a branch home from, so the
+    /// cleanup has nothing to clean up.
+    fn gitea_merge_head_inputs(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Option<GiteaMergeHeadInputs>, GeectlError> {
+        let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
+        let reference = PullRequestRef::Gitea {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+        };
+        let pr = gitea.pr_get(owner, repo, number)?;
+        let head = match pr.head.repo.as_ref() {
+            Some(head) => {
+                let (head_owner, head_name) =
+                    parse_gitea_full_name(&head.full_name, &reference.to_string())?;
+                let repo = gitea.repo_get(&head_owner, &head_name)?;
+                Some((head_owner, head_name, repo))
+            }
+            None => None,
+        };
+        let Some((head_owner, head_name, head_repo)) = head else {
+            return Ok(None);
+        };
+        let repo_url = head_repo
+            .clone_url
+            .strip_suffix(".git")
+            .unwrap_or(&head_repo.clone_url);
+        Ok(Some(GiteaMergeHeadInputs {
+            owner: head_owner,
+            repo: head_name,
+            branch: pr.head.branch.clone(),
+            default_branch: head_repo.default_branch,
+            repo_url: repo_url.to_string(),
+        }))
     }
 
     /// Decline a pull request. On OBS this changes the request
@@ -1599,6 +2047,220 @@ impl<'a> PullRequestClient<'a> {
                 "cannot approve or request changes on a submit request without a review target or an OBS username — an API token carries no username (pass a target, or unset the OBS API key first and set GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
             )),
         }
+    }
+}
+
+/// The options for the full merge ([`PullRequestClient::merge_with_forward`]):
+/// the bare accept/merge plus the forward and the branch-home cleanup.
+#[derive(Debug, Clone, Copy)]
+pub struct MergeOptions<'a> {
+    /// The message left with the accept on OBS and the merge commit
+    /// message on Gitea.
+    pub comment: Option<&'a str>,
+    /// The Gitea merge style; refused on an OBS ref.
+    pub method: Option<GiteaMergeMethod>,
+    /// Accept past open reviews on OBS; refused on a Gitea ref.
+    pub force: bool,
+    /// Forward after the merge lands. The OBS arm always forwards;
+    /// on Gitea this is the `--no-forward` switch, off when the
+    /// caller passes it.
+    pub forward: bool,
+    /// The `.changes` entry for the forwarded request, overriding
+    /// the default; `-m` / `--forward-message` on the CLI.
+    pub forward_message: Option<&'a str>,
+}
+
+/// The outcome of the full merge: the status after the merge, what
+/// the forward did, and what the branch-home cleanup did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutcome {
+    /// The unified status after the merge, or `None` in dry-run.
+    pub status: Option<PullRequestStatus>,
+    /// What the forward did.
+    pub forward: MergeForwardOutcome,
+    /// What the branch-home cleanup did.
+    pub cleanup: MergeCleanupOutcome,
+    /// The dry-run plan lines the cleanup recorded, in order. The
+    /// cleanup runs with its own dry-run mode so its lines stay
+    /// with the cleanup payload, like the accept-time cleanup's;
+    /// empty live, and empty in dry-run when nothing was planned.
+    pub cleanup_plan: Vec<String>,
+}
+
+/// What the merge-time forward did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeForwardOutcome {
+    /// No forward was requested (`--no-forward` on Gitea).
+    NotRequested,
+    /// The forward was planned but not run (dry-run): nothing was
+    /// filed. `preflight_skipped` is set on the Gitea arm when no
+    /// OBS credentials were available to verify the forward
+    /// against — the forward is planned unverified.
+    Planned { preflight_skipped: bool },
+    /// The OBS forward result: one outcome per submit action.
+    Obs(ForwardResult),
+    /// The Gitea forward result: the single forward action.
+    Gitea(ForwardActionResult),
+}
+
+/// What the merge-time branch-home cleanup did. A cleanup that
+/// cannot run at all is reported, never an error: the merge stands
+/// regardless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeCleanupOutcome {
+    /// The cleanup did not run; the error says why.
+    NotRun { error: String },
+    /// The OBS cleanup: one outcome per distinct submit source.
+    Obs(AcceptCleanup),
+    /// The Gitea cleanup: the outcomes for the package synced from
+    /// the merged pull request's head — empty when the head syncs
+    /// no OBS package.
+    Gitea {
+        /// The merged pull request, by its handle.
+        reference: String,
+        /// One outcome for the resolved branch home, when one was.
+        outcomes: Vec<AcceptCleanupOutcome>,
+    },
+}
+
+/// The Gitea side of the forward: the merged pull request's base
+/// repo and branch, the repo's clone URL and default branch, and
+/// the forward description and `.changes` entry.
+struct GiteaForwardInputs {
+    base_owner: String,
+    base_repo: String,
+    base_branch: String,
+    default_branch: String,
+    repo_url: String,
+    description: String,
+    changes_entry: String,
+}
+
+/// The head side of a merged Gitea pull request: the fork repo and
+/// branch, and the repo's clone URL and default branch.
+struct GiteaMergeHeadInputs {
+    owner: String,
+    repo: String,
+    branch: String,
+    default_branch: String,
+    repo_url: String,
+}
+
+/// Whether the OBS arm carries credentials that can act: a Basic
+/// pair or a Bearer token. `Credentials::None` reads public data
+/// only and cannot file, forward, or clean up.
+fn obs_ready(obs: &ObsClient) -> bool {
+    matches!(
+        obs.credentials(),
+        Credentials::Basic { .. } | Credentials::Bearer { .. }
+    )
+}
+
+/// Resolve the OBS package synced from a Gitea repo and branch:
+/// search OBS packages by the scmsync repo URL, then verify each
+/// hit against its own `_meta` scmsync — the search is a prefix
+/// match, so a repo name that prefixes another matches both, and
+/// only a hit whose parsed scmsync names this repo and branch is
+/// the package. A hit with no branch named tracks the repo's
+/// default branch; a hit whose fragment pins a commit still
+/// tracks the branch its `trackingbranch` names. No hit is `None`
+/// (nothing to forward); more than one distinct package is an
+/// error — the forward must not guess which one the merge
+/// targeted. A hit whose scmsync does not parse is skipped, not
+/// an error: it cannot be verified as this repo, and the search
+/// prefix alone does not prove it is.
+fn resolve_forward_package(
+    obs: &ObsClient,
+    repo_url: &str,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    default_branch: &str,
+) -> Result<Option<(String, String)>, GeectlError> {
+    let candidates = obs.search_packages_by_scmsync(repo_url)?;
+    let mut matched: Vec<(String, String)> = Vec::new();
+    for candidate in &candidates {
+        let meta = obs.package_meta_authenticated(&candidate.project, &candidate.name)?;
+        let Some(scmsync) = &meta.scmsync else {
+            continue;
+        };
+        let Ok(parsed) = parse_scmsync_url(scmsync) else {
+            continue;
+        };
+        if parsed.owner != owner || parsed.repo != repo {
+            continue;
+        }
+        if !scmsync_branch_matches(&parsed, branch, default_branch) {
+            continue;
+        }
+        let found = (candidate.project.clone(), candidate.name.clone());
+        if !matched.contains(&found) {
+            matched.push(found);
+        }
+    }
+    match matched.len() {
+        0 => Ok(None),
+        1 => Ok(matched.into_iter().next()),
+        _ => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "more than one OBS package is synced from {repo_url}#{branch}: {}; refusing to guess which one the merge targeted",
+                matched
+                    .iter()
+                    .map(|(project, package)| format!("{project}/{package}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
+    }
+}
+
+/// Whether `value` pins a commit rather than naming a branch: a
+/// full SHA-1 (40 hex) or SHA-256 (64 hex) — the shapes the server
+/// writes into a scmsync fragment when it pins a revision. A branch
+/// literally named 40 or 64 hex digits would read as a pin; no
+/// such branch exists in practice, and the server's own fixtures
+/// pin full SHAs.
+fn is_commit_pin(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Whether a parsed scmsync URL tracks `branch`: the fragment
+/// wins — when it names a branch, only that branch matches, and
+/// the tracking branch does not. When the fragment pins a commit
+/// instead, it names no branch at all: only the tracking branch
+/// matches. With neither a fragment nor a tracking branch, the
+/// package tracks the repo's default branch.
+fn scmsync_branch_matches(parsed: &ScmsyncUrl, branch: &str, default_branch: &str) -> bool {
+    match &parsed.branch {
+        Some(fragment) if is_commit_pin(fragment) => {
+            parsed.tracking_branch.as_deref() == Some(branch)
+        }
+        Some(fragment) => fragment.as_str() == branch,
+        None => branch == default_branch,
+    }
+}
+
+/// Split a Gitea `full_name` into its owner and repo: exactly one
+/// non-empty owner/repo pair. Anything else is malformed server
+/// data — a merged pull request always names its base repo this
+/// way — so it maps to `ServerError`, never `InvalidInput`: the
+/// caller did not supply the name.
+fn parse_gitea_full_name(
+    full_name: &str,
+    reference: &str,
+) -> Result<(String, String), GeectlError> {
+    let mut parts = full_name.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(repo), None) if !owner.is_empty() && !repo.is_empty() => {
+            Ok((owner.to_string(), repo.to_string()))
+        }
+        _ => Err(GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "the merged pull request {reference} names a malformed base repository {full_name:?}: expected one owner/repo pair"
+            ),
+        )),
     }
 }
 
@@ -1941,6 +2603,7 @@ mod tests {
     use super::*;
     use crate::auth::Credentials;
     use crate::http::{HttpClient, Timeout, UreqClient};
+    use crate::obs::request::CleanupStep;
     use crate::obs::test_support::{basic_credentials, FakeHttp};
     use crate::obs::{BuildResult, BuildResults, PackageBuildStatus};
 
@@ -4700,5 +5363,331 @@ please fix this</comment></comments>"#,
             .submit(&SubmitTarget::Obs(sr_payload()), &DryRun::new(false))
             .expect_err("an OBS submit without an OBS arm must fail");
         assert_eq!(err.kind(), ErrorKind::ConfigError);
+    }
+
+    #[test]
+    fn scmsync_branch_matches_fragment_pin_and_tracking_branch() {
+        // A fragment that pins a commit still tracks the branch the
+        // `trackingbranch` names; a fragment naming a branch
+        // matches it — and only it; no branch at all tracks the
+        // default branch only.
+        let pinned = parse_scmsync_url(
+            "http://127.0.0.1:9/pool/systemd?trackingbranch=factory#deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        )
+        .expect("fixture scmsync parses");
+        assert!(scmsync_branch_matches(&pinned, "factory", "factory"));
+        assert!(!scmsync_branch_matches(&pinned, "main", "factory"));
+        let fragment_names_a_branch =
+            parse_scmsync_url("http://127.0.0.1:9/pool/systemd?trackingbranch=factory#main")
+                .expect("fixture scmsync parses");
+        assert!(scmsync_branch_matches(
+            &fragment_names_a_branch,
+            "main",
+            "factory"
+        ));
+        // The fragment wins: the tracking branch does not match
+        // when the fragment names another branch.
+        assert!(!scmsync_branch_matches(
+            &fragment_names_a_branch,
+            "factory",
+            "factory"
+        ));
+        let branched = parse_scmsync_url("http://127.0.0.1:9/pool/systemd#factory")
+            .expect("fixture scmsync parses");
+        assert!(scmsync_branch_matches(&branched, "factory", "factory"));
+        assert!(!scmsync_branch_matches(&branched, "main", "factory"));
+        let bare =
+            parse_scmsync_url("http://127.0.0.1:9/pool/systemd").expect("fixture scmsync parses");
+        assert!(scmsync_branch_matches(&bare, "factory", "factory"));
+        assert!(!scmsync_branch_matches(&bare, "main", "factory"));
+    }
+
+    #[test]
+    fn parse_gitea_full_name_requires_one_non_empty_pair() {
+        assert_eq!(
+            parse_gitea_full_name("pool/systemd", "gitea:pool/systemd#7").unwrap(),
+            ("pool".to_string(), "systemd".to_string())
+        );
+        for malformed in [
+            "pool",
+            "pool/systemd/extra",
+            "pool/",
+            "/systemd",
+            "",
+            "pool//systemd",
+        ] {
+            let err = parse_gitea_full_name(malformed, "gitea:pool/systemd#7").unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError, "{malformed}: {err}");
+        }
+    }
+
+    /// The request XML with the state and the id replaced: the
+    /// re-read after a level act answers the state the act moved
+    /// the request to, and the id matches the handle.
+    fn request_xml_accepted() -> String {
+        REQUEST_XML
+            .replace("name=\"review\"", "name=\"accepted\"")
+            .replace("id=\"123\"", "id=\"1398977\"")
+    }
+
+    /// A project meta with no branch marker: the cleanup skips the
+    /// source, planning nothing.
+    const PROJECT_META_XML: &str =
+        r#"<project name="xyz"><title>t</title><description>plain</description></project>"#;
+
+    /// A repo JSON, shaped like Gitea 1.24.7 answers.
+    const REPO_JSON: &str = r#"{"owner": {"login": "openSUSE"}, "name": "geectl", "full_name": "openSUSE/geectl", "parent": null, "default_branch": "main", "private": false, "clone_url": "https://src.opensuse.org/openSUSE/geectl.git", "ssh_url": "gitea@src.opensuse.org:openSUSE/geectl.git", "permissions": {"admin": true, "push": true, "pull": true}}"#;
+
+    fn merge_options() -> MergeOptions<'static> {
+        MergeOptions {
+            comment: Some("Merging."),
+            method: None,
+            force: false,
+            forward: true,
+            forward_message: None,
+        }
+    }
+
+    #[test]
+    fn merge_with_forward_obs_dry_run_plans_forward_and_cleanup() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/request/1398977?withhistory=1",
+                REQUEST_XML,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/xyz/_meta",
+                PROJECT_META_XML,
+            );
+        let obs = obs_client(&http);
+        let dry = DryRun::new(true);
+        let outcome = act_client(Some(&obs), None)
+            .merge_with_forward(&obs_ref(), &merge_options(), &dry)
+            .unwrap();
+        assert!(outcome.status.is_none());
+        assert_eq!(
+            outcome.forward,
+            MergeForwardOutcome::Planned {
+                preflight_skipped: false
+            }
+        );
+        assert!(outcome.cleanup_plan.is_empty());
+        match &outcome.cleanup {
+            MergeCleanupOutcome::Obs(cleanup) => {
+                assert_eq!(cleanup.id, 123);
+                assert_eq!(cleanup.outcomes.len(), 1);
+                assert_eq!(cleanup.outcomes[0].source_project, "xyz");
+                assert_eq!(cleanup.outcomes[0].source_package, "abc");
+                assert!(matches!(
+                    &cleanup.outcomes[0].package,
+                    CleanupStep::Skipped { reason }
+                        if reason == crate::obs::request::NO_BRANCH_MARKER_REASON
+                ));
+            }
+            other => panic!("expected the OBS cleanup, got {other:?}"),
+        }
+        assert!(http.post_calls().is_empty());
+        assert_eq!(dry.plan().len(), 1);
+        assert!(dry.plan()[0].contains("to accepted"));
+    }
+
+    #[test]
+    fn merge_with_forward_obs_live_forwards_nothing_and_cleans_up() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/request/1398977?cmd=changestate&newstate=accepted",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/request/1398977?withhistory=1",
+                &request_xml_accepted(),
+            )
+            .with_get(
+                "https://api.opensuse.org/source/xyz/_meta",
+                PROJECT_META_XML,
+            );
+        let obs = obs_client(&http);
+        let outcome = act_client(Some(&obs), None)
+            .merge_with_forward(&obs_ref(), &merge_options(), &DryRun::new(false))
+            .unwrap();
+        assert_eq!(outcome.status, Some(PullRequestStatus::Merged));
+        assert!(outcome.cleanup_plan.is_empty());
+        match &outcome.forward {
+            MergeForwardOutcome::Obs(forward) => {
+                assert_eq!(forward.id, 1398977);
+                assert_eq!(forward.actions.len(), 1);
+                assert!(matches!(
+                    &forward.actions[0],
+                    ForwardActionResult::Skipped { source, reason }
+                        if source == "xyz/abc" && reason == "the action names no target project"
+                ));
+            }
+            other => panic!("expected the OBS forward, got {other:?}"),
+        }
+        match &outcome.cleanup {
+            MergeCleanupOutcome::Obs(cleanup) => {
+                assert_eq!(cleanup.id, 1398977);
+                assert_eq!(cleanup.outcomes.len(), 1);
+                assert!(matches!(
+                    &cleanup.outcomes[0].package,
+                    CleanupStep::Skipped { reason }
+                        if reason == crate::obs::request::NO_BRANCH_MARKER_REASON
+                ));
+            }
+            other => panic!("expected the OBS cleanup, got {other:?}"),
+        }
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn merge_with_forward_obs_method_is_refused_before_any_call() {
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let options = MergeOptions {
+            method: Some(GiteaMergeMethod::Squash),
+            ..merge_options()
+        };
+        let err = act_client(Some(&obs), None)
+            .merge_with_forward(&obs_ref(), &options, &DryRun::new(false))
+            .expect_err("a merge method on an OBS ref must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--method squash"));
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn merge_with_forward_obs_no_forward_is_refused_before_any_call() {
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let options = MergeOptions {
+            forward: false,
+            ..merge_options()
+        };
+        let err = act_client(Some(&obs), None)
+            .merge_with_forward(&obs_ref(), &options, &DryRun::new(false))
+            .expect_err("a --no-forward on an OBS ref must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--no-forward"));
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn merge_with_forward_gitea_no_forward_skips_obs() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/merge",
+                "",
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &pr_json_with_state("closed", true),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = gitea_client(&http);
+        let options = MergeOptions {
+            comment: None,
+            forward: false,
+            ..merge_options()
+        };
+        let outcome = act_client(None, Some(&gitea))
+            .merge_with_forward(&gitea_ref(), &options, &DryRun::new(false))
+            .unwrap();
+        assert_eq!(outcome.status, Some(PullRequestStatus::Merged));
+        assert_eq!(outcome.forward, MergeForwardOutcome::NotRequested);
+        assert!(matches!(
+            &outcome.cleanup,
+            MergeCleanupOutcome::NotRun { error } if error.contains("OBS credentials")
+        ));
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn merge_with_forward_gitea_forward_without_obs_fails_before_merge() {
+        let http = FakeHttp::new();
+        let gitea = gitea_client(&http);
+        let err = act_client(None, Some(&gitea))
+            .merge_with_forward(&gitea_ref(), &merge_options(), &DryRun::new(false))
+            .expect_err("a Gitea merge with a forward and no OBS arm must fail");
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err
+            .to_string()
+            .contains("cannot merge a Gitea pull request without OBS credentials"));
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn merge_with_forward_gitea_dry_run_without_obs_credentials_plans_unverified() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, Credentials::None).unwrap();
+        let gitea = gitea_client(&http);
+        let dry = DryRun::new(true);
+        let outcome = act_client(Some(&obs), Some(&gitea))
+            .merge_with_forward(&gitea_ref(), &merge_options(), &dry)
+            .unwrap();
+        assert!(outcome.status.is_none());
+        assert_eq!(
+            outcome.forward,
+            MergeForwardOutcome::Planned {
+                preflight_skipped: true
+            }
+        );
+        assert!(matches!(
+            &outcome.cleanup,
+            MergeCleanupOutcome::NotRun { error } if error.contains("without OBS credentials")
+        ));
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+        assert_eq!(dry.plan().len(), 1);
+        assert!(dry.plan()[0].contains("merge pull request openSUSE/geectl#122"));
+    }
+
+    #[test]
+    fn merge_with_forward_gitea_preflight_refuses_ambiguous_package() {
+        // Two OBS packages sync the base repo and branch: the
+        // preflight refuses before the merge lands, so the pull
+        // request stays open and nothing is posted.
+        use crate::obs::common::build_url;
+        let match_expr = "starts-with(scmsync,'https://src.opensuse.org/openSUSE/geectl')";
+        let search_url = build_url(
+            "https://api.opensuse.org",
+            &["search", "package"],
+            &[("match", match_expr)],
+        );
+        let search_xml = "<collection matches=\"2\"><package name=\"geectl\" project=\"home:foo\"><title>t</title><description>d</description></package><package name=\"geectl\" project=\"home:bar\"><title>t</title><description>d</description></package></collection>";
+        let meta_xml = "<package name=\"geectl\" project=\"home:foo\"><title>t</title><description>d</description><scmsync>https://src.opensuse.org/openSUSE/geectl#main</scmsync></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                PR_JSON,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl",
+                REPO_JSON,
+            )
+            .with_get(&search_url, search_xml)
+            .with_get(
+                "https://api.opensuse.org/source/home:foo/geectl/_meta",
+                meta_xml,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/home:bar/geectl/_meta",
+                meta_xml,
+            );
+        let obs = obs_client(&http);
+        let gitea = gitea_client(&http);
+        let err = act_client(Some(&obs), Some(&gitea))
+            .merge_with_forward(&gitea_ref(), &merge_options(), &DryRun::new(false))
+            .expect_err("an ambiguous forward package must fail the preflight");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains(
+            "more than one OBS package is synced from https://src.opensuse.org/openSUSE/geectl#main"
+        ));
+        assert!(http.post_calls().is_empty());
     }
 }
