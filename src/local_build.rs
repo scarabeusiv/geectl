@@ -1029,6 +1029,19 @@ fn check_clean_custom_root(root: &Path) -> Result<(), GeectlError> {
 /// the spec and flavor checks need the source directory, so they
 /// stay in `build`. The CLI calls this before the pre-steps, so a
 /// bad coordinate fails before any service runs or script executes.
+/// The error `--privileged` raises on macOS, worded once:
+/// validation refuses it early, and `BuildContainer::start`
+/// refuses it as the shared gate no caller can bypass — the shell
+/// always uses the privileged shape, so without the gate
+/// `build-shell`/`chroot` would silently run the exact shape
+/// `build --privileged` refuses.
+fn privileged_on_macos_error() -> GeectlError {
+    GeectlError::new(
+        ErrorKind::InvalidInput,
+        "--privileged is refused on macOS: the privileged shape mounts the build root from the host and macOS file sharing breaks dependency installation — use the rootless shape",
+    )
+}
+
 pub fn validate_build_request(req: &BuildRequest) -> Result<(), GeectlError> {
     if !valid_obs_name(&req.project) {
         return Err(GeectlError::new(
@@ -1095,23 +1108,28 @@ pub fn validate_build_request(req: &BuildRequest) -> Result<(), GeectlError> {
             "--noinit and --preinstall-image conflict: no deps are installed without initialization",
         ));
     }
+    // The platform check runs first: a `--noinit` build on
+    // macOS must not prescribe `--privileged` and then have the
+    // platform refuse it — `--noinit` is impossible there, and
+    // the error says so instead of sending the caller in a circle.
+    if req.privileged && std::env::consts::OS == "macos" {
+        return Err(privileged_on_macos_error());
+    }
     // `--noinit` builds in the existing root: the default rootless
     // container discards its root with the container, so there is
     // no existing root to build in — pass `--privileged` to build
-    // in a preserved root.
+    // in a preserved root. On macOS that shape is refused, so
+    // `--noinit` has no remediation there.
     if req.noinit && !req.privileged {
+        if std::env::consts::OS == "macos" {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "--noinit is unavailable on macOS: it needs a preserved root, and --privileged — the preserved-root shape — is refused on macOS",
+            ));
+        }
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
             "--noinit needs a preserved root: the default rootless container discards its root — pass --privileged to build in a preserved root",
-        ));
-    }
-    // `--privileged` is refused on macOS: the privileged shape
-    // mounts the build root from the host, and macOS file sharing
-    // breaks dependency installation — use the rootless shape.
-    if req.privileged && std::env::consts::OS == "macos" {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--privileged is refused on macOS: the privileged shape mounts the build root from the host and macOS file sharing breaks dependency installation — use the rootless shape",
         ));
     }
     // A custom root is a user directory, not a cache dir: `--clean`
@@ -4626,6 +4644,11 @@ impl BuildContainer {
         privileged: bool,
         deadline: std::time::Instant,
     ) -> Result<Self, GeectlError> {
+        // The shared gate: `--privileged` is refused on macOS at
+        // every entry, not only in `validate_build_request`.
+        if privileged && std::env::consts::OS == "macos" {
+            return Err(privileged_on_macos_error());
+        }
         // The mounts carry the cache dir (the root, the pkg cache,
         // the sccache store) and the workdir (the source dir for a
         // build, the root itself for a shell), all at their host
@@ -7147,7 +7170,10 @@ impl<'a> LocalBuild<'a> {
         // so the container's workdir is the root itself — and so
         // the shell always uses the privileged shape: the rootless
         // shape discards its root with the container, and there
-        // is no preserved root to enter.
+        // is no preserved root to enter. That shape is refused on
+        // macOS by the shared gate in `BuildContainer::start`, so
+        // the shell refuses there instead of silently running the
+        // shape `build --privileged` refuses.
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
         let container = BuildContainer::start(self, &root, &root, true, deadline)?;
         container.install_engine(deadline)?;
@@ -10867,6 +10893,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn validate_build_request_rejects_rootless_noinit() {
             let dir = TempDir::new();
             let source = write_source(dir.path(), "foo.spec");
@@ -10875,6 +10902,26 @@ exit 0
             let err = validate_build_request(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(err.to_string().contains("--noinit needs a preserved root"));
+        }
+
+        #[test]
+        #[cfg(target_os = "macos")]
+        fn validate_build_request_rejects_noinit_on_macos() {
+            // On macOS the remediation does not exist: `--noinit`
+            // needs `--privileged`, which the platform refuses —
+            // so the error names the dead end instead of
+            // prescribing the refused flag.
+            let dir = TempDir::new();
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.noinit = true;
+            let err = validate_build_request(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.to_string().contains("--noinit is unavailable on macOS"),
+                "got: {}",
+                err
+            );
         }
 
         #[test]
@@ -13145,6 +13192,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn shell_wipe_and_log_round_trip() {
             let dir = TempDir::new();
             let (podman, _, argv_log) = stub_podman(dir.path(), true);
@@ -13634,6 +13682,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn build_shell_joins_commands_into_one_shell_fragment() {
             // Two commands reach the engine as one `--shell-cmd`
             // string joined by ` && `: a shell fragment for the
@@ -13665,6 +13714,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn build_shell_debug_line_redacts_the_shell_command() {
             // The fragments are free-form stdin: a pasted secret in
             // one must never reach `--debug`, so the debug line shows
@@ -13711,6 +13761,78 @@ exit 0
         }
 
         #[test]
+        #[cfg(target_os = "macos")]
+        fn build_shell_refuses_the_privileged_shape_on_macos() {
+            // The shell always uses the privileged shape, and the
+            // shared gate in `BuildContainer::start` refuses it on
+            // macOS — the shell fails closed instead of silently
+            // running the shape `build --privileged` refuses.
+            let dir = TempDir::new();
+            let (podman, _, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            vertical.build(&req).unwrap();
+            let err = vertical
+                .build_shell(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    &["echo hi".to_string()],
+                    60,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.to_string().contains("--privileged is refused on macOS"),
+                "got: {}",
+                err
+            );
+        }
+
+        #[test]
+        #[cfg(target_os = "macos")]
+        fn chroot_refuses_the_privileged_shape_on_macos() {
+            // The chroot enters the preserved root through the
+            // shell, which always uses the privileged shape, and
+            // the shared gate in `BuildContainer::start` refuses
+            // it on macOS — the chroot fails closed instead of
+            // silently running the shape `build --privileged`
+            // refuses.
+            let dir = TempDir::new();
+            let (podman, _, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
+            vertical.build(&req).unwrap();
+            let err = vertical
+                .build_chroot(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    &["false".to_string()],
+                    60,
+                    false,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.to_string().contains("--privileged is refused on macOS"),
+                "got: {}",
+                err
+            );
+        }
+
+        #[test]
+        #[cfg(not(target_os = "macos"))]
         fn chroot_live_round_trip_after_build() {
             // The shell runs the stdin commands in the preserved
             // root: two commands reach the engine as one
@@ -13766,6 +13888,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn chroot_live_nonzero_exit_is_data_not_a_failure() {
             // A failing repro is data, not a failed command: the
             // engine exits 1, `build_chroot` still returns `Ok`,
