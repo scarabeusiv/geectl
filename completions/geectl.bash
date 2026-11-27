@@ -3484,7 +3484,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__commit)
-            opts="-m -h --message --noservice --format --debug --debug-body --live --instance --help"
+            opts="-m -h --message --noservice --no-local-services --no-server-services --format --debug --debug-body --live --instance --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

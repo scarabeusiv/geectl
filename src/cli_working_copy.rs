@@ -684,6 +684,8 @@ fn addremove_result(wc: &WorkingCopy, dry_run: bool, plan: Option<Vec<String>>) 
 pub fn commit(
     message: &str,
     noservice: bool,
+    no_local_services: bool,
+    no_server_services: bool,
     debug: &Debug,
     live: bool,
     instance: Option<&str>,
@@ -706,12 +708,18 @@ pub fn commit(
     let auth = if live { gitea_auth(&endpoints)? } else { None };
     let auth = gitea_auth_ref(&auth);
     let mut wc = open_working_copy(live, Some(&client))?;
+    // `--noservice` is the combined shorthand: both halves at
+    // once. Each split flag skips its own half only.
+    let skips = working_copy::ServiceSkips {
+        local: noservice || no_local_services,
+        server: noservice || no_server_services,
+    };
     let report = working_copy::commit(
         &mut wc,
         &client,
         &endpoints.config,
         message,
-        noservice,
+        skips,
         auth.as_ref(),
         &dry_run,
     )?;
@@ -1241,9 +1249,9 @@ mod tests {
 
     #[test]
     fn commit_rejects_an_empty_message_before_any_resolution() {
-        let err = commit("", false, &Debug::disabled(), false, None).unwrap_err();
+        let err = commit("", false, false, false, &Debug::disabled(), false, None).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        let err = commit("   ", false, &Debug::disabled(), false, None).unwrap_err();
+        let err = commit("   ", false, false, false, &Debug::disabled(), false, None).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 

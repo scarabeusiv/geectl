@@ -4755,8 +4755,39 @@ fn refresh_base(wc: &mut WorkingCopy, rev: &str, srcmd5: &str) -> Result<(), Gee
     Ok(())
 }
 
+/// Which services a commit skips. `--noservice` is the combined
+/// shorthand: both at once. The halves are independent on an
+/// OBS-native commit — the local gate and the server's
+/// `noservice=1` — while a git-backed commit has no server-side
+/// switch: the server half is accepted and has no effect there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ServiceSkips {
+    /// Skip the local precommit gate (services + `pre_checkin.sh`).
+    pub local: bool,
+    /// Send `noservice=1` on the server commit.
+    pub server: bool,
+}
+
+impl ServiceSkips {
+    /// Skip nothing: both gates run.
+    pub fn none() -> Self {
+        Self {
+            local: false,
+            server: false,
+        }
+    }
+
+    /// Skip both: `--noservice`.
+    pub fn all() -> Self {
+        Self {
+            local: true,
+            server: true,
+        }
+    }
+}
+
 /// Commit the working copy: the index state against the base, with
-/// the service gate (unless `noservice`) and the changelog gate on
+/// the service gate (unless `skips.local`) and the changelog gate on
 /// the `.changes` entries the commit sends. An OBS-native commit
 /// sends the file list through the `commitfilelist` protocol and
 /// refreshes the base to the new revision; a git-backed commit
@@ -4770,7 +4801,7 @@ pub fn commit(
     client: &ObsClient,
     config: &Config,
     message: &str,
-    noservice: bool,
+    skips: ServiceSkips,
     gitea_auth: Option<&GiteaAuth<'_>>,
     dry_run: &DryRun,
 ) -> Result<Option<CommitReport>, GeectlError> {
@@ -4791,8 +4822,8 @@ pub fn commit(
         return Ok(None);
     }
     match wc.backend {
-        Backend::Obs => commit_obs(wc, client, config, message, noservice, dry_run).map(Some),
-        Backend::Git => commit_git(wc, client, config, message, noservice, gitea_auth).map(Some),
+        Backend::Obs => commit_obs(wc, client, config, message, skips, dry_run).map(Some),
+        Backend::Git => commit_git(wc, client, config, message, skips, gitea_auth).map(Some),
     }
 }
 
@@ -4911,7 +4942,7 @@ fn commit_obs(
     client: &ObsClient,
     config: &Config,
     message: &str,
-    noservice: bool,
+    skips: ServiceSkips,
     dry_run: &DryRun,
 ) -> Result<CommitReport, GeectlError> {
     // The client must be the checkout's own instance before any
@@ -4931,7 +4962,7 @@ fn commit_obs(
         ));
     }
     let snapshot = snapshot_gate_inputs(wc)?;
-    if !noservice {
+    if !skips.local {
         run_service_gate(client, config, &wc.root)?;
     }
     stage_gate_changes(wc, &snapshot)?;
@@ -4966,7 +4997,7 @@ fn commit_obs(
     let mut options = CommitFilelistOptions::new(message);
     options.validate = true;
     options.keeplink = keeplink;
-    options.noservice = noservice;
+    options.noservice = skips.server;
     let answer = client
         .commit_filelist(&wc.project, &wc.package, &entries, &options, dry_run)?
         .ok_or_else(|| {
@@ -5000,8 +5031,8 @@ fn commit_obs(
                 client.put_file_staged_bytes(&wc.project, &wc.package, name, &content, dry_run)?;
             }
             // The final pass: no validation flag, the sha256 answers
-            // attached, and no server-side services when `noservice` is
-            // set. One revision for the whole file list. The final pass
+            // attached, and no server-side services when `skips.server`
+            // is set. One revision for the whole file list. The final pass
             // reports files still missing instead of committing, so a
             // stage that raced is retried (three final passes at most).
             let mut attempts = 0;
@@ -5013,7 +5044,7 @@ fn commit_obs(
                 attempts += 1;
                 let mut options = CommitFilelistOptions::new(message);
                 options.keeplink = keeplink;
-                options.noservice = noservice;
+                options.noservice = skips.server;
                 let answer = client
                     .commit_filelist(&wc.project, &wc.package, &entries, &options, dry_run)?
                     .ok_or_else(|| {
@@ -5188,7 +5219,7 @@ fn commit_git(
     client: &ObsClient,
     config: &Config,
     message: &str,
-    noservice: bool,
+    skips: ServiceSkips,
     gitea_auth: Option<&GiteaAuth<'_>>,
 ) -> Result<CommitReport, GeectlError> {
     // The client must be the checkout's own instance before any
@@ -5233,7 +5264,7 @@ fn commit_git(
         ));
     }
     let snapshot = snapshot_gate_inputs(wc)?;
-    if !noservice {
+    if !skips.local {
         run_service_gate(client, config, &wc.root)?;
     }
     stage_gate_changes(wc, &snapshot)?;
@@ -8573,7 +8604,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             None,
             &DryRun::new(false),
         )
@@ -9098,7 +9129,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -9168,7 +9199,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             None,
             &DryRun::new(false),
         )
@@ -9402,7 +9433,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -9442,7 +9473,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -9490,7 +9521,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -9551,7 +9582,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -9650,7 +9681,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -9722,7 +9753,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -9766,7 +9797,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -9785,7 +9816,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -10209,7 +10240,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -10259,7 +10290,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             None,
             &DryRun::new(false),
         )
@@ -10303,7 +10334,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -10364,7 +10395,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -10391,12 +10422,115 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_obs_no_server_services_keeps_the_local_gate() {
+        // The server half alone: the commitfilelist calls carry
+        // noservice=1, while the local gate still runs — the
+        // fixture carries no _service, so the gate passes
+        // trivially and the commit lands.
+        let validate_url = "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=test&user=scarabeus_iv&withvalidate=1&noservice=1";
+        let final_url = "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=test&user=scarabeus_iv&noservice=1";
+        let http = checkout_http()
+            .with_post(
+                validate_url,
+                    "<directory error=\"missing\" name=\"foo\"><entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" name=\"bar.txt\" /></directory>",
+                )
+            .with_post(
+                final_url,
+                &format!("<directory name=\"foo\" rev=\"2\" srcmd5=\"{SRCMD5_2}\" vrev=\"2\" />"),
+            )
+            .with_put_bytes(
+                "https://api.opensuse.org/source/home:alice/foo/bar.txt?rev=repository",
+                "<revision rev=\"repository\"><srcmd5>empty</srcmd5></revision>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search_url = client
+            .package_requests_search_url("home:alice", "foo")
+            .unwrap();
+        let http = http.with_get(
+            &search_url,
+            "<collection matches=\"1\"><request id=\"42\" /></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        write_file(&wc.root, "foo.spec", "Name: bar\n");
+        write_file(&wc.root, "bar.txt", "new file\n");
+        add(
+            &wc,
+            &["foo.spec".to_string(), "bar.txt".to_string()],
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            ServiceSkips {
+                local: false,
+                server: true,
+            },
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.rev, Some(2));
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_obs_no_local_services_keeps_server_services() {
+        // The local half alone: a malformed _service would fail
+        // the gate, but the gate is skipped — and the
+        // commitfilelist calls carry no noservice=1, so the
+        // server still runs its services for the commit.
+        let validate_url = "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=test&user=scarabeus_iv&withvalidate=1";
+        let final_url = "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=test&user=scarabeus_iv";
+        let http = checkout_http()
+            .with_post(
+                validate_url,
+                    "<directory error=\"missing\" name=\"foo\"><entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" name=\"_service\" /></directory>",
+                )
+            .with_post(
+                final_url,
+                &format!("<directory name=\"foo\" rev=\"2\" srcmd5=\"{SRCMD5_2}\" vrev=\"2\" />"),
+            )
+            .with_put_bytes(
+                "https://api.opensuse.org/source/home:alice/foo/_service?rev=repository",
+                "<revision rev=\"repository\"><srcmd5>empty</srcmd5></revision>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        write_file(&wc.root, "_service", "<notservices/>");
+        add(&wc, &["_service".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            ServiceSkips {
+                local: true,
+                server: false,
+            },
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.rev, Some(2));
         let _ = dir;
     }
 
@@ -10428,7 +10562,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             None,
             &DryRun::new(false),
         )
@@ -10473,7 +10607,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -10512,7 +10646,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -10547,7 +10681,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -10595,7 +10729,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -10620,7 +10754,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -10669,7 +10803,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -10700,7 +10834,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -11590,7 +11724,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -11641,7 +11775,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -11741,7 +11875,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -11786,7 +11920,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -11821,7 +11955,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -12265,7 +12399,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             None,
             &DryRun::new(false),
         )
@@ -12610,7 +12744,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &dry_run,
         )
@@ -12655,7 +12789,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &dry_run,
         )
@@ -12690,7 +12824,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             None,
             &dry_run,
         )
@@ -12873,7 +13007,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            false,
+            ServiceSkips::none(),
             None,
             &DryRun::new(false),
         )
@@ -13344,7 +13478,7 @@ mod tests {
                 &client,
                 &Config::default(),
                 message,
-                false,
+                ServiceSkips::none(),
                 None,
                 &DryRun::new(false),
             )
@@ -13389,7 +13523,7 @@ mod tests {
                 &client,
                 &Config::default(),
                 "test",
-                false,
+                ServiceSkips::none(),
                 None,
                 &DryRun::new(dry),
             )
@@ -13580,7 +13714,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -13622,7 +13756,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -13668,7 +13802,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -13730,7 +13864,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -13787,7 +13921,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -13855,7 +13989,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -13928,7 +14062,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -13984,7 +14118,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -14048,7 +14182,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -14101,7 +14235,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -14173,7 +14307,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -14243,7 +14377,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
@@ -14302,7 +14436,7 @@ mod tests {
             &client,
             &Config::default(),
             "test",
-            true,
+            ServiceSkips::all(),
             Some(&auth),
             &DryRun::new(false),
         )
