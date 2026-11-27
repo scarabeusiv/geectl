@@ -1272,7 +1272,8 @@ fn check_file_ending(
 /// new version. NEWS only changes the message — when a section was
 /// found, the finding names it as the material to distill.
 /// A draft marker left by `generate` (`TODO` slots) is also a
-/// needs-detail finding: the human step has not run yet.
+/// needs-detail finding, update line or not: the human step has not
+/// run yet.
 fn check_bare_update(
     changes_name: &str,
     entry: &Entry,
@@ -1281,6 +1282,21 @@ fn check_bare_update(
     options: &ValidateOptions<'_>,
     report: &mut ValidationReport,
 ) {
+    // A leftover generation slot is never a finished entry, update line or not.
+    let has_todo_slot = entry
+        .body_nonblank()
+        .iter()
+        .any(|(_, line)| is_unfilled_slot(line));
+    if has_todo_slot {
+        report.findings.push(Finding {
+            rule: Rule::V9,
+            file: changes_name.to_string(),
+            line: entry.bullets().first().map(|(n, _, _)| *n).unwrap_or(entry.header_line),
+            message: "entry still carries unfilled generation slots (TODO) — fill in the reasons and the upstream highlights before filing"
+                .to_string(),
+        });
+        return;
+    }
     let bullets = entry.bullets();
     let update = |text: &str| {
         let lower = text.to_lowercase();
@@ -1308,21 +1324,6 @@ fn check_bare_update(
             || contains_ci(line, "no user visible change")
             || contains_ci(line, "no visible change")
     });
-    // A leftover generation slot is never a finished entry.
-    let has_todo_slot = entry
-        .body_nonblank()
-        .iter()
-        .any(|(_, line)| is_unfilled_slot(line));
-    if has_todo_slot {
-        report.findings.push(Finding {
-            rule: Rule::V9,
-            file: changes_name.to_string(),
-            line: entry.bullets().first().map(|(n, _, _)| *n).unwrap_or(entry.header_line),
-            message: "entry still carries unfilled generation slots (TODO) — fill in the reasons and the upstream highlights before filing"
-                .to_string(),
-        });
-        return;
-    }
     if other.is_empty() && !states_no_change {
         // NEWS only changes the message, never whether the rule
         // fires: with a section the author has material to distill,
@@ -2526,6 +2527,49 @@ mod tests {
         ]);
         let report = validate(&local, None, &options);
         assert!(!report.findings.iter().any(|f| f.rule == Rule::V9));
+    }
+
+    #[test]
+    fn v9_todo_slot_is_a_finding_without_an_update_line() {
+        let local = snapshot(&[
+            ("foo.spec", SPEC),
+            (
+                "foo.changes",
+                &changes_file(
+                    "- Fix the crash on startup\n- Upstream highlights (TODO: distill to the user-facing items; drop CI, test-only and non-Linux noise):\n  * TODO: summarize the upstream changes, or state '* No user-visible changes' if the release truly has none",
+                    "- Initial package",
+                ),
+            ),
+        ]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == Rule::V9 && f.message.contains("unfilled generation slots")),
+            "findings: {:?}",
+            report.findings
+        );
+        // A `reason: TODO` sub-bullet in a non-update entry is likewise a leftover slot.
+        let local = snapshot(&[
+            ("foo.spec", SPEC),
+            (
+                "foo.changes",
+                &changes_file(
+                    "- Fix the crash on startup\n  * reason: TODO",
+                    "- Initial package",
+                ),
+            ),
+        ]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == Rule::V9 && f.message.contains("unfilled generation slots")),
+            "findings: {:?}",
+            report.findings
+        );
     }
 
     #[test]
