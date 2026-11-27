@@ -48,8 +48,9 @@ fn run(
             geectl::cli_local_build::run_local_build(debug, command, cli.live, instance)?
         }
         Some(Command::Config { command }) => match command {
-            ConfigCommand::Show => {
-                let payload = config_show_payload(format, format_source, instance)?;
+            ConfigCommand::Show { resolve_identity } => {
+                let payload =
+                    config_show_payload(format, format_source, instance, debug, resolve_identity)?;
                 let text = render_config_show_text(&payload);
                 (payload, text)
             }
@@ -285,6 +286,8 @@ fn config_show_payload(
     format: Format,
     format_source: &'static str,
     instance: Option<&str>,
+    debug: &Debug,
+    resolve_identity: bool,
 ) -> Result<serde_json::Value, GeectlError> {
     // The config path is resolved once and passed to the load: a
     // second `config_path()` call here could diverge from the one
@@ -375,6 +378,15 @@ fn config_show_payload(
             &effective.config.instances,
         )),
     };
+    // The resolved identity and its source, from the same funnel
+    // as `changelog generate` — the local levels without the
+    // network, the OBS account too with `--resolve-identity`.
+    let (identity, identity_source) = geectl::cli_changelog::show_identity(
+        &effective.config,
+        instance,
+        debug,
+        resolve_identity,
+    )?;
     let mut instances_json = serde_json::Map::new();
     for (alias, url) in &effective.config.instances {
         instances_json.insert(alias.clone(), json!(url));
@@ -387,15 +399,11 @@ fn config_show_payload(
         "gitea_url_source": gitea_url_source,
         "format": format.as_str(),
         "format_source": format_source,
-        "identity": match &effective.config.identity {
-            Some(identity) => json!(identity.format()),
+        "identity": match &identity {
+            Some(identity) => json!(identity),
             None => json!(null),
         },
-        "identity_source": if effective.config.identity.is_some() {
-            "config"
-        } else {
-            "none"
-        },
+        "identity_source": identity_source,
         "build_cache_dir": build_cache_dir,
         "build_cache_dir_source": build_cache_dir_source,
         "build_cache_cap_gib": build_cache_cap_gib,
@@ -968,18 +976,42 @@ mod tests {
 
     #[test]
     fn config_show_payload_reports_format_and_source() {
-        let payload = config_show_payload(Format::Text, "config", None).unwrap();
+        // Without `--resolve-identity` the OBS level never
+        // resolves over the network, so the source is never
+        // `"obs"` — but the level depends on the machine (a git
+        // identity may be configured), so the test pins the
+        // shape and the text/payload agreement, not one source.
+        let payload =
+            config_show_payload(Format::Text, "config", None, &Debug::disabled(), false).unwrap();
         assert_eq!(payload["format"], "text");
         assert_eq!(payload["format_source"], "config");
         assert!(matches!(
             payload["identity_source"].as_str(),
-            Some("config") | Some("none")
+            Some("config")
+                | Some("env")
+                | Some("git")
+                | Some("obs (unresolved)")
+                | Some("env (unresolved)")
+                | Some("obs (error)")
+                | Some("none")
         ));
         let text = render_config_show_text(&payload);
         assert!(text.contains("format: text (config)"), "{text}");
         assert!(text.contains("identity: "), "{text}");
+        let source = payload["identity_source"].as_str().unwrap();
         if payload["identity"].is_null() {
-            assert!(text.contains("identity: - (none)"), "{text}");
+            assert!(
+                text.contains(&format!("identity: - ({source})")),
+                "{text}"
+            );
+        } else {
+            assert!(
+                text.contains(&format!(
+                    "identity: {} ({source})",
+                    payload["identity"].as_str().unwrap()
+                )),
+                "{text}"
+            );
         }
     }
 

@@ -148,7 +148,7 @@ directory's `.env` only.
 - `geectl prjconf` — Read, validate and clean a project's prjconf.
 - `geectl version` — Print version information as the result payload.
 - `geectl config` — Inspect or initialise the config file.
-- `geectl config show` — Show the effective config: endpoint URLs with their source, the changelog identity with its source (`config` or `none`), and credential status (never a secret value).
+- `geectl config show` — Show the effective config: endpoint URLs with their source, the changelog identity with its source (`config`, `env`, `obs`, `git`, `obs (unresolved)`, `env (unresolved)`, `obs (error)`, or `none`), and credential status (never a secret value). `--resolve-identity` resolves the OBS identity over the network too, like `changelog generate` does; without it the OBS level reports `obs (unresolved)` when the OBS account might still identify the author.
 - `geectl config init` — Write the config template (endpoints only); refuses if the file already exists.
 - `geectl config import-oscrc` — Import one instance mapping from an oscrc file (one-time migration); dry-run is the default, `--live` writes the config.
 

@@ -11833,6 +11833,220 @@ fn config_show_with_instance_never_borrows_the_plain_obs_credentials() {
 }
 
 #[test]
+fn config_show_reports_the_config_identity_level() {
+    // The `[identity]` section wins the funnel, and `config show`
+    // reports it with its source.
+    let dir = TempDir::new();
+    write_instances_config(
+        &dir,
+        "[identity]\nname = \"Config Author\"\nemail = \"config@example.com\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["identity"], "Config Author <config@example.com>");
+    assert_eq!(value["identity_source"], "config");
+}
+
+#[test]
+fn config_show_reports_the_env_identity_level() {
+    // No `[identity]` in the config: the `VC_REALNAME` /
+    // `VC_MAILADDR` environment is the level reported.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["config", "show"])
+        .env("VC_REALNAME", "Env Author")
+        .env("VC_MAILADDR", "env@example.com")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["identity"], "Env Author <env@example.com>");
+    assert_eq!(value["identity_source"], "env");
+}
+
+#[test]
+fn config_show_reports_env_unresolved_for_a_half_set_env_identity() {
+    // VC_REALNAME without VC_MAILADDR is a refused env level, not
+    // a fatal error: the show reports `env (unresolved)` and exits 0.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["config", "show"])
+        .env("VC_REALNAME", "Half Author")
+        .env_remove("VC_MAILADDR")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert!(value["identity"].is_null());
+    assert_eq!(value["identity_source"], "env (unresolved)");
+}
+
+#[test]
+fn config_show_reports_no_identity_when_nothing_identifies() {
+    // Isolated, no config or env identity, no OBS username, and
+    // the working directory is no repo: no level yields one.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert!(value["identity"].is_null());
+    assert_eq!(value["identity_source"], "none");
+}
+
+#[test]
+fn config_show_reports_obs_unresolved_without_the_flag() {
+    // No config or env identity, but the flagged alias carries an
+    // OBS username: OBS might still identify the author, so the
+    // level reports `obs (unresolved)` — and no whois call is
+    // made, so no mock server is needed here. No credential value
+    // leaks into the output.
+    let dir = TempDir::new();
+    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["--instance", "example", "config", "show"])
+        .env("GEECTL_OBS_USERNAME_EXAMPLE", "alias-user")
+        .env("GEECTL_OBS_PASSWORD_EXAMPLE", "alias-secret")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(value["identity"].is_null());
+    assert_eq!(value["identity_source"], "obs (unresolved)");
+    // The username is reported by `obs_auth` by design; the
+    // password must never appear.
+    assert_eq!(value["obs_auth"]["username"], "alias-user");
+    assert!(!stdout.contains("alias-secret"));
+}
+
+#[test]
+fn config_show_reports_obs_error_for_a_misconfigured_obs_credential() {
+    // A half-configured OBS credential is a read error, not an
+    // absence: the OBS level reports `obs (error)` instead of
+    // falling through to git and misattributing the level.
+    let dir = TempDir::new();
+    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["--instance", "example", "config", "show"])
+        .env("GEECTL_OBS_USERNAME_EXAMPLE", "alias-user")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert!(value["identity"].is_null());
+    assert_eq!(value["identity_source"], "obs (error)");
+}
+
+#[test]
+fn config_show_resolve_identity_reports_the_obs_identity_level() {
+    // With `--resolve-identity` the OBS lookup runs over the
+    // network, like a generate: the fixture is the flagged
+    // instance only, so success proves the author came from the
+    // flagged instance's whois.
+    let addr = serve_routes(&[("/person/Admin", ADMIN_PERSON_BODY)]);
+    let dir = TempDir::new();
+    write_instances_config(&dir, &format!("[instances]\nexample = \"http://{addr}\"\n"));
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args([
+            "--instance",
+            "example",
+            "config",
+            "show",
+            "--resolve-identity",
+        ])
+        .env("GEECTL_OBS_USERNAME_EXAMPLE", "Admin")
+        .env("GEECTL_OBS_PASSWORD_EXAMPLE", "secret")
+        .env_remove("VC_REALNAME")
+        .env_remove("VC_MAILADDR")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["identity"], "Admin User <admin@example.com>");
+    assert_eq!(value["identity_source"], "obs");
+    assert!(!stdout.contains("secret"));
+}
+
+#[test]
+fn config_show_reports_the_git_identity_level() {
+    // No config, env, or OBS identity: the working copy's local
+    // git identity is the level reported.
+    let dir = TempDir::new();
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git_in(&repo, &["init", "--quiet"]);
+    git_in(&repo, &["config", "--local", "user.name", "Git Author"]);
+    git_in(
+        &repo,
+        &["config", "--local", "user.email", "git@example.com"],
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&repo)
+        .args(["config", "show"])
+        .env_remove("VC_REALNAME")
+        .env_remove("VC_MAILADDR")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["identity"], "Git Author <git@example.com>");
+    assert_eq!(value["identity_source"], "git");
+}
+
+#[test]
 fn instance_flag_with_missing_credentials_fails_closed() {
     // Plain credentials and another instance's credentials are set;
     // neither may serve the flagged instance: the call fails naming

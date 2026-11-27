@@ -234,7 +234,16 @@ pub enum Command {
 pub enum ConfigCommand {
     /// Show the effective config: endpoint URLs with their source,
     /// and credential status (never a secret value).
-    Show,
+    Show {
+        /// Resolve the OBS identity over the network too, like
+        /// `changelog generate` does. Without it, `config show`
+        /// reports the local levels and `obs (unresolved)` when
+        /// the OBS account might still identify the author; a
+        /// misconfigured level reports `env (unresolved)` or
+        /// `obs (error)` instead of failing the show.
+        #[arg(long)]
+        resolve_identity: bool,
+    },
     /// Write the config template (endpoints only). Refuses if the
     /// file already exists.
     Init,

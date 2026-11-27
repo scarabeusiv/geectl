@@ -4,10 +4,13 @@
 .SH NAME
 geectl\-config\-show \- Show the effective config: endpoint URLs with their source, and credential status (never a secret value)
 .SH SYNOPSIS
-\fBgeectl config show\fR [\fB\-h\fR|\fB\-\-help\fR] 
+\fBgeectl config show\fR [\fB\-\-resolve\-identity\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Show the effective config: endpoint URLs with their source, and credential status (never a secret value)
 .SH OPTIONS
+.TP
+\fB\-\-resolve\-identity\fR
+Resolve the OBS identity over the network too, like `changelog generate` does. Without it, `config show` reports the local levels and `obs (unresolved)` when the OBS account might still identify the author
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help

@@ -3662,7 +3662,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__config__subcmd__show)
-            opts="-h --format --debug --debug-body --live --instance --help"
+            opts="-h --resolve-identity --format --debug --debug-body --live --instance --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
