@@ -1763,8 +1763,10 @@ const NOT_FIXED: [&str; 17] = [
 ];
 
 /// Phrases that state an issue does not affect this package.
-const NOT_AFFECTED: [&str; 9] = [
+const NOT_AFFECTED: [&str; 11] = [
     "not affected",
+    "does not affect",
+    "doesn't affect",
     "is not affected by",
     "unaffected",
     "not vulnerable",
@@ -2732,6 +2734,31 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.rule == Rule::V12 && f.message.contains("not fixed / not affected")));
+    }
+
+    #[test]
+    fn v12_flags_a_cve_the_entry_says_does_not_affect_the_package() {
+        for bullet in [
+            "- CVE-2026-12345 does not affect this package",
+            "- CVE-2026-12345 doesn't affect this package",
+        ] {
+            let local = snapshot(&[
+                ("foo.spec", SPEC),
+                (
+                    "foo.changes",
+                    &changes_file(&format!("- Update to 2.0\n{bullet}"), "- Initial package"),
+                ),
+            ]);
+            let report = validate(&local, None, &ValidateOptions::default());
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|f| f.rule == Rule::V12 && f.message.contains("not fixed / not affected")),
+                "bullet {bullet:?} findings: {:?}",
+                report.findings
+            );
+        }
     }
 
     #[test]
