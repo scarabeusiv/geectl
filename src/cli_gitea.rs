@@ -11,8 +11,9 @@
 //! `GEECTL_GITEA_TOKEN_FILE`), so a dry-run preview cannot be built
 //! without one. That is the library's rule, not a CLI shortcut.
 //! Per-instance Gitea credentials (one token per configured Gitea
-//! instance, on the alias model): the host stays configured and
-//! `--instance` selects the alias token.
+//! instance, on the alias model): `--instance` selects the alias
+//! URL as the host and the alias token as the account, like the OBS
+//! side.
 //!
 //! The `branch` composite (Gitea fork + OBS `cmd=fork`, library
 //! `GiteaClient::branch`) is exposed as `branch create`: the
@@ -40,13 +41,13 @@
 //! The JSON payload remains the complete record in every case.
 
 use crate::auth::EnvGiteaAuth;
-use crate::config::{self, DEFAULT_GITEA_URL};
+use crate::config;
 use crate::debug::{strip_terminal_controls_marked, Debug};
 use crate::error::GeectlError;
 use crate::gitea::{
-    require_credentials_for_url, CleanupForkEntry, CleanupForkOutcome, CleanupForksResult,
-    ForkRepoOptions, GiteaBranch, GiteaClient, GiteaCommitStatus, GiteaRepository, GiteaUser,
-    MaintainerInfo, Maintainership, RepoCreateOptions,
+    require_credentials_for_url, validate_gitea_base, CleanupForkEntry, CleanupForkOutcome,
+    CleanupForksResult, ForkRepoOptions, GiteaBranch, GiteaClient, GiteaCommitStatus,
+    GiteaRepository, GiteaUser, MaintainerInfo, Maintainership, RepoCreateOptions,
 };
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::request::PROJECT_FORK_NO_HOME_PACKAGE_REASON;
@@ -602,13 +603,15 @@ fn cleanup_fork_entry_line(entry: &CleanupForkEntry, dry_run: &DryRun) -> String
 /// env / default) with the Bearer token resolved for that URL — the
 /// matching alias's variables when the URL is named in `[instances]`,
 /// the plain variables otherwise — reporting on the debug channel.
-/// With `--instance`, strictly the flagged alias's variables (see
-/// `resolve_gitea_for_instance`); the host stays the configured URL.
-/// Construction fails closed without a token — even in dry-run, even
-/// for reads (see the `gitea` group's module docs). The one
-/// construction for the `gitea` group, the `pull-request` group's
-/// Gitea backend, and the `meta` group's Gitea arm, so the credential
-/// resolution cannot drift between them.
+/// With `--instance`, the flagged alias's URL is the base and
+/// strictly the flagged alias's variables authenticate (see
+/// `resolve_gitea_for_instance`); the flag selects the host and
+/// the account together, like the OBS side. Construction fails
+/// closed without a token — even in dry-run, even for reads (see
+/// the `gitea` group's module docs). The one construction for the
+/// `gitea` group, the `pull-request` group's Gitea backend, and
+/// the `meta` group's Gitea arm, so the credential resolution
+/// cannot drift between them.
 pub(crate) fn gitea_client<'a>(
     http: &'a dyn HttpClient,
     debug: &Debug,
@@ -616,15 +619,11 @@ pub(crate) fn gitea_client<'a>(
 ) -> Result<GiteaClient<'a>, GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
-    // Unreachable by construction — effective_config always yields
-    // Some(gitea_url) — but kept as a defensive default rather than
-    // an unwrap: a config change must not turn into a panic here.
-    let base = effective
-        .config
-        .gitea_url
-        .as_deref()
-        .unwrap_or(DEFAULT_GITEA_URL);
+    let base = config::gitea_base_url(instance, &file_config)?;
+    // The base validates before any credential is resolved: a
+    // configured base with a path is the base's own error, not a
+    // misleading "no token configured".
+    validate_gitea_base(&base)?;
     // Both arguments are `base`: it is the effective URL
     // (environment, then config file, then default), so the plain
     // variables belong to it. A second URL must never be resolved
@@ -639,13 +638,13 @@ pub(crate) fn gitea_client<'a>(
     let credentials = match instance {
         Some(alias) => EnvGiteaAuth::credentials_for_instance(alias, &file_config.instances)?,
         None => require_credentials_for_url(
-            EnvGiteaAuth::credentials_for_url(base, base, &file_config.instances)?,
-            base,
-            base,
+            EnvGiteaAuth::credentials_for_url(&base, &base, &file_config.instances)?,
+            &base,
+            &base,
             &file_config.instances,
         )?,
     };
-    GiteaClient::with_base(http, base, credentials).map(|client| client.with_debug(debug.clone()))
+    GiteaClient::with_base(http, &base, credentials).map(|client| client.with_debug(debug.clone()))
 }
 
 /// The `repo-create` result line: the created repository's full

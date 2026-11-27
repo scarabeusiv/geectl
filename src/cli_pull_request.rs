@@ -46,7 +46,7 @@
 //! `show` call away.
 
 use crate::auth::{Credentials, EnvGiteaAuth, EnvObsAuth};
-use crate::config::{self, DEFAULT_GITEA_URL};
+use crate::config;
 use crate::debug::{strip_terminal_controls, strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{
@@ -840,9 +840,9 @@ fn with_gitea<T>(
 /// are validated before any credential resolution — like the other
 /// arms validate their handles and targets first. Each arm then
 /// refuses a checkout that is not submittable before filing.
-/// `--instance` selects the account on both arms: the OBS instance
-/// on the OBS arm, the Gitea token on the Gitea arm; the Gitea host
-/// stays the configured one.
+/// `--instance` selects the instance on both arms: the OBS instance
+/// on the OBS arm, the Gitea instance (host and token) on the Gitea
+/// arm.
 fn submit(
     args: SubmitArgs,
     debug: &Debug,
@@ -875,7 +875,8 @@ fn submit(
                 working_copy::refuse_not_submittable_obs(&wc, obs)?;
                 let client = PullRequestClient::new(Some(obs), None)
                     .with_debug(debug.clone())
-                    .with_gitea_http(gitea_http);
+                    .with_gitea_http(gitea_http)
+                    .with_gitea_instance(instance);
                 let submitted = client.submit(&target, &dry_run)?;
                 record_submitted_request(&wc.root, &submitted);
                 Ok((
@@ -907,7 +908,7 @@ fn submit(
             // client to plan with — the token is a build
             // requirement, not a live-only one. Lifting that is a
             // group-wide policy call, not this verb's.
-            let (base, instances) = gitea_instance()?;
+            let (base, instances) = gitea_instance(instance)?;
             // The base validates before any credential is resolved:
             // a configured base with a path is the base's own error,
             // not a misleading "no token configured".
@@ -979,30 +980,26 @@ fn current_dir() -> Result<std::path::PathBuf, GeectlError> {
 /// `[instances]` table, for the alias-aware token resolution.
 /// Config only — no credentials are read here, so the target build
 /// (flag validation, origin-host check) can run before any
-/// credential resolution.
-fn gitea_instance() -> Result<(String, Vec<(String, String)>), GeectlError> {
+/// credential resolution. With `--instance`, the flagged alias's
+/// URL is the base, like the OBS side.
+fn gitea_instance(instance: Option<&str>) -> Result<(String, Vec<(String, String)>), GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
-    let base = effective
-        .config
-        .gitea_url
-        .as_deref()
-        .unwrap_or(DEFAULT_GITEA_URL)
-        .to_string();
+    let base = config::gitea_base_url(instance, &file_config)?;
     Ok((base, file_config.instances))
 }
 
 /// The Gitea token for `base`: with `--instance`, strictly the
 /// flagged alias's variables (see `resolve_gitea_for_instance`) —
-/// the flag selects the account the filing authenticates as; the
-/// host stays `base`. Without it, alias-aware by URL: the matching
-/// alias's variables from `[instances]` when one matches, else the
-/// plain variables (see `resolve_gitea_bearer_for_url`). The one
-/// resolution the submit arm shares between its API client and its
-/// pre-filing fetch. A missing token fails closed with the plain
-/// message; the alias-aware error names the alias variables when
-/// an alias matches.
+/// the flag selects the account the filing authenticates as, and
+/// `base` is the flagged alias's URL. Without it, alias-aware by
+/// URL: the matching alias's variables from `[instances]` when one
+/// matches, else the plain variables (see
+/// `resolve_gitea_bearer_for_url`). The one resolution the submit
+/// arm shares between its API client and its pre-filing fetch. A
+/// missing token fails closed with the plain message; the
+/// alias-aware error names the alias variables when an alias
+/// matches.
 fn gitea_token_for(
     base: &str,
     instances: &[(String, String)],

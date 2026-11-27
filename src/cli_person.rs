@@ -31,10 +31,10 @@
 //! JSON payload remains the complete record in every case.
 
 use crate::auth::{EnvGiteaAuth, EnvObsAuth};
-use crate::config::{self, DEFAULT_GITEA_URL};
+use crate::config;
 use crate::debug::{strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
-use crate::gitea::{GiteaClient, GiteaUser};
+use crate::gitea::{validate_gitea_base, GiteaClient, GiteaUser};
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{ObsClient, ProjectMatch};
 use crate::person::{PersonBackend, PersonClient, PersonSearch, PersonSearchResult};
@@ -152,9 +152,10 @@ fn with_obs<T>(
 /// the configured URL from its instance alias like the OBS arm
 /// (`EnvGiteaAuth::credentials_for_url`, the same per-URL shape
 /// as the OBS arm), reporting on the debug channel. With
-/// `--instance`, strictly the flagged alias's variables; the host
-/// stays the configured URL. Construction fails closed without a
-/// token.
+/// `--instance`, the flagged alias's URL is the base and strictly
+/// the flagged alias's variables authenticate; the flag selects the
+/// host and the account together, like the OBS arm. Construction
+/// fails closed without a token.
 /// The same construction as the `gitea` group's, except the
 /// alias-aware resolution.
 fn gitea_client<'a>(
@@ -164,20 +165,16 @@ fn gitea_client<'a>(
 ) -> Result<GiteaClient<'a>, GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
-    // Unreachable by construction — effective_config always yields
-    // Some(gitea_url) — but kept as a defensive default rather than
-    // an unwrap: a config change must not turn into a panic here.
-    let base = effective
-        .config
-        .gitea_url
-        .as_deref()
-        .unwrap_or(DEFAULT_GITEA_URL);
+    let base = config::gitea_base_url(instance, &file_config)?;
+    // The base validates before any credential is resolved: a
+    // configured base with a path is the base's own error, not a
+    // misleading "no token configured".
+    validate_gitea_base(&base)?;
     let credentials = match instance {
         Some(alias) => EnvGiteaAuth::credentials_for_instance(alias, &file_config.instances)?,
-        None => EnvGiteaAuth::credentials_for_url(base, base, &file_config.instances)?,
+        None => EnvGiteaAuth::credentials_for_url(&base, &base, &file_config.instances)?,
     };
-    GiteaClient::with_base(http, base, credentials).map(|client| client.with_debug(debug.clone()))
+    GiteaClient::with_base(http, &base, credentials).map(|client| client.with_debug(debug.clone()))
 }
 
 /// Run `f` with a `GiteaClient` for the configured instance. The

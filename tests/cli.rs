@@ -944,6 +944,33 @@ fn debug_config_line_reports_alias_credentials() {
     assert!(!stderr.contains("target-secret"));
 }
 
+#[test]
+fn debug_config_line_reports_the_flagged_gitea_host() {
+    // With `--instance`, the debug config line names the flagged
+    // alias's Gitea host and the alias token's kind — not the
+    // default host and the plain token.
+    let dir = TempDir::new();
+    write_instances_config(
+        &dir,
+        "[instances]\nexample = \"https://gitea.example.org\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .args(["--instance", "example", "--debug", "version"])
+        .env("GEECTL_GITEA_URL", "https://src.opensuse.org")
+        .env("GEECTL_GITEA_TOKEN", "plain-token")
+        .env("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("gitea gitea.example.org (auth: bearer)"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("alias-token"));
+    assert!(!stderr.contains("plain-token"));
+}
+
 // --- remote-read integration tests ---
 
 #[test]
@@ -6943,6 +6970,131 @@ fn serve_obs_gitea_merge_forward_ambiguous(
     (addr, seen)
 }
 
+/// A combined OBS+Gitea stub on one address: one `[instances]`
+/// alias URL serves both backends under `--instance`, so the stub
+/// answers the OBS filing calls and the Gitea branch read the
+/// freshness check makes. The source package syncs from the stub's
+/// own Gitea repo on `factory`, with the obsinfo commit matching
+/// the branch head.
+fn serve_obs_gitea_aliased_filing() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_thread = std::sync::Arc::clone(&seen);
+    let head = "2ec4b574be01c905f83a91b026682b839cfce0521a5b24d164c818d54d0880ec";
+    let source_meta = format!(
+        "<package name=\"gsl\" project=\"science\"><scmsync>http://{addr}/adamm/gsl.git#factory</scmsync></package>"
+    );
+    let obsinfo = format!(
+        "mtime: 1774534342\ncommit: {head}\nurl: http://{addr}/adamm/gsl.git\nrevision: factory\n"
+    );
+    let branch = format!(
+        "{{\"name\": \"factory\", \"commit\": {{\"id\": \"{head}\", \"message\": \"OBS bridge sync\"}}, \"protected\": false}}"
+    );
+    let empty_collection = "<collection matches=\"0\"></collection>";
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            seen_in_thread
+                .lock()
+                .unwrap()
+                .push(text.lines().next().unwrap_or("").to_string());
+            let mut parts = text.lines().next().unwrap_or("").split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let (status, body) = if method == "POST" && target.contains("cmd=create") {
+                (
+                    200,
+                    "<request id=\"1400001\" creator=\"alice\"></request>".to_string(),
+                )
+            } else if target.contains("/api/v1/repos/adamm/gsl/branches/factory") {
+                (200, branch.clone())
+            } else if target.contains("/_scmsync.obsinfo") {
+                (200, obsinfo.clone())
+            } else if target.contains("/_meta") {
+                (200, source_meta.clone())
+            } else if target.contains("search/request") {
+                (200, empty_collection.to_string())
+            } else {
+                (404, "<status code=\"not_found\" />".to_string())
+            };
+            let reason = http_reason(status);
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, seen)
+}
+
+#[test]
+fn request_file_aliased_filing_uses_the_flagged_gitea_host() {
+    // The freshness check's lazy Gitea client must resolve through
+    // the flagged instance: the branch read goes to the alias host
+    // (this stub), never the default Gitea host. A lazy client
+    // ignoring `--instance` would read the branch from
+    // src.opensuse.org and the filing would fail.
+    let (addr, seen) = serve_obs_gitea_aliased_filing();
+    let dir = TempDir::new();
+    write_instances_config(&dir, &format!("[instances]\nexample = \"http://{addr}\"\n"));
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "--instance",
+            "example",
+            "request",
+            "file",
+            "--source-project",
+            "science",
+            "--source-package",
+            "gsl",
+            "--target-project",
+            "devel:languages:python",
+            "--target-package",
+            "gsl",
+            "--description",
+            "Update gsl to 2.0",
+            "--changes-entry",
+            "- Update to version 2.0.",
+        ])
+        .env("GEECTL_OBS_USERNAME_EXAMPLE", "alice")
+        .env("GEECTL_OBS_PASSWORD_EXAMPLE", "test-password")
+        .env("GEECTL_GITEA_TOKEN_EXAMPLE", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["id"], 1400001);
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|r| r.contains("/api/v1/repos/adamm/gsl/branches/factory")),
+        "requests: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|r| r.contains("cmd=create")),
+        "requests: {seen:?}"
+    );
+}
+
 #[test]
 fn pull_request_merge_gitea_live_forwards_after_merge() {
     let (gitea_addr, gitea_seen) = serve_gitea_merge_forward();
@@ -8073,7 +8225,10 @@ fn pull_request_submit_gitea_instance_flag_uses_the_alias_token() {
         &checkout,
         &["config", "--local", "remote.origin.url", origin.as_str()],
     );
-    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    // The flagged alias's URL is the Gitea base: the alias names
+    // the mock server, and the flag beats the configured URL in
+    // the environment.
+    write_instances_config(&dir, &format!("[instances]\nexample = \"http://{addr}\"\n"));
     let out = geectl_isolated(&dir)
         .current_dir(&checkout)
         .args([
@@ -8086,7 +8241,7 @@ fn pull_request_submit_gitea_instance_flag_uses_the_alias_token() {
             "--title",
             "Update foo",
         ])
-        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
+        .env("GEECTL_GITEA_URL", "https://gitea.example.org")
         .env("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token")
         .output()
         .unwrap();
@@ -8118,7 +8273,10 @@ fn pull_request_submit_gitea_instance_flag_never_borrows_the_plain_token() {
         &checkout,
         &["config", "--local", "remote.origin.url", origin.as_str()],
     );
-    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    // The flagged alias's URL is the Gitea base (the mock server),
+    // so the origin-host check passes and the token resolution is
+    // what fails: the plain token never serves the flagged alias.
+    write_instances_config(&dir, &format!("[instances]\nexample = \"http://{addr}\"\n"));
     let out = geectl_isolated(&dir)
         .current_dir(&checkout)
         .args([
@@ -11544,6 +11702,38 @@ fn instance_flag_beats_environment_in_config_show() {
 }
 
 #[test]
+fn instance_flag_selects_the_gitea_host_in_config_show() {
+    // The flag selects the Gitea host and the Gitea account
+    // together, like the OBS side: `config show --instance
+    // example` reports the alias URL with source `flag` and the
+    // alias token's status — not the default instance's.
+    let dir = TempDir::new();
+    write_instances_config(
+        &dir,
+        "[instances]\nexample = \"https://gitea.example.org\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .args(["--instance", "example", "config", "show"])
+        .env("GEECTL_GITEA_URL", "https://src.opensuse.org")
+        .env("GEECTL_GITEA_TOKEN", "plain-token")
+        .env("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["gitea_url"], "https://gitea.example.org");
+    assert_eq!(value["gitea_url_source"], "flag");
+    assert_eq!(value["gitea_auth"]["status"], "configured");
+    assert!(!stdout.contains("alias-token"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("alias-token"));
+}
+
+#[test]
 fn instance_flag_with_missing_credentials_fails_closed() {
     // Plain credentials and another instance's credentials are set;
     // neither may serve the flagged instance: the call fails naming
@@ -11631,12 +11821,14 @@ fn instance_flag_obs_leaf_success_reads_from_the_flagged_endpoint() {
 
 #[test]
 fn instance_flag_gitea_leaf_uses_the_alias_token() {
-    // The flag selects the account on every Gitea leaf, not just on
+    // The flag selects the instance on every Gitea leaf, not just on
     // pull-request filing: with only the alias token set, a `gitea`
-    // read succeeds and returns the fixture's repository.
+    // read succeeds and returns the fixture's repository. The
+    // flagged alias's URL is the base (the mock server), and the
+    // flag beats the configured URL in the environment.
     let addr = serve_routes(&[("/api/v1/repos/owner/repo", SUBMIT_FORK_REPO_JSON)]);
     let dir = TempDir::new();
-    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    write_instances_config(&dir, &format!("[instances]\nexample = \"http://{addr}\"\n"));
     let out = geectl_isolated(&dir)
         .args([
             "--instance",
@@ -11646,7 +11838,7 @@ fn instance_flag_gitea_leaf_uses_the_alias_token() {
             "owner",
             "repo",
         ])
-        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
+        .env("GEECTL_GITEA_URL", "https://gitea.example.org")
         .env("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token")
         .output()
         .unwrap();
@@ -11691,12 +11883,17 @@ fn instance_flag_gitea_leaf_never_borrows_the_plain_token() {
 #[test]
 fn instance_flag_person_search_gitea_uses_the_alias_token() {
     // `person search --backend gitea` builds its own Gitea client:
-    // the flag selects the account there too.
+    // the flag selects the instance there too — the alias URL is
+    // the base (the mock server), and the flag beats the configured
+    // URL in the environment.
     let gitea_addr = serve_once(
         r#"{"ok": true, "data": [{"login": "alice", "full_name": "Alice", "email": "alice@example.com"}]}"#,
     );
     let dir = TempDir::new();
-    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    write_instances_config(
+        &dir,
+        &format!("[instances]\nexample = \"http://{gitea_addr}\"\n"),
+    );
     let out = geectl_isolated(&dir)
         .args([
             "--instance",
@@ -11707,7 +11904,7 @@ fn instance_flag_person_search_gitea_uses_the_alias_token() {
             "--backend",
             "gitea",
         ])
-        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_URL", "https://gitea.example.org")
         .env("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token")
         .output()
         .unwrap();

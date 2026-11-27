@@ -19,7 +19,7 @@
 //! plan.
 
 use crate::auth::{Credentials, EnvGiteaAuth, EnvObsAuth};
-use crate::config::{self, DEFAULT_GITEA_URL};
+use crate::config;
 use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{HttpClient, Timeout, UreqClient};
@@ -31,11 +31,13 @@ use crate::working_copy::{
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-/// The resolved endpoints: the OBS base URL, the config file's
-/// instances, the flagged instance when `--instance` names one,
-/// and the effective config (for the commit service gate).
+/// The resolved endpoints: the OBS base URL, the Gitea base URL,
+/// the config file's instances, the flagged instance when
+/// `--instance` names one, and the effective config (for the commit
+/// service gate).
 struct Endpoints {
     obs_base: String,
+    gitea_base: String,
     instances: Vec<(String, String)>,
     instance: Option<String>,
     config: config::Config,
@@ -53,8 +55,12 @@ fn endpoints(instance: Option<&str>) -> Result<Endpoints, GeectlError> {
             .clone()
             .unwrap_or_else(|| OBS_API_BASE.to_string()),
     };
+    // The Gitea base honours `--instance` like the OBS base: the
+    // flagged alias's URL, else the effective Gitea URL.
+    let gitea_base = config::gitea_base_url(instance, &file_config)?;
     Ok(Endpoints {
         obs_base,
+        gitea_base,
         instances: file_config.instances,
         instance: instance.map(str::to_string),
         config: effective.config,
@@ -113,14 +119,23 @@ fn obs_client<'a>(
 /// configured: a public git-backed checkout needs none, and the
 /// push is what fails closed without one. The URL scopes the token
 /// (see `working_copy::GiteaAuth`): git only sends it to that
-/// instance.
+/// instance. With `--instance`, the flagged alias's URL is the
+/// base and only the alias's token variables authenticate — but
+/// the token stays optional: an alias with no token variables
+/// reads as no token (a public checkout), while a set-but-
+/// misconfigured alias token fails closed.
 fn gitea_auth(endpoints: &Endpoints) -> Result<Option<(String, String)>, GeectlError> {
-    let url = endpoints
-        .config
-        .gitea_url
-        .clone()
-        .unwrap_or_else(|| DEFAULT_GITEA_URL.to_string());
-    match EnvGiteaAuth::credentials_for_url(&url, &url, &endpoints.instances)? {
+    let url = endpoints.gitea_base.clone();
+    let credentials = match &endpoints.instance {
+        Some(alias) => {
+            match EnvGiteaAuth::credentials_for_instance_optional(alias, &endpoints.instances)? {
+                Some(credentials) => credentials,
+                None => return Ok(None),
+            }
+        }
+        None => EnvGiteaAuth::credentials_for_url(&url, &url, &endpoints.instances)?,
+    };
+    match credentials {
         Credentials::Bearer { token } => Ok(Some((token, url))),
         _ => Ok(None),
     }
@@ -1191,6 +1206,7 @@ mod tests {
         let http = FakeHttp::new();
         let endpoints = Endpoints {
             obs_base: "https://api.example.org".to_string(),
+            gitea_base: "https://gitea.example.org".to_string(),
             instances: vec![("example".to_string(), "https://api.example.org".to_string())],
             instance: Some("example".to_string()),
             config: config::Config {

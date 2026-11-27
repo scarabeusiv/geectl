@@ -74,9 +74,10 @@ pub struct Cli {
     /// `GEECTL_OBS_PASSWORD[_FILE]_<ALIAS>` /
     /// `GEECTL_OBS_APIKEY[_FILE]_<ALIAS>`); another instance's
     /// variables are never borrowed, and a missing credential for
-    /// the flagged instance fails the call. For Gitea, the host is
-    /// unaffected, but every Gitea call authenticates with the
-    /// flagged alias's `GEECTL_GITEA_TOKEN[_FILE]_<ALIAS>` only.
+    /// the flagged instance fails the call. For Gitea, the flagged
+    /// alias's URL replaces the configured URL too, and every
+    /// Gitea call authenticates with the flagged alias's
+    /// `GEECTL_GITEA_TOKEN[_FILE]_<ALIAS>` only.
     #[arg(long, global = true, value_name = "ALIAS")]
     pub instance: Option<String>,
 

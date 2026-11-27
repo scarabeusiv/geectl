@@ -1583,6 +1583,7 @@ pub struct SrFiling<'a> {
     obs: &'a ObsClient<'a>,
     gitea: Option<&'a GiteaClient<'a>>,
     gitea_http: Option<&'a dyn HttpClient>,
+    gitea_instance: Option<String>,
     dry_run: &'a DryRun,
     debug: Debug,
 }
@@ -1615,6 +1616,7 @@ impl<'a> SrFiling<'a> {
             obs,
             gitea: None,
             gitea_http: None,
+            gitea_instance: None,
             dry_run,
             debug: Debug::disabled(),
         }
@@ -1648,6 +1650,17 @@ impl<'a> SrFiling<'a> {
     /// [`SrFiling::check_source_freshness`].
     pub fn with_gitea_http(mut self, http: Option<&'a dyn HttpClient>) -> Self {
         self.gitea_http = http;
+        self
+    }
+
+    /// The instance the lazy Gitea client resolves for: with
+    /// `--instance`, the flagged alias's URL and token variables
+    /// (see [`GiteaClient::try_from_config_for`]) — without it the
+    /// lazy client would silently serve an aliased filing with the
+    /// default host and token. `None` (the default) keeps the
+    /// default resolution.
+    pub fn with_gitea_instance(mut self, instance: Option<&str>) -> Self {
+        self.gitea_instance = instance.map(str::to_string);
         self
     }
 
@@ -1888,7 +1901,7 @@ impl<'a> SrFiling<'a> {
     /// after the source meta says `<scmsync>`: an explicit client
     /// wired in ([`SrFiling::with_gitea`]) is used as-is, otherwise
     /// the HTTP client wired in ([`SrFiling::with_gitea_http`])
-    /// resolves one through [`GiteaClient::try_from_config`]. A
+    /// resolves one through [`GiteaClient::try_from_config_for`]. A
     /// malformed `gitea_url`/instance config therefore fails only a
     /// git-backed filing, never an OBS-native one. Without any client
     /// wired in the check is off before any read — the meta read only
@@ -1919,7 +1932,7 @@ impl<'a> SrFiling<'a> {
         };
         // The source is git-backed: only now does the Gitea client
         // resolve. An explicit client wins; otherwise the wired HTTP
-        // client resolves one through `try_from_config`, so a
+        // client resolves one through `try_from_config_for`, so a
         // malformed `gitea_url`/instance config fails here — a filing
         // that needs Gitea — and never an OBS-native filing. A
         // missing token is not an error: the check is off and the
@@ -1928,7 +1941,11 @@ impl<'a> SrFiling<'a> {
         let gitea: &GiteaClient<'_> = match (self.gitea, self.gitea_http) {
             (Some(client), _) => client,
             (None, Some(http)) => {
-                lazy = GiteaClient::try_from_config(http, &self.debug)?;
+                lazy = GiteaClient::try_from_config_for(
+                    http,
+                    self.gitea_instance.as_deref(),
+                    &self.debug,
+                )?;
                 match lazy.as_ref() {
                     Some(client) => client,
                     None => return Ok(()),
