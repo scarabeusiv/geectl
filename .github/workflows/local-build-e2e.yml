@@ -6,8 +6,8 @@
 # stub podman, this job proves the real engine, image, and cache end to
 # end. It gates PRs: each leg is a required status check. When a leg
 # regresses, it blocks the merge until fixed. It runs
-# on every pull request, weekly (Mondays 06:00 UTC, the same slot as
-# the freshness workflow and the live job), and on demand.
+# on every pull request, on pushes to main, weekly (Mondays 06:00 UTC,
+# the same slot as the freshness workflow and the live job), and on demand.
 #
 # The job is a matrix of container shapes (rootless, the default, and
 # privileged, the `--privileged` opt-in) on Ubuntu. Each leg provisions
@@ -35,6 +35,8 @@ name: local-build-e2e
 
 on:
   pull_request:
+  push:
+    branches: [main]
   schedule:
     # Weekly, Mondays 06:00 UTC.
     - cron: "0 6 * * 1"
