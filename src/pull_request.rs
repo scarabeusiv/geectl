@@ -969,6 +969,16 @@ impl<'a> PullRequestClient<'a> {
         Ok(summaries)
     }
 
+    /// Whether a `--commit` pin is supported for this handle: the
+    /// recorded limitation a queue can ask about before approving
+    /// with one, instead of hitting the runtime refusal. Gitea
+    /// only: a Gitea review is recorded against the head commit
+    /// server-side. OBS reviews carry no revision, so a pin on an
+    /// OBS ref is refused.
+    pub fn commit_pin_supported(reference: &PullRequestRef) -> bool {
+        matches!(reference, PullRequestRef::Gitea { .. })
+    }
+
     /// Approve a pull request as the review asked of `target`:
     /// `Some` target acts on that target, `None` acts on the
     /// review asked of the acting user. A `Some` target on a
@@ -979,6 +989,8 @@ impl<'a> PullRequestClient<'a> {
     /// moved. The pin is best-effort: the head is read just before
     /// the review posts, so a push landing between the read and
     /// the post is not caught; on an OBS ref a commit is refused.
+    /// Whether a pin is supported for a handle is
+    /// [`commit_pin_supported`](Self::commit_pin_supported).
     /// Returns the recorded opinion, or `None` in dry-run.
     pub fn approve(
         &self,
@@ -1956,6 +1968,8 @@ impl<'a> PullRequestClient<'a> {
     ) -> Result<Option<ReviewOpinion>, GeectlError> {
         match reference {
             PullRequestRef::Obs(id) => {
+                // The pin is Gitea-only (see `commit_pin_supported`):
+                // OBS reviews carry no revision.
                 if let Some(commit) = commit {
                     return Err(GeectlError::new(
                         ErrorKind::InvalidInput,
@@ -5689,5 +5703,11 @@ please fix this</comment></comments>"#,
             "more than one OBS package is synced from https://src.opensuse.org/openSUSE/geectl#main"
         ));
         assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn commit_pin_supported_is_gitea_only() {
+        assert!(!PullRequestClient::commit_pin_supported(&obs_ref()));
+        assert!(PullRequestClient::commit_pin_supported(&gitea_ref()));
     }
 }

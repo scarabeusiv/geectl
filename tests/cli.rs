@@ -6575,6 +6575,30 @@ fn pull_request_approve_gitea_with_malformed_commit_is_invalid_input() {
 }
 
 #[test]
+fn pull_request_approve_obs_with_commit_is_invalid_input() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "pull-request",
+            "approve",
+            "obs:42",
+            "--commit",
+            "e490820bfabf010f5f267335067a52757aca72af2",
+        ])
+        .output()
+        .unwrap();
+    // InvalidInput exits 2; a --commit pin is Gitea-only, and
+    // the refusal precedes credential resolution, so it fires
+    // without OBS credentials where a plain approve would fail
+    // with ConfigError.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("--commit"), "stderr: {stderr}");
+}
+
+#[test]
 fn pull_request_merge_gitea_dry_run_prints_forward_plan() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)

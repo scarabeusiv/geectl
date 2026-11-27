@@ -1396,6 +1396,21 @@ fn review_act_with(
     ) -> Result<Option<ReviewOpinion>, GeectlError>,
 ) -> Result<(Value, String), GeectlError> {
     let reference: PullRequestRef = args.reference.parse()?;
+    // A `--commit` pin is Gitea-only (see
+    // `PullRequestClient::commit_pin_supported`): refuse it on an
+    // OBS ref before any credential resolution, like the merge
+    // leaf refuses its backend-only options — the library refuses
+    // again, as enforcement.
+    if let Some(commit) = args.commit.as_deref() {
+        if !PullRequestClient::commit_pin_supported(&reference) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "--commit {commit} does not apply to a submit request: OBS reviews are not pinned to a commit"
+                ),
+            ));
+        }
+    }
     let target = review_target(
         args.user.as_deref(),
         args.group.as_deref(),
