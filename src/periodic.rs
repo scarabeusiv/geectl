@@ -158,11 +158,37 @@ pub struct PeriodicOutcome {
     pub commands: Vec<Vec<String>>,
 }
 
-/// The status of the schedule on one platform. `installed` is
-/// `None` on Windows when the query fails ambiguously: the query is
-/// the only answer there, so a failed query is unknown, not absent.
-/// `enabled` and `active` are `None` when the scheduler cannot be
-/// asked or its answer names no known state: unknown, not disabled.
+/// The status of the schedule on one platform, as the
+/// `periodic-status` JSON payload carries it. The fields are
+/// platform-neutral names over platform-specific answers — the
+/// meaning of each field depends on `platform`:
+///
+/// * `label` is the name the platform scheduler knows the task by:
+///   `geectl-prune.timer` on Linux, `io.github.scarabeusiv.geectl.prune`
+///   on macOS, `geectl-prune` on Windows.
+/// * `installed` is whether the schedule definition is present:
+///   on Linux and macOS every plan file exists; on Windows the
+///   schtasks query found the task. It is `None` only on Windows,
+///   when the query fails ambiguously: the query is the only answer
+///   there, so a failed query is unknown, not absent. A schedule
+///   whose files exist but the scheduler never registered still
+///   reads installed on Linux and macOS — `enabled` is the
+///   scheduler's half of that answer.
+/// * `enabled` is whether the scheduler will run it: `systemctl
+///   --user is-enabled` on Linux, `launchctl list` finding the
+///   agent loaded on macOS, a schtasks `Status:` other than
+///   `Disabled` on Windows. `None` when the scheduler cannot be
+///   asked or its answer names no known state: unknown, not
+///   disabled.
+/// * `active` is whether it is running right now: `systemctl
+///   --user is-active` on Linux, a schtasks `Status:` of `Running`
+///   on Windows, and always `None` on macOS — launchd reports no
+///   persistent active state for a calendar agent. `None` is
+///   unknown, not stopped.
+/// * `files` is the files the schedule owns: the plan files on
+///   Linux and macOS, always empty on Windows — the import XML is
+///   transient, written for schtasks and removed, so the task owns
+///   no file afterwards.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PeriodicStatus {
     pub platform: PeriodicOs,
@@ -1169,9 +1195,10 @@ fn query_enabled_active(os: PeriodicOs, label: &str) -> SchedulerState {
 }
 
 /// The status of the schedule for `os`: whether its files exist,
-/// and what the scheduler reports. On Windows the task owns no
-/// file, so installed is the scheduler query itself — and the
-/// transient import XML is not listed as a file.
+/// and what the scheduler reports. The per-field, per-platform
+/// meaning is documented on [`PeriodicStatus`]: on Windows the
+/// task owns no file, so installed is the scheduler query itself —
+/// and the transient import XML is not listed as a file.
 pub fn status(
     os: PeriodicOs,
     home: &Path,
@@ -1409,6 +1436,55 @@ mod tests {
         } else {
             "/xdg/config"
         }
+    }
+
+    #[test]
+    fn status_linux_reports_the_plan_files_and_file_based_installed() {
+        // The fake home owns no files, so installed is false;
+        // the scheduler half is host-dependent and not pinned
+        // here — only the file-based shape is.
+        let status = status(PeriodicOs::Linux, &home(), None).unwrap();
+        assert_eq!(status.platform, PeriodicOs::Linux);
+        assert_eq!(status.label, "geectl-prune.timer");
+        assert_eq!(status.installed, Some(false));
+        assert_eq!(
+            status.files,
+            install_plan(PeriodicOs::Linux, &exe(), &home(), None)
+                .unwrap()
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn status_macos_reports_the_plist_and_never_an_active_state() {
+        // launchd reports no persistent active state for a
+        // calendar agent, so active is None whatever the
+        // scheduler says; installed is file-based like Linux.
+        let status = status(PeriodicOs::MacOs, &home(), None).unwrap();
+        assert_eq!(status.platform, PeriodicOs::MacOs);
+        assert_eq!(status.label, LAUNCHD_LABEL);
+        assert_eq!(status.installed, Some(false));
+        assert_eq!(status.active, None);
+        assert_eq!(
+            status.files,
+            vec![home()
+                .join("Library")
+                .join("LaunchAgents")
+                .join(format!("{LAUNCHD_LABEL}.plist"))]
+        );
+    }
+
+    #[test]
+    fn status_windows_owns_no_files() {
+        // The import XML is transient, so the task owns no file
+        // afterwards — whatever the scheduler query answers.
+        let status = status(PeriodicOs::Windows, &home(), None).unwrap();
+        assert_eq!(status.platform, PeriodicOs::Windows);
+        assert_eq!(status.label, TASK_NAME);
+        assert_eq!(status.files, Vec::<PathBuf>::new());
     }
 
     #[test]
