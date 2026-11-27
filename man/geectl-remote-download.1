@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH geectl-remote-download 1  "geectl-remote-download 0.2.3" 
+.TH geectl-remote-download 1  "geectl-remote-download 0.2.4" 
 .SH NAME
 geectl\-remote\-download \- Download a source file to a local path. The binary counterpart of `cat`: the library streams the file to disk instead of reading it as a UTF\-8 string, so a binary file (a source tarball) downloads instead of failing the UTF\-8 check, and a file larger than the transport\*(Aqs 10 MiB body cap downloads instead of failing. A read: `\-\-live` is ignored, like `cat`
 .SH SYNOPSIS
@@ -27,4 +27,4 @@ The package the file lives in
 <\fIFILE\fR>
 The file to download
 .SH VERSION
-v0.2.3
+v0.2.4

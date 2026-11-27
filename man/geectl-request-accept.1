@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH geectl-request-accept 1  "geectl-request-accept 0.2.3" 
+.TH geectl-request-accept 1  "geectl-request-accept 0.2.4" 
 .SH NAME
 geectl\-request\-accept \- Accept a submit request, with a comment as the message left with the accept. An accepted request is forwarded to its link parent unless `\-\-no\-forward` is given; a refused forward is reported and the accepted request stands, with the work staying queued in the devel project. The forwarded request\*(Aqs `.changes` entry is the original description, overridable with `\-m` / `\-\-forward\-message`. Dry\-run by default; mutates only with `\-\-live`
 .SH SYNOPSIS
@@ -27,4 +27,4 @@ Print help
 <\fIID\fR>
 The request id
 .SH VERSION
-v0.2.3
+v0.2.4

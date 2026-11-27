@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH geectl-pull-request-cleanup 1  "geectl-pull-request-cleanup 0.2.3" 
+.TH geectl-pull-request-cleanup 1  "geectl-pull-request-cleanup 0.2.4" 
 .SH NAME
 geectl\-pull\-request\-cleanup \- Clean the local build roots for the submit request filed from the working copy in the current directory, when that request is accepted. The request id was recorded by `submit` in the checkout; the leaf reads the request state once and wipes the roots only on `accepted`. A request in any other state, and a checkout with nothing recorded, delete nothing. Dry\-run by default; mutates only with `\-\-live`
 .SH SYNOPSIS
@@ -12,4 +12,4 @@ Clean the local build roots for the submit request filed from the working copy i
 \fB\-h\fR, \fB\-\-help\fR
 Print help
 .SH VERSION
-v0.2.3
+v0.2.4

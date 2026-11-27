@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH geectl-local-build-chroot 1  "geectl-local-build-chroot 0.2.3" 
+.TH geectl-local-build-chroot 1  "geectl-local-build-chroot 0.2.4" 
 .SH NAME
 geectl\-local\-build\-chroot \- Enter the preserved build root of the last build for the package and run repro commands there, read from stdin, one per line, joined with `&&` into one shell command. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` runs the commands in the root. A terminal on stdin is refused instead of blocking on a read that never arrives. A failing repro still exits 0: the exit code is data, in `exit:` and in `record.result.exit_code`
 .SH SYNOPSIS
@@ -30,4 +30,4 @@ Print help
 <\fIDIRECTORY\fR>
 The source directory (spec + sources); the package comes from the spec file in it, like the build
 .SH VERSION
-v0.2.3
+v0.2.4
