@@ -408,7 +408,7 @@ jobs:
   # the job updates the same branch and PR.
   post-release-bump:
     if: github.event_name == 'push'
-    needs: [check-version, release]
+    needs: [check-version, release, publish-crates-io]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
