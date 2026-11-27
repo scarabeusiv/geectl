@@ -4,7 +4,7 @@
 .SH NAME
 geectl\-build\-wait\-for\-results \- Poll the build results until they settle, or the deadline passes
 .SH SYNOPSIS
-\fBgeectl build wait\-for\-results\fR [\fB\-\-package\fR] [\fB\-\-repository\fR] [\fB\-\-arch\fR] [\fB\-\-code\fR] [\fB\-\-multibuild\fR] [\fB\-\-locallink\fR] [\fB\-\-lastbuild\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-deadline\-secs\fR> <\fIPROJECT\fR> 
+\fBgeectl build wait\-for\-results\fR [\fB\-\-package\fR] [\fB\-\-repository\fR] [\fB\-\-arch\fR] [\fB\-\-code\fR] [\fB\-\-multibuild\fR] [\fB\-\-local\-link\fR] [\fB\-\-last\-build\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-deadline\-secs\fR> <\fIPROJECT\fR> 
 .SH DESCRIPTION
 Poll the build results until they settle, or the deadline passes
 .SH OPTIONS
@@ -24,10 +24,10 @@ Only packages with this build code (e.g. `failed`)
 \fB\-\-multibuild\fR
 Expand multibuild flavors into their own statuses
 .TP
-\fB\-\-locallink\fR
+\fB\-\-local\-link\fR
 Follow local links when expanding multibuild flavors
 .TP
-\fB\-\-lastbuild\fR
+\fB\-\-last\-build\fR
 The last build\*(Aqs results instead of the current state
 .TP
 \fB\-\-deadline\-secs\fR \fI<DEADLINE_SECS>\fR

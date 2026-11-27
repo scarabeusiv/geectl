@@ -4,12 +4,12 @@
 .SH NAME
 geectl\-pull\-request\-merge \- Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless `\-\-no\-forward` is given. The forwarded request\*(Aqs `.changes` entry is the original description on the OBS arm and the pull request\*(Aqs text on the Gitea arm, overridable with `\-m` / `\-\-forward\-message`. Dry\-run by default; mutates only with `\-\-live`
 .SH SYNOPSIS
-\fBgeectl pull\-request merge\fR [\fB\-\-message\fR] [\fB\-m\fR|\fB\-\-forward\-message\fR] [\fB\-\-method\fR] [\fB\-\-force\fR] [\fB\-\-no\-forward\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
+\fBgeectl pull\-request merge\fR [\fB\-\-comment\fR] [\fB\-m\fR|\fB\-\-forward\-message\fR] [\fB\-\-method\fR] [\fB\-\-force\fR] [\fB\-\-no\-forward\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
 .SH DESCRIPTION
 Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless `\-\-no\-forward` is given. The forwarded request\*(Aqs `.changes` entry is the original description on the OBS arm and the pull request\*(Aqs text on the Gitea arm, overridable with `\-m` / `\-\-forward\-message`. Dry\-run by default; mutates only with `\-\-live`
 .SH OPTIONS
 .TP
-\fB\-\-message\fR \fI<MESSAGE>\fR
+\fB\-\-comment\fR \fI<COMMENT>\fR
 The message left with the merge. Values starting with `\-` are taken literally: a message may open with a `\- ` bullet
 .TP
 \fB\-m\fR, \fB\-\-forward\-message\fR \fI<FORWARD_MESSAGE>\fR

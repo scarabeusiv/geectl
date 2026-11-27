@@ -2,15 +2,15 @@
 .el .ds Aq '
 .TH geectl-pull-request-diff 1  "geectl-pull-request-diff 0.3.0" 
 .SH NAME
-geectl\-pull\-request\-diff \- Show the diff of a pull request: the unified diff, like `request diff`. With `\-\-xml` the OBS arm renders the request XML with the diff injected; `\-\-xml` is refused on a Gitea pull request, which has no request XML. A read, always live
+geectl\-pull\-request\-diff \- Show the diff of a pull request: the unified diff, like `request diff`. `\-\-xml` is the OBS\-only escape hatch: the OBS arm renders the request XML with the diff injected, and `\-\-xml` is refused on a Gitea pull request, which has no request XML. A read, always live
 .SH SYNOPSIS
 \fBgeectl pull\-request diff\fR [\fB\-\-xml\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
 .SH DESCRIPTION
-Show the diff of a pull request: the unified diff, like `request diff`. With `\-\-xml` the OBS arm renders the request XML with the diff injected; `\-\-xml` is refused on a Gitea pull request, which has no request XML. A read, always live
+Show the diff of a pull request: the unified diff, like `request diff`. `\-\-xml` is the OBS\-only escape hatch: the OBS arm renders the request XML with the diff injected, and `\-\-xml` is refused on a Gitea pull request, which has no request XML. A read, always live
 .SH OPTIONS
 .TP
 \fB\-\-xml\fR
-Render the OBS request XML with the diff injected, instead of the bare diff. Refused on a Gitea ref
+Render the OBS request XML with the diff injected, instead of the bare diff — the OBS\-only escape hatch. Refused on a Gitea ref
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help

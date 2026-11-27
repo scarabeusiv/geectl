@@ -4,13 +4,13 @@
 .SH NAME
 geectl\-remote\-unlock \- Unlock a project or a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the unlock. The message is required: the server refuses an unlock without a comment
 .SH SYNOPSIS
-\fBgeectl remote unlock\fR [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-message\fR> <\fIPROJECT\fR> [\fIPACKAGE\fR] 
+\fBgeectl remote unlock\fR [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-comment\fR> <\fIPROJECT\fR> [\fIPACKAGE\fR] 
 .SH DESCRIPTION
 Unlock a project or a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the unlock. The message is required: the server refuses an unlock without a comment
 .SH OPTIONS
 .TP
-\fB\-\-message\fR \fI<MESSAGE>\fR
-A message recorded on the unlock, sent as the server\*(Aqs `comment` query parameter
+\fB\-\-comment\fR \fI<COMMENT>\fR
+A message recorded on the unlock
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help

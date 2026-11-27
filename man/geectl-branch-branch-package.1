@@ -4,7 +4,7 @@
 .SH NAME
 geectl\-branch\-branch\-package \- Branch a package: create a linked copy under a branch project. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the branch
 .SH SYNOPSIS
-\fBgeectl branch branch\-package\fR [\fB\-\-target\-project\fR] [\fB\-\-target\-package\fR] [\fB\-\-no\-devel\-project\fR] [\fB\-\-new\-package\fR] [\fB\-\-force\fR] [\fB\-\-revision\fR] [\fB\-\-linkrev\fR] [\fB\-\-comment\fR] [\fB\-\-noaccess\fR] [\fB\-\-add\-repositories\fR] [\fB\-\-add\-repositories\-block\fR] [\fB\-\-add\-repositories\-rebuild\fR] [\fB\-\-extend\-package\-names\fR] [\fB\-\-maintenance\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-package\fR> 
+\fBgeectl branch branch\-package\fR [\fB\-\-target\-project\fR] [\fB\-\-target\-package\fR] [\fB\-\-no\-devel\-project\fR] [\fB\-\-new\-package\fR] [\fB\-\-force\fR] [\fB\-\-revision\fR] [\fB\-\-link\-rev\fR] [\fB\-\-comment\fR] [\fB\-\-no\-access\fR] [\fB\-\-add\-repositories\fR] [\fB\-\-add\-repositories\-block\fR] [\fB\-\-add\-repositories\-rebuild\fR] [\fB\-\-extend\-package\-names\fR] [\fB\-\-maintenance\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-package\fR> 
 .SH DESCRIPTION
 Branch a package: create a linked copy under a branch project. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the branch
 .SH OPTIONS
@@ -33,13 +33,13 @@ Overwrite an existing target package
 \fB\-\-revision\fR \fI<REVISION>\fR
 Branch from this source revision instead of the latest
 .TP
-\fB\-\-linkrev\fR \fI<LINKREV>\fR
+\fB\-\-link\-rev\fR \fI<LINKREV>\fR
 The link revision the branch records
 .TP
 \fB\-\-comment\fR \fI<COMMENT>\fR
 A comment recorded on the branch
 .TP
-\fB\-\-noaccess\fR
+\fB\-\-no\-access\fR
 Withhold the branch\*(Aqs read access to the source package\*(Aqs project
 .TP
 \fB\-\-add\-repositories\fR
