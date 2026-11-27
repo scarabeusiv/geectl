@@ -530,7 +530,8 @@ pub enum ServiceRunMode {
     /// `manualrun`: services with mode `manual` only.
     ManualRun,
     /// `precommit`: services with mode `trylocal` or `localonly`
-    /// only — the set a commit runs.
+    /// only — the services the precommit gate runs, before it runs
+    /// `pre_checkin.sh`. The mode alone is not the gate.
     Precommit,
     /// `localrun`: `run` plus services with mode `serveronly`.
     LocalRun,

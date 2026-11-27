@@ -10,7 +10,7 @@ Run the `_service` file\*(Aqs services in the container, filtered by the run mod
 .SH OPTIONS
 .TP
 \fB\-\-mode\fR \fI<MODE>\fR [default: run]
-The run mode: run, manualrun, precommit, localrun, disabledrun
+The run mode: run, manualrun, precommit, localrun, disabledrun. `precommit` selects only the trylocal/localonly services; it is not the precommit gate and does not run `pre_checkin.sh` — use the `precommit` leaf for the gate
 .br
 
 .br

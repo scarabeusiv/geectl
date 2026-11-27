@@ -2335,7 +2335,7 @@ _arguments "${_arguments_options[@]}" : \
         case $line[1] in
             (service-run)
 _arguments "${_arguments_options[@]}" : \
-'--mode=[The run mode\: run, manualrun, precommit, localrun, disabledrun]:MODE:(run manualrun precommit localrun disabledrun)' \
+'--mode=[The run mode\: run, manualrun, precommit, localrun, disabledrun. \`precommit\` selects only the trylocal/localonly services; it is not the precommit gate and does not run \`pre_checkin.sh\` — use the \`precommit\` leaf for the gate]:MODE:(run manualrun precommit localrun disabledrun)' \
 '--service=[Run only this service, with the run mode forced as its mode]:SERVICE:_default' \
 '--project=[The OBS project the services validate against\: in a git checkout it names the parent project, in an OBS checkout it defaults to the checkout'\''s project, and a value that disagrees with the checkout refuses]:PROJECT:_default' \
 '--timeout-secs=[Timeout in seconds for the whole run]:TIMEOUT_SECS:_default' \

@@ -64,7 +64,10 @@ pub enum LocalBuildCommand {
         /// The source directory carrying the `_service` file.
         directory: PathBuf,
         /// The run mode: run, manualrun, precommit, localrun,
-        /// disabledrun.
+        /// disabledrun. `precommit` selects only the
+        /// trylocal/localonly services; it is not the precommit
+        /// gate and does not run `pre_checkin.sh` — use the
+        /// `precommit` leaf for the gate.
         #[arg(
             long,
             default_value = "run",
@@ -307,6 +310,22 @@ pub enum LocalBuildCommand {
     },
 }
 
+/// The warning `service-run --mode precommit` carries: the mode
+/// selects the precommit services only, while the `precommit` leaf
+/// runs those services plus `pre_checkin.sh`. Same token, two
+/// coverages — the leaf says so instead of letting the run read
+/// as the gate. `None` for every other mode.
+fn service_run_precommit_warning(mode: ServiceRunMode) -> Option<&'static str> {
+    match mode {
+        ServiceRunMode::Precommit => Some(
+            "service-run --mode precommit runs only the precommit-mode services; \
+            it is not the precommit gate and does not run pre_checkin.sh — \
+            use `geectl local-build precommit` for the gate",
+        ),
+        _ => None,
+    }
+}
+
 /// Run a `local-build` command, returning the JSON payload and its
 /// text rendering.
 pub fn run_local_build(
@@ -346,6 +365,9 @@ pub fn run_local_build(
             timeout_secs,
         } => {
             let mode = ServiceRunMode::from_command_name(&mode)?;
+            if let Some(warning) = service_run_precommit_warning(mode) {
+                eprintln!("warning: {warning}");
+            }
             let mut req = ServiceRunRequest::new(directory.clone(), mode);
             req.service = service.clone();
             req.project = project;
@@ -1290,6 +1312,37 @@ mod tests {
                 assert_eq!(timeout_secs, 3600);
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn service_run_precommit_mode_warns_and_other_modes_do_not() {
+        let warning = service_run_precommit_warning(ServiceRunMode::Precommit).unwrap();
+        assert!(
+            warning.contains("pre_checkin.sh"),
+            "the precommit warning names the missing script step"
+        );
+        // One clean line: no doubled spaces from a wrapped
+        // literal, no newline.
+        assert!(
+            !warning.contains("  "),
+            "warning carries doubled spaces: {warning:?}"
+        );
+        assert!(!warning.contains('\n'), "warning spans lines: {warning:?}");
+        assert!(
+            warning.starts_with(
+                "service-run --mode precommit runs only the precommit-mode services; it is not"
+            ),
+            "got: {warning:?}"
+        );
+        assert!(warning.ends_with("for the gate"), "got: {warning:?}");
+        for mode in [
+            ServiceRunMode::Run,
+            ServiceRunMode::ManualRun,
+            ServiceRunMode::LocalRun,
+            ServiceRunMode::DisabledRun,
+        ] {
+            assert_eq!(service_run_precommit_warning(mode), None, "{mode:?} warns");
         }
     }
 
