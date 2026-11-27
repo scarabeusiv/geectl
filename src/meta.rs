@@ -361,6 +361,7 @@ fn empty_package_meta(project: &str, package: &str) -> PackageMeta {
         devel: None,
         persons: Vec::new(),
         groups: Vec::new(),
+        build: Vec::new(),
     }
 }
 

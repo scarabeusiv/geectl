@@ -644,6 +644,23 @@ pub struct PackageMeta {
     pub persons: Vec<NamedRole>,
     /// Groups with roles on the package.
     pub groups: Vec<NamedRole>,
+    /// Build flags (`<build>`), in document order.
+    pub build: Vec<BuildFlag>,
+}
+
+/// A build flag (`<disable>` / `<enable>`) inside a package meta
+/// `<build>` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildFlag {
+    /// Whether the flag enables the build (`<enable>`) rather than
+    /// disabling it (`<disable>`).
+    pub enabled: bool,
+    /// Repository the flag applies to, when set; absent means all
+    /// repositories.
+    pub repository: Option<String>,
+    /// Architecture the flag applies to, when set; absent means all
+    /// architectures.
+    pub arch: Option<String>,
 }
 
 /// A package match from a package search.

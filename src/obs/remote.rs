@@ -19,6 +19,7 @@ use super::valid_obs_name;
 use super::AddChannelsOptions;
 use super::AddContainersOptions;
 use super::AggregateOptions;
+use super::BuildFlag;
 use super::CommitFileEntry;
 use super::CommitFilelistOptions;
 use super::CommitFilelistResponse;
@@ -69,6 +70,8 @@ use crate::xml::xml_elements;
 use crate::xml::xml_escape;
 use crate::xml::xml_reject_stray_text;
 use crate::xml::xml_unescape;
+use crate::xml::XmlChild;
+use crate::xml::XmlChildren;
 use crate::xml::XmlDoc;
 use std::path::Path;
 
@@ -1758,7 +1761,8 @@ pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
 
 /// Parse a package meta (`<package>` with `title`, `description`,
 /// `url?`, `scmsync?`, `releasename?`, `devel project package?`,
-/// `<person userid role/>`, and `<group groupid role/>` children).
+/// `<person userid role/>`, `<group groupid role/>` children, and a
+/// `<build>` block of `<disable>`/`<enable>` flags).
 /// A `<devel>` without a `package` attribute means the devel package
 /// keeps this package's name.
 /// The body must be a `<package>` document with `name` and `project`
@@ -1802,6 +1806,7 @@ pub fn parse_package_meta(body: &str) -> Result<PackageMeta, GeectlError> {
         found
     };
     let (persons, groups) = meta_roles(inner)?;
+    let build = parse_package_build_flags(inner)?;
     Ok(PackageMeta {
         name: xml_unescape(&name),
         project: xml_unescape(&project),
@@ -1813,7 +1818,204 @@ pub fn parse_package_meta(body: &str) -> Result<PackageMeta, GeectlError> {
         devel,
         persons,
         groups,
+        build,
     })
+}
+
+/// Validate the attributes on a flag's opening tag: every attribute
+/// must be `repository` or `arch`, may not repeat, and must carry a
+/// quoted value (`"` or `'`, whitespace around `=` allowed).
+/// Attributes are separated from each other by whitespace, and the
+/// self-closing `/` may follow the last value directly. Anything
+/// else — an unknown
+/// name, a bare name, an unquoted or unterminated value, a blank
+/// value, a missing separator, a repeated name — is malformed and
+/// fails the parse, so
+/// a scoped flag never reads as a broader one. The values themselves
+/// are read through `tag_attr` afterwards, which is unambiguous once
+/// the structure is validated: no duplicates, all values quoted.
+fn validate_flag_attributes(
+    open_tag: &str,
+    label: &str,
+    malformed: &dyn Fn(&str) -> GeectlError,
+) -> Result<(), GeectlError> {
+    let bytes = open_tag.as_bytes();
+    let mut i = 0;
+    let mut seen: Vec<&str> = Vec::new();
+    while i < bytes.len() {
+        // Whitespace between attributes.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        // A trailing `/` ends a self-closing tag; only whitespace
+        // may follow it.
+        if bytes[i] == b'/' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i != bytes.len() {
+                return Err(malformed(&format!(
+                    "unexpected content after `/` on <{label}> in <build>"
+                )));
+            }
+            break;
+        }
+        // The name.
+        if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            return Err(malformed(&format!(
+                "unexpected character in attributes on <{label}> in <build>"
+            )));
+        }
+        let start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.' | b':'))
+        {
+            i += 1;
+        }
+        let name = &open_tag[start..i];
+        if !matches!(name, "repository" | "arch") {
+            return Err(malformed(&format!(
+                "unknown attribute {name} on <{label}> in <build>"
+            )));
+        }
+        if seen.contains(&name) {
+            return Err(malformed(&format!(
+                "duplicate attribute {name} on <{label}> in <build>"
+            )));
+        }
+        seen.push(name);
+        // Whitespace around `=` is allowed; a bare name is not.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            return Err(malformed(&format!(
+                "attribute {name} without a value on <{label}> in <build>"
+            )));
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // The value must be quoted; a `/` or the end of the tag
+        // right after `=` means the value is missing, not unquoted.
+        if i >= bytes.len() || bytes[i] == b'/' {
+            return Err(malformed(&format!(
+                "missing value for attribute {name} on <{label}> in <build>"
+            )));
+        }
+        if bytes[i] != b'"' && bytes[i] != b'\'' {
+            return Err(malformed(&format!(
+                "unquoted value for attribute {name} on <{label}> in <build>"
+            )));
+        }
+        let quote = bytes[i];
+        i += 1;
+        let value_start = i;
+        while i < bytes.len() && bytes[i] != quote {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return Err(malformed(&format!(
+                "unterminated value for attribute {name} on <{label}> in <build>"
+            )));
+        }
+        // A blank value reads as absent in `tag_attr`, so a scoped
+        // flag with an empty value would read as a global one: reject
+        // it here, on the unescaped value, mirroring `tag_attr`'s
+        // blank rule (`&#32;` counts as blank too).
+        let value = &open_tag[value_start..i];
+        let blank = if value.contains('&') {
+            xml_attr_blank(&xml_unescape(value))
+        } else {
+            xml_attr_blank(value)
+        };
+        if blank {
+            return Err(malformed(&format!(
+                "blank value for attribute {name} on <{label}> in <build>"
+            )));
+        }
+        i += 1;
+        // A separator (whitespace) or the self-closing slash must
+        // follow the value: a name directly after the closing quote
+        // is a missing separator, not another attribute.
+        if i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'/' {
+            return Err(malformed(&format!(
+                "missing separator after attribute {name} on <{label}> in <build>"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Parse the `<build>` block of a package meta document into the
+/// build flags it carries, in document order. A package meta without
+/// `<build>` reads as no flags; a second `<build>` block is a
+/// malformed document and fails the parse, like a duplicate `<devel>`.
+/// A flag carries only `repository` and `arch` attributes: any other
+/// attribute fails the parse, so a flag the caller cannot model never
+/// reads as a flag it does model. Children other than `<disable>` and
+/// `<enable>` are skipped, per the gate's unmodeled-children rule:
+/// the model carries no entry for them.
+fn parse_package_build_flags(inner: &str) -> Result<Vec<BuildFlag>, GeectlError> {
+    let malformed = |context: &str| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected OBS package meta response: {context}"),
+        )
+    };
+    let blocks = elements(inner, "build")?;
+    if blocks.len() > 1 {
+        return Err(malformed("duplicate <build> in package meta"));
+    }
+    let Some((_, block_inner)) = blocks.into_iter().next() else {
+        return Ok(Vec::new());
+    };
+    // The package-level gate leaves a `<build>` block's own
+    // content unchecked (it only looks for package-modeled tags
+    // hidden in it), so the block is gated on its own arm here:
+    // stray text inside the block, text inside a flag, and a modeled
+    // flag hidden in a comment all fail the parse instead of reading
+    // as no flags.
+    xml_reject_stray_text(&block_inner, "build", "OBS package meta response")?;
+    let mut flags = Vec::new();
+    for child in XmlChildren::new(&block_inner) {
+        let child = match child {
+            Ok(child) => child,
+            Err(_) => return Err(malformed("malformed content in <build>")),
+        };
+        let XmlChild::Element {
+            start,
+            name,
+            tag_end,
+            ..
+        } = child
+        else {
+            continue;
+        };
+        let (enabled, label) = match name {
+            "disable" => (false, "disable"),
+            "enable" => (true, "enable"),
+            _ => continue,
+        };
+        // The opening-tag text starts past `<disable` / `<enable`,
+        // the same slice the descendant search hands back.
+        let open_tag = &block_inner[start + 1 + name.len()..tag_end - 1];
+        // The attributes are validated structurally before any
+        // value is read, so a scoped flag never reads as a broader
+        // one: see `validate_flag_attributes`.
+        validate_flag_attributes(open_tag, label, &malformed)?;
+        flags.push(BuildFlag {
+            enabled,
+            repository: tag_attr(open_tag, "repository").map(|value| xml_unescape(&value)),
+            arch: tag_attr(open_tag, "arch").map(|value| xml_unescape(&value)),
+        });
+    }
+    Ok(flags)
 }
 
 /// True when `body` is an OBS search collection: it carries a
@@ -12436,6 +12638,167 @@ mod tests {
                 realname: None,
             }]
         );
+    }
+
+    #[test]
+    fn package_meta_parses_build_flags() {
+        let body = "<package name=\"foo\" project=\"openSUSE:Factory\">\
+            <title>Foo package</title>\
+            <build><disable repository=\"openSUSE_Leap_15.6\"/><enable repository=\"openSUSE_Tumbleweed\" arch=\"x86_64\"/><disable/></build>\
+            </package>";
+        let meta = parse_package_meta(body).unwrap();
+        assert_eq!(
+            meta.build,
+            vec![
+                BuildFlag {
+                    enabled: false,
+                    repository: Some("openSUSE_Leap_15.6".to_string()),
+                    arch: None,
+                },
+                BuildFlag {
+                    enabled: true,
+                    repository: Some("openSUSE_Tumbleweed".to_string()),
+                    arch: Some("x86_64".to_string()),
+                },
+                BuildFlag {
+                    enabled: false,
+                    repository: None,
+                    arch: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn package_meta_build_flags_accept_non_self_closing_and_empty_build() {
+        let meta = parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build><disable repository=\"r\"></disable></build></package>",
+        )
+        .unwrap();
+        assert_eq!(
+            meta.build,
+            vec![BuildFlag {
+                enabled: false,
+                repository: Some("r".to_string()),
+                arch: None,
+            }]
+        );
+        let meta =
+            parse_package_meta("<package name=\"foo\" project=\"p\"><build/></package>").unwrap();
+        assert!(meta.build.is_empty());
+        // Single quotes and whitespace around `=` are accepted.
+        let meta = parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build><disable repository = 'r' arch = 'x86_64'></disable></build></package>",
+        )
+        .unwrap();
+        assert_eq!(
+            meta.build,
+            vec![BuildFlag {
+                enabled: false,
+                repository: Some("r".to_string()),
+                arch: Some("x86_64".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn package_meta_rejects_malformed_build_flags() {
+        // A duplicate <build> block.
+        assert!(
+            parse_package_meta(
+                "<package name=\"foo\" project=\"p\"><build><disable/></build><build><disable/></build></package>"
+            )
+            .is_err()
+        );
+        // An unknown attribute on a flag.
+        assert!(
+            parse_package_meta(
+                "<package name=\"foo\" project=\"p\"><build><disable repository=\"r\" package=\"foo\"/></build></package>"
+            )
+            .is_err()
+        );
+        // Stray text inside <build>.
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build>text<disable/></build></package>"
+        )
+        .is_err());
+        // Text inside a flag.
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build><disable>text</disable></build></package>"
+        )
+        .is_err());
+        // A modeled flag hidden in a comment inside <build>.
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build><!--<disable/>--></build></package>"
+        )
+        .is_err());
+        // An unquoted attribute value on a flag.
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build><disable repository=r/></build></package>"
+        )
+        .is_err());
+        // An unquoted attribute value on a flag, slash as the value.
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build><disable repository=/></build></package>"
+        )
+        .is_err());
+        // A <build> block hidden in a comment at package level.
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><!--<build><disable/></build>--></package>"
+        )
+        .is_err());
+        // A <build> block nested inside an unmodeled child.
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><lock><build><disable/></build></lock></package>"
+        )
+        .is_err());
+        // A duplicate attribute, blank first then valid: the scoped
+        // value must not read as a global flag.
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build><disable repository=\"\" repository=\"r\"/></build></package>"
+        )
+        .is_err());
+        // A lone blank value on a flag: it reads as absent in
+        // `tag_attr`, so the scoped flag would read as a global one.
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build><disable repository=\"\"/></build></package>"
+        )
+        .is_err());
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build><disable arch=\"\"/></build></package>"
+        )
+        .is_err());
+        // A whitespace-only value, and an entity-encoded one, are
+        // blank the same way.
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build><disable repository=\" \"/></build></package>"
+        )
+        .is_err());
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build><disable repository=\"&#32;\"/></build></package>"
+        )
+        .is_err());
+        // A duplicate attribute, valid twice.
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build><disable repository=\"a\" repository=\"b\"/></build></package>"
+        )
+        .is_err());
+        // A missing separator between attributes: the second
+        // attribute must not read as absent.
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build><disable repository=\"r\"arch=\"x86_64\"/></build></package>"
+        )
+        .is_err());
+        // A bare attribute name with no value.
+        assert!(parse_package_meta(
+            "<package name=\"foo\" project=\"p\"><build><disable repository></build></package>"
+        )
+        .is_err());
+        // A meta without <build> reads as no flags.
+        let meta =
+            parse_package_meta("<package name=\"foo\" project=\"p\"><title>Foo</title></package>")
+                .unwrap();
+        assert!(meta.build.is_empty());
     }
 
     #[test]

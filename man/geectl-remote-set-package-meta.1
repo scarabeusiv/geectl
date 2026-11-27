@@ -8,7 +8,7 @@ geectl\-remote\-set\-package\-meta \- Set a package\*(Aqs meta, field by field o
 .SH DESCRIPTION
 Set a package\*(Aqs meta, field by field or whole from a file. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the write. Field flags change only the given fields; the rest of the meta is kept as it is. Clear a field with `\-\-from\-file`: fields the file omits are cleared.
 .PP
-`\-\-from\-file FILE` writes the given meta file as the whole meta instead: the file\*(Aqs title, description, URL, scmsync, release name, devel project and package, persons, and groups replace what the server holds, and fields the file omits are cleared. The file\*(Aqs package name and project must match the package. Settings outside the typed meta survive, as in the field\-wise write. `\-\-from\-file` conflicts with every field and person flag.
+`\-\-from\-file FILE` writes the given meta file as the whole meta instead: the file\*(Aqs title, description, URL, scmsync, release name, devel project and package, persons, groups, and build flags replace what the server holds, and fields the file omits are cleared. The file\*(Aqs package name and project must match the package. Settings outside the typed meta survive, as in the field\-wise write. `\-\-from\-file` conflicts with every field and person flag.
 .PP
 `\-\-add\-person LOGIN:ROLE` grants a role to a person; `\-\-remove\-person LOGIN` removes every role that login holds. Removal applies before addition, so the pair moves a person to a new role. There is no last\-maintainer refusal on a package: the project maintainers still cover it. Roles: maintainer, bugowner, reviewer, reader, downloader.
 .PP

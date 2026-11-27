@@ -250,6 +250,7 @@ pub use self::types::AggregateOptions;
 pub use self::types::BranchMarker;
 pub use self::types::BranchOptions;
 pub use self::types::BranchResult;
+pub use self::types::BuildFlag;
 pub use self::types::CommitFileEntry;
 pub use self::types::CommitFilelistOptions;
 pub use self::types::CommitFilelistResponse;

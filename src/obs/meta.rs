@@ -782,7 +782,7 @@ impl<'a> ObsClient<'a> {
     /// Write the package meta of `package` in `project` (`PUT
     /// /source/<project>/<package>/_meta` with the meta edited in
     /// place): title, description, URL, scmsync, release name, devel,
-    /// persons, and groups. Same in-place terms as
+    /// persons, groups, and build flags. Same in-place terms as
     /// [`ObsClient::set_project_meta`]: settings outside the typed
     /// meta survive untouched, and nothing is PUT when nothing
     /// changed.
@@ -885,6 +885,28 @@ impl<'a> ObsClient<'a> {
         if current.persons != meta.persons || current.groups != meta.groups {
             set_roles(&mut doc, &meta.persons, &meta.groups)?;
         }
+        if current.build != meta.build {
+            if meta.build.is_empty() {
+                doc.remove_elements("build");
+            } else {
+                let mut element = String::from("<build>");
+                for flag in &meta.build {
+                    element.push_str(&format!(
+                        "<{}",
+                        if flag.enabled { "enable" } else { "disable" }
+                    ));
+                    if let Some(repository) = &flag.repository {
+                        element.push_str(&format!(" repository=\"{}\"", xml_escape(repository)));
+                    }
+                    if let Some(arch) = &flag.arch {
+                        element.push_str(&format!(" arch=\"{}\"", xml_escape(arch)));
+                    }
+                    element.push_str("/>");
+                }
+                element.push_str("</build>");
+                doc.replace_or_insert_element("build", &element)?;
+            }
+        }
         // No change, no PUT: writing the meta that is already there
         // writes nothing. The comparison is on the parsed documents,
         // so a prolog in the fetched meta does not read as a change.
@@ -908,8 +930,9 @@ impl<'a> ObsClient<'a> {
     /// the spec read go through the authenticated source endpoints,
     /// so restricted projects and the `_project` pseudo-package
     /// work: the public source routes cannot address them. The other meta
-    /// fields (release name, devel, persons, groups, scmsync) are
-    /// kept as they are, and nothing is PUT when nothing changed.
+    /// fields (release name, devel, persons, groups, scmsync,
+    /// build flags) are kept as they are, and nothing is PUT when
+    /// nothing changed.
     /// Requires credentials; without them the call fails loudly
     /// before any request. In dry-run the update is recorded in the
     /// plan and nothing is written — the guard runs before the
@@ -1274,7 +1297,7 @@ mod tests {
     use super::*;
     use crate::error::ErrorKind;
     use crate::obs::test_support::{basic_credentials, FakeHttp};
-    use crate::obs::{DownloadMaster, ReleaseTarget, RepositoryDownload};
+    use crate::obs::{BuildFlag, DownloadMaster, ReleaseTarget, RepositoryDownload};
 
     const PROJECT_META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><description>Old description</description><lock><enable/></lock><person userid=\"alice\" role=\"maintainer\"/><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository><build><disable/></build></project>";
 
@@ -2489,6 +2512,126 @@ mod tests {
         assert!(rendered.contains("<scmsync>https://github.com/openSUSE/foo.git</scmsync>"));
         assert!(rendered.contains("<releasename>foo</releasename>"));
         assert!(rendered.contains("<lock><enable/></lock>"));
+    }
+
+    #[test]
+    fn set_package_meta_puts_build_flags_and_keeps_the_lock() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+                PACKAGE_META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let mut meta = parse_package_meta(PACKAGE_META).unwrap();
+        meta.build = vec![
+            BuildFlag {
+                enabled: false,
+                repository: Some("openSUSE_Leap_15.6".to_string()),
+                arch: None,
+            },
+            BuildFlag {
+                enabled: true,
+                repository: Some("openSUSE_Tumbleweed".to_string()),
+                arch: Some("x86_64".to_string()),
+            },
+        ];
+        assert!(client
+            .set_package_meta("home:scarabeus_iv", "foo", &meta, &DryRun::new(false))
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        let rendered = &puts[0].1;
+        assert!(rendered.contains(
+            "<build><disable repository=\"openSUSE_Leap_15.6\"/><enable repository=\"openSUSE_Tumbleweed\" arch=\"x86_64\"/></build>"
+        ));
+        assert!(rendered.contains("<lock><enable/></lock>"));
+    }
+
+    #[test]
+    fn set_package_meta_clearing_build_flags_removes_the_build_element() {
+        let with_build = PACKAGE_META.replace(
+            "</package>",
+            "<build><disable repository=\"openSUSE_Leap_15.6\"/></build></package>",
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+                &with_build,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let meta = parse_package_meta(PACKAGE_META).unwrap();
+        assert!(client
+            .set_package_meta("home:scarabeus_iv", "foo", &meta, &DryRun::new(false))
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert!(!puts[0].1.contains("<build"));
+        assert!(puts[0].1.contains("<lock><enable/></lock>"));
+    }
+
+    #[test]
+    fn set_package_meta_replacing_build_flags_keeps_the_position() {
+        let with_build = PACKAGE_META.replace(
+            "<lock>",
+            "<build><disable repository=\"old\"/></build><lock>",
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+                &with_build,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let mut meta = parse_package_meta(&with_build).unwrap();
+        meta.build = vec![BuildFlag {
+            enabled: true,
+            repository: Some("openSUSE_Tumbleweed".to_string()),
+            arch: None,
+        }];
+        assert!(client
+            .set_package_meta("home:scarabeus_iv", "foo", &meta, &DryRun::new(false))
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        let rendered = &puts[0].1;
+        assert!(rendered.contains("<build><enable repository=\"openSUSE_Tumbleweed\"/></build>"));
+        assert!(!rendered.contains("repository=\"old\""));
+        assert!(rendered.contains("<lock><enable/></lock>"));
+        assert!(rendered.find("<build>").unwrap() < rendered.find("<lock>").unwrap());
+    }
+
+    #[test]
+    fn set_package_meta_with_unchanged_build_flags_writes_nothing() {
+        let with_build = PACKAGE_META.replace(
+            "</package>",
+            "<build><disable repository=\"openSUSE_Leap_15.6\"/></build></package>",
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+                &with_build,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let meta = parse_package_meta(&with_build).unwrap();
+        assert!(client
+            .set_package_meta("home:scarabeus_iv", "foo", &meta, &DryRun::new(false))
+            .is_ok());
+        assert!(http.put_calls().is_empty());
     }
 
     #[test]

@@ -1469,6 +1469,11 @@ pub(crate) fn xml_reject_stray_text(
             ("url", ModeledChildKind::Text),
             ("scmsync", ModeledChildKind::Text),
             ("releasename", ModeledChildKind::Text),
+            ("build", ModeledChildKind::Structured),
+        ],
+        "build" => &[
+            ("disable", ModeledChildKind::AttributeOnly),
+            ("enable", ModeledChildKind::AttributeOnly),
         ],
         _ => &[],
     };

@@ -305,12 +305,12 @@ pub enum RemoteCommand {
     ///
     /// `--from-file FILE` writes the given meta file as the whole
     /// meta instead: the file's title, description, URL, scmsync,
-    /// release name, devel project and package, persons, and groups
-    /// replace what the server holds, and fields the file omits are
-    /// cleared. The file's package name and project must match the
-    /// package. Settings outside the typed meta survive, as in the
-    /// field-wise write. `--from-file` conflicts with every field
-    /// and person flag.
+    /// release name, devel project and package, persons, groups, and
+    /// build flags replace what the server holds, and fields the file
+    /// omits are cleared. The file's package name and project must
+    /// match the package. Settings outside the typed meta survive,
+    /// as in the field-wise write. `--from-file` conflicts with
+    /// every field and person flag.
     ///
     /// `--add-person LOGIN:ROLE` grants a role to a person;
     /// `--remove-person LOGIN` removes every role that login holds.
@@ -2567,6 +2567,7 @@ fn empty_package_meta(project: &str, package: &str) -> PackageMeta {
         devel: None,
         persons: vec![],
         groups: vec![],
+        build: vec![],
     }
 }
 
@@ -4072,6 +4073,17 @@ fn package_meta_json(meta: &PackageMeta) -> Value {
         })),
         "persons": meta.persons.iter().map(named_role_json).collect::<Vec<_>>(),
         "groups": meta.groups.iter().map(named_role_json).collect::<Vec<_>>(),
+        "build": meta
+            .build
+            .iter()
+            .map(|flag| {
+                json!({
+                    "enabled": flag.enabled,
+                    "repository": flag.repository,
+                    "arch": flag.arch,
+                })
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -4360,6 +4372,16 @@ fn render_package_meta(meta: &PackageMeta) -> String {
     }
     lines.extend(render_named_roles("person", &meta.persons));
     lines.extend(render_named_roles("group", &meta.groups));
+    for flag in &meta.build {
+        let mut line = format!("build: {}", if flag.enabled { "enable" } else { "disable" });
+        if let Some(repository) = &flag.repository {
+            line.push_str(&format!(" repository={repository}"));
+        }
+        if let Some(arch) = &flag.arch {
+            line.push_str(&format!(" arch={arch}"));
+        }
+        lines.push(line);
+    }
     lines.join("\n")
 }
 
@@ -4641,6 +4663,7 @@ fn render_project_diff(packages: &[PackageDiff]) -> String {
 mod tests {
     use super::*;
     use crate::cli::{Cli, Command};
+    use crate::obs::BuildFlag;
     use clap::Parser;
 
     fn parse(args: &[&str]) -> RemoteCommand {
@@ -5926,6 +5949,7 @@ mod tests {
             devel: None,
             persons: vec![],
             groups: vec![],
+            build: vec![],
         };
         let flags = PackageMetaFlags {
             title: None,
@@ -5958,6 +5982,7 @@ mod tests {
             devel: None,
             persons: vec![],
             groups: vec![],
+            build: vec![],
         };
         let flags = PackageMetaFlags {
             title: None,
@@ -6165,6 +6190,7 @@ mod tests {
                 realname: None,
             }],
             groups: vec![],
+            build: vec![],
         };
         assert_eq!(
             plan_package_removals("P", "vim", &meta, &["alice".to_string()]).unwrap(),
@@ -6473,6 +6499,7 @@ mod tests {
             devel: None,
             persons: vec![],
             groups: vec![],
+            build: vec![],
         };
         let (_, text) =
             set_package_meta_result(&meta, &["from-file: meta.xml".to_string()], false, None);
@@ -6586,6 +6613,7 @@ mod tests {
                 realname: None,
             }],
             groups: vec![],
+            build: vec![],
         };
         assert_eq!(
             plan_package_removals(
@@ -6677,6 +6705,7 @@ mod tests {
             devel: None,
             persons: vec![],
             groups: vec![],
+            build: vec![],
         };
         let fields = vec!["title: Vi Improved".to_string()];
         let (payload, text) = set_package_meta_result(&meta, &fields, true, None);
@@ -7971,6 +8000,7 @@ mod tests {
             devel: Some(("editors".to_string(), "vim".to_string())),
             persons: vec![],
             groups: vec![],
+            build: vec![],
         };
         let payload = package_meta_json(&meta);
         assert_eq!(payload["devel"]["project"], "editors");
@@ -7980,6 +8010,53 @@ mod tests {
         assert!(text.contains("project: openSUSE:Factory"));
         assert!(text.contains("releasename: vim"));
         assert!(text.contains("devel: editors/vim"));
+    }
+
+    #[test]
+    fn package_meta_renders_build_flags() {
+        let meta = PackageMeta {
+            name: "vim".to_string(),
+            project: "openSUSE:Factory".to_string(),
+            title: None,
+            description: None,
+            url: None,
+            scmsync: None,
+            releasename: None,
+            devel: None,
+            persons: vec![],
+            groups: vec![],
+            build: vec![
+                BuildFlag {
+                    enabled: false,
+                    repository: Some("openSUSE_Leap_15.6".to_string()),
+                    arch: None,
+                },
+                BuildFlag {
+                    enabled: true,
+                    repository: Some("openSUSE_Tumbleweed".to_string()),
+                    arch: Some("x86_64".to_string()),
+                },
+                BuildFlag {
+                    enabled: false,
+                    repository: None,
+                    arch: None,
+                },
+            ],
+        };
+        let payload = package_meta_json(&meta);
+        assert_eq!(payload["build"][0]["enabled"], false);
+        assert_eq!(payload["build"][0]["repository"], "openSUSE_Leap_15.6");
+        assert!(payload["build"][0]["arch"].is_null());
+        assert_eq!(payload["build"][1]["enabled"], true);
+        assert_eq!(payload["build"][1]["repository"], "openSUSE_Tumbleweed");
+        assert_eq!(payload["build"][1]["arch"], "x86_64");
+        assert_eq!(payload["build"][2]["enabled"], false);
+        assert!(payload["build"][2]["repository"].is_null());
+        assert!(payload["build"][2]["arch"].is_null());
+        let text = render_package_meta(&meta);
+        assert!(text.contains("build: disable repository=openSUSE_Leap_15.6"));
+        assert!(text.contains("build: enable repository=openSUSE_Tumbleweed arch=x86_64"));
+        assert!(text.lines().any(|line| line == "build: disable"));
     }
 
     #[test]
@@ -7999,6 +8076,7 @@ mod tests {
             devel: None,
             persons: vec![],
             groups: vec![],
+            build: vec![],
         };
         let text = render_package_meta(&meta);
         assert!(!text.contains('\u{1b}'), "text: {text}");
@@ -8779,6 +8857,7 @@ mod tests {
                 realname: None,
             }],
             groups: vec![],
+            build: vec![],
         };
         let text = render_package_meta(&package_meta);
         for field in [
