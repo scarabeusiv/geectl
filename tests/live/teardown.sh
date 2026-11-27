@@ -23,8 +23,11 @@ OBS_SOURCE_DIR="${OBS_SOURCE_DIR:-$SCRIPT_DIR/obs}"
 # `tests/live/obs-2` in CI) fails provisioning with "refers to
 # undefined volume". Resolve it against the current directory here,
 # before any compose invocation reads it.
+# A Windows absolute path (D:/...) is absolute too: the
+# matrix runs the provision scripts under Git Bash on Windows,
+# where OBS_SOURCE_DIR is set in that form.
 case "$OBS_SOURCE_DIR" in
-    /*) ;;
+    /*|[A-Za-z]:[\/]*) ;;
     *) OBS_SOURCE_DIR="$PWD/$OBS_SOURCE_DIR" ;;
 esac
 # Compose command resolution (same as provision.sh): an explicit
