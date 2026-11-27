@@ -386,7 +386,15 @@ the flag selects the host and the account together.
 `GEECTL_GITEA_TOKEN_<ALIAS>` and `GEECTL_GITEA_TOKEN_FILE_<ALIAS>` when
 the URL is named in `[instances]`, resolved per URL by
 `resolve_gitea_bearer_for_url`. `GiteaSshKey` carries the private-key path
-from `GEECTL_GITEA_SSH_KEY` for the agent's `git clone` over SSH.
+from `GEECTL_GITEA_SSH_KEY`, or from `GEECTL_GITEA_SSH_KEY_<ALIAS>` when
+the flagged alias sets one: the key rides into `GIT_SSH_COMMAND` as
+`-o IdentityFile=<key> -o IdentitiesOnly=yes`, but only for a checkout
+whose origin names the configured Gitea host — the key is scoped
+host-wise like the token, so an SSH origin on another forge, or a
+checkout with no recorded origin, authenticates with the agent and
+the default keys as before, never with this key. HTTPS remotes ignore
+the command, and a checkout with no configured key uses the agent
+and the default keys as before.
 `GiteaClient` construction requires a token, including in dry-run.
 
 Typed package and project meta carry `scmsync: Option<String>`

@@ -227,7 +227,9 @@ fn obs_auth_kind(
 /// when `gitea_url` is named in `[instances]`, the plain variables
 /// otherwise — so an alias-only setup does not read as
 /// unauthenticated here. With `--instance`, strictly the flagged
-/// alias's variables (see `resolve_gitea_for_instance`).
+/// alias's variables (see `resolve_gitea_for_instance`); the key
+/// follows the same instance, the alias variable winning when set,
+/// else the plain key.
 fn gitea_auth_kind(
     gitea_url: &str,
     instances: &[(String, String)],
@@ -237,7 +239,10 @@ fn gitea_auth_kind(
         Some(alias) => EnvGiteaAuth::credentials_for_instance(alias, instances),
         None => EnvGiteaAuth::credentials_for_url(gitea_url, gitea_url, instances),
     };
-    let key = GiteaSshKey.credentials();
+    let key = match instance {
+        Some(alias) => GiteaSshKey::credentials_for_instance(alias, instances),
+        None => GiteaSshKey.credentials(),
+    };
     if matches!(bearer, Ok(Credentials::Bearer { .. })) {
         "bearer"
     } else if matches!(key, Ok(Credentials::SshKey { .. })) {
@@ -381,12 +386,8 @@ fn config_show_payload(
     // The resolved identity and its source, from the same funnel
     // as `changelog generate` — the local levels without the
     // network, the OBS account too with `--resolve-identity`.
-    let (identity, identity_source) = geectl::cli_changelog::show_identity(
-        &effective.config,
-        instance,
-        debug,
-        resolve_identity,
-    )?;
+    let (identity, identity_source) =
+        geectl::cli_changelog::show_identity(&effective.config, instance, debug, resolve_identity)?;
     let mut instances_json = serde_json::Map::new();
     for (alias, url) in &effective.config.instances {
         instances_json.insert(alias.clone(), json!(url));
@@ -411,7 +412,16 @@ fn config_show_payload(
         "instances": instances_json,
         "obs_auth": obs_auth_status(&obs_url, &effective.config.instances, instance),
         "gitea_auth": gitea_auth,
-        "gitea_ssh_key": auth_status(&GiteaSshKey),
+        // With `--instance`, the flagged alias's key variable wins
+        // when set, else the plain key — the key is a
+        // git-transport credential, so the alias form overrides
+        // rather than strictly replacing.
+        "gitea_ssh_key": credentials_status(match instance {
+            Some(alias) => {
+                GiteaSshKey::credentials_for_instance(alias, &effective.config.instances)
+            }
+            None => GiteaSshKey.credentials(),
+        }),
     }))
 }
 
@@ -432,17 +442,11 @@ fn obs_auth_status(
     })
 }
 
-/// The credential status as JSON: `{"status": "configured"}` plus,
-/// for Basic auth, the username (never the password); for an SSH key,
-/// the path; for a misconfiguration, `{"status": "error", "message":
-/// ...}` naming the variable, never the value.
-fn auth_status(provider: &dyn AuthProvider) -> serde_json::Value {
-    credentials_status(provider.credentials())
-}
-
-/// The credential status as JSON for an already-resolved result
-/// — the same shape as [`auth_status`], for credentials resolved
-/// per URL instead of through a provider.
+/// The credential status as JSON for an already-resolved result:
+/// `{"status": "configured"}` plus, for Basic auth, the username
+/// (never the password); for an SSH key, the path; for a
+/// misconfiguration, `{"status": "error", "message": ...}` naming
+/// the variable, never the value.
 fn credentials_status(credentials: Result<Credentials, GeectlError>) -> serde_json::Value {
     match credentials {
         Ok(Credentials::None) => json!({"status": "not_configured"}),
@@ -1000,10 +1004,7 @@ mod tests {
         assert!(text.contains("identity: "), "{text}");
         let source = payload["identity_source"].as_str().unwrap();
         if payload["identity"].is_null() {
-            assert!(
-                text.contains(&format!("identity: - ({source})")),
-                "{text}"
-            );
+            assert!(text.contains(&format!("identity: - ({source})")), "{text}");
         } else {
             assert!(
                 text.contains(&format!(

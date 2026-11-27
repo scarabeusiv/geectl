@@ -924,9 +924,20 @@ fn submit(
                 },
             )
             .map(|client| client.with_debug(debug.clone()))?;
+            // The SSH key rides along when one is configured, so
+            // a submit from an SSH-origin checkout authenticates
+            // with it; a misconfigured key fails closed here, like
+            // the token does. Live only: the fetch runs live, so a
+            // dry-run plan must not fail on a key it never uses.
+            let ssh_key = if live {
+                crate::cli_working_copy::gitea_ssh_key_path(instance, &instances)?
+            } else {
+                None
+            };
             let auth = working_copy::GiteaAuth {
-                token: &token,
+                token: Some(&token),
                 url: &base,
+                ssh_key: ssh_key.as_deref(),
             };
             // `resolve_git_submit_target` consumes the parts, so
             // the explicitness is read first: verification rewords

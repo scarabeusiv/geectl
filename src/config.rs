@@ -1062,7 +1062,8 @@ pub const CONFIG_TEMPLATE: &str = r#"# geectl configuration — endpoint URLs, t
 #          or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD
 #          (or GEECTL_OBS_PASSWORD_FILE)
 #   Gitea: GEECTL_GITEA_TOKEN (or GEECTL_GITEA_TOKEN_FILE)
-#          GEECTL_GITEA_SSH_KEY for git operations
+#          GEECTL_GITEA_SSH_KEY for git operations over SSH
+#          (or GEECTL_GITEA_SSH_KEY_<ALIAS> for one instance)
 # A credential-shaped key in this file is a refusal to run.
 # A second instance gets one line in [instances] (alias → URL) and
 # its own variables, with the alias uppercased:

@@ -227,6 +227,23 @@ fn config_show_reports_environment_source() {
     assert_eq!(value["obs_url_source"], "environment");
 }
 
+/// Write a PEM SSH key file into the temp dir (0600 on unix, so
+/// the mode check passes) and return its path.
+fn write_ssh_key(dir: &TempDir, name: &str) -> PathBuf {
+    let path = dir.0.join(name);
+    fs::write(
+        &path,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    path
+}
+
 /// Write a `.env` file into the temp dir (0600 on unix, so the mode
 /// check passes) and return its path.
 fn write_dotenv(dir: &TempDir, content: &str) -> PathBuf {
@@ -993,6 +1010,31 @@ fn debug_config_line_reports_the_flagged_gitea_host() {
     );
     assert!(!stderr.contains("alias-token"));
     assert!(!stderr.contains("plain-token"));
+}
+
+#[test]
+fn debug_config_line_reports_the_alias_ssh_key_kind() {
+    // With `--instance` and an alias key but no token, the debug
+    // config line reads the key for the flagged instance: kind
+    // `ssh` on the alias host, not the plain key or `none`.
+    let dir = TempDir::new();
+    let alias_key = write_ssh_key(&dir, "id_example");
+    write_instances_config(
+        &dir,
+        "[instances]\nexample = \"https://gitea.example.org\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .args(["--instance", "example", "--debug", "version"])
+        .env("GEECTL_GITEA_SSH_KEY_EXAMPLE", &alias_key)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("gitea gitea.example.org (auth: ssh)"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("BEGIN OPENSSH"));
 }
 
 // --- remote-read integration tests ---
@@ -12044,6 +12086,71 @@ fn config_show_reports_the_git_identity_level() {
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(value["identity"], "Git Author <git@example.com>");
     assert_eq!(value["identity_source"], "git");
+}
+
+#[test]
+fn config_show_with_instance_reports_the_alias_ssh_key() {
+    // With `--instance`, the flagged alias's own key variable is
+    // the key reported — not the plain key — and only the path is
+    // shown, never the key itself.
+    let dir = TempDir::new();
+    let alias_key = write_ssh_key(&dir, "id_example");
+    let plain_key = write_ssh_key(&dir, "id_plain");
+    write_instances_config(
+        &dir,
+        "[instances]\nexample = \"https://gitea.example.org\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["--instance", "example", "config", "show"])
+        .env("GEECTL_GITEA_SSH_KEY_EXAMPLE", &alias_key)
+        .env("GEECTL_GITEA_SSH_KEY", &plain_key)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["gitea_ssh_key"]["status"], "configured");
+    assert_eq!(
+        value["gitea_ssh_key"]["path"].as_str(),
+        Some(alias_key.to_str().unwrap())
+    );
+    assert!(!stdout.contains("BEGIN OPENSSH"));
+}
+
+#[test]
+fn config_show_with_instance_falls_back_to_the_plain_ssh_key() {
+    // An alias without its own key keeps using the single
+    // configured git key: the alias form overrides, it does not
+    // strictly replace.
+    let dir = TempDir::new();
+    let plain_key = write_ssh_key(&dir, "id_plain");
+    write_instances_config(
+        &dir,
+        "[instances]\nexample = \"https://gitea.example.org\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["--instance", "example", "config", "show"])
+        .env("GEECTL_GITEA_SSH_KEY", &plain_key)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["gitea_ssh_key"]["status"], "configured");
+    assert_eq!(
+        value["gitea_ssh_key"]["path"].as_str(),
+        Some(plain_key.to_str().unwrap())
+    );
 }
 
 #[test]
