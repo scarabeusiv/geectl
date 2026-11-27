@@ -294,6 +294,8 @@ the devel branch. The CLI `submit` verb is `pull-request submit`.
 
 List operations page internally at 50 entries per page and fail past a
 bound of 500 entries with a structured error naming the filter to narrow.
+The instance-wide pull-request search is the exception: it cannot be
+narrowed per repo, so it reads every page and returns the full list.
 Reads that take a branch take it as a typed parameter. The maintainership
 read takes the file from the repo's default branch; a missing file answers
 `NotFound`.

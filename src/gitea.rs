@@ -2870,7 +2870,9 @@ impl<'a> GiteaClient<'a> {
     /// the token owner: the server filters review requests for
     /// the authenticated user only (`review_requested`), so a
     /// reviewer naming anyone else fails as invalid input.
-    /// Paginates internally and is bounded like `repo_list`. The
+    /// Paginates internally and reads every page: the search cannot
+    /// be narrowed per repo, so it returns the full list, like the
+    /// OBS arm. The
     /// token needs the `read:issue` scope: the server gates the
     /// issues search on it (403 without it).
     /// Search pull requests across the instance, unscoped: the
@@ -2905,11 +2907,10 @@ impl<'a> GiteaClient<'a> {
             }
             params.push(("review_requested", "true"));
         }
-        self.list_paged::<GiteaIssue>(
+        self.list_paged_unbounded::<GiteaIssue>(
             &["api", "v1", "repos", "issues", "search"],
             &params,
             "pull requests on the instance",
-            "the list is bounded at 500 entries",
         )
     }
 
@@ -3625,6 +3626,30 @@ impl<'a> GiteaClient<'a> {
         ))
     }
 
+    /// Read every page of a paged endpoint (`page`/`limit` query)
+    /// into one typed list, fetching each page through
+    /// `fetch_page`, with no bound: a page shorter than the page
+    /// size ends the list. Only the instance-wide pull-request
+    /// search uses it — that list cannot be narrowed (there is no
+    /// repo list to scope it by) and must return the full list,
+    /// like the OBS arm. Every other list uses `read_paged` and
+    /// fails past 500 entries instead of reading unboundedly.
+    fn read_paged_unbounded<T>(
+        fetch_page: impl Fn(u32) -> Result<Vec<T>, GeectlError>,
+    ) -> Result<Vec<T>, GeectlError> {
+        let mut items = Vec::new();
+        let mut page = 1;
+        loop {
+            let page_items = fetch_page(page)?;
+            let full = page_items.len() == LIST_PAGE_SIZE as usize;
+            items.extend(page_items);
+            if !full {
+                return Ok(items);
+            }
+            page += 1;
+        }
+    }
+
     /// Read every page of a list endpoint (`page`/`limit` query)
     /// into one typed list. Gitea answers a JSON `null` body for
     /// an empty list — verified live on the branches endpoint of
@@ -3644,6 +3669,39 @@ impl<'a> GiteaClient<'a> {
         T: for<'de> Deserialize<'de>,
     {
         Self::read_paged(scope, remedy, |page| {
+            let page_arg = page.to_string();
+            let limit_arg = LIST_PAGE_SIZE.to_string();
+            let mut query: Vec<(&str, &str)> = params.to_vec();
+            query.push(("page", &page_arg));
+            query.push(("limit", &limit_arg));
+            let url = build_url(&self.base, segments, &query);
+            let body = self.http.get_with(&url, &self.credentials)?;
+            let page_items: Vec<T> = serde_json::from_str::<Option<Vec<T>>>(&body)
+                .map_err(|err| {
+                    GeectlError::new(
+                        ErrorKind::ServerError,
+                        format!("unexpected Gitea {scope} response (page {page}): {err}"),
+                    )
+                })?
+                .unwrap_or_default();
+            Ok(page_items)
+        })
+    }
+
+    /// Read every page of a list endpoint (`page`/`limit` query)
+    /// into one typed list, with no bound — the unbounded form of
+    /// `list_paged`. Only the instance-wide pull-request search
+    /// uses it; see `read_paged_unbounded`.
+    fn list_paged_unbounded<T>(
+        &self,
+        segments: &[&str],
+        params: &[(&str, &str)],
+        scope: &str,
+    ) -> Result<Vec<T>, GeectlError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        Self::read_paged_unbounded(|page| {
             let page_arg = page.to_string();
             let limit_arg = LIST_PAGE_SIZE.to_string();
             let mut query: Vec<(&str, &str)> = params.to_vec();
