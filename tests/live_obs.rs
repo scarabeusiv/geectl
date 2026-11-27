@@ -71,6 +71,7 @@
 //! the authority on who may move a request.
 //
 //! The working-copy tests (`live_working_copy_checkout_edit_commit_update`,
+//! `live_working_copy_checkout_by_md5_records_the_numeric_revision`,
 //! `live_working_copy_pull_pulls_a_linked_package`) exercise the git
 //! working-copy layer the same way: checkout through the library, edit
 //! and commit, then read the committed content back from the server; the
@@ -8294,6 +8295,65 @@ fn live_working_copy_checkout_edit_commit_update() {
             .expect("status after update")
             .is_empty(),
         "the working copy is clean after the update"
+    );
+}
+
+/// Checkout by source md5 records the numeric revision: the live
+/// directory listing echoes the md5 as `rev`, and the public
+/// `_history` read resolves it — the checkout is clean afterwards.
+#[test]
+fn live_working_copy_checkout_by_md5_records_the_numeric_revision() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&client, &package);
+    let spec = format!("{package}.spec");
+    let v1 = "Name: geectl-live-pkg\nVersion: 1.0\n";
+    client
+        .upload_file(&source_project, &package, &spec, v1, &DryRun::new(false))
+        .expect("upload the v1 spec to the live instance");
+    let dir = TempDir::new();
+    let wc = working_copy::checkout(
+        &client,
+        &source_project,
+        &package,
+        None,
+        dir.path(),
+        None,
+        &DryRun::new(false),
+    )
+    .expect("checkout the package")
+    .expect("checkout is live, not a dry run");
+    let md5 = wc.base_srcmd5.clone();
+    assert!(
+        md5.len() == 32,
+        "the checkout records a source md5 to ask for: {md5}"
+    );
+    let dir2 = TempDir::new();
+    let md5_spec = RevisionSpec::parse(&md5).expect("the recorded base srcmd5 parses");
+    let wc2 = working_copy::checkout(
+        &client,
+        &source_project,
+        &package,
+        Some(&md5_spec),
+        dir2.path(),
+        None,
+        &DryRun::new(false),
+    )
+    .expect("checkout by source md5")
+    .expect("checkout is live, not a dry run");
+    assert_eq!(
+        wc2.base_rev, wc.base_rev,
+        "the md5 checkout records the numeric revision"
+    );
+    assert_eq!(wc2.base_srcmd5, md5);
+    assert!(
+        working_copy::status(&wc2)
+            .expect("status the md5 checkout")
+            .is_empty(),
+        "the md5 checkout is clean"
     );
 }
 
