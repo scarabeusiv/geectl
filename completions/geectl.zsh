@@ -67,7 +67,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the flagged alias'\''s URL replaces the configured URL too, and every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
-'--resolve-identity[Resolve the OBS identity over the network too, like \`changelog generate\` does. Without it, \`config show\` reports the local levels and \`obs (unresolved)\` when the OBS account might still identify the author]' \
+'--resolve-identity[Resolve the OBS identity over the network too, like \`changelog generate\` does. Without it, \`config show\` reports the local levels and \`obs (unresolved)\` when the OBS account might still identify the author; a misconfigured level reports \`env (unresolved)\` or \`obs (error)\` instead of failing the show]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
 '--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
@@ -297,14 +297,14 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (set-project-meta)
 _arguments "${_arguments_options[@]}" : \
-'(--title --description --url --scmsync --devel-project --add-person --remove-person)--from-file=[Write the given meta file as the whole meta instead of setting fields\: the file is a \`<project>\` document whose name matches the project. Conflicts with every field and person flag]:FROM_FILE:_files' \
-'--title=[The new title]:TITLE:_default' \
-'--description=[The new description]:DESCRIPTION:_default' \
-'--url=[The new URL]:URL:_default' \
-'--scmsync=[The new scmsync URL]:SCMSYNC:_default' \
-'--devel-project=[The new devel project]:DEVEL_PROJECT:_default' \
-'*--add-person=[Grant a role to a person\: \`LOGIN\:ROLE\`, repeatable]:ADD_PERSON:_default' \
-'*--remove-person=[Remove a person\: every role the login holds, repeatable]:REMOVE_PERSON:_default' \
+'(--title --description --url --scmsync --devel-project --add-person --remove-person)--from-file=[Write the given meta file as the whole meta instead of setting fields\: the file is the typed JSON \`remote project-meta\` emits (an OBS XML \`<project>\` document stays accepted as a legacy format) whose name matches the project. Conflicts with every field and person flag]:FROM_FILE:_files' \
+'(--from-file)--title=[The new title]:TITLE:_default' \
+'(--from-file)--description=[The new description]:DESCRIPTION:_default' \
+'(--from-file)--url=[The new URL]:URL:_default' \
+'(--from-file)--scmsync=[The new scmsync URL]:SCMSYNC:_default' \
+'(--from-file)--devel-project=[The new devel project]:DEVEL_PROJECT:_default' \
+'(--from-file)*--add-person=[Grant a role to a person\: \`LOGIN\:ROLE\`, repeatable]:ADD_PERSON:_default' \
+'(--from-file)*--remove-person=[Remove a person\: every role the login holds, repeatable]:REMOVE_PERSON:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the flagged alias'\''s URL replaces the configured URL too, and every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
@@ -330,16 +330,16 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (set-package-meta)
 _arguments "${_arguments_options[@]}" : \
-'(--title --description --url --scmsync --releasename --devel-project --devel-package --add-person --remove-person)--from-file=[Write the given meta file as the whole meta instead of setting fields\: the file is a \`<package>\` document whose name and project match the package. Conflicts with every field and person flag]:FROM_FILE:_files' \
-'--title=[The new title]:TITLE:_default' \
-'--description=[The new description]:DESCRIPTION:_default' \
-'--url=[The new URL]:URL:_default' \
-'--scmsync=[The new scmsync URL]:SCMSYNC:_default' \
-'--releasename=[The new release name]:RELEASENAME:_default' \
-'--devel-project=[The new devel project]:DEVEL_PROJECT:_default' \
-'--devel-package=[The new devel package. Needs \`--devel-project\` unless the package already has a devel project]:DEVEL_PACKAGE:_default' \
-'*--add-person=[Grant a role to a person\: \`LOGIN\:ROLE\`, repeatable]:ADD_PERSON:_default' \
-'*--remove-person=[Remove a person\: every role the login holds, repeatable]:REMOVE_PERSON:_default' \
+'(--title --description --url --scmsync --releasename --devel-project --devel-package --add-person --remove-person)--from-file=[Write the given meta file as the whole meta instead of setting fields\: the file is the typed JSON \`remote package-meta\` emits (an OBS XML \`<package>\` document stays accepted as a legacy format) whose name and project match the package. Conflicts with every field and person flag]:FROM_FILE:_files' \
+'(--from-file)--title=[The new title]:TITLE:_default' \
+'(--from-file)--description=[The new description]:DESCRIPTION:_default' \
+'(--from-file)--url=[The new URL]:URL:_default' \
+'(--from-file)--scmsync=[The new scmsync URL]:SCMSYNC:_default' \
+'(--from-file)--releasename=[The new release name]:RELEASENAME:_default' \
+'(--from-file)--devel-project=[The new devel project]:DEVEL_PROJECT:_default' \
+'(--from-file)--devel-package=[The new devel package. Needs \`--devel-project\` unless the package already has a devel project]:DEVEL_PACKAGE:_default' \
+'(--from-file)*--add-person=[Grant a role to a person\: \`LOGIN\:ROLE\`, repeatable]:ADD_PERSON:_default' \
+'(--from-file)*--remove-person=[Remove a person\: every role the login holds, repeatable]:REMOVE_PERSON:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the flagged alias'\''s URL replaces the configured URL too, and every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
@@ -3445,8 +3445,9 @@ _arguments "${_arguments_options[@]}" : \
 '(--repo)--project=[The OBS project whose meta to set]:PROJECT:_default' \
 '--package=[The OBS package in \`--project\` whose meta to set; the project meta when omitted]:PACKAGE:_default' \
 '(--project)--repo=[The Gitea repository, as \`owner/repo\`, whose settings to set]:REPO:_default' \
-'--description=[A short description]:DESCRIPTION:_default' \
-'--url=[A URL with more information; the repository website on the Gitea arm]:URL:_default' \
+'(--from-file)--description=[A short description]:DESCRIPTION:_default' \
+'(--from-file)--url=[A URL with more information; the repository website on the Gitea arm]:URL:_default' \
+'(--description --url)--from-file=[Write the given meta file as the whole meta instead of setting fields\: the file is the typed JSON \`remote project-meta\` / \`remote package-meta\` emits (an OBS XML document stays accepted as a legacy format). OBS targets only\: Gitea has no whole-file meta concept. Fields the file omits are cleared. Conflicts with --description and --url]:FROM_FILE:_files' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the flagged alias'\''s URL replaces the configured URL too, and every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
@@ -5979,7 +5980,7 @@ _geectl__subcmd__help__subcmd__maintenance__subcmd__maintenance-branch_commands(
 (( $+functions[_geectl__subcmd__help__subcmd__meta_commands] )) ||
 _geectl__subcmd__help__subcmd__meta_commands() {
     local commands; commands=(
-'set:Set the meta of an OBS project, an OBS package, or a Gitea repository\: the description and/or URL. The target selects the backend\: \`--project\` (with \`--package\` for a package) writes OBS meta, \`--repo\` writes Gitea repo settings. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field' \
+'set:Set the meta of an OBS project, an OBS package, or a Gitea repository\: the description and/or URL, or the whole meta from a file on the OBS arm. The target selects the backend\: \`--project\` (with \`--package\` for a package) writes OBS meta, \`--repo\` writes Gitea repo settings. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the write. Field flags change only the given fields; the rest of the meta is kept as it is. \`--from-file\` instead replaces the whole meta\: fields the file omits are cleared. There is no field flag to clear a field' \
     )
     _describe -t commands 'geectl help meta commands' commands "$@"
 }
@@ -6815,7 +6816,7 @@ _geectl__subcmd__maintenance__subcmd__maintenance-branch_commands() {
 (( $+functions[_geectl__subcmd__meta_commands] )) ||
 _geectl__subcmd__meta_commands() {
     local commands; commands=(
-'set:Set the meta of an OBS project, an OBS package, or a Gitea repository\: the description and/or URL. The target selects the backend\: \`--project\` (with \`--package\` for a package) writes OBS meta, \`--repo\` writes Gitea repo settings. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field' \
+'set:Set the meta of an OBS project, an OBS package, or a Gitea repository\: the description and/or URL, or the whole meta from a file on the OBS arm. The target selects the backend\: \`--project\` (with \`--package\` for a package) writes OBS meta, \`--repo\` writes Gitea repo settings. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the write. Field flags change only the given fields; the rest of the meta is kept as it is. \`--from-file\` instead replaces the whole meta\: fields the file omits are cleared. There is no field flag to clear a field' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl meta commands' commands "$@"
@@ -6823,7 +6824,7 @@ _geectl__subcmd__meta_commands() {
 (( $+functions[_geectl__subcmd__meta__subcmd__help_commands] )) ||
 _geectl__subcmd__meta__subcmd__help_commands() {
     local commands; commands=(
-'set:Set the meta of an OBS project, an OBS package, or a Gitea repository\: the description and/or URL. The target selects the backend\: \`--project\` (with \`--package\` for a package) writes OBS meta, \`--repo\` writes Gitea repo settings. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field' \
+'set:Set the meta of an OBS project, an OBS package, or a Gitea repository\: the description and/or URL, or the whole meta from a file on the OBS arm. The target selects the backend\: \`--project\` (with \`--package\` for a package) writes OBS meta, \`--repo\` writes Gitea repo settings. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the write. Field flags change only the given fields; the rest of the meta is kept as it is. \`--from-file\` instead replaces the whole meta\: fields the file omits are cleared. There is no field flag to clear a field' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl meta help commands' commands "$@"

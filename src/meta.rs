@@ -160,6 +160,17 @@ impl MetaFields {
     }
 }
 
+/// A whole meta document for a `set_whole_meta` call: the typed
+/// meta of one OBS project or package, as `remote project-meta` /
+/// `remote package-meta` emits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WholeMeta {
+    /// A whole project meta.
+    Project(ProjectMeta),
+    /// A whole package meta.
+    Package(PackageMeta),
+}
+
 /// The meta a `set_meta` call wrote: the backend, the target, and
 /// the resulting description and URL — the merged values on the
 /// OBS arm, the edited repo's values on the Gitea arm, the flag
@@ -299,6 +310,54 @@ impl<'a> MetaClient<'a> {
                     url,
                 })
             }
+        }
+    }
+
+    /// Write the whole meta of `target` from a typed document: the
+    /// OBS arm of `set_project_meta` / `set_package_meta`, fed the
+    /// file's meta instead of field merges. Fields the document
+    /// omits are cleared, like the `remote` leaves' `--from-file`;
+    /// settings outside the typed meta survive untouched. The
+    /// Gitea arm has no whole-file meta concept and fails closed
+    /// naming it. The document must name its target: a project
+    /// meta for a different project, or a package meta for a
+    /// different project/package, fails as InvalidInput before any
+    /// write (the OBS leaf's own name check).
+    pub fn set_whole_meta(
+        &self,
+        target: &MetaTarget,
+        whole: WholeMeta,
+        dry_run: &DryRun,
+    ) -> Result<SetMeta, GeectlError> {
+        match (target, whole) {
+            (MetaTarget::ObsProject { project }, WholeMeta::Project(meta)) => {
+                let obs = self.obs.ok_or_else(|| missing_obs_arm(target))?;
+                obs.set_project_meta(project, &meta, dry_run)?;
+                Ok(SetMeta {
+                    backend: MetaBackend::Obs,
+                    target: target.clone(),
+                    description: meta.description,
+                    url: meta.url,
+                })
+            }
+            (MetaTarget::ObsPackage { project, package }, WholeMeta::Package(meta)) => {
+                let obs = self.obs.ok_or_else(|| missing_obs_arm(target))?;
+                obs.set_package_meta(project, package, &meta, dry_run)?;
+                Ok(SetMeta {
+                    backend: MetaBackend::Obs,
+                    target: target.clone(),
+                    description: meta.description,
+                    url: meta.url,
+                })
+            }
+            (MetaTarget::GiteaRepo { .. }, _) => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "meta set --from-file has no Gitea arm: Gitea has no whole-file meta concept — repo settings are field-wise only, use --description/--url",
+            )),
+            _ => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "meta set --from-file: the file's meta does not match its target (a project file for a package target, or the reverse)",
+            )),
         }
     }
 }
@@ -730,6 +789,114 @@ mod tests {
             dry_run.plan(),
             vec!["[dry-run] would: set project meta of home:scarabeus_iv".to_string()]
         );
+    }
+
+    fn whole_project_meta() -> WholeMeta {
+        let mut meta = empty_project_meta("home:scarabeus_iv");
+        meta.description = Some("Whole description".to_string());
+        meta.url = Some("https://example.com/whole".to_string());
+        WholeMeta::Project(meta)
+    }
+
+    fn whole_package_meta() -> WholeMeta {
+        let mut meta = empty_package_meta("home:scarabeus_iv", "foo");
+        meta.description = Some("Whole description".to_string());
+        meta.url = Some("https://example.com/whole".to_string());
+        WholeMeta::Package(meta)
+    }
+
+    #[test]
+    fn set_whole_meta_project_dry_run_plans_and_writes_nothing() {
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let client = MetaClient::new(Some(&obs), None);
+        let dry_run = DryRun::new(true);
+        let set = client
+            .set_whole_meta(
+                &MetaTarget::ObsProject {
+                    project: "home:scarabeus_iv".to_string(),
+                },
+                whole_project_meta(),
+                &dry_run,
+            )
+            .unwrap();
+        assert_eq!(set.backend, MetaBackend::Obs);
+        assert_eq!(set.description.as_deref(), Some("Whole description"));
+        assert_eq!(set.url.as_deref(), Some("https://example.com/whole"));
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: set project meta of home:scarabeus_iv".to_string()]
+        );
+    }
+
+    #[test]
+    fn set_whole_meta_package_dry_run_plans_and_writes_nothing() {
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let client = MetaClient::new(Some(&obs), None);
+        let dry_run = DryRun::new(true);
+        let set = client
+            .set_whole_meta(
+                &MetaTarget::ObsPackage {
+                    project: "home:scarabeus_iv".to_string(),
+                    package: "foo".to_string(),
+                },
+                whole_package_meta(),
+                &dry_run,
+            )
+            .unwrap();
+        assert_eq!(set.backend, MetaBackend::Obs);
+        assert_eq!(set.description.as_deref(), Some("Whole description"));
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: set package meta of home:scarabeus_iv/foo".to_string()]
+        );
+    }
+
+    #[test]
+    fn set_whole_meta_gitea_arm_fails_closed() {
+        // Gitea has no whole-file meta concept: the arm refuses
+        // naming it, before any client is needed.
+        let client = MetaClient::new(None, None);
+        let err = client
+            .set_whole_meta(
+                &MetaTarget::GiteaRepo {
+                    owner: "pool".to_string(),
+                    repo: "systemd".to_string(),
+                },
+                whole_project_meta(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("no whole-file meta concept"),
+            "message: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn set_whole_meta_mismatched_document_fails() {
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let client = MetaClient::new(Some(&obs), None);
+        let err = client
+            .set_whole_meta(
+                &MetaTarget::ObsProject {
+                    project: "home:scarabeus_iv".to_string(),
+                },
+                whole_package_meta(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
     }
 
     #[test]

@@ -4209,6 +4209,67 @@ fn remote_set_project_meta_from_file_dry_run() {
 }
 
 #[test]
+fn remote_set_project_meta_from_file_json_dry_run() {
+    // The whole-file write takes the typed JSON `remote
+    // project-meta` emits: title, description, URL, devel project,
+    // person, and a repository carrying its full settings.
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.json");
+    fs::write(
+        &file,
+        r#"{"name": "home:alice", "title": "Alice",
+        "description": "Home project", "url": "https://example.org",
+        "scmsync": null, "devel": "openSUSE:Factory",
+        "persons": [{"name": "alice", "role": "maintainer", "email": null}],
+        "groups": [],
+        "repositories": [{"name": "standard",
+        "arch": ["x86_64", "aarch64"],
+        "paths": [{"project": "openSUSE:Factory", "repository": "standard"}],
+        "rebuild": "local", "block": "all", "linkedbuild": "all",
+        "downloads": [{"arch": "x86_64", "url": "https://example.org/repo",
+        "repotype": "rpm-md", "archfilter": null, "pubkey": null,
+        "master": {"url": "https://example.org/master", "sslfingerprint": "AA:BB"}}],
+        "release_targets": [{"project": "openSUSE:Factory", "repository": "snapshot", "trigger": "manual"}],
+        "hostsystem": [{"project": "openSUSE:Factory", "repository": "standard"}]}]}"#,
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["name"], "home:alice");
+    assert_eq!(value["title"], "Alice");
+    assert_eq!(value["description"], "Home project");
+    assert_eq!(value["url"], "https://example.org");
+    assert_eq!(value["devel"], "openSUSE:Factory");
+    assert_eq!(value["persons"][0]["name"], "alice");
+    let repo = &value["repositories"][0];
+    assert_eq!(repo["name"], "standard");
+    assert_eq!(repo["arch"][1], "aarch64");
+    assert_eq!(repo["rebuild"], "local");
+    assert_eq!(repo["downloads"][0]["master"]["sslfingerprint"], "AA:BB");
+    assert_eq!(repo["release_targets"][0]["trigger"], "manual");
+    assert_eq!(
+        value["plan"],
+        serde_json::json!(["[dry-run] would: set project meta of home:alice"])
+    );
+}
+
+#[test]
 fn remote_set_package_meta_from_file_dry_run() {
     // The whole-file write plans the file's meta: title, URL,
     // release name, devel pair, and person.
@@ -4223,6 +4284,56 @@ fn remote_set_package_meta_from_file_dry_run() {
          <devel project=\"devel:languages:vim\" package=\"vim\"/>\
          <person userid=\"alice\" role=\"maintainer\"/>\
          </package>",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-package-meta",
+            "home:alice",
+            "vim",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["project"], "home:alice");
+    assert_eq!(value["name"], "vim");
+    assert_eq!(value["title"], "Vim");
+    assert_eq!(value["url"], "https://example.org/vim");
+    assert_eq!(value["releasename"], "vim");
+    assert_eq!(value["devel"]["project"], "devel:languages:vim");
+    assert_eq!(value["devel"]["package"], "vim");
+    assert_eq!(value["persons"][0]["name"], "alice");
+    assert_eq!(
+        value["plan"],
+        serde_json::json!(["[dry-run] would: set package meta of home:alice/vim"])
+    );
+}
+
+#[test]
+fn remote_set_package_meta_from_file_json_dry_run() {
+    // The whole-file write takes the typed JSON `remote
+    // package-meta` emits: title, URL, release name, devel pair,
+    // and person.
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.json");
+    fs::write(
+        &file,
+        r#"{"name": "vim", "project": "home:alice", "title": "Vim",
+        "description": null, "url": "https://example.org/vim",
+        "scmsync": null, "releasename": "vim",
+        "devel": {"project": "devel:languages:vim", "package": "vim"},
+        "persons": [{"name": "alice", "role": "maintainer", "email": null}],
+        "groups": []}"#,
     )
     .unwrap();
     let out = geectl_isolated(&dir)
@@ -6439,9 +6550,125 @@ fn meta_set_help_names_the_target_and_field_flags() {
     let out = geectl().args(["meta", "set", "--help"]).output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    for flag in ["--project", "--package", "--repo", "--description", "--url"] {
+    for flag in [
+        "--project",
+        "--package",
+        "--repo",
+        "--description",
+        "--url",
+        "--from-file",
+    ] {
         assert!(text.contains(flag), "meta set --help misses {flag}");
     }
+}
+
+#[test]
+fn meta_set_from_file_dry_run() {
+    // The unified leaf writes a whole OBS project meta from the
+    // typed JSON file: description and URL come from the file, and
+    // the plan names the file.
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.json");
+    fs::write(
+        &file,
+        r#"{"name": "home:alice", "title": "Alice",
+        "description": "Whole description", "url": "https://example.org/whole",
+        "scmsync": null, "devel": null,
+        "persons": [], "groups": [], "repositories": []}"#,
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "meta",
+            "set",
+            "--project",
+            "home:alice",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["backend"], "obs");
+    assert_eq!(value["project"], "home:alice");
+    assert_eq!(value["description"], "Whole description");
+    assert_eq!(value["url"], "https://example.org/whole");
+    assert_eq!(
+        value["fields"],
+        serde_json::json!([format!("from-file: {}", file.display())])
+    );
+    assert_eq!(
+        value["plan"],
+        serde_json::json!(["[dry-run] would: set project meta of home:alice"])
+    );
+}
+
+#[test]
+fn meta_set_from_file_refuses_a_gitea_target() {
+    // Gitea has no whole-file meta concept: the flag refuses
+    // before any client is built, naming it.
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.json");
+    fs::write(
+        &file,
+        r#"{"name": "home:alice", "title": "Alice",
+        "description": "Whole description", "url": null,
+        "scmsync": null, "devel": null,
+        "persons": [], "groups": [], "repositories": []}"#,
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "meta",
+            "set",
+            "--repo",
+            "pool/systemd",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("no whole-file meta concept"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn meta_set_from_file_conflicts_with_description() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "meta",
+            "set",
+            "--project",
+            "home:alice",
+            "--from-file",
+            "meta.json",
+            "--description",
+            "New description",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
 }
 
 #[test]

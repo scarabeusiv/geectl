@@ -2,11 +2,11 @@
 .el .ds Aq '
 .TH geectl-meta-set 1  "geectl-meta-set 0.2.4" 
 .SH NAME
-geectl\-meta\-set \- Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL. The target selects the backend: `\-\-project` (with `\-\-package` for a package) writes OBS meta, `\-\-repo` writes Gitea repo settings. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field
+geectl\-meta\-set \- Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL, or the whole meta from a file on the OBS arm. The target selects the backend: `\-\-project` (with `\-\-package` for a package) writes OBS meta, `\-\-repo` writes Gitea repo settings. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the write. Field flags change only the given fields; the rest of the meta is kept as it is. `\-\-from\-file` instead replaces the whole meta: fields the file omits are cleared. There is no field flag to clear a field
 .SH SYNOPSIS
-\fBgeectl meta set\fR [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-\-repo\fR] [\fB\-\-description\fR] [\fB\-\-url\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBgeectl meta set\fR [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-\-repo\fR] [\fB\-\-description\fR] [\fB\-\-url\fR] [\fB\-\-from\-file\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL. The target selects the backend: `\-\-project` (with `\-\-package` for a package) writes OBS meta, `\-\-repo` writes Gitea repo settings. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field
+Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL, or the whole meta from a file on the OBS arm. The target selects the backend: `\-\-project` (with `\-\-package` for a package) writes OBS meta, `\-\-repo` writes Gitea repo settings. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the write. Field flags change only the given fields; the rest of the meta is kept as it is. `\-\-from\-file` instead replaces the whole meta: fields the file omits are cleared. There is no field flag to clear a field
 .SH OPTIONS
 .TP
 \fB\-\-project\fR \fI<PROJECT>\fR
@@ -23,6 +23,9 @@ A short description
 .TP
 \fB\-\-url\fR \fI<URL>\fR
 A URL with more information; the repository website on the Gitea arm
+.TP
+\fB\-\-from\-file\fR \fI<FROM_FILE>\fR
+Write the given meta file as the whole meta instead of setting fields: the file is the typed JSON `remote project\-meta` / `remote package\-meta` emits (an OBS XML document stays accepted as a legacy format). OBS targets only: Gitea has no whole\-file meta concept. Fields the file omits are cleared. Conflicts with \-\-description and \-\-url
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
