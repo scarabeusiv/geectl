@@ -216,9 +216,17 @@ fn obs_auth_kind(url: &str, instances: &[(String, String)]) -> &'static str {
 /// the configured URL would use — the matching alias's variables
 /// when `gitea_url` is named in `[instances]`, the plain variables
 /// otherwise — so an alias-only setup does not read as
-/// unauthenticated here.
-fn gitea_auth_kind(gitea_url: &str, instances: &[(String, String)]) -> &'static str {
-    let bearer = EnvGiteaAuth::credentials_for_url(gitea_url, gitea_url, instances);
+/// unauthenticated here. With `--instance`, strictly the flagged
+/// alias's variables (see `resolve_gitea_for_instance`).
+fn gitea_auth_kind(
+    gitea_url: &str,
+    instances: &[(String, String)],
+    instance: Option<&str>,
+) -> &'static str {
+    let bearer = match instance {
+        Some(alias) => EnvGiteaAuth::credentials_for_instance(alias, instances),
+        None => EnvGiteaAuth::credentials_for_url(gitea_url, gitea_url, instances),
+    };
     let key = GiteaSshKey.credentials();
     if matches!(bearer, Ok(Credentials::Bearer { .. })) {
         "bearer"
@@ -238,19 +246,18 @@ fn gitea_auth_kind(gitea_url: &str, instances: &[(String, String)]) -> &'static 
 fn debug_config_line(instance: Option<&str>) -> Option<String> {
     let path = config::config_path().ok()?;
     let file_config = config::load_config_at(&path).ok()?;
-    let effective = config::effective_config(&file_config).ok()?;
-    // effective_config resolves env > file > default, so both URLs
-    // are present by construction; the fallback is only for the
-    // type, never expected to fire. The OBS URL honours
-    // `--instance`: the flagged alias's URL, else the effective one.
+    // Both URLs honour `--instance`: the flagged alias's URL,
+    // else the effective one (environment, then config file, then
+    // the built-in default — the `*_base_url` calls resolve the
+    // effective config themselves on the no-flag path).
     let obs_url = config::obs_base_url(instance, &file_config).ok()?;
-    let gitea_url = effective.config.gitea_url.as_deref().unwrap_or("");
+    let gitea_url = config::gitea_base_url(instance, &file_config).ok()?;
     Some(format!(
         "config: obs {} (auth: {}), gitea {} (auth: {})",
         geectl::debug::url_host(&obs_url),
         obs_auth_kind(&obs_url, &file_config.instances),
-        geectl::debug::url_host(gitea_url),
-        gitea_auth_kind(gitea_url, &file_config.instances)
+        geectl::debug::url_host(&gitea_url),
+        gitea_auth_kind(&gitea_url, &file_config.instances, instance)
     ))
 }
 
@@ -324,19 +331,41 @@ fn config_show_payload(
             effective.obs_url_source,
         ),
     };
+    // `--instance` names the Gitea URL and its source too: the
+    // flagged alias's URL with source `flag`, else the effective
+    // URL with its own source — the mirror of the OBS side, so
+    // `config show --instance foo` reports foo's host, not the
+    // default's.
+    let (gitea_url, gitea_url_source) = match instance {
+        Some(alias) => (config::gitea_base_url(Some(alias), &file_config)?, "flag"),
+        None => (
+            effective
+                .config
+                .gitea_url
+                .as_deref()
+                .unwrap_or("")
+                .to_string(),
+            effective.gitea_url_source,
+        ),
+    };
     // The effective Gitea URL is the configured default for the
     // single configured URL, so `gitea_auth` reports the
     // credentials that URL would actually use — the matching
     // alias's variables when the URL is named in `[instances]`,
     // the plain variables otherwise — not the plain-only status.
-    // (Computed before the payload: the borrow of the effective
-    // URL ends here, and the payload moves it below.)
-    let gitea_url = effective.config.gitea_url.as_deref().unwrap_or("");
-    let gitea_auth = credentials_status(EnvGiteaAuth::credentials_for_url(
-        gitea_url,
-        gitea_url,
-        &effective.config.instances,
-    ));
+    // With `--instance`, strictly the flagged alias's variables
+    // (see `resolve_gitea_for_instance`).
+    let gitea_auth = match instance {
+        Some(alias) => credentials_status(EnvGiteaAuth::credentials_for_instance(
+            alias,
+            &effective.config.instances,
+        )),
+        None => credentials_status(EnvGiteaAuth::credentials_for_url(
+            &gitea_url,
+            &gitea_url,
+            &effective.config.instances,
+        )),
+    };
     let mut instances_json = serde_json::Map::new();
     for (alias, url) in &effective.config.instances {
         instances_json.insert(alias.clone(), json!(url));
@@ -345,8 +374,8 @@ fn config_show_payload(
         "config_file": path.to_string_lossy(),
         "obs_url": json!(obs_url),
         "obs_url_source": obs_url_source,
-        "gitea_url": effective.config.gitea_url,
-        "gitea_url_source": effective.gitea_url_source,
+        "gitea_url": gitea_url,
+        "gitea_url_source": gitea_url_source,
         "format": format.as_str(),
         "format_source": format_source,
         "identity": match &effective.config.identity {

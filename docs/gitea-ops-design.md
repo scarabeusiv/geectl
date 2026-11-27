@@ -373,10 +373,11 @@ shape.
 ## Configuration and auth
 
 `gitea_url` in the config file, default `https://src.opensuse.org`, with
-the `GEECTL_GITEA_URL` environment override. One configured Gitea instance
-per client; a repo URL on another host answers `ConfigError` naming the
-configured host. Named instances live in the config `[instances]` table;
-the identity is scheme, host, and effective port.
+the `GEECTL_GITEA_URL` environment override. Named instances live in the
+config `[instances]` table; the identity is scheme, host, and effective
+port. `--instance` selects the alias's URL as the Gitea base, like the
+OBS side, and only the alias's token variables authenticate the call —
+the flag selects the host and the account together.
 
 `EnvGiteaAuth` carries the Bearer token from `GEECTL_GITEA_TOKEN` or
 `GEECTL_GITEA_TOKEN_FILE`, exactly one, or from the matching alias's

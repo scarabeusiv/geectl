@@ -1122,9 +1122,10 @@ pub fn gitea_alias_vars(alias: &str) -> (String, String) {
 /// `ConfigError` naming the variables to set — it fails closed
 /// even when nothing is configured anywhere, unlike
 /// [`resolve_gitea_bearer_for_url`], which returns
-/// [`Credentials::None`] in that case. The alias's URL is not
-/// used: the flag selects the account, not the host — the Gitea
-/// host stays the configured one.
+/// [`Credentials::None`] in that case. The alias's URL is the
+/// host: the caller pairs this with the alias URL from
+/// [`crate::config::gitea_base_url`], so the flag selects the
+/// account and the host together.
 pub fn resolve_gitea_for_instance(
     alias: &str,
     instances: &[(String, String)],
@@ -1142,6 +1143,29 @@ pub fn resolve_gitea_for_instance(
         )),
         creds => Ok(creds),
     }
+}
+
+/// Resolve Gitea credentials strictly for one named instance,
+/// when the alias carries a token at all — the optional-token
+/// form of [`resolve_gitea_for_instance`]. `None` when neither
+/// alias token variable is set: a public operation proceeds
+/// without one, like the no-flag path when nothing is configured
+/// at all. A set-but-misconfigured alias token still fails
+/// closed, and an unknown alias fails naming the known aliases.
+pub fn resolve_gitea_for_instance_optional(
+    alias: &str,
+    instances: &[(String, String)],
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Option<Credentials>, GeectlError> {
+    let _ = url_for_alias(instances, alias)?;
+    let (token_var, token_file_var) = gitea_alias_vars(alias);
+    if vars(&token_var).is_none() && vars(&token_file_var).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(resolve_gitea_for_instance(
+        alias, instances, vars, read_file,
+    )?))
 }
 
 /// Resolve the Gitea API token for one Gitea URL.
@@ -1774,6 +1798,30 @@ impl EnvGiteaAuth {
             &read_secret_file_production,
         )
     }
+
+    /// Gitea credentials strictly for one named instance from the
+    /// process environment, when the alias carries a token at all —
+    /// the `--instance` path for a token that is optional. `None`
+    /// when neither alias token variable is set: a public operation
+    /// proceeds without one, like the no-flag path when nothing is
+    /// configured at all. A set-but-misconfigured alias token (both
+    /// variables set, an unreadable token file) still fails closed,
+    /// like [`credentials_for_instance`], and an unknown alias fails
+    /// naming the known aliases.
+    pub fn credentials_for_instance_optional(
+        alias: &str,
+        instances: &[(String, String)],
+    ) -> Result<Option<Credentials>, GeectlError> {
+        let (token_var, token_file_var) = gitea_alias_vars(alias);
+        let names = [token_var.as_str(), token_file_var.as_str()];
+        let env = snapshot_env(&names)?;
+        resolve_gitea_for_instance_optional(
+            alias,
+            instances,
+            &|name| env.get(name).cloned(),
+            &read_secret_file_production,
+        )
+    }
 }
 
 /// Gitea SSH key from the process environment. See
@@ -2093,6 +2141,55 @@ mod tests {
     fn instance_flag_with_no_gitea_token_fails_closed() {
         let map = vars(&[]);
         let err = resolve_gitea_for_instance(
+            "example",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("GEECTL_GITEA_TOKEN_EXAMPLE"));
+    }
+
+    #[test]
+    fn optional_instance_token_is_none_when_the_alias_sets_nothing() {
+        // The public-operation form: neither alias variable set
+        // reads as no token, even with a plain token configured —
+        // the plain token belongs to the default instance and is
+        // never borrowed for the flagged alias.
+        let map = vars(&[(GITEA_TOKEN_VAR, "plain-token")]);
+        let creds = resolve_gitea_for_instance_optional(
+            "example",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(creds.is_none());
+    }
+
+    #[test]
+    fn optional_instance_token_resolves_the_alias_token_when_set() {
+        let map = vars(&[("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token")]);
+        let creds = resolve_gitea_for_instance_optional(
+            "example",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(matches!(creds, Some(Credentials::Bearer { ref token }) if token == "alias-token"));
+    }
+
+    #[test]
+    fn optional_instance_token_fails_closed_on_a_misconfigured_alias() {
+        // Both alias variables set is a misconfiguration, not an
+        // absence: the optional form fails like the strict one.
+        let map = vars(&[
+            ("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token"),
+            ("GEECTL_GITEA_TOKEN_FILE_EXAMPLE", "/tmp/token"),
+        ]);
+        let err = resolve_gitea_for_instance_optional(
             "example",
             &instances(&[("example", "https://api.example.org")]),
             &lookup(&map),
