@@ -1540,8 +1540,9 @@ fn check_bug_refs(changes_name: &str, entry: &Entry, report: &mut ValidationRepo
                 ),
             });
         }
-        // Incomplete CVE ids.
-        for partial in partial_cve_ids(&text) {
+        // Incomplete CVE ids: the bare-CVE arm below strips these first, so a partial id is not also a bare mention.
+        let partials = partial_cve_ids(&text);
+        for partial in &partials {
             report.findings.push(Finding {
                 rule: Rule::V12,
                 file: changes_name.to_string(),
@@ -1561,7 +1562,12 @@ fn check_bug_refs(changes_name: &str, entry: &Entry, report: &mut ValidationRepo
             || !bug_refs(&text, "bnc").is_empty()
             || text.to_uppercase().contains("GHSA-");
         let lower = text.to_lowercase();
-        let bare_cve = contains_word(&lower, "cve") || contains_word(&lower, "cves");
+        // A partial id reads as a bare `CVE` word to `contains_word`; strip the covered ids first.
+        let mut stripped = lower.clone();
+        for partial in &partials {
+            stripped = stripped.replace(&partial.to_lowercase(), " ");
+        }
+        let bare_cve = contains_word(&stripped, "cve") || contains_word(&stripped, "cves");
         let security_claim = [
             "security fix",
             "security fixes",
@@ -2230,6 +2236,25 @@ mod tests {
         assert!(v12
             .iter()
             .any(|f| f.message.contains("without a full CVE id")));
+    }
+
+    #[test]
+    fn v12_reports_one_incomplete_cve_id_once() {
+        let local = snapshot(&[
+            ("foo.spec", SPEC),
+            (
+                "foo.changes",
+                &changes_file("- Update to 2.0\n- Fix CVE-2026-12", "- Initial package"),
+            ),
+        ]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        let v12: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == Rule::V12)
+            .collect();
+        assert_eq!(v12.len(), 1, "findings: {:?}", report.findings);
+        assert!(v12[0].message.contains("incomplete CVE"));
     }
 
     #[test]
