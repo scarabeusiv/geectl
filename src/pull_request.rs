@@ -420,11 +420,6 @@ pub struct PullRequest {
     /// One entry per review asked or given, in order.
     #[serde(default)]
     pub reviews: Vec<ReviewOpinion>,
-    /// The reviews-fetch error on the Gitea arm, when the PR read
-    /// but its reviews did not; `None` otherwise, and always
-    /// `None` on OBS, whose reviews arrive with the request.
-    #[serde(default)]
-    pub reviews_error: Option<String>,
     /// Gitea label names; empty on OBS.
     #[serde(default)]
     pub labels: Vec<String>,
@@ -470,7 +465,6 @@ impl PullRequest {
             source,
             target,
             reviews,
-            reviews_error: None,
             labels: Vec::new(),
         })
     }
@@ -510,7 +504,6 @@ impl PullRequest {
             source: gitea_endpoint(&pr.head),
             target: gitea_endpoint(&pr.base),
             reviews: opinions,
-            reviews_error: None,
             labels: pr
                 .labels
                 .iter()
@@ -880,9 +873,9 @@ impl<'a> PullRequestClient<'a> {
 
     /// Read one pull request as the unified shape: the OBS arm
     /// reads the request with its reviews, the Gitea arm reads the
-    /// PR and its reviews. A Gitea reviews fetch that fails leaves
-    /// the PR with no reviews and the error recorded, instead of
-    /// failing the read.
+    /// PR and its reviews. A Gitea reviews fetch that fails fails
+    /// the read: a returned PR always carries its reviews, so
+    /// `reviews: []` means "no reviews" on both arms.
     pub fn show(&self, reference: &PullRequestRef) -> Result<PullRequest, GeectlError> {
         match reference {
             PullRequestRef::Obs(id) => {
@@ -897,13 +890,8 @@ impl<'a> PullRequestClient<'a> {
             } => {
                 let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
                 let pr = gitea.pr_get(owner, repo, *number)?;
-                let (reviews, reviews_error) = match gitea.pr_reviews(owner, repo, *number) {
-                    Ok(reviews) => (reviews, None),
-                    Err(err) => (Vec::new(), Some(err.to_string())),
-                };
-                let mut pull_request = PullRequest::from_gitea(owner, repo, &pr, &reviews)?;
-                pull_request.reviews_error = reviews_error;
-                Ok(pull_request)
+                let reviews = gitea.pr_reviews(owner, repo, *number)?;
+                PullRequest::from_gitea(owner, repo, &pr, &reviews)
             }
         }
     }
@@ -2884,7 +2872,6 @@ mod tests {
                 comment: String::new(),
                 when: None,
             }],
-            reviews_error: None,
             labels: vec![],
         };
         let json = serde_json::to_value(&pull_request).unwrap();
@@ -2897,11 +2884,6 @@ mod tests {
         assert_eq!(json["mergeable"], serde_json::Value::Null);
         assert_eq!(json["merge_base"], serde_json::Value::Null);
         assert_eq!(json["reviews"][0]["state"], "approved");
-        assert!(
-            json.as_object().unwrap().contains_key("reviews_error"),
-            "reviews_error must be emitted on every read"
-        );
-        assert_eq!(json["reviews_error"], serde_json::Value::Null);
         assert_eq!(json["labels"], serde_json::json!([]));
         let round_tripped: PullRequest = serde_json::from_value(json).unwrap();
         assert_eq!(round_tripped, pull_request);
@@ -3149,10 +3131,10 @@ mod tests {
     }
 
     #[test]
-    fn show_gitea_reads_the_pr_when_reviews_fail() {
-        // The reviews are enrichment: when their fetch fails the
-        // read still returns the PR, with no reviews and the error
-        // recorded, instead of failing the whole read.
+    fn show_gitea_fails_when_reviews_fail() {
+        // The reviews are part of the read, not enrichment: when
+        // their fetch fails the whole read fails, so a returned PR
+        // never silently carries no reviews.
         let http = FakeHttp::new()
             .with_get(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
@@ -3169,14 +3151,15 @@ mod tests {
             repo: "geectl".to_string(),
             number: 122,
         };
-        let pr = client.show(&reference).unwrap();
-        assert_eq!(pr.reference, reference);
-        assert_eq!(pr.status, PullRequestStatus::Open);
-        assert!(pr.reviews.is_empty());
-        assert_eq!(
-            pr.reviews_error.as_deref(),
-            Some("network_error: a network error occurred (canned GET error for https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50)")
-        );
+        let err = client
+            .show(&reference)
+            .expect_err("a failed reviews fetch must fail the read");
+        assert_eq!(err.kind(), ErrorKind::NetworkError);
+        // The PR read ran first: the failure is on the reviews
+        // fetch, not on the PR itself.
+        assert!(http.get_calls().iter().any(
+            |(url, _)| url == "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122"
+        ));
     }
 
     #[test]

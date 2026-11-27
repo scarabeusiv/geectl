@@ -2614,9 +2614,6 @@ fn render_pull_request_text(pr: &PullRequest) -> String {
             lines.push(format!("review {} at: {}", index + 1, when));
         }
     }
-    if let Some(error) = &pr.reviews_error {
-        lines.push(format!("reviews unavailable: {error}"));
-    }
     if !pr.labels.is_empty() {
         lines.push(format!(
             "labels: {}",
@@ -2845,11 +2842,6 @@ mod tests {
         assert_eq!(payload["merged"], false);
         assert_eq!(payload["mergeable"], true);
         assert_eq!(payload["merge_base"], serde_json::Value::Null);
-        assert!(
-            payload.as_object().unwrap().contains_key("reviews_error"),
-            "reviews_error must be emitted on every read"
-        );
-        assert_eq!(payload["reviews_error"], serde_json::Value::Null);
         assert_eq!(payload["source"]["repository"], "scarabeusiv/geectl");
         assert_eq!(payload["source"]["branch"], "change-review-state");
         assert_eq!(payload["target"]["repository"], "openSUSE/geectl");
@@ -2956,24 +2948,6 @@ mod tests {
                 "text missing {expected:?}:\n{text}"
             );
         }
-    }
-
-    #[test]
-    fn gitea_show_text_names_a_failed_reviews_fetch() {
-        let mut pr = fixture_gitea_pull_request();
-        pr.reviews = Vec::new();
-        pr.reviews_error = Some("NetworkError: canned GET error".to_string());
-        let payload = payload_json(&pr).unwrap();
-        assert_eq!(payload["reviews_error"], "NetworkError: canned GET error");
-        let text = render_pull_request_text(&pr);
-        assert!(
-            text.contains("reviews unavailable: NetworkError: canned GET error"),
-            "the text must name the failed reviews fetch:\n{text}"
-        );
-        assert!(
-            !text.contains("review 1:"),
-            "no reviews must render when the fetch failed:\n{text}"
-        );
     }
 
     #[test]

@@ -158,9 +158,6 @@ branch; `None` on OBS), `commit: Option<String>` (Gitea head and base SHA;
 OBS source revision when the action carries one).
 `reviews: Vec<ReviewOpinion>` — one entry per review asked or given, in
 order.
-`reviews_error: Option<String>` — the reviews-fetch error on the Gitea
-arm, when the pull request read but its reviews did not; `None` otherwise,
-always `None` on OBS.
 `labels: Vec<String>` — Gitea label names; empty on OBS.
 
 `search` returns `PullRequestSummary`: `reference`, `title`, `author`,
