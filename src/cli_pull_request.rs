@@ -22,15 +22,10 @@
 //! credentials; scope with `--backend` when only one is configured. `--repo` needs
 //! `--backend gitea`.
 //!
-//! In dry-run the OBS client builds without credentials (the plan
-//! prints without them), like the request group; the Gitea client
-//! still needs its credential to be built, so a dry-run Gitea act
-//! without one fails closed naming it, like the gitea group. A
-//! dry-run approve on OBS without OBS credentials also fails
-//! closed: the plan names the acting user, and without credentials
-//! there is no actor to name. A dry-run merge, decline, withdraw
-//! or reopen on OBS prints without credentials: the plan names no
-//! acting user.
+//! A dry-run act needs its arm's credentials to build its client,
+//! on both arms: dry-run only skips the mutation, never the
+//! credential requirement. Without them the act fails closed
+//! naming the missing credentials, like a live act does.
 //!
 //! Coordinate header (design rule 1): every text rendering opens
 //! with one header line echoing the query coordinates — the
@@ -160,7 +155,10 @@ pub enum PullRequestCommand {
     /// checkout; the leaf reads the state once and wipes the
     /// roots only on `accepted`/`merged`. A request in any other
     /// state, and a checkout with nothing recorded, delete
-    /// nothing. Dry-run by default; mutates only with `--live`.
+    /// nothing. A dry run still needs the recorded arm's
+    /// credentials to build its client — dry-run only skips the
+    /// mutation, never the credential requirement. Dry-run by
+    /// default; mutates only with `--live`.
     Cleanup,
 }
 
@@ -708,9 +706,10 @@ pub fn run_pull_request(
 /// through. The client borrows the transport, so both live in this
 /// scope and the caller runs inside it. Reads pass `live` as true
 /// and fail fast on a credential resolution error; an act in
-/// dry-run takes the request group's leniency instead — the plan
-/// prints without credentials, with the failure on the debug
-/// channel and as a stderr warning.
+/// dry-run needs its credentials like a live act does — dry-run
+/// only skips the mutation, never the credential requirement —
+/// so a dry-run act without OBS credentials fails closed naming
+/// them, like the Gitea arm.
 fn with_obs<T>(
     debug: &Debug,
     live: bool,
@@ -723,8 +722,9 @@ fn with_obs<T>(
 }
 
 /// The OBS client build behind `with_obs`: the configured base
-/// URL and its environment credentials, with the dry-run
-/// leniency `with_obs` documents.
+/// URL and its environment credentials. In dry-run the build
+/// fails closed when no credentials are configured, like the
+/// Gitea client build does — there is no client to plan with.
 fn obs_client_from<'a>(
     http: &'a UreqClient,
     debug: &Debug,
@@ -732,25 +732,19 @@ fn obs_client_from<'a>(
     instance: Option<&str>,
 ) -> Result<ObsClient<'a>, GeectlError> {
     let (base, resolve) = crate::cli_arms::obs_base_and_credentials(instance)?;
-    let credentials = match resolve {
-        Ok(credentials) => credentials,
-        Err(err) if !live && instance.is_none() => {
-            // The dry run prints the plan without credentials, but
-            // the failure must not be silent: the same credentials
-            // would fail a `--live` run, so the error goes on the
-            // debug channel and as a stderr warning. With
-            // `--instance` the error propagates even in dry-run:
-            // the flagged instance's credentials are strict, and
-            // a dry run must not silently plan against an
-            // instance it cannot use.
-            debug.emit(&format!(
-                "ignoring credential resolution error in dry-run mode: {err}"
-            ));
-            eprintln!("warning: ignoring credential resolution error in dry-run mode: {err}");
-            Credentials::None
-        }
-        Err(err) => return Err(err),
-    };
+    let credentials = resolve?;
+    if !live && matches!(credentials, Credentials::None) {
+        // A dry-run act needs the arm's credentials, like the
+        // Gitea arm: dry-run only skips the mutation, never the
+        // credential requirement. Without credentials there is no
+        // client to plan with, so the act fails closed naming
+        // them instead of printing a plan against an account it
+        // cannot use.
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            "no OBS credentials configured (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+        ));
+    }
     Ok(ObsClient::with_base_and_credentials(http, &base, credentials)?.with_debug(debug.clone()))
 }
 
@@ -774,23 +768,19 @@ fn merge_obs_client<'a>(
     let credentials = match resolve {
         Ok(credentials) => credentials,
         Err(err) if !live && instance.is_none() => {
-            // The dry run prints the plan without credentials, but
-            // the failure must not be silent: the same credentials
-            // would fail a `--live` run, so the error goes on the
-            // debug channel and as a stderr warning. With
-            // `--instance` the error propagates even in dry-run:
-            // the flagged instance's credentials are strict, and
-            // a dry run must not silently plan against an
-            // instance it cannot use.
             debug.emit(&format!(
-                "ignoring credential resolution error in dry-run mode: {err}"
+                "ignoring OBS credential resolution error in dry-run merge: {err}"
             ));
-            eprintln!("warning: ignoring credential resolution error in dry-run mode: {err}");
-            Credentials::None
+            return Ok(None);
         }
         Err(err) => return Err(err),
     };
-    Ok(ObsClient::with_base_and_credentials(http, &base, credentials)?.with_debug(debug.clone()))
+    if matches!(credentials, Credentials::None) {
+        return Ok(None);
+    }
+    Ok(Some(
+        ObsClient::with_base_and_credentials(http, &base, credentials)?.with_debug(debug.clone()),
+    ))
 }
 
 /// Build the OBS client for an unscoped search, or `None` when
@@ -939,13 +929,11 @@ fn submit(
             // an alias-vars fetch, or the reverse). The fetch runs
             // only live; in dry-run the token serves the client
             // alone — a dry-run Gitea act still needs one to build,
-            // like every Gitea act in this group. That is the
-            // asymmetry with the OBS arm, which prints its dry-run
-            // plan with a warning when credentials fail: the Gitea
-            // client fails closed without a Bearer <redacted>, so there is
-            // no unauthenticated client to plan with — the token is
-            // a build requirement, not a live-only one. Lifting that
-            // is a group-wide policy call, not this verb's.
+            // like every Gitea act in this group, and the OBS arm
+            // is the same: a dry-run act needs its arm's
+            // credentials to build its client, so there is no
+            // unauthenticated client to plan with — the credential
+            // is a build requirement, not a live-only one.
             let token = gitea_token_for(&base, &instances, instance)?;
             let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
             let gitea = GiteaClient::with_base(
@@ -1333,96 +1321,94 @@ fn merge_gitea(
 ) -> Result<(Value, String), GeectlError> {
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     let reference: PullRequestRef = reference.parse()?;
-    // One client carries both arms: the Gitea arm merges, the OBS
-    // arm forwards and cleans up. The OBS client builds first, so
-    // a credential error fails before the merge, like the
-    // preflight's resolution did; with no credentials at all it
-    // builds credential-less and the library fails closed on the
-    // forward preflight instead.
-    with_obs(debug, live, instance, |obs| {
-        with_gitea(debug, instance, |gitea| {
-            let client = PullRequestClient::new(Some(obs), Some(gitea)).with_debug(debug.clone());
-            let outcome = client.merge_with_forward(
-                &reference,
-                &MergeOptions {
-                    comment: message,
-                    method,
-                    force: false,
-                    forward: !no_forward,
-                    forward_message,
-                },
-                &dry_run,
-            )?;
-            let mut payload = level_act_payload(&reference, &outcome.status, &dry_run)?;
-            let mut text = level_act_text(
-                "merge",
-                "merged",
-                &reference,
-                &outcome.status,
-                message,
-                &dry_run,
-            );
-            let (cleanup_payload, cleanup_text) =
-                merge_cleanup_render(&reference, &outcome, &dry_run);
-            if let Value::Object(map) = &mut payload {
-                map.insert("cleanup".to_string(), cleanup_payload);
-            }
-            if !cleanup_text.is_empty() {
-                text.push_str(&format!("; {cleanup_text}"));
-            }
-            if no_forward {
-                return Ok((payload, text));
-            }
-            if !live {
-                let forward_note = match forward_message {
-                    Some(entry) => format!(" with changes entry: {entry}"),
-                    None => String::new(),
-                };
-                if let Value::Object(map) = &mut payload {
-                    if let Some(Value::Array(plan)) = map.get_mut("plan") {
-                        plan.push(Value::String(format!(
-                            "[dry-run] would: forward {reference} after merge{forward_note}"
-                        )));
-                        if matches!(
-                            outcome.forward,
-                            MergeForwardOutcome::Planned {
-                                preflight_skipped: true
-                            }
-                        ) {
-                            plan.push(Value::String(
-                                "[dry-run] note: forward preflight skipped: no OBS credentials, so the forward was not verified".to_string(),
-                            ));
-                        }
-                    }
-                }
-                text.push_str(&format!("; would forward after merge{forward_note}"));
-                return Ok((payload, text));
-            }
-            // Live: the merge landed and the forward ran with it.
-            let MergeForwardOutcome::Gitea(action) = &outcome.forward else {
-                return Err(GeectlError::new(
-                    ErrorKind::InternalError,
-                    format!(
-                        "merge_with_forward on {reference} returned no Gitea forward outcome: {:?}",
-                        outcome.forward
-                    ),
-                ));
+    // The merge's own arm is Gitea; the OBS client only verifies
+    // the forward, so it is optional — with no OBS credentials the
+    // library skips the forward preflight in dry-run and fails
+    // closed live. A credential resolution error still fails the
+    // merge before anything runs.
+    let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+    let obs = merge_obs_client(&http, debug, live, instance)?;
+    with_gitea(debug, instance, |gitea| {
+        let client = PullRequestClient::new(obs.as_ref(), Some(gitea)).with_debug(debug.clone());
+        let outcome = client.merge_with_forward(
+            &reference,
+            &MergeOptions {
+                comment: message,
+                method,
+                force: false,
+                forward: !no_forward,
+                forward_message,
+            },
+            &dry_run,
+        )?;
+        let mut payload = level_act_payload(&reference, &outcome.status, &dry_run)?;
+        let mut text = level_act_text(
+            "merge",
+            "merged",
+            &reference,
+            &outcome.status,
+            message,
+            &dry_run,
+        );
+        let (cleanup_payload, cleanup_text) = merge_cleanup_render(&reference, &outcome, &dry_run);
+        if let Value::Object(map) = &mut payload {
+            map.insert("cleanup".to_string(), cleanup_payload);
+        }
+        if !cleanup_text.is_empty() {
+            text.push_str(&format!("; {cleanup_text}"));
+        }
+        if no_forward {
+            return Ok((payload, text));
+        }
+        if !live {
+            let forward_note = match forward_message {
+                Some(entry) => format!(" with changes entry: {entry}"),
+                None => String::new(),
             };
             if let Value::Object(map) = &mut payload {
-                map.insert(
-                    "forward".to_string(),
-                    json!({
-                        "actions": [crate::cli_request::forward_action_json(action)],
-                        "dry_run": false,
-                    }),
-                );
+                if let Some(Value::Array(plan)) = map.get_mut("plan") {
+                    plan.push(Value::String(format!(
+                        "[dry-run] would: forward {reference} after merge{forward_note}"
+                    )));
+                    if matches!(
+                        outcome.forward,
+                        MergeForwardOutcome::Planned {
+                            preflight_skipped: true
+                        }
+                    ) {
+                        plan.push(Value::String(
+                                "[dry-run] note: forward preflight skipped: no OBS credentials, so the forward was not verified".to_string(),
+                            ));
+                    }
+                }
             }
-            text.push_str(&format!(
-                "; {}",
-                crate::cli_request::forward_action_text(action, &dry_run)
+            text.push_str(&format!("; would forward after merge{forward_note}"));
+            return Ok((payload, text));
+        }
+        // Live: the merge landed and the forward ran with it.
+        let MergeForwardOutcome::Gitea(action) = &outcome.forward else {
+            return Err(GeectlError::new(
+                ErrorKind::InternalError,
+                format!(
+                    "merge_with_forward on {reference} returned no Gitea forward outcome: {:?}",
+                    outcome.forward
+                ),
             ));
-            Ok((payload, text))
-        })
+        };
+        if let Value::Object(map) = &mut payload {
+            map.insert(
+                "forward".to_string(),
+                json!({
+                    "actions": [crate::cli_request::forward_action_json(action)],
+                    "dry_run": false,
+                }),
+            );
+        }
+        text.push_str(&format!(
+            "; {}",
+            crate::cli_request::forward_action_text(action, &dry_run)
+        ));
+        Ok((payload, text))
     })
 }
 

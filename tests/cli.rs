@@ -6395,6 +6395,34 @@ fn meta_set_help_names_the_target_and_field_flags() {
 }
 
 #[test]
+fn meta_set_obs_dry_run_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "meta",
+            "set",
+            "--project",
+            "home:alice",
+            "--description",
+            "A project",
+        ])
+        .output()
+        .unwrap();
+    // ConfigError exits 9; a dry-run write needs its arm's
+    // credentials, like a live write does — dry-run only skips
+    // the mutation.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_OBS_USERNAME"));
+}
+
+#[test]
 fn top_help_lists_the_working_copy_leaves() {
     let out = geectl().arg("--help").output().unwrap();
     assert!(out.status.success());
@@ -6416,40 +6444,46 @@ fn top_help_lists_the_working_copy_leaves() {
 }
 
 #[test]
-fn pull_request_merge_obs_dry_run_without_credentials_prints_plan() {
+fn pull_request_merge_obs_dry_run_without_credentials_fails_with_config_error() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["pull-request", "merge", "obs:123"])
         .output()
         .unwrap();
-    // A dry-run level act on OBS prints without credentials: the
-    // plan names no acting user.
-    assert!(out.status.success());
+    // ConfigError exits 9; a dry-run act needs its arm's
+    // credentials, like a live act does — dry-run only skips the
+    // mutation.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     let value: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
-    assert_eq!(value["reference"], "obs:123");
-    assert_eq!(value["status"], serde_json::Value::Null);
-    assert_eq!(value["dry_run"], true);
-    assert_eq!(
-        value["plan"][0],
-        "[dry-run] would: change state of submit request 123 to accepted"
-    );
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_OBS_USERNAME"));
 }
 
 #[test]
-fn pull_request_merge_obs_text_dry_run_without_credentials_prints_plan() {
+fn pull_request_merge_obs_text_dry_run_without_credentials_fails_with_config_error() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["--format", "text", "pull-request", "merge", "obs:123"])
         .output()
         .unwrap();
-    assert!(out.status.success());
-    // The accept-time branch cleanup cannot read the request without
-    // credentials, so it reports instead of planning the deletes.
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        "dry-run: would merge obs:123; branch cleanup not run; would forward after merge"
+    // ConfigError exits 9; a dry-run act needs its arm's
+    // credentials, like a live act does. In text mode the error
+    // renders as plain text on stderr, not JSON, so the
+    // assertions are substrings.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error:"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("no OBS credentials configured"),
+        "stderr: {stderr}"
     );
+    assert!(stderr.contains("GEECTL_OBS_USERNAME"), "stderr: {stderr}");
 }
 
 #[test]
@@ -6457,6 +6491,8 @@ fn pull_request_merge_obs_dry_run_forward_message_names_the_changes_entry() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["pull-request", "merge", "obs:123", "-m", "- custom entry"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
         .output()
         .unwrap();
     assert!(
@@ -6517,6 +6553,65 @@ fn pull_request_merge_gitea_without_credentials_fails_with_config_error() {
 }
 
 #[test]
+fn pull_request_cleanup_obs_dry_run_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let checkout = obs_submit_checkout(&dir, "https://api.opensuse.org");
+    git_in(
+        &checkout,
+        &["config", "--local", "geectl.submitted-request", "1398492"],
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args(["pull-request", "cleanup"])
+        .output()
+        .unwrap();
+    // ConfigError exits 9; the cleanup dry-run reads no server
+    // at all, yet still needs the recorded arm's credentials to
+    // build its client — dry-run only skips the mutation.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_OBS_USERNAME"));
+}
+
+#[test]
+fn pull_request_cleanup_gitea_dry_run_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    git_in(
+        &checkout,
+        &[
+            "config",
+            "--local",
+            "geectl.submitted-pull-request",
+            "gitea:openSUSE/geectl#122",
+        ],
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args(["pull-request", "cleanup"])
+        .output()
+        .unwrap();
+    // ConfigError exits 9; the cleanup dry-run reads no server
+    // at all, yet still needs the recorded arm's token to build
+    // its client — dry-run only skips the mutation.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_GITEA_TOKEN"));
+}
+
+#[test]
 fn pull_request_merge_obs_with_a_method_is_invalid_input() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
@@ -6524,9 +6619,8 @@ fn pull_request_merge_obs_with_a_method_is_invalid_input() {
         .output()
         .unwrap();
     // InvalidInput exits 2; --method does not apply to OBS.
-    // The refusal precedes credential resolution, so the dry-run
-    // credential warning never appears; the assertions are
-    // substrings, not a JSON parse.
+    // The refusal precedes credential resolution; the assertions
+    // are substrings, not a JSON parse.
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -8127,11 +8221,13 @@ fn pull_request_submit_obs_dry_run_prints_plan() {
             "- Update to 1.1.",
         ])
         .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
         .output()
         .unwrap();
-    // A dry-run submit on OBS prints without credentials: the
-    // plan names no acting user, and the only network read is the
-    // base revision for the freshness check.
+    // A dry-run submit on OBS prints the plan with credentials
+    // configured: the plan names no acting user, and the only
+    // network read is the base revision for the freshness check.
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -8146,6 +8242,39 @@ fn pull_request_submit_obs_dry_run_prints_plan() {
         value["plan"][0],
         "[dry-run] would: file submit request for foo to home:devel"
     );
+}
+
+#[test]
+fn pull_request_submit_obs_dry_run_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let checkout = obs_submit_checkout(&dir, "https://api.opensuse.org");
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "pull-request",
+            "submit",
+            "--target-project",
+            "home:devel",
+            "--description",
+            "Update foo",
+            "--changes-entry",
+            "- Update to 1.1.",
+        ])
+        .output()
+        .unwrap();
+    // ConfigError exits 9; a dry-run act needs its arm's
+    // credentials, like a live act does. The flag validation
+    // still precedes credential resolution, so an invalid flag
+    // fails as InvalidInput instead.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_OBS_USERNAME"));
 }
 
 #[test]
@@ -8172,6 +8301,8 @@ fn pull_request_submit_obs_text_dry_run_prints_plan() {
             "- Update to 1.1.",
         ])
         .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
         .output()
         .unwrap();
     assert!(

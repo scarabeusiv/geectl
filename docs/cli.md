@@ -95,7 +95,7 @@ the dropped error goes to the debug channel) — except
 credentials like the reads, and `request accept`'s cleanup leg,
 which reads the request first and reports an error in its cleanup
 section without them. With `--instance` the flagged instance's
-credentials are strict, so the error propagates even in dry-run. `meta` takes the same leniency on its OBS arm: a dry-run `meta set --project` prints the plan while any credential-resolution error (a half-configured pair or a conflicting set) is reported on the debug channel and as a stderr warning. The Gitea arm resolves its token up front: a dry-run `meta set --repo` reports a missing token as a configuration error. `remote` and `build`
+credentials are strict, so the error propagates even in dry-run. `meta` fails fast on it on both arms: a dry-run `meta set` needs its arm's credentials to build its client, like a live write does — dry-run only skips the mutation. The Gitea arm resolves its token up front: a dry-run `meta set --repo` reports a missing token as a configuration error, and a dry-run `meta set --project` without OBS credentials reports them the same way. `remote` and `build`
 resolve credentials per command instead: the public reads (see
 Credentials in `docs/architecture.md`) skip credentials, so a half-set
 env leaves them working; a dry-run `remote` mutation
@@ -341,7 +341,7 @@ without evaluating trust.
 - `geectl pull-request withdraw <REFERENCE>` — Withdraw a pull request; key flags: --message <MESSAGE>
 - `geectl pull-request reopen <REFERENCE>` — Reopen a pull request.
 - `geectl pull-request submit` — File a submission from the working copy in the current directory: an OBS submit request from an OBS-native checkout, a Gitea pull request from a git-backed one; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --description <DESCRIPTION>, --changes-entry <CHANGES_ENTRY>, --title <TITLE>, --body <BODY>, --draft
-- `geectl pull-request cleanup` — Clean the local build roots for the submit request or pull request filed from the working copy in the current directory, when that request is accepted (OBS) or merged (Gitea).
+- `geectl pull-request cleanup` — Clean the local build roots for the submit request or pull request filed from the working copy in the current directory, when that request is accepted (OBS) or merged (Gitea); a dry run still needs the recorded arm's credentials to build its client.
 
 ## `person` — unified person search
 
