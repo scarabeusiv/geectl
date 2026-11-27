@@ -715,8 +715,15 @@ fn check_entry_format(
                 ),
             });
         }
-        // Blank line after the header.
-        if let Some((_, first)) = entry.body.first() {
+        // Blank line after the header; a body of blank lines only is no body at all.
+        if entry.body_nonblank().is_empty() {
+            report.findings.push(Finding {
+                rule: Rule::V11,
+                file: changes_name.to_string(),
+                line: entry.header_line,
+                message: "entry has no body — describe the change".to_string(),
+            });
+        } else if let Some((_, first)) = entry.body.first() {
             if !first.trim().is_empty() {
                 report.findings.push(Finding {
                     rule: Rule::V11,
@@ -725,13 +732,6 @@ fn check_entry_format(
                     message: "missing blank line after the entry header".to_string(),
                 });
             }
-        } else {
-            report.findings.push(Finding {
-                rule: Rule::V11,
-                file: changes_name.to_string(),
-                line: entry.header_line,
-                message: "entry has no body — describe the change".to_string(),
-            });
         }
         // Blank line before the next separator (the boundary after
         // the newest entry is in scope even when the next entry is
@@ -2670,6 +2670,24 @@ mod tests {
             .collect();
         assert_eq!(eof.len(), 1, "findings: {:?}", report.findings);
         assert_eq!(eof[0].line, 11);
+    }
+
+    #[test]
+    fn v11_flags_a_newest_entry_whose_body_is_only_blank_lines() {
+        // The newest entry carries no content, only the blank line(s) before the next separator.
+        let local = snapshot(&[
+            ("foo.spec", SPEC),
+            ("foo.changes", &changes_file("", "- Initial package")),
+        ]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == Rule::V11 && f.message.contains("entry has no body")),
+            "findings: {:?}",
+            report.findings
+        );
     }
 
     #[test]
