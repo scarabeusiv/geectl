@@ -881,10 +881,10 @@ complete -c geectl -n "__fish_geectl_using_subcommand request; and __fish_seen_s
 complete -c geectl -n "__fish_geectl_using_subcommand request; and __fish_seen_subcommand_from file-add-role" -l debug-body -d 'Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`'
 complete -c geectl -n "__fish_geectl_using_subcommand request; and __fish_seen_subcommand_from file-add-role" -l live -d 'Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations'
 complete -c geectl -n "__fish_geectl_using_subcommand request; and __fish_seen_subcommand_from file-add-role" -s h -l help -d 'Print help'
-complete -c geectl -n "__fish_geectl_using_subcommand request; and __fish_seen_subcommand_from file-change-devel" -l source-project -d 'The project the package lives in' -r
-complete -c geectl -n "__fish_geectl_using_subcommand request; and __fish_seen_subcommand_from file-change-devel" -l source-package -d 'The package whose devel project changes' -r
-complete -c geectl -n "__fish_geectl_using_subcommand request; and __fish_seen_subcommand_from file-change-devel" -l target-project -d 'The project that becomes the devel project' -r
-complete -c geectl -n "__fish_geectl_using_subcommand request; and __fish_seen_subcommand_from file-change-devel" -l target-package -d 'The package in the devel project' -r
+complete -c geectl -n "__fish_geectl_using_subcommand request; and __fish_seen_subcommand_from file-change-devel" -l source-project -d 'The project holding the new devel package' -r
+complete -c geectl -n "__fish_geectl_using_subcommand request; and __fish_seen_subcommand_from file-change-devel" -l source-package -d 'The new devel package' -r
+complete -c geectl -n "__fish_geectl_using_subcommand request; and __fish_seen_subcommand_from file-change-devel" -l target-project -d 'The project holding the package whose devel changes' -r
+complete -c geectl -n "__fish_geectl_using_subcommand request; and __fish_seen_subcommand_from file-change-devel" -l target-package -d 'The package whose devel changes' -r
 complete -c geectl -n "__fish_geectl_using_subcommand request; and __fish_seen_subcommand_from file-change-devel" -l description -d 'The request description. Values starting with `-` are taken literally: a description may open with a `- ` bullet' -r
 complete -c geectl -n "__fish_geectl_using_subcommand request; and __fish_seen_subcommand_from file-change-devel" -l format -d 'Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json`' -r -f -a "json\t''
 text\t''"

@@ -1405,10 +1405,10 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (file-change-devel)
 _arguments "${_arguments_options[@]}" : \
-'--source-project=[The project the package lives in]:SOURCE_PROJECT:_default' \
-'--source-package=[The package whose devel project changes]:SOURCE_PACKAGE:_default' \
-'--target-project=[The project that becomes the devel project]:TARGET_PROJECT:_default' \
-'--target-package=[The package in the devel project]:TARGET_PACKAGE:_default' \
+'--source-project=[The project holding the new devel package]:SOURCE_PROJECT:_default' \
+'--source-package=[The new devel package]:SOURCE_PACKAGE:_default' \
+'--target-project=[The project holding the package whose devel changes]:TARGET_PROJECT:_default' \
+'--target-package=[The package whose devel changes]:TARGET_PACKAGE:_default' \
 '--description=[The request description. Values starting with \`-\` are taken literally\: a description may open with a \`- \` bullet]:DESCRIPTION:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \

@@ -406,13 +406,13 @@ pub enum RequestAction {
     },
     /// Change the devel project of a package.
     ChangeDevel {
-        /// The project the package lives in.
+        /// The project holding the new devel package.
         source_project: String,
-        /// The package whose devel project changes.
+        /// The new devel package.
         source_package: String,
-        /// The project that becomes the devel project.
+        /// The project holding the package whose devel changes.
         target_project: String,
-        /// The package in the devel project.
+        /// The package whose devel changes.
         target_package: String,
     },
     /// Create a maintenance incident from a source package.

@@ -1012,11 +1012,11 @@ fn request_file_change_devel_dry_run_names_the_description() {
             "request",
             "file-change-devel",
             "--source-project",
-            "home:foo",
+            "devel:foo",
             "--source-package",
             "bar",
             "--target-project",
-            "devel:foo",
+            "home:foo",
             "--target-package",
             "bar",
             "--description",
@@ -2467,11 +2467,11 @@ fn request_file_change_devel_dry_run_text_names_source_and_target() {
             "request",
             "file-change-devel",
             "--source-project",
-            "home:foo",
+            "devel:foo",
             "--source-package",
             "bar",
             "--target-project",
-            "devel:foo",
+            "home:foo",
             "--target-package",
             "bar",
             "--description",
@@ -2482,7 +2482,55 @@ fn request_file_change_devel_dry_run_text_names_source_and_target() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "dry-run: would file change-devel request for home:foo/bar to devel:foo/bar"
+        "dry-run: would file change-devel request for devel:foo/bar to home:foo/bar"
+    );
+}
+
+#[test]
+fn request_file_change_devel_dry_run_xml_names_new_devel_as_source() {
+    // #565: the source is the NEW devel, the target the package
+    // whose devel changes. The dry-run plan carries the would-be
+    // request XML, so it pins the OBS reading end to end.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "request",
+            "file-change-devel",
+            "--source-project",
+            "devel:foo",
+            "--source-package",
+            "bar",
+            "--target-project",
+            "home:foo",
+            "--target-package",
+            "bar",
+            "--description",
+            "Move bar to devel",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["source_project"], "devel:foo");
+    assert_eq!(value["target_project"], "home:foo");
+    let plan = value["plan"].as_array().expect("payload carries a plan");
+    let plan_text = plan
+        .iter()
+        .filter_map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan_text.contains("<source project=\"devel:foo\" package=\"bar\" />"),
+        "plan XML names the new devel as source: {plan_text}"
+    );
+    assert!(
+        plan_text.contains("<target project=\"home:foo\" package=\"bar\" />"),
+        "plan XML names the package whose devel changes as target: {plan_text}"
     );
 }
 
