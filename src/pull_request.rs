@@ -754,12 +754,6 @@ impl PullRequestSearch {
                 "a repo-scoped search needs backend gitea: the OBS arm has no repo to scope to",
             ));
         }
-        if self.reviewer.is_some() && self.backend != Some(PullRequestBackend::Gitea) {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                "a reviewer-scoped search needs backend gitea: the OBS arm has no reviewer filter",
-            ));
-        }
         // A state filter only reads as the states it names when
         // every arm in scope can produce them: a state an in-scope
         // arm cannot produce would return arm-skewed results
@@ -975,6 +969,9 @@ impl<'a> PullRequestClient<'a> {
             }
             if let Some(creator) = &query.creator {
                 search = search.creators(vec![creator.clone()]);
+            }
+            if let Some(reviewer) = &query.reviewer {
+                search = search.reviewers(vec![reviewer.clone()]);
             }
             for request in &obs.search_requests(&search)? {
                 summaries.push(PullRequestSummary::from_obs(request)?);
@@ -3625,32 +3622,6 @@ mod tests {
     }
 
     #[test]
-    fn search_reviewer_scoped_search_needs_the_gitea_backend() {
-        // A reviewer scopes the Gitea arm only: with no backend,
-        // or with the OBS backend, the reviewer filter would be
-        // silently ignored on the OBS arm, so the search fails as
-        // invalid input instead. No HTTP call runs: the fake has
-        // no canned responses, so any arm running would fail with
-        // a network error, not the invalid-input error asserted
-        // here.
-        let http = FakeHttp::new();
-        let obs = obs_client(&http);
-        let gitea = gitea_client(&http);
-        let client = PullRequestClient::new(Some(&obs), Some(&gitea));
-        for backend in [None, Some(PullRequestBackend::Obs)] {
-            let query = PullRequestSearch {
-                backend,
-                reviewer: Some("scarabeus_iv".to_string()),
-                ..Default::default()
-            };
-            let err = client
-                .search(&query)
-                .expect_err("a reviewer-scoped search without the Gitea backend must fail");
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        }
-    }
-
-    #[test]
     fn search_reviewer_and_repo_scopes_to_both() {
         // A reviewer-scoped repo search runs the global search
         // (the repo-scoped list has no reviewer filter) and the
@@ -5819,6 +5790,48 @@ please fix this</comment></comments>"#,
                 };
                 assert!(query.validate().is_ok());
             }
+        }
+    }
+
+    #[test]
+    fn search_obs_scopes_reviewer_server_side() {
+        // The reviewer reaches the OBS search as an open review
+        // addressed to the login; with no explicit states the
+        // default narrows to the states a request can still be
+        // reviewed in.
+        let collection = format!("<collection matches=\"1\">\n{REQUEST_XML}\n</collection>");
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/request?match=review%5B%40by_user%3D%27plusky%27%20and%20%40state%3D%27new%27%5D%20and%20state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%5D",
+            &collection,
+        );
+        let obs = obs_client(&http);
+        let client = PullRequestClient::new(Some(&obs), None);
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Obs),
+            reviewer: Some("plusky".to_string()),
+            ..Default::default()
+        };
+        let summaries = client.search(&query).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].reference, PullRequestRef::Obs(123));
+    }
+
+    #[test]
+    fn search_reviewer_is_accepted_on_both_arms() {
+        // The reviewer filter is no longer Gitea-only: OBS
+        // supports it server-side (an open review addressed to the
+        // login), so it validates unscoped and on either arm.
+        for backend in [
+            None,
+            Some(PullRequestBackend::Obs),
+            Some(PullRequestBackend::Gitea),
+        ] {
+            let query = PullRequestSearch {
+                backend,
+                reviewer: Some("plusky".to_string()),
+                ..Default::default()
+            };
+            assert!(query.validate().is_ok());
         }
     }
 }

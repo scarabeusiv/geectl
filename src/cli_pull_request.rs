@@ -384,9 +384,9 @@ pub struct SearchArgs {
     #[arg(long)]
     creator: Option<String>,
     /// Only pull requests with review requested of this login.
-    /// Requires `--backend gitea`. Only the token owner's login:
-    /// the server filters review requests for the authenticated
-    /// user only.
+    /// On Gitea, only the token owner's login: the server filters
+    /// review requests for the authenticated user only. On OBS, an
+    /// open review addressed to the login.
     #[arg(long)]
     reviewer: Option<String>,
     /// Only pull requests in this Gitea repo (`owner/repo`).
