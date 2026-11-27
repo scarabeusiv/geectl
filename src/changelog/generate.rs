@@ -538,7 +538,7 @@ pub struct PrependedEntry {
 /// legacy encodings transcoded to UTF-8 — so the suffix check runs
 /// on the normalized text, not the raw bytes, and bytes no known
 /// encoding decodes refuse the write instead of being kept as
-/// U+FFFD.
+/// U+FFFD. The composed file ends with exactly one newline.
 pub fn prepend_entry(old_bytes: &[u8], entry: &str) -> Result<PrependedEntry, String> {
     let report = normalize_changes_content_checked(old_bytes);
     if report.had_undecodable_bytes {
@@ -548,6 +548,15 @@ pub fn prepend_entry(old_bytes: &[u8], entry: &str) -> Result<PrependedEntry, St
         );
     }
     let old_content = report.text;
+    // The composed file ends with exactly one newline; a blank-only old file reads as empty.
+    let old_content = {
+        let trimmed = old_content.trim_end_matches('\n');
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}\n")
+        }
+    };
     let source_encoding = report.source_encoding;
     let guessed_single_byte = report.guessed_single_byte;
     // A fresh file ends with exactly one newline: the entry's
@@ -608,6 +617,27 @@ mod tests {
 
     const SPEC_V2: &str = "Name:           foo\nVersion:        2.0\nLicense:        GPL-3.0-only\nSource0:        foo-2.0.tar.gz\nPatch0:         new.patch\nBuildRequires:  pkgconfig\n%changelog\n";
     const SPEC_V1: &str = "Name:           foo\nVersion:        1.0\nLicense:        MIT\nSource0:        foo-1.0.tar.gz\nPatch0:         old.patch\n%changelog\n";
+
+    /// The written file ends with the given last line plus exactly one newline.
+    fn assert_single_trailing_newline(content: &str, last_line: &str) {
+        assert!(content.ends_with(&format!("{last_line}\n")));
+        assert!(!content.ends_with("\n\n"));
+    }
+
+    /// The file just written passes validate's end-of-file check.
+    fn assert_passes_v11_end_of_file(content: &str) {
+        use crate::changelog::validate::Rule;
+        let local = snapshot(&[("foo.spec", SPEC_V2), ("foo.changes", content)]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == Rule::V11 && f.message.contains("trailing blank line")),
+            "findings: {:?}",
+            report.findings
+        );
+    }
 
     #[test]
     fn generate_skeleton_from_the_diff() {
@@ -715,8 +745,33 @@ mod tests {
             format!("{sep}\nThu May 28 10:00:00 UTC 2026 - Jane <jane@example.com>\n\n- New\n\n");
         let new = prepend_entry(old.as_bytes(), &entry).expect("prepend succeeds");
         assert!(new.content.starts_with(&entry));
-        assert!(new.content.ends_with(&old));
+        assert_single_trailing_newline(&new.content, "- Old");
         assert_eq!(new.source_encoding, None);
+    }
+
+    #[test]
+    fn prepend_entry_drops_trailing_blank_lines_from_the_old_file() {
+        let sep = "-".repeat(67);
+        let old =
+            format!("{sep}\nWed May 27 16:31:48 UTC 2026 - Jane <jane@example.com>\n\n- Old\n\n");
+        let entry =
+            format!("{sep}\nThu May 28 10:00:00 UTC 2026 - Jane <jane@example.com>\n\n- New\n\n");
+        let new = prepend_entry(old.as_bytes(), &entry).expect("prepend succeeds");
+        assert!(new.content.starts_with(&entry));
+        assert_single_trailing_newline(&new.content, "- Old");
+        assert_passes_v11_end_of_file(&new.content);
+    }
+
+    #[test]
+    fn prepend_entry_adds_a_missing_final_newline() {
+        let sep = "-".repeat(67);
+        let old = format!("{sep}\nWed May 27 16:31:48 UTC 2026 - Jane <jane@example.com>\n\n- Old");
+        let entry =
+            format!("{sep}\nThu May 28 10:00:00 UTC 2026 - Jane <jane@example.com>\n\n- New\n\n");
+        let new = prepend_entry(old.as_bytes(), &entry).expect("prepend succeeds");
+        assert!(new.content.starts_with(&entry));
+        assert_single_trailing_newline(&new.content, "- Old");
+        assert_passes_v11_end_of_file(&new.content);
     }
 
     #[test]
@@ -733,7 +788,7 @@ mod tests {
             format!("{sep}\nThu May 28 10:00:00 UTC 2026 - Jane <jane@example.com>\n\n- New\n\n");
         let new = prepend_entry(old.as_bytes(), &entry).expect("prepend succeeds");
         assert!(new.content.starts_with(&entry));
-        assert!(new.content.ends_with(&old));
+        assert_single_trailing_newline(&new.content, "- Old Meego change");
         assert_eq!(new.source_encoding, None);
     }
 
@@ -749,7 +804,7 @@ mod tests {
             format!("{sep}\nThu May 28 10:00:00 UTC 2026 - Jane <jane@example.com>\n\n- New\n\n");
         let new = prepend_entry(old.as_bytes(), &entry).expect("prepend succeeds");
         assert!(new.content.starts_with(&entry));
-        assert!(new.content.ends_with(old));
+        assert_single_trailing_newline(&new.content, "- Older change");
         assert_eq!(new.source_encoding, None);
     }
 
