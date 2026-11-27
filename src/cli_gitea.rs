@@ -40,9 +40,11 @@
 //! The JSON payload remains the complete record in every case.
 
 use crate::auth::EnvGiteaAuth;
+use crate::cli_pull_request::payload_json;
+use crate::cli_request::add_plan;
 use crate::config::{self, DEFAULT_GITEA_URL};
 use crate::debug::{strip_terminal_controls_marked, Debug};
-use crate::error::GeectlError;
+use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{
     require_credentials_for_url, CleanupForkEntry, CleanupForkOutcome, CleanupForksResult,
     ForkRepoOptions, GiteaBranch, GiteaClient, GiteaCommitStatus, GiteaRepository, GiteaUser,
@@ -51,6 +53,8 @@ use crate::gitea::{
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::request::PROJECT_FORK_NO_HOME_PACKAGE_REASON;
 use crate::obs::DryRun;
+use crate::obs::{package_show_url, ResultsQuery};
+use crate::pull_request::{build_comment_body, PullRequestClient, PullRequestRef, ReviewComment};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
@@ -175,6 +179,13 @@ pub enum GiteaCommand {
         #[arg(long)]
         user: Option<String>,
     },
+    /// Post the build-link comment on a Gitea pull request: the
+    /// OBS build results for the test project and package, as a
+    /// link plus a one-line per-instance summary. The comment is
+    /// posted once, on PR opening; there is no polling, no live
+    /// update, and no edit. Dry-run by default; mutates only
+    /// with `--live`.
+    BuildComment(BuildCommentArgs),
 }
 
 /// Arguments for `gitea repo-list`.
@@ -221,6 +232,21 @@ pub struct RepoForkArgs {
     organization: Option<String>,
 }
 
+/// Arguments for `gitea build-comment`.
+#[derive(Debug, Args)]
+pub struct BuildCommentArgs {
+    /// The pull-request handle: `gitea:<owner>/<repo>#<number>`.
+    /// An OBS handle is refused: the build link belongs on the
+    /// Gitea pull request.
+    reference: String,
+    /// The test project the build results are read from.
+    #[arg(long)]
+    project: String,
+    /// The package in the test project.
+    #[arg(long)]
+    package: String,
+}
+
 /// Run a `gitea` command, returning the JSON payload and its text
 /// rendering.
 pub fn run_gitea(
@@ -229,10 +255,73 @@ pub fn run_gitea(
     live: bool,
     instance: Option<&str>,
 ) -> Result<(Value, String), GeectlError> {
+    // build-comment refuses an OBS ref before any credential
+    // resolution, like it did under pull-request: the build link
+    // belongs on a Gitea pull request, and the library refuses
+    // again as enforcement.
+    if let GiteaCommand::BuildComment(args) = &command {
+        let reference: PullRequestRef = args.reference.parse()?;
+        if let PullRequestRef::Obs(id) = &reference {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "build-comment posts the build link on a Gitea pull request; {id} is an OBS submit request"
+                ),
+            ));
+        }
+    }
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let client = gitea_client(&http, debug, instance)?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     match command {
+        GiteaCommand::BuildComment(args) => {
+            let reference: PullRequestRef = args.reference.parse()?;
+            let (base, instances) = crate::cli_build::obs_endpoint(instance)?;
+            // The link forms before the results read: a
+            // non-production host fails before any network.
+            let link = package_show_url(&args.project, &args.package, &base)?;
+            let query = ResultsQuery {
+                package: Some(args.package.clone()),
+                ..Default::default()
+            };
+            let outcomes = crate::cli_build::read_results_across_instances(
+                &http,
+                debug,
+                &base,
+                &instances,
+                &args.project,
+                &query,
+                instance,
+            )?;
+            let body = build_comment_body(&args.project, &args.package, &link, &outcomes);
+            let pr_client = PullRequestClient::new(None, Some(&client));
+            let comment = pr_client.build_comment(
+                &reference,
+                &args.project,
+                &args.package,
+                &link,
+                &outcomes,
+                &dry_run,
+            )?;
+            Ok((
+                build_comment_payload(
+                    &reference,
+                    &args.project,
+                    &args.package,
+                    &link,
+                    &comment,
+                    &dry_run,
+                )?,
+                build_comment_text(
+                    &reference,
+                    &args.project,
+                    &args.package,
+                    &comment,
+                    &body,
+                    &dry_run,
+                ),
+            ))
+        }
         GiteaCommand::RepoGet { owner, repo } => {
             let repository = client.repo_get(&owner, &repo)?;
             let payload = gitea_repository_json(&repository);
@@ -1022,6 +1111,61 @@ fn join_row(cells: &[&str], widths: &[usize]) -> String {
         .to_string()
 }
 
+/// The payload for a build-link comment: the reference, the
+/// test project and package, the link, the created comment
+/// (`null` in dry-run), and `dry_run`, plus the plan in dry-run.
+fn build_comment_payload(
+    reference: &PullRequestRef,
+    project: &str,
+    package: &str,
+    link: &str,
+    comment: &Option<ReviewComment>,
+    dry_run: &DryRun,
+) -> Result<Value, GeectlError> {
+    let mut payload = json!({
+        "reference": reference.to_string(),
+        "project": project,
+        "package": package,
+        "link": link,
+        "comment": match comment {
+            Some(comment) => payload_json(comment)?,
+            None => Value::Null,
+        },
+        "dry_run": dry_run.enabled(),
+    });
+    add_plan(&mut payload, dry_run);
+    Ok(payload)
+}
+
+/// The text for a build-link comment: the header first — the
+/// reference and the test project/package — then the posted
+/// comment body in full, so a dry-run shows the comment that
+/// would be posted.
+fn build_comment_text(
+    reference: &PullRequestRef,
+    project: &str,
+    package: &str,
+    comment: &Option<ReviewComment>,
+    body: &str,
+    dry_run: &DryRun,
+) -> String {
+    if dry_run.enabled() {
+        format!(
+            "dry-run: would post the build-link comment on {reference} for {project}/{package}:\n{body}"
+        )
+    } else {
+        match comment {
+            Some(comment) => format!(
+                "posted the build-link comment on {reference} (comment {} by {}) for {project}/{package}:\n{body}",
+                comment.id, comment.author
+            ),
+            None => format!(
+                "posted the build-link comment on {reference} for {project}/{package}:\n{body}"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1661,5 +1805,71 @@ mod tests {
         ] {
             assert!(text.contains(field), "branch text misses {field}:\n{text}");
         }
+    }
+
+    #[test]
+    fn build_comment_json_and_text_agree() {
+        let reference = PullRequestRef::Gitea {
+            owner: "openSUSE".to_string(),
+            repo: "geectl".to_string(),
+            number: 122,
+        };
+        let comment = Some(ReviewComment {
+            id: 7,
+            author: "plusky".to_string(),
+            created: "2026-11-22T19:52:58Z".to_string(),
+            body: "One nit.".to_string(),
+            parent_id: None,
+            diff_target: None,
+            diff_file: None,
+            diff_line: None,
+        });
+        let link = "https://build.opensuse.org/package/show/home:test/foo";
+        let body = "Build results for home:test/foo: https://build.opensuse.org/package/show/home:test/foo";
+        let dry_run = DryRun::new(false);
+        let payload =
+            build_comment_payload(&reference, "home:test", "foo", link, &comment, &dry_run)
+                .unwrap();
+        assert_eq!(payload["reference"], "gitea:openSUSE/geectl#122");
+        assert_eq!(payload["project"], "home:test");
+        assert_eq!(payload["package"], "foo");
+        assert_eq!(payload["link"], link);
+        assert_eq!(payload["comment"]["id"], 7);
+        assert_eq!(payload["comment"]["author"], "plusky");
+        assert_eq!(payload["comment"]["body"], "One nit.");
+        assert_eq!(payload["dry_run"], false);
+
+        let text = build_comment_text(&reference, "home:test", "foo", &comment, body, &dry_run);
+        for expected in [
+            "gitea:openSUSE/geectl#122",
+            "comment 7",
+            "plusky",
+            "Build results for home:test/foo",
+        ] {
+            assert!(
+                text.contains(expected),
+                "text missing {expected:?}:\n{text}"
+            );
+        }
+
+        let dry_run = DryRun::new(true);
+        dry_run.allow("comment on pull request openSUSE/geectl#122");
+        let payload =
+            build_comment_payload(&reference, "home:test", "foo", link, &None, &dry_run).unwrap();
+        assert_eq!(payload["comment"], Value::Null);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            payload["plan"][0],
+            "[dry-run] would: comment on pull request openSUSE/geectl#122"
+        );
+
+        let text = build_comment_text(&reference, "home:test", "foo", &None, body, &dry_run);
+        assert!(
+            text.starts_with(
+                "dry-run: would post the build-link comment on gitea:openSUSE/geectl#122 for home:test/foo:"
+            ),
+            "text: {text}"
+        );
+        assert!(text.contains(body), "text: {text}");
     }
 }

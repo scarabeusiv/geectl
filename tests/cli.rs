@@ -6259,7 +6259,7 @@ fn top_help_lists_the_service_group() {
 }
 
 #[test]
-fn gitea_help_lists_all_twelve_subcommands() {
+fn gitea_help_lists_all_subcommands() {
     let out = geectl().args(["gitea", "--help"]).output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
@@ -6276,6 +6276,7 @@ fn gitea_help_lists_all_twelve_subcommands() {
         "raw-file",
         "commit-statuses",
         "maintainers",
+        "build-comment",
     ] {
         assert!(text.contains(name), "gitea --help misses {name}");
     }
@@ -6301,7 +6302,6 @@ fn pull_request_help_lists_the_subcommands() {
         "approve",
         "request-changes",
         "comment",
-        "build-comment",
         "comments",
         "cancel-review-request",
         "merge",
@@ -9034,7 +9034,7 @@ fn build_comment_env(
 }
 
 #[test]
-fn pull_request_build_comment_dry_run_plans_and_posts_nothing() {
+fn gitea_build_comment_dry_run_plans_and_posts_nothing() {
     let (gitea, recorded, dir) = build_comment_setup();
     let link = "https://build.opensuse.org/package/show/testproject/foo";
     let run = |format: &str| {
@@ -9042,7 +9042,7 @@ fn pull_request_build_comment_dry_run_plans_and_posts_nothing() {
         cmd.args([
             "--format",
             format,
-            "pull-request",
+            "gitea",
             "build-comment",
             "gitea:owner/repo#122",
             "--project",
@@ -9107,7 +9107,7 @@ fn pull_request_build_comment_dry_run_plans_and_posts_nothing() {
 }
 
 #[test]
-fn pull_request_build_comment_live_posts_once() {
+fn gitea_build_comment_live_posts_once() {
     let (gitea, recorded, dir) = build_comment_setup();
     let link = "https://build.opensuse.org/package/show/testproject/foo";
     let mut cmd = geectl_isolated(&dir);
@@ -9115,7 +9115,7 @@ fn pull_request_build_comment_live_posts_once() {
         "--live",
         "--format",
         "text",
-        "pull-request",
+        "gitea",
         "build-comment",
         "gitea:owner/repo#122",
         "--project",
@@ -9157,13 +9157,13 @@ fn pull_request_build_comment_live_posts_once() {
 }
 
 #[test]
-fn pull_request_build_comment_refuses_an_obs_reference() {
+fn gitea_build_comment_refuses_an_obs_reference() {
     // The refusal happens before any credential resolution, so no
     // servers and no credentials are needed.
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args([
-            "pull-request",
+            "gitea",
             "build-comment",
             "obs:123",
             "--project",
@@ -9189,7 +9189,7 @@ fn pull_request_build_comment_refuses_an_obs_reference() {
 }
 
 #[test]
-fn pull_request_build_comment_refuses_a_non_production_host() {
+fn gitea_build_comment_refuses_a_non_production_host() {
     // The stub stands in for a non-production OBS: the link forms
     // before the results read, so the stub answers nothing and the
     // Gitea stub sees no post.
@@ -9198,7 +9198,7 @@ fn pull_request_build_comment_refuses_a_non_production_host() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args([
-            "pull-request",
+            "gitea",
             "build-comment",
             "gitea:owner/repo#122",
             "--project",
@@ -9224,14 +9224,14 @@ fn pull_request_build_comment_refuses_a_non_production_host() {
 }
 
 #[test]
-fn pull_request_build_comment_without_credentials_fails_with_config_error() {
-    // One configured instance only, no credentials: the merged read
-    // reports that instance's own failure unchanged — no comment is
-    // posted, and the Gitea client is never built.
+fn gitea_build_comment_without_credentials_fails_with_config_error() {
+    // No credentials: the Gitea client is built first, so the
+    // missing token fails before the OBS results read — no comment
+    // is posted.
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args([
-            "pull-request",
+            "gitea",
             "build-comment",
             "gitea:owner/repo#122",
             "--project",
@@ -9251,7 +9251,7 @@ fn pull_request_build_comment_without_credentials_fails_with_config_error() {
         value["error"]["context"]
             .as_str()
             .unwrap()
-            .contains("GEECTL_OBS_USERNAME"),
+            .contains("GEECTL_GITEA_TOKEN"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
