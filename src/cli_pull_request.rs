@@ -51,18 +51,17 @@ use crate::debug::{strip_terminal_controls, strip_terminal_controls_marked, Debu
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{
     parse_gitea_repo, parse_scmsync_url, validate_gitea_base, GiteaClient, GiteaMergeMethod,
-    PrCreateOptions,
 };
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::local_build::LocalBuild;
 use crate::obs::{
-    AcceptCleanupOutcome, CveId, DryRun, ObsClient, RequestAction, RequestState, ReviewTarget,
-    SrPayload,
+    AcceptCleanupOutcome, DryRun, ObsClient, RequestAction, RequestState, ReviewTarget,
 };
 use crate::pull_request::{
     MergeCleanupOutcome, MergeForwardOutcome, MergeOptions, MergeOutcome, PullRequest,
     PullRequestBackend, PullRequestClient, PullRequestEndpoint, PullRequestRef, PullRequestSearch,
-    PullRequestStatus, PullRequestSummary, ReviewComment, ReviewOpinion, SubmitTarget, Submitted,
+    PullRequestStatus, PullRequestSummary, ReviewComment, ReviewOpinion, SubmitFiling,
+    SubmitTarget, Submitted,
 };
 use crate::working_copy::{self, Backend};
 use clap::{Args, Subcommand};
@@ -867,10 +866,12 @@ fn with_gitea<T>(
 
 /// File a submission from the working copy in the current
 /// directory. The checkout opens first (a local read, no
-/// credentials), its backend decides the arm, and the arm's flags
-/// are validated before any credential resolution — like the other
-/// arms validate their handles and targets first. Each arm then
-/// refuses a checkout that is not submittable before filing.
+/// credentials), and the filing goes through the library's
+/// `submit_from_checkout`, which resolves the arm from the
+/// checkout backend. The flags are validated before any
+/// credential resolution — like the other arms validate their
+/// handles and targets first — by building the target once
+/// here; the library rebuilds it when it files.
 /// `--instance` selects the account on both arms: the OBS instance
 /// on the OBS arm, the Gitea token on the Gitea arm; the Gitea host
 /// stays the configured one.
@@ -886,9 +887,15 @@ fn submit(
     } else {
         working_copy::open_read(&current_dir()?)
     }?;
+    let filing = submit_filing(&args);
     match wc.backend {
         Backend::Obs => {
-            let target = obs_submit_target(&args, &wc)?;
+            // The flags are validated before any credential
+            // resolution, so an invalid flag fails as InvalidInput
+            // without credentials and without a network read. The
+            // target is rebuilt inside `submit_from_checkout`;
+            // this call only validates.
+            let _ = crate::pull_request::obs_submit_target(&wc, &filing)?;
             // The freshness check's Gitea client resolves lazily,
             // live-only, after the source meta says `<scmsync>`: a
             // dry-run plan reads nothing, so no client is wired
@@ -903,47 +910,42 @@ fn submit(
                 None
             };
             with_obs(debug, live, instance, |obs| {
-                working_copy::refuse_not_submittable_obs(&wc, obs)?;
                 let client = PullRequestClient::new(Some(obs), None)
                     .with_debug(debug.clone())
                     .with_gitea_http(gitea_http);
-                let submitted = client.submit(&target, &dry_run)?;
-                record_submitted_request(&wc.root, &submitted);
+                let outcome = client.submit_from_checkout(&wc, &filing, None, &dry_run)?;
+                record_submitted_request(&wc.root, &outcome.submitted);
                 Ok((
-                    submit_payload(&submitted, &dry_run)?,
-                    submit_text(&target, &submitted, &dry_run),
+                    submit_payload(&outcome.submitted, &dry_run)?,
+                    submit_text(&outcome.target, &outcome.submitted, &dry_run),
                 ))
             })
         }
         Backend::Git => {
-            // The instance URL comes first (config only, no
-            // credentials): the target build's first phase validates
-            // the flags and the origin host against it before any
-            // credential resolution, like the other arms. The token
-            // is then resolved once, alias-aware, and shared by the
-            // API client and the pre-filing fetch, so the two can
-            // never disagree (a plain-vars client against an
-            // alias-vars fetch, or the reverse). The second phase
-            // resolves the defaults the first left open — the
-            // parent repo, the target's default branch — through
-            // the client, so a dry-run plan reads those (like the
-            // OBS arm's freshness read) but files nothing. The
-            // fetch runs only live; in
-            // dry-run the token serves the client alone — a dry-run
-            // Gitea act still needs one to build, like every Gitea
-            // act in this group. That is the asymmetry with the OBS
-            // arm, which prints its dry-run plan with a warning
-            // when credentials fail: the Gitea client fails closed
-            // without a Bearer token, so there is no unauthenticated
-            // client to plan with — the token is a build
-            // requirement, not a live-only one. Lifting that is a
-            // group-wide policy call, not this verb's.
             let (base, instances) = gitea_instance()?;
             // The base validates before any credential is resolved:
             // a configured base with a path is the base's own error,
             // not a misleading "no token configured".
             validate_gitea_base(&base)?;
-            let parts = git_submit_parts(&args, &wc, &base)?;
+            // The flags are validated before any credential
+            // resolution, as on the OBS arm: the target build's
+            // first phase validates the flags and the origin host
+            // against the base. The parts are rebuilt inside
+            // `submit_from_checkout`; this call only validates.
+            let _ = crate::pull_request::git_submit_parts(&wc, &filing, &base)?;
+            // The token is resolved once, alias-aware, and shared
+            // by the API client and the pre-filing fetch, so the
+            // two can never disagree (a plain-vars client against
+            // an alias-vars fetch, or the reverse). The fetch runs
+            // only live; in dry-run the token serves the client
+            // alone — a dry-run Gitea act still needs one to build,
+            // like every Gitea act in this group. That is the
+            // asymmetry with the OBS arm, which prints its dry-run
+            // plan with a warning when credentials fail: the Gitea
+            // client fails closed without a Bearer <redacted>, so there is
+            // no unauthenticated client to plan with — the token is
+            // a build requirement, not a live-only one. Lifting that
+            // is a group-wide policy call, not this verb's.
             let token = gitea_token_for(&base, &instances, instance)?;
             let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
             let gitea = GiteaClient::with_base(
@@ -954,45 +956,34 @@ fn submit(
                 },
             )
             .map(|client| client.with_debug(debug.clone()))?;
-            let auth = working_copy::GiteaAuth {
-                token: &token,
-                url: &base,
-            };
-            // `resolve_git_submit_target` consumes the parts, so
-            // the explicitness is read first: verification rewords
-            // its "pass --repo" remedy when the user already
-            // passed it.
-            let repo_explicit = parts.repo.is_some();
-            let target = resolve_git_submit_target(parts, &gitea)?;
-            let verification = match &target {
-                SubmitTarget::Gitea {
-                    owner,
-                    repo,
-                    options,
-                } => Some(working_copy::GitTargetVerification {
-                    client: &gitea,
-                    instance_url: &base,
-                    owner,
-                    repo,
-                    base: &options.base,
-                    repo_explicit,
-                }),
-                SubmitTarget::Obs(_) => None,
-            };
-            working_copy::refuse_not_submittable_git(
-                &wc,
-                Some(&auth),
-                verification.as_ref(),
-                &dry_run,
-            )?;
             let client = PullRequestClient::new(None, Some(&gitea)).with_debug(debug.clone());
-            let submitted = client.submit(&target, &dry_run)?;
-            record_submitted_pull_request(&wc.root, &submitted);
+            let outcome = client.submit_from_checkout(&wc, &filing, Some(&token), &dry_run)?;
+            record_submitted_pull_request(&wc.root, &outcome.submitted);
             Ok((
-                submit_payload(&submitted, &dry_run)?,
-                submit_text(&target, &submitted, &dry_run),
+                submit_payload(&outcome.submitted, &dry_run)?,
+                submit_text(&outcome.target, &outcome.submitted, &dry_run),
             ))
         }
+    }
+}
+
+/// The submit flags as the backend-neutral filing the library
+/// files from the checkout: the same fields, without the CLI
+/// parsing around them.
+fn submit_filing(args: &SubmitArgs) -> SubmitFiling {
+    SubmitFiling {
+        target_project: args.target_project.clone(),
+        target_package: args.target_package.clone(),
+        description: args.description.clone(),
+        changes_entry: args.changes_entry.clone(),
+        cve: args.cve.clone(),
+        without_cleanup: args.without_cleanup,
+        repo: args.repo.clone(),
+        head: args.head.clone(),
+        base: args.base.clone(),
+        title: args.title.clone(),
+        body: args.body.clone(),
+        draft: args.draft,
     }
 }
 
@@ -1051,343 +1042,6 @@ fn gitea_token_for(
             "no Gitea token configured (GEECTL_GITEA_TOKEN or GEECTL_GITEA_TOKEN_FILE)",
         )),
     }
-}
-
-/// The OBS filing target from the submit flags: the foreign
-/// (Gitea) flags are refused, the required flags are named, the
-/// CVEs are parsed. The source is the checkout itself.
-fn obs_submit_target(
-    args: &SubmitArgs,
-    wc: &working_copy::WorkingCopy,
-) -> Result<SubmitTarget, GeectlError> {
-    refuse_gitea_flags(args)?;
-    let target_project = args.target_project.as_deref().ok_or_else(|| {
-        GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--target-project is required to file an OBS submit request",
-        )
-    })?;
-    let description = args.description.as_deref().ok_or_else(|| {
-        GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--description is required to file an OBS submit request",
-        )
-    })?;
-    let changes_entry = args.changes_entry.as_deref().ok_or_else(|| {
-        GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--changes-entry is required to file an OBS submit request",
-        )
-    })?;
-    let mut cves = Vec::new();
-    for value in &args.cve {
-        cves.push(CveId::parse(value)?);
-    }
-    let mut payload = SrPayload::new(
-        &wc.project,
-        &wc.package,
-        target_project,
-        args.target_package.as_deref().unwrap_or(&wc.package),
-        description,
-        changes_entry,
-        &cves,
-    )?;
-    if args.without_cleanup {
-        payload = payload.without_cleanup();
-    }
-    Ok(SubmitTarget::Obs(payload))
-}
-
-/// Refuse the Gitea arm's flags on an OBS-native checkout: each
-/// names what applies instead, so the agent sees the OBS spelling.
-fn refuse_gitea_flags(args: &SubmitArgs) -> Result<(), GeectlError> {
-    if args.repo.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--repo does not apply to an OBS-native checkout: an OBS submit request targets a project, not a Gitea repo",
-        ));
-    }
-    if args.head.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--head does not apply to an OBS-native checkout: the request files the checkout as it stands",
-        ));
-    }
-    if args.base.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--base does not apply to an OBS-native checkout: the target is --target-project",
-        ));
-    }
-    if args.title.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--title does not apply to an OBS-native checkout: the request takes --description",
-        ));
-    }
-    if args.body.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--body does not apply to an OBS-native checkout: the request takes --description",
-        ));
-    }
-    if args.draft {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--draft does not apply to an OBS-native checkout: OBS has no draft requests",
-        ));
-    }
-    Ok(())
-}
-
-/// The parts of a Gitea filing target the checkout already
-/// knows, before any API read: the target repo when the flags name
-/// it (else the origin, for the parent resolution), the head, and
-/// the base when the flags or the checkout name it (else the
-/// target's default branch). Built before any credential
-/// resolution, so an invalid flag fails as InvalidInput whether or
-/// not credentials are configured.
-#[derive(Debug)]
-struct GitSubmitParts {
-    /// The target repo when `--repo` names it; None when it must
-    /// default to the origin's parent.
-    repo: Option<(String, String)>,
-    /// The origin repo, when it was read: always, for the head
-    /// qualification in phase two — a bare head names a branch on
-    /// the fork, and only the origin says which fork that is. None
-    /// when `--repo` was explicit and the checkout carries no
-    /// readable origin; the target verification re-reads the origin
-    /// before anything files, so an unreadable origin is refused
-    /// there, not silently filed bare.
-    origin: Option<(String, String)>,
-    /// The branch the change comes from.
-    head: String,
-    /// The target branch when the flags or the checkout's scmsync
-    /// branch name it; None when it must default to the target
-    /// repo's default branch.
-    base: Option<String>,
-    /// The pull request title.
-    title: String,
-    /// The pull request body.
-    body: Option<String>,
-    /// Open the pull request as a draft.
-    draft: bool,
-}
-
-/// The Gitea filing target from the submit flags, phase one: the
-/// foreign (OBS) flags are refused, the required flags are named,
-/// and what the checkout already knows is resolved — the repo from
-/// `--repo` or the origin remote, the head from `--head` or the
-/// current branch, the base from `--base` or the checkout's
-/// scmsync branch. The origin is read whether or not `--repo`
-/// names the target: the default path resolves the parent from
-/// it, and the explicit path qualifies the head with it (phase
-/// two). The `factory` base is refused here when it is already
-/// known; a defaulted base is refused in phase two.
-fn git_submit_parts(
-    args: &SubmitArgs,
-    wc: &working_copy::WorkingCopy,
-    instance_url: &str,
-) -> Result<GitSubmitParts, GeectlError> {
-    refuse_obs_flags(args)?;
-    // The origin is read in both paths: the default path needs it
-    // to resolve the parent, and the explicit path needs it to
-    // qualify the head (phase two) — a bare head lives on the
-    // fork, and only the origin names the fork. With an explicit
-    // `--repo` the origin is best-effort: a checkout without a
-    // readable origin still reaches the named target, and the
-    // target verification re-reads the origin before anything
-    // files, so an unreadable origin is refused there.
-    let (repo, origin) = match &args.repo {
-        Some(repo) => (
-            Some(parse_gitea_repo(repo)?),
-            working_copy::origin_repo(wc, instance_url).ok(),
-        ),
-        None => {
-            let origin = working_copy::origin_repo(wc, instance_url)?;
-            (None, Some(origin))
-        }
-    };
-    let head = match &args.head {
-        Some(head) => head.clone(),
-        None => working_copy::current_branch(wc)?,
-    };
-    let base = match &args.base {
-        Some(base) => Some(base.clone()),
-        None => wc.scmsync_branch.clone(),
-    };
-    if let Some(base) = &base {
-        refuse_factory_base(base)?;
-    }
-    let title = args.title.as_deref().ok_or_else(|| {
-        GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--title is required to open a Gitea pull request",
-        )
-    })?;
-    Ok(GitSubmitParts {
-        repo,
-        origin,
-        head,
-        base,
-        title: title.to_string(),
-        body: args.body.clone(),
-        draft: args.draft,
-    })
-}
-
-/// Refuse a pull request onto the `factory` branch: it does not
-/// take pull requests. The Factory leg is an OBS submit request,
-/// never a Gitea PR — the devel branch takes the PR instead. The
-/// match is case-insensitive: the rule names the Factory leg, not
-/// a case-sensitive branch spelling, so `Factory` is refused like
-/// `factory`.
-fn refuse_factory_base(base: &str) -> Result<(), GeectlError> {
-    if base.eq_ignore_ascii_case("factory") {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "the factory branch does not take pull requests: target the devel branch with --base instead, and file the Factory leg as an OBS submit request (`osc sr`)",
-        ));
-    }
-    Ok(())
-}
-
-/// Qualify a bare head with the fork owner: Gitea resolves a bare
-/// head against the base repo, so a bare branch that also exists
-/// on the target would file from the target's branch, and one
-/// that does not fails head-not-found. A head the caller already
-/// qualified (`owner:branch`) passes through untouched.
-fn qualify_head(head: &str, owner: &str) -> String {
-    if head.contains(':') {
-        head.to_string()
-    } else {
-        format!("{owner}:{head}")
-    }
-}
-
-/// The Gitea filing target from the submit flags, phase two: the
-/// repo defaults to the origin's parent (resolved via `repo_get`
-/// on the origin) and the base to the target repo's default branch
-/// (via `repo_get`, only when the checkout carries no scmsync
-/// branch). The head is qualified with the origin owner
-/// (`owner:branch`) whenever the target is not the origin repo:
-/// Gitea resolves a bare head against the base repo, so a bare
-/// branch that also exists on the target would file from the
-/// target's branch — or fail head-not-found when it does not. A
-/// parentless origin is not a fork and names no target; a default
-/// branch of `factory` is refused like an explicit one.
-fn resolve_git_submit_target(
-    parts: GitSubmitParts,
-    gitea: &GiteaClient,
-) -> Result<SubmitTarget, GeectlError> {
-    // Destructured up front: the target resolution moves `repo`,
-    // `origin` and `base` out of the parts in turn, and the head
-    // qualification below still needs the origin and the head.
-    let GitSubmitParts {
-        repo,
-        origin,
-        head,
-        base,
-        title,
-        body,
-        draft,
-    } = parts;
-    let (owner, repo) = match repo {
-        Some(repo) => repo,
-        None => {
-            // Unreachable by construction — `git_submit_parts`
-            // sets exactly one of `repo`/`origin` — but kept as a
-            // defensive error rather than an unwrap: a parts value
-            // built any other way must not panic here.
-            let (origin_owner, origin_repo) = origin.as_ref().ok_or_else(|| {
-                GeectlError::new(
-                    ErrorKind::InternalError,
-                    "the submit target has no repo and no origin to resolve it from",
-                )
-            })?;
-            let origin = gitea.repo_get(origin_owner, origin_repo)?;
-            let parent = origin.parent.as_ref().ok_or_else(|| {
-                GeectlError::new(
-                    ErrorKind::InvalidInput,
-                    format!(
-                        "the checkout's origin {origin_owner}/{origin_repo} is not a fork on this instance: pass --repo to name the repo the pull request goes to"
-                    ),
-                )
-            })?;
-            (parent.owner.login.clone(), parent.name.clone())
-        }
-    };
-    let base = match base {
-        Some(base) => base,
-        None => {
-            let target = gitea.repo_get(&owner, &repo)?;
-            refuse_factory_base(&target.default_branch)?;
-            target.default_branch
-        }
-    };
-    // The head lives on the fork: qualify it with the origin
-    // owner whenever the target is not the origin repo itself. A
-    // head into the origin repo stays bare — it already names a
-    // branch on the target. Without a readable origin there is no
-    // fork owner to qualify with and the head stays bare; the
-    // target verification re-reads the origin before anything
-    // files, so that case never files unqualified.
-    let head = match &origin {
-        Some((origin_owner, origin_repo)) if origin_owner != &owner || origin_repo != &repo => {
-            qualify_head(&head, origin_owner)
-        }
-        _ => head,
-    };
-    let mut options = PrCreateOptions::new(&head, &base, &title)?;
-    options.body = body;
-    options.draft = draft;
-    Ok(SubmitTarget::Gitea {
-        owner,
-        repo,
-        options,
-    })
-}
-
-/// Refuse the OBS arm's flags on a git-backed checkout: each names
-/// what applies instead, so the agent sees the Gitea spelling.
-fn refuse_obs_flags(args: &SubmitArgs) -> Result<(), GeectlError> {
-    if args.target_project.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--target-project does not apply to a git-backed checkout: the pull request goes to --repo",
-        ));
-    }
-    if args.target_package.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--target-package does not apply to a git-backed checkout: the pull request files the whole branch",
-        ));
-    }
-    if args.description.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--description does not apply to a git-backed checkout: the pull request takes --title and --body",
-        ));
-    }
-    if args.changes_entry.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--changes-entry does not apply to a git-backed checkout: OBS-only",
-        ));
-    }
-    if !args.cve.is_empty() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--cve does not apply to a git-backed checkout: OBS-only",
-        ));
-    }
-    if args.without_cleanup {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--without-cleanup does not apply to a git-backed checkout: OBS-only",
-        ));
-    }
-    Ok(())
 }
 
 /// The review target for an act: `None` when no target flag
@@ -2970,11 +2624,12 @@ fn render_table(headers: &[&str], rows: &[Vec<String>]) -> Result<String, Geectl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gitea::{GiteaPullRequest, GiteaReview};
+    use crate::gitea::{GiteaPullRequest, GiteaReview, PrCreateOptions};
     use crate::http::HttpClient;
     use crate::local_build::RootMarker;
-    use crate::obs::parse_request;
     use crate::obs::test_support::{basic_credentials, FakeHttp};
+    use crate::obs::{parse_request, SrPayload};
+    use crate::pull_request::{git_submit_parts, resolve_git_submit_target};
 
     const REQUEST_XML: &str = r#"<request creator="creator" id="123">
   <action type="submit">
@@ -4326,7 +3981,8 @@ mod tests {
     fn git_submit_parts_defaults_base_from_the_scmsync_branch() {
         let (_dir, wc) = git_parts_checkout(Some("devel"));
         let args = gitea_submit_args();
-        let parts = git_submit_parts(&args, &wc, "https://src.opensuse.org").unwrap();
+        let parts =
+            git_submit_parts(&wc, &submit_filing(&args), "https://src.opensuse.org").unwrap();
         assert_eq!(parts.repo, None);
         assert_eq!(
             parts.origin,
@@ -4343,7 +3999,8 @@ mod tests {
         let mut args = gitea_submit_args();
         args.repo = Some("pool/foo".to_string());
         args.base = Some("main".to_string());
-        let parts = git_submit_parts(&args, &wc, "https://src.opensuse.org").unwrap();
+        let parts =
+            git_submit_parts(&wc, &submit_filing(&args), "https://src.opensuse.org").unwrap();
         assert_eq!(parts.repo, Some(("pool".to_string(), "foo".to_string())));
         // Phase one reads the origin even with an explicit `--repo`:
         // phase two qualifies the head with it.
@@ -4360,7 +4017,8 @@ mod tests {
         let (_dir, wc) = git_parts_checkout(None);
         let mut args = gitea_submit_args();
         args.base = Some("factory".to_string());
-        let err = git_submit_parts(&args, &wc, "https://src.opensuse.org").unwrap_err();
+        let err =
+            git_submit_parts(&wc, &submit_filing(&args), "https://src.opensuse.org").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(
             err.to_string()
@@ -4375,7 +4033,8 @@ mod tests {
         let (_dir, wc) = git_parts_checkout(None);
         let mut args = gitea_submit_args();
         args.base = Some("Factory".to_string());
-        let err = git_submit_parts(&args, &wc, "https://src.opensuse.org").unwrap_err();
+        let err =
+            git_submit_parts(&wc, &submit_filing(&args), "https://src.opensuse.org").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(
             err.to_string()
@@ -4388,7 +4047,8 @@ mod tests {
     fn git_submit_parts_refuses_a_factory_scmsync_branch() {
         let (_dir, wc) = git_parts_checkout(Some("factory"));
         let args = gitea_submit_args();
-        let err = git_submit_parts(&args, &wc, "https://src.opensuse.org").unwrap_err();
+        let err =
+            git_submit_parts(&wc, &submit_filing(&args), "https://src.opensuse.org").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(
             err.to_string()
@@ -4402,7 +4062,8 @@ mod tests {
         let (_dir, wc) = git_parts_checkout(None);
         let mut args = gitea_submit_args();
         args.title = None;
-        let err = git_submit_parts(&args, &wc, "https://src.opensuse.org").unwrap_err();
+        let err =
+            git_submit_parts(&wc, &submit_filing(&args), "https://src.opensuse.org").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(
             err.to_string().contains("--title is required"),
@@ -4414,7 +4075,8 @@ mod tests {
     fn git_submit_parts_without_a_base_leaves_it_for_phase_two() {
         let (_dir, wc) = git_parts_checkout(None);
         let args = gitea_submit_args();
-        let parts = git_submit_parts(&args, &wc, "https://src.opensuse.org").unwrap();
+        let parts =
+            git_submit_parts(&wc, &submit_filing(&args), "https://src.opensuse.org").unwrap();
         assert_eq!(parts.base, None);
     }
 
@@ -4575,7 +4237,8 @@ mod tests {
         let (_dir, wc) = git_parts_checkout(None);
         let mut args = gitea_submit_args();
         args.repo = Some("pool/repo".to_string());
-        let parts = git_submit_parts(&args, &wc, "https://src.opensuse.org").unwrap();
+        let parts =
+            git_submit_parts(&wc, &submit_filing(&args), "https://src.opensuse.org").unwrap();
         let http = ResolveHttp::with_get(
             "https://src.opensuse.org/api/v1/repos/pool/repo",
             &resolve_repo_json("pool", "repo", "devel", None),
@@ -4604,7 +4267,8 @@ mod tests {
         let (_dir, wc) = git_parts_checkout(None);
         let mut args = gitea_submit_args();
         args.repo = Some("pool/repo".to_string());
-        let parts = git_submit_parts(&args, &wc, "https://src.opensuse.org").unwrap();
+        let parts =
+            git_submit_parts(&wc, &submit_filing(&args), "https://src.opensuse.org").unwrap();
         let http = ResolveHttp::with_get(
             "https://src.opensuse.org/api/v1/repos/pool/repo",
             &resolve_repo_json("pool", "repo", "Factory", None),
@@ -4623,7 +4287,8 @@ mod tests {
     fn resolve_git_submit_target_refuses_a_defaulted_target_whose_default_is_factory() {
         let (_dir, wc) = git_parts_checkout(None);
         let args = gitea_submit_args();
-        let parts = git_submit_parts(&args, &wc, "https://src.opensuse.org").unwrap();
+        let parts =
+            git_submit_parts(&wc, &submit_filing(&args), "https://src.opensuse.org").unwrap();
         let http = ResolveHttp::with_get(
             "https://src.opensuse.org/api/v1/repos/scarabeus_iv/foo",
             &resolve_repo_json("scarabeus_iv", "foo", "main", Some(("pool", "foo"))),
@@ -4646,7 +4311,8 @@ mod tests {
     fn resolve_git_submit_target_defaults_to_the_parent_and_qualifies_the_head() {
         let (_dir, wc) = git_parts_checkout(None);
         let args = gitea_submit_args();
-        let parts = git_submit_parts(&args, &wc, "https://src.opensuse.org").unwrap();
+        let parts =
+            git_submit_parts(&wc, &submit_filing(&args), "https://src.opensuse.org").unwrap();
         let http = ResolveHttp::with_get(
             "https://src.opensuse.org/api/v1/repos/scarabeus_iv/foo",
             &resolve_repo_json("scarabeus_iv", "foo", "main", Some(("pool", "foo"))),
@@ -4677,7 +4343,8 @@ mod tests {
         let (_dir, wc) = git_parts_checkout(None);
         let mut args = gitea_submit_args();
         args.repo = Some("scarabeus_iv/foo".to_string());
-        let parts = git_submit_parts(&args, &wc, "https://src.opensuse.org").unwrap();
+        let parts =
+            git_submit_parts(&wc, &submit_filing(&args), "https://src.opensuse.org").unwrap();
         let http = ResolveHttp::with_get(
             "https://src.opensuse.org/api/v1/repos/scarabeus_iv/foo",
             &resolve_repo_json("scarabeus_iv", "foo", "devel", Some(("pool", "foo"))),
@@ -4705,7 +4372,8 @@ mod tests {
         let mut args = gitea_submit_args();
         args.repo = Some("pool/repo".to_string());
         args.head = Some("other:feature".to_string());
-        let parts = git_submit_parts(&args, &wc, "https://src.opensuse.org").unwrap();
+        let parts =
+            git_submit_parts(&wc, &submit_filing(&args), "https://src.opensuse.org").unwrap();
         let http = ResolveHttp::with_get(
             "https://src.opensuse.org/api/v1/repos/pool/repo",
             &resolve_repo_json("pool", "repo", "devel", None),

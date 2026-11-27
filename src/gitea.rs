@@ -1316,6 +1316,11 @@ impl<'a> GiteaClient<'a> {
     /// credentials. The base is a bare `https://` URL (scheme +
     /// host, no path, query, fragment, or userinfo), or a bare
     /// `http://` URL on a loopback host (a test instance only).
+    /// The configured base URL the client talks to.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
     pub fn with_base(
         http: &'a dyn HttpClient,
         base: &str,

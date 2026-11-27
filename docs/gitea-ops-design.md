@@ -251,7 +251,12 @@ current labels, returning a structured error naming the missing label.
 
 ## Submit
 
-The library `submit` files a pull request and returns the handle:
+The library `submit_from_checkout` files a pull request from the
+checkout and returns the outcome: it resolves the arm from the
+checkout backend, builds the target from the backend-neutral
+filing, runs the arm's submittability refusal, and files. The
+lower-level `submit` still takes a `SubmitTarget` for callers
+that already resolved one:
 
 ```rust
 pub enum SubmitTarget {
@@ -268,9 +273,7 @@ The OBS arm files through `SrFiling::file` and returns
 `PullRequestRef::Obs(id)`; the Gitea arm opens the pull request through
 `GiteaClient::pr_create` (`POST /repos/{owner}/{repo}/pulls` with `head`,
 `base`, `title`, and `body`) and returns `PullRequestRef::Gitea { owner,
-repo, number }`. The caller picks the variant for the backend it files to
-— the backend kind is known at the call site from the checkout — and reads
-the result backend-agnostically.
+repo, number }`. The caller reads the result backend-agnostically.
 
 The Gitea-side routing: a pull request goes to the immediate parent repo —
 for a fork of the devel repo, the devel repo — on the branch the checkout
