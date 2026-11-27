@@ -29,6 +29,26 @@ fn enabled() -> bool {
     std::env::var("GEECTL_LOCAL_BUILD_E2E").as_deref() == Ok("1")
 }
 
+/// The container shape the build runs in, from
+/// `GEECTL_LOCAL_BUILD_E2E_SHAPE`: `rootless` (the default) or
+/// `privileged`. An unknown value fails fast: a typo must not
+/// silently run the rootless shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Rootless,
+    Privileged,
+}
+
+fn shape() -> Shape {
+    match std::env::var("GEECTL_LOCAL_BUILD_E2E_SHAPE").as_deref() {
+        Ok("privileged") => Shape::Privileged,
+        Ok("rootless") | Err(_) => Shape::Rootless,
+        Ok(other) => {
+            panic!("GEECTL_LOCAL_BUILD_E2E_SHAPE must be 'rootless' or 'privileged'; got '{other}'")
+        }
+    }
+}
+
 /// Validate a live-instance base URL: `http://`, bare (no path, query,
 /// or fragment), no userinfo, and loopback. The same rule as the live
 /// harness, on the same shared primitives — the bootstrap credentials
@@ -135,7 +155,9 @@ fn on_path(binary: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&path).any(|dir| dir.join(binary).is_file())
+    std::env::split_paths(&path).any(|dir| {
+        dir.join(binary).is_file() || (cfg!(windows) && dir.join(format!("{binary}.exe")).is_file())
+    })
 }
 
 #[test]
@@ -162,15 +184,29 @@ fn real_podman_build_of_fixture_package_succeeds() {
     let client = ObsClient::with_base_and_credentials(http, &base, live_credentials())
         .expect("the live base is a loopback http URL")
         .with_debug(debug.clone());
+    let shape = shape();
+    eprintln!(
+        "local-build e2e shape: {}",
+        if shape == Shape::Privileged {
+            "privileged"
+        } else {
+            "rootless"
+        }
+    );
     let cache = TempDir::new();
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/local_build_e2e");
-    let request = BuildRequest::new(source, "geectl:e2e", "standard", std::env::consts::ARCH);
+    let mut request = BuildRequest::new(source, "geectl:e2e", "standard", std::env::consts::ARCH);
+    request.privileged = shape == Shape::Privileged;
     let record = LocalBuild::new(&client, cache.path().to_path_buf())
         .with_debug(debug)
         .build(&request)
         .expect("local build succeeds");
     assert_eq!(record.verdict, "green");
     assert_eq!(record.exit_code, 0);
+    assert_eq!(
+        record.privileged, request.privileged,
+        "build record shape does not match the requested shape"
+    );
     assert!(
         record.engine_version.is_some(),
         "engine answered no version; log: {}",
