@@ -390,11 +390,16 @@ pub(crate) fn resolve_changelog_identity(
 /// The OBS-account level of the identity chain: the authenticated
 /// user's real name and email from `whois`. No username in the
 /// credentials (API-key auth carries none) yields nothing — the
-/// chain falls through to git.
+/// chain falls through to git. With `--instance`, strictly the
+/// flagged alias's variables: the identity path must not borrow
+/// the default credentials where a `--live` leaf would refuse.
 fn obs_identity(debug: &Debug, instance: Option<&str>) -> Result<Option<Identity>, GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let (base, instances) = crate::cli_remote::obs_endpoint(instance)?;
-    let credentials = crate::auth::EnvObsAuth::credentials_for_url(&base, &base, &instances)?;
+    let credentials = match instance {
+        Some(alias) => crate::auth::EnvObsAuth::credentials_for_instance(alias, &instances)?,
+        None => crate::auth::EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
+    };
     let client =
         ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
     identity_from_obs_client(&client)

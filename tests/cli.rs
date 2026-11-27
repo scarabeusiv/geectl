@@ -945,6 +945,30 @@ fn debug_config_line_reports_alias_credentials() {
 }
 
 #[test]
+fn debug_config_line_reports_the_flagged_obs_auth() {
+    // With `--instance`, the debug config line resolves OBS auth
+    // with the same strict resolver as `config show`: alias-only
+    // credentials read as `basic` for the flagged host, not `none`.
+    // One alias URL serves both backends, so the Gitea host is the
+    // flagged host too; the Gitea side reads `error` here because
+    // no alias token is set and the strict resolver requires one.
+    let dir = TempDir::new();
+    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    let out = geectl_isolated(&dir)
+        .args(["--instance", "example", "--debug", "version"])
+        .env("GEECTL_OBS_USERNAME_EXAMPLE", "alias-user")
+        .env("GEECTL_OBS_PASSWORD_EXAMPLE", "alias-secret")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(
+        "config: obs api.example.org (auth: basic), gitea api.example.org (auth: error)"
+    ));
+    assert!(!stderr.contains("alias-secret"));
+}
+
+#[test]
 fn debug_config_line_reports_the_flagged_gitea_host() {
     // With `--instance`, the debug config line names the flagged
     // alias's Gitea host and the alias token's kind — not the
@@ -10760,6 +10784,42 @@ fn changelog_identity_instance_flag_resolves_the_author_on_the_flagged_instance(
 }
 
 #[test]
+fn changelog_identity_instance_flag_never_borrows_the_plain_obs_credentials() {
+    // The flagged alias names the default OBS URL, so a lenient
+    // per-URL identity lookup would borrow the plain credentials
+    // and contact the default host. The strict per-instance path
+    // fails first, naming the alias variables, before any server
+    // contact — so no mock server is needed here.
+    let dir = TempDir::new();
+    let pkg = dir.0.join("pkg");
+    fs::create_dir_all(&pkg).unwrap();
+    write_instances_config(
+        &dir,
+        "[instances]\nexample = \"https://api.opensuse.org\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&pkg)
+        .args(["--instance", "example", "changelog", "identity", "."])
+        .env("GEECTL_OBS_USERNAME", "plain-user")
+        .env("GEECTL_OBS_PASSWORD", "plain-secret")
+        .env_remove("VC_REALNAME")
+        .env_remove("VC_MAILADDR")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    let message = value["error"]["context"].as_str().unwrap();
+    assert!(
+        message.contains("GEECTL_OBS_USERNAME_EXAMPLE"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("plain-user"));
+    assert!(!stderr.contains("plain-secret"));
+}
+
+#[test]
 fn changelog_generate_message_hotfix_skips_news() {
     // The hotfix shape with upstream NEWS: the version is
     // unchanged, so no NEWS is extracted — no highlights slot, no
@@ -11731,6 +11791,45 @@ fn instance_flag_selects_the_gitea_host_in_config_show() {
     assert_eq!(value["gitea_auth"]["status"], "configured");
     assert!(!stdout.contains("alias-token"));
     assert!(!String::from_utf8_lossy(&out.stderr).contains("alias-token"));
+}
+
+#[test]
+fn config_show_with_instance_never_borrows_the_plain_obs_credentials() {
+    // The flagged alias names the default OBS URL, so a lenient
+    // per-URL status would match the plain credentials. The strict
+    // per-instance path reports the flagged alias as an error
+    // instead, naming its own variables — and no plain credential
+    // value leaks into the output.
+    let dir = TempDir::new();
+    write_instances_config(
+        &dir,
+        "[instances]\nexample = \"https://api.opensuse.org\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .args(["--instance", "example", "config", "show"])
+        .env("GEECTL_OBS_USERNAME", "plain-user")
+        .env("GEECTL_OBS_PASSWORD", "plain-secret")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["obs_auth"]["status"], "error");
+    assert!(
+        value["obs_auth"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("GEECTL_OBS_USERNAME_EXAMPLE"),
+        "obs_auth: {}",
+        value["obs_auth"]
+    );
+    assert!(!stdout.contains("plain-user"));
+    assert!(!stdout.contains("plain-secret"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("plain-secret"));
 }
 
 #[test]

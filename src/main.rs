@@ -193,14 +193,23 @@ fn startup_line(argv: &[String]) -> String {
 }
 
 /// The OBS auth kind for the debug config line: the per-URL
-/// resolution (alias, else plain for the default) — the plain-only
-/// provider would report `none` for an alias-only setup while every
-/// command authenticates fine, the same staleness
-/// [`obs_auth_status`] fixes for `config show`. `basic`, `bearer`,
-/// `ssh`, `none`, or `error`. Never a username, never a value — the
-/// channel is stricter than `config show`.
-fn obs_auth_kind(url: &str, instances: &[(String, String)]) -> &'static str {
-    match EnvObsAuth::credentials_for_url(url, url, instances) {
+/// resolution (alias, else plain for the default), strictly the
+/// flagged alias's variables with `--instance` — the same resolver
+/// [`obs_auth_status`] uses for `config show`, so the debug line
+/// never reports `none` for an alias-only setup while every
+/// command authenticates fine. `basic`, `bearer`, `ssh`, `none`,
+/// or `error`. Never a username, never a value — the channel is
+/// stricter than `config show`.
+fn obs_auth_kind(
+    url: &str,
+    instances: &[(String, String)],
+    instance: Option<&str>,
+) -> &'static str {
+    let resolved = match instance {
+        Some(alias) => EnvObsAuth::credentials_for_instance(alias, instances),
+        None => EnvObsAuth::credentials_for_url(url, url, instances),
+    };
+    match resolved {
         Ok(Credentials::None) => "none",
         Ok(Credentials::Basic { .. }) => "basic",
         Ok(Credentials::Bearer { .. }) => "bearer",
@@ -255,7 +264,7 @@ fn debug_config_line(instance: Option<&str>) -> Option<String> {
     Some(format!(
         "config: obs {} (auth: {}), gitea {} (auth: {})",
         geectl::debug::url_host(&obs_url),
-        obs_auth_kind(&obs_url, &file_config.instances),
+        obs_auth_kind(&obs_url, &file_config.instances, instance),
         geectl::debug::url_host(&gitea_url),
         gitea_auth_kind(&gitea_url, &file_config.instances, instance)
     ))
@@ -392,18 +401,27 @@ fn config_show_payload(
         "build_cache_cap_gib": build_cache_cap_gib,
         "build_cache_cap_gib_source": build_cache_cap_gib_source,
         "instances": instances_json,
-        "obs_auth": obs_auth_status(&obs_url, &effective.config.instances),
+        "obs_auth": obs_auth_status(&obs_url, &effective.config.instances, instance),
         "gitea_auth": gitea_auth,
         "gitea_ssh_key": auth_status(&GiteaSshKey),
     }))
 }
 
-/// The OBS credential status for one URL: the matching instance
-/// alias's variables win, else the plain variables when it is the
-/// configured default — so `config show` reports what the commands
-/// would actually use, instead of the plain variables only.
-fn obs_auth_status(url: &str, instances: &[(String, String)]) -> serde_json::Value {
-    credentials_status(EnvObsAuth::credentials_for_url(url, url, instances))
+/// The OBS credential status for one URL: with `--instance`,
+/// strictly the flagged alias's variables; without it, the
+/// matching instance alias's variables win, else the plain
+/// variables when it is the configured default — so `config show`
+/// reports what the commands would actually use, instead of the
+/// plain variables only.
+fn obs_auth_status(
+    url: &str,
+    instances: &[(String, String)],
+    instance: Option<&str>,
+) -> serde_json::Value {
+    credentials_status(match instance {
+        Some(alias) => EnvObsAuth::credentials_for_instance(alias, instances),
+        None => EnvObsAuth::credentials_for_url(url, url, instances),
+    })
 }
 
 /// The credential status as JSON: `{"status": "configured"}` plus,
