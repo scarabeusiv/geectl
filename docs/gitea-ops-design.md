@@ -156,6 +156,9 @@ merged.
 `project/package`; Gitea `owner/repo`), `branch: Option<String>` (Gitea
 branch; `None` on OBS), `commit: Option<String>` (Gitea head and base SHA;
 OBS source revision when the action carries one).
+`action_count: usize` — how many actions the request carries: 1 on Gitea,
+the OBS action count on OBS. `source`/`target` are the first action's
+endpoints.
 `reviews: Vec<ReviewOpinion>` — one entry per review asked or given, in
 order.
 `labels: Vec<String>` — Gitea label names; empty on OBS.

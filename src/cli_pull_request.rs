@@ -2596,6 +2596,9 @@ fn render_pull_request_text(pr: &PullRequest) -> String {
     if let Some(text) = endpoint_text(&pr.target) {
         lines.push(format!("target: {text}"));
     }
+    if pr.action_count > 1 {
+        lines.push(format!("actions: {}", pr.action_count));
+    }
     for (index, review) in pr.reviews.iter().enumerate() {
         lines.push(format!(
             "review {}: {} {}",
@@ -2676,8 +2679,9 @@ fn search_header(coordinates: &str, count: usize) -> String {
 }
 
 /// The search text: one header line echoing the coordinates, then
-/// the table (reference, state, author, source, target) — or `no
-/// pull requests` under the header when nothing matched.
+/// the table (reference, state, author, source, target — plus an
+/// ACTIONS column only when some row carries more than one action)
+/// — or `no pull requests` under the header when nothing matched.
 fn render_search_text(
     coordinates: &str,
     summaries: &[PullRequestSummary],
@@ -2686,22 +2690,32 @@ fn render_search_text(
     if summaries.is_empty() {
         return Ok(format!("{header}\nno pull requests"));
     }
+    // The ACTIONS column exists only when some row carries
+    // more than one action: a column of empty cells says
+    // nothing and changes the table shape for pre-existing
+    // consumers of single-action output.
+    let multi_action = summaries.iter().any(|summary| summary.action_count > 1);
     let rows: Vec<Vec<String>> = summaries
         .iter()
         .map(|summary| {
-            vec![
+            let mut row = vec![
                 summary.reference.to_string(),
                 summary.status.as_str().to_string(),
                 summary.author.clone(),
                 endpoint_cell(&summary.source),
                 endpoint_cell(&summary.target),
-            ]
+            ];
+            if multi_action {
+                row.push(summary.action_count.to_string());
+            }
+            row
         })
         .collect();
-    Ok(format!(
-        "{header}\n{}",
-        render_table(&["REFERENCE", "STATE", "AUTHOR", "SOURCE", "TARGET"], &rows)?
-    ))
+    let mut headers = vec!["REFERENCE", "STATE", "AUTHOR", "SOURCE", "TARGET"];
+    if multi_action {
+        headers.push("ACTIONS");
+    }
+    Ok(format!("{header}\n{}", render_table(&headers, &rows)?))
 }
 
 /// One endpoint as a table cell: the repository, the branch in
@@ -2993,6 +3007,10 @@ mod tests {
         assert!(columns.contains("AUTHOR"));
         assert!(columns.contains("SOURCE"));
         assert!(columns.contains("TARGET"));
+        assert!(
+            !columns.contains("ACTIONS"),
+            "a single-action table carries no ACTIONS column:\n{text}"
+        );
         let row = lines.next().expect("a row line");
         assert!(row.contains("gitea:openSUSE/geectl#122"));
         assert!(row.contains("open"));
@@ -3003,6 +3021,19 @@ mod tests {
             render_search_text(" backend=gitea", &[]).expect("empty table renders"),
             "search backend=gitea (0 pull requests)\nno pull requests"
         );
+    }
+
+    #[test]
+    fn search_text_shows_the_actions_column_only_for_multi_action_rows() {
+        let request = parse_request(REQUEST_XML).expect("fixture request parses");
+        let summary = PullRequestSummary::from_obs(&request).expect("fixture request maps");
+        assert_eq!(summary.action_count, 2);
+        let text = render_search_text("", &[summary], &[]).expect("table renders");
+        let mut lines = text.lines();
+        let columns = lines.nth(1).expect("a column header line");
+        assert!(columns.contains("ACTIONS"), "columns: {columns}");
+        let row = lines.next().expect("a row line");
+        assert!(row.trim_end().ends_with('2'), "row: {row}");
     }
 
     #[test]
@@ -3023,6 +3054,33 @@ mod tests {
             table.contains("(change-review-state)"),
             "the search table must name the deleted-fork branch:\n{table}"
         );
+    }
+
+    #[test]
+    fn show_text_names_a_multi_action_request() {
+        let pr = fixture_obs_pull_request();
+        assert_eq!(pr.action_count, 2);
+        let text = render_pull_request_text(&pr);
+        assert!(
+            text.contains("actions: 2"),
+            "the text must name the action count:\n{text}"
+        );
+        let single = fixture_gitea_pull_request();
+        assert_eq!(single.action_count, 1);
+        assert!(
+            !render_pull_request_text(&single).contains("actions:"),
+            "a single-action PR names no count"
+        );
+    }
+
+    #[test]
+    fn search_table_names_a_multi_action_request() {
+        let request = parse_request(REQUEST_XML).expect("fixture request parses");
+        let summary = PullRequestSummary::from_obs(&request).expect("fixture request maps");
+        assert_eq!(summary.action_count, 2);
+        let table = render_search_text("", &[summary]).expect("table renders");
+        let row = table.lines().nth(2).expect("a row line");
+        assert_eq!(row.split_whitespace().last(), Some("2"));
     }
 
     #[test]

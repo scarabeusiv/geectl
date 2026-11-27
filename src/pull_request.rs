@@ -417,6 +417,12 @@ pub struct PullRequest {
     /// Where the change goes to.
     #[serde(default)]
     pub target: PullRequestEndpoint,
+    /// How many actions the request carries: 1 on Gitea, the OBS
+    /// action count on OBS. `source`/`target` are the first
+    /// action's endpoints — a count above 1 says the request
+    /// carries more than the endpoints shown.
+    #[serde(default)]
+    pub action_count: usize,
     /// One entry per review asked or given, in order.
     #[serde(default)]
     pub reviews: Vec<ReviewOpinion>,
@@ -429,7 +435,8 @@ impl PullRequest {
     /// Read an OBS submit request as the unified shape. The title
     /// is empty when the request carries none; the endpoints are
     /// the first action's — a request with several actions reads
-    /// its first. A review reads its asked-of target as the
+    /// its first, and `action_count` names how many actions it
+    /// carries. A review reads its asked-of target as the
     /// reviewer.
     pub fn from_obs(request: &Request) -> Result<Self, GeectlError> {
         let (source, target) = request
@@ -464,6 +471,7 @@ impl PullRequest {
             merge_base: None,
             source,
             target,
+            action_count: request.actions.len(),
             reviews,
             labels: Vec::new(),
         })
@@ -503,6 +511,7 @@ impl PullRequest {
             merge_base: pr.merge_base.clone().filter(|s| !s.is_empty()),
             source: gitea_endpoint(&pr.head),
             target: gitea_endpoint(&pr.base),
+            action_count: 1,
             reviews: opinions,
             labels: pr
                 .labels
@@ -647,6 +656,10 @@ pub struct PullRequestSummary {
     /// Where the change goes to.
     #[serde(default)]
     pub target: PullRequestEndpoint,
+    /// How many actions the request carries: 1 on Gitea, the OBS
+    /// action count on OBS. See `PullRequest::action_count`.
+    #[serde(default)]
+    pub action_count: usize,
 }
 
 impl PullRequestSummary {
@@ -660,6 +673,7 @@ impl PullRequestSummary {
             status: pull_request.status,
             source: pull_request.source,
             target: pull_request.target,
+            action_count: pull_request.action_count,
         })
     }
 
@@ -673,6 +687,7 @@ impl PullRequestSummary {
             status: pull_request.status,
             source: pull_request.source,
             target: pull_request.target,
+            action_count: pull_request.action_count,
         })
     }
 
@@ -701,6 +716,7 @@ impl PullRequestSummary {
             status: PullRequestStatus::from_gitea(&issue.state, merged)?,
             source: PullRequestEndpoint::default(),
             target: PullRequestEndpoint::default(),
+            action_count: 1,
         })
     }
 }
@@ -2866,6 +2882,7 @@ mod tests {
             merge_base: None,
             source: endpoint("home:scarabeus_iv:patterns/patterns-base"),
             target: endpoint("openSUSE:Factory/patterns-base"),
+            action_count: 1,
             reviews: vec![ReviewOpinion {
                 reviewer: "dimstar".to_string(),
                 state: OpinionState::Approved,
@@ -2884,6 +2901,7 @@ mod tests {
         assert_eq!(json["mergeable"], serde_json::Value::Null);
         assert_eq!(json["merge_base"], serde_json::Value::Null);
         assert_eq!(json["reviews"][0]["state"], "approved");
+        assert_eq!(json["action_count"], 1);
         assert_eq!(json["labels"], serde_json::json!([]));
         let round_tripped: PullRequest = serde_json::from_value(json).unwrap();
         assert_eq!(round_tripped, pull_request);
@@ -2902,6 +2920,7 @@ mod tests {
             status: PullRequestStatus::Open,
             source: endpoint("scarabeusiv/geectl"),
             target: endpoint("openSUSE/geectl"),
+            action_count: 1,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"gitea:openSUSE/geectl#122\""));
@@ -5816,5 +5835,52 @@ please fix this</comment></comments>"#,
             };
             assert!(query.validate().is_ok());
         }
+    }
+
+    #[test]
+    fn multi_action_obs_request_carries_its_action_count() {
+        // The unified endpoints are the first action's only: the
+        // count says how many actions the request carries, so a
+        // multi-action request no longer reads as a single-action
+        // one. REQUEST_XML carries a submit and an add_role.
+        let collection = format!("<collection matches=\"1\">\n{REQUEST_XML}\n</collection>");
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/request/123?withhistory=1",
+                REQUEST_XML,
+            )
+            .with_get(
+                "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%20or%20%40name%3D%27declined%27%5D",
+                &collection,
+            );
+        let obs = obs_client(&http);
+        let client = PullRequestClient::new(Some(&obs), None);
+        let pr = client.show(&PullRequestRef::Obs(123)).unwrap();
+        assert_eq!(pr.action_count, 2);
+        assert_eq!(pr.source.repository, "xyz/abc");
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Obs),
+            ..Default::default()
+        };
+        let summaries = client.search(&query).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].action_count, 2);
+    }
+
+    #[test]
+    fn gitea_pull_request_carries_one_action() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                PR_JSON,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let pr = client.show(&gitea_ref()).unwrap();
+        assert_eq!(pr.action_count, 1);
     }
 }
