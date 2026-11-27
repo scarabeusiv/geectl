@@ -945,7 +945,10 @@ impl<'a> PullRequestClient<'a> {
 
     /// Search pull requests as the list shape. With no backend
     /// both arms run, OBS first then Gitea; a backend scopes the
-    /// search to that arm. Both arms filter server-side (the
+    /// search to that arm. An arm without credentials is skipped:
+    /// the search runs on the configured arm(s), and only a
+    /// search with no arm at all fails closed naming the missing
+    /// credentials. Both arms filter server-side (the
     /// state mapping, the creator, and the reviewer:
     /// `review_requested` on Gitea, token owner only; an open
     /// review addressed to the login on OBS). A
@@ -965,42 +968,61 @@ impl<'a> PullRequestClient<'a> {
     ) -> Result<Vec<PullRequestSummary>, GeectlError> {
         query.validate()?;
         let mut summaries = Vec::new();
+        let mut ran = false;
         if query.backend.is_none() || query.backend == Some(PullRequestBackend::Obs) {
-            let obs = self.obs.ok_or_else(missing_obs_arm)?;
-            let mut search = RequestSearch::new();
-            if let Some(states) = obs_states_for(&query.states) {
-                search = search.states(states);
-            }
-            if let Some(creator) = &query.creator {
-                search = search.creators(vec![creator.clone()]);
-            }
-            if let Some(reviewer) = &query.reviewer {
-                search = search.reviewers(vec![reviewer.clone()]);
-            }
-            for request in &obs.search_requests(&search)? {
-                summaries.push(PullRequestSummary::from_obs(request)?);
+            if let Some(obs) = self.obs {
+                ran = true;
+                let mut search = RequestSearch::new();
+                if let Some(states) = obs_states_for(&query.states) {
+                    search = search.states(states);
+                }
+                if let Some(creator) = &query.creator {
+                    search = search.creators(vec![creator.clone()]);
+                }
+                if let Some(reviewer) = &query.reviewer {
+                    search = search.reviewers(vec![reviewer.clone()]);
+                }
+                for request in &obs.search_requests(&search)? {
+                    summaries.push(PullRequestSummary::from_obs(request)?);
+                }
             }
         }
         if query.backend.is_none() || query.backend == Some(PullRequestBackend::Gitea) {
-            let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
-            let wire = gitea_state_for(&query.states);
-            // The repo-scoped list has no reviewer filter, so a
-            // reviewer-scoped search runs the global search even
-            // with a repo given; the retain below scopes it.
-            let mut items = match (&query.repo, &query.reviewer) {
-                (Some((owner, repo)), None) => gitea
-                    .pr_list(owner, repo, wire)?
-                    .iter()
-                    .map(|pr| PullRequestSummary::from_gitea(owner, repo, pr))
-                    .collect::<Result<Vec<_>, _>>()?,
-                _ => gitea
-                    .pr_search_scoped(wire, query.creator.as_deref(), query.reviewer.as_deref())?
-                    .iter()
-                    .map(PullRequestSummary::from_gitea_issue)
-                    .collect::<Result<Vec<_>, _>>()?,
-            };
-            items.retain(|summary| matches_query(summary, query));
-            summaries.extend(items);
+            if let Some(gitea) = self.gitea {
+                ran = true;
+                let wire = gitea_state_for(&query.states);
+                // The repo-scoped list has no reviewer filter, so a
+                // reviewer-scoped search runs the global search even
+                // with a repo given; the retain below scopes it.
+                let mut items = match (&query.repo, &query.reviewer) {
+                    (Some((owner, repo)), None) => gitea
+                        .pr_list(owner, repo, wire)?
+                        .iter()
+                        .map(|pr| PullRequestSummary::from_gitea(owner, repo, pr))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    _ => gitea
+                        .pr_search_scoped(
+                            wire,
+                            query.creator.as_deref(),
+                            query.reviewer.as_deref(),
+                        )?
+                        .iter()
+                        .map(PullRequestSummary::from_gitea_issue)
+                        .collect::<Result<Vec<_>, _>>()?,
+                };
+                items.retain(|summary| matches_query(summary, query));
+                summaries.extend(items);
+            }
+        }
+        if !ran {
+            // No arm ran: the search had nothing to read from.
+            // The first arm in scope names the missing
+            // credentials, as a scoped search without its arm
+            // does.
+            return Err(match query.backend {
+                Some(PullRequestBackend::Gitea) => missing_gitea_arm(),
+                _ => missing_obs_arm(),
+            });
         }
         Ok(summaries)
     }
@@ -3511,20 +3533,54 @@ mod tests {
     }
 
     #[test]
-    fn search_without_backend_fails_when_an_arm_is_missing() {
-        // No backend means both arms run, so a missing arm fails
-        // the search closed instead of silently returning one
-        // backend's results: the caller scopes with --backend.
+    fn search_without_backend_runs_the_configured_arm() {
+        // No backend means both arms run — but an arm without
+        // credentials is skipped, so the search returns the
+        // configured arm's results instead of failing on the
+        // missing one. Only a search with no arm at all fails
+        // closed.
         let collection = format!("<collection matches=\"1\">\n{REQUEST_XML}\n</collection>");
-        let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%20or%20%40name%3D%27declined%27%5D",
-            &collection,
-        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%20or%20%40name%3D%27declined%27%5D",
+                &collection,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&page=1&limit=50",
+                &format!("[{}]", issue_json(122, "open", false, "scarabeusiv")),
+            );
         let obs = obs_client(&http);
-        let err = PullRequestClient::new(Some(&obs), None)
-            .search(&PullRequestSearch::default())
-            .expect_err("a both-arms search without a Gitea arm must fail");
+        let gitea = gitea_client(&http);
+        let query = PullRequestSearch::default();
+        // OBS only: the unscoped search runs the OBS arm.
+        let summaries = PullRequestClient::new(Some(&obs), None)
+            .search(&query)
+            .unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].reference, PullRequestRef::Obs(123));
+        // Gitea only: the mirror case.
+        let summaries = PullRequestClient::new(None, Some(&gitea))
+            .search(&query)
+            .unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].reference,
+            PullRequestRef::Gitea {
+                owner: "openSUSE".to_string(),
+                repo: "geectl".to_string(),
+                number: 122,
+            }
+        );
+        // No arms at all: the search fails closed naming the
+        // OBS credentials, the first arm in scope.
+        let err = PullRequestClient::new(None, None)
+            .search(&query)
+            .expect_err("a search without arms must fail");
         assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.to_string().contains("OBS credentials"),
+            "the missing-arm error must name the credentials; got {err}"
+        );
     }
 
     #[test]

@@ -330,7 +330,7 @@ without evaluating trust.
 
 - `geectl pull-request show <REFERENCE>` — Show one pull request: `obs:<id>` or `gitea:<owner>/<repo>#<number>`.
 - `geectl pull-request diff <REFERENCE>` — Show the diff of a pull request: the unified diff, like `request diff`; key flags: --xml
-- `geectl pull-request search` — Search pull requests: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea; key flags: --backend <BACKEND>, --state <STATE>, --creator <CREATOR>, --reviewer <REVIEWER>, --repo <REPO>
+- `geectl pull-request search` — Search pull requests: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea; an arm without credentials is skipped and the search runs on the other arm, naming the skipped arm in the result; key flags: --backend <BACKEND>, --state <STATE>, --creator <CREATOR>, --reviewer <REVIEWER>, --repo <REPO>
 - `geectl pull-request approve <REFERENCE>` — Approve a pull request as the review asked of the target: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea); key flags: --message <MESSAGE>, --commit <COMMIT>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
 - `geectl pull-request request-changes <REFERENCE>` — Ask for changes on a pull request, as `approve` but with the review declined instead of accepted; key flags: --message <MESSAGE>, --commit <COMMIT>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
 - `geectl pull-request comment --body <BODY> <REFERENCE>` — Comment on a pull request; key flags: --parent <PARENT>
@@ -345,7 +345,7 @@ without evaluating trust.
 
 ## `person` — unified person search
 
-- `geectl person search <QUERY>` — Search for a person: the OBS projects naming the login, and the Gitea users matching the keyword; key flags: --backend <BACKEND>
+- `geectl person search <QUERY>` — Search for a person: the OBS projects naming the login, and the Gitea users matching the keyword; an arm without credentials is skipped and the search runs on the other arm, naming the skipped arm in the result; key flags: --backend <BACKEND>
 
 ## `meta` — unified meta write
 

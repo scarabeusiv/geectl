@@ -12,7 +12,7 @@
 //! the OBS arm resolves its credentials for the configured URL
 //! from its instance alias, and the Gitea arm resolves its token
 //! for the configured URL the same way
-//! (`EnvGiteaAuth::credentials_for_url`, the same per-URL shape
+//! (the shared `cli_arms` resolution, the same per-URL shape
 //! as the OBS arm) — a single-instance plain-token setup
 //! behaves exactly as before. Both clients build before the
 //! search runs, so a both-arms search fails closed on the first
@@ -30,8 +30,7 @@
 //! carries no description (long free text — titles stay). The
 //! JSON payload remains the complete record in every case.
 
-use crate::auth::{EnvGiteaAuth, EnvObsAuth};
-use crate::config::{self, DEFAULT_GITEA_URL};
+use crate::auth::Credentials;
 use crate::debug::{strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{GiteaClient, GiteaUser};
@@ -88,16 +87,29 @@ pub fn run_person(
             query.validate()?;
             match query.backend {
                 Some(PersonBackend::Obs) => with_obs(debug, instance, |obs| {
-                    search_with(&PersonClient::new(Some(obs), None), &query)
+                    search_with(&PersonClient::new(Some(obs), None), &query, &[])
                 }),
                 Some(PersonBackend::Gitea) => with_gitea(debug, instance, |gitea| {
-                    search_with(&PersonClient::new(None, Some(gitea)), &query)
+                    search_with(&PersonClient::new(None, Some(gitea)), &query, &[])
                 }),
-                None => with_obs(debug, instance, |obs| {
-                    with_gitea(debug, instance, |gitea| {
-                        search_with(&PersonClient::new(Some(obs), Some(gitea)), &query)
-                    })
-                }),
+                None => {
+                    // Each arm builds lazily: an arm without
+                    // credentials is skipped and the search runs
+                    // on the other arm, instead of failing the
+                    // whole search on the missing one. With
+                    // neither arm the library fails closed naming
+                    // the missing credentials.
+                    let obs_http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+                    let gitea_http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+                    let mut skipped = Vec::new();
+                    let obs = try_obs_client(&obs_http, debug, instance, &mut skipped)?;
+                    let gitea = try_gitea_client(&gitea_http, debug, instance, &mut skipped)?;
+                    search_with(
+                        &PersonClient::new(obs.as_ref(), gitea.as_ref()),
+                        &query,
+                        &skipped,
+                    )
+                }
             }
         }
     }
@@ -111,6 +123,7 @@ pub fn run_person(
 fn search_with(
     client: &PersonClient,
     query: &PersonSearch,
+    skipped: &[PersonBackend],
 ) -> Result<(Value, String), GeectlError> {
     let result = client.search(query)?;
     let payload = json!({
@@ -118,8 +131,15 @@ fn search_with(
         "backend": query.backend.map(|backend| backend.as_str()),
         "projects": result.projects.iter().map(project_match_json).collect::<Vec<_>>(),
         "users": result.users.iter().map(gitea_user_json).collect::<Vec<_>>(),
+        "skipped": skipped
+            .iter()
+            .map(|backend| json!({
+                "backend": backend.as_str(),
+                "reason": skipped_arm_reason(*backend),
+            }))
+            .collect::<Vec<_>>(),
     });
-    Ok((payload, render_search_text(query, &result)?))
+    Ok((payload, render_search_text(query, &result, skipped)?))
 }
 
 /// Build the OBS client from the effective config and the
@@ -135,22 +155,51 @@ fn with_obs<T>(
     f: impl FnOnce(&ObsClient) -> Result<T, GeectlError>,
 ) -> Result<T, GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let path = config::config_path()?;
-    let file_config = config::load_config_at(&path)?;
-    let base = config::obs_base_url(instance, &file_config)?;
-    let credentials = match instance {
-        Some(alias) => EnvObsAuth::credentials_for_instance(alias, &file_config.instances)?,
-        None => EnvObsAuth::credentials_for_url(&base, &base, &file_config.instances)?,
-    };
-    let client =
-        ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
+    let client = obs_client_from(&http, debug, instance)?;
     f(&client)
+}
+
+/// The OBS client build behind `with_obs`: the configured base
+/// URL and its environment credentials.
+fn obs_client_from<'a>(
+    http: &'a UreqClient,
+    debug: &Debug,
+    instance: Option<&str>,
+) -> Result<ObsClient<'a>, GeectlError> {
+    let (base, resolve) = crate::cli_arms::obs_base_and_credentials(instance)?;
+    let credentials = resolve?;
+    Ok(ObsClient::with_base_and_credentials(http, &base, credentials)?.with_debug(debug.clone()))
+}
+
+/// Build the OBS client for an unscoped search, or `None` when
+/// its credentials are not configured: the arm is skipped and
+/// the search runs on the other arm. A resolution failure is
+/// not "not configured" and still fails the search. With an
+/// explicit `--instance` the skip does not apply: the flagged
+/// account is the one asked for, so its client builds as usual
+/// (with `Credentials::None` when the account has none, and the
+/// library fails closed on the arm).
+fn try_obs_client<'a>(
+    http: &'a UreqClient,
+    debug: &Debug,
+    instance: Option<&str>,
+    skipped: &mut Vec<PersonBackend>,
+) -> Result<Option<ObsClient<'a>>, GeectlError> {
+    let (base, resolve) = crate::cli_arms::obs_base_and_credentials(instance)?;
+    let credentials = resolve?;
+    if instance.is_none() && matches!(credentials, Credentials::None) {
+        skipped.push(PersonBackend::Obs);
+        return Ok(None);
+    }
+    Ok(Some(
+        ObsClient::with_base_and_credentials(http, &base, credentials)?.with_debug(debug.clone()),
+    ))
 }
 
 /// A `GiteaClient` for the configured Gitea instance (config file /
 /// env / default) with the environment Bearer token, resolved for
 /// the configured URL from its instance alias like the OBS arm
-/// (`EnvGiteaAuth::credentials_for_url`, the same per-URL shape
+/// (the shared `cli_arms` resolution, the same per-URL shape
 /// as the OBS arm), reporting on the debug channel. With
 /// `--instance`, strictly the flagged alias's variables; the host
 /// stays the configured URL. Construction fails closed without a
@@ -162,22 +211,40 @@ fn gitea_client<'a>(
     debug: &Debug,
     instance: Option<&str>,
 ) -> Result<GiteaClient<'a>, GeectlError> {
-    let path = config::config_path()?;
-    let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
-    // Unreachable by construction — effective_config always yields
-    // Some(gitea_url) — but kept as a defensive default rather than
-    // an unwrap: a config change must not turn into a panic here.
-    let base = effective
-        .config
-        .gitea_url
-        .as_deref()
-        .unwrap_or(DEFAULT_GITEA_URL);
-    let credentials = match instance {
-        Some(alias) => EnvGiteaAuth::credentials_for_instance(alias, &file_config.instances)?,
-        None => EnvGiteaAuth::credentials_for_url(base, base, &file_config.instances)?,
-    };
-    GiteaClient::with_base(http, base, credentials).map(|client| client.with_debug(debug.clone()))
+    let (base, resolve) = crate::cli_arms::gitea_base_and_credentials(instance)?;
+    let credentials = resolve?;
+    GiteaClient::with_base(http, &base, credentials).map(|client| client.with_debug(debug.clone()))
+}
+
+/// Build the Gitea client for an unscoped search, or `None`
+/// when no token is configured: the arm is skipped and the
+/// search runs on the other arm. A resolution failure is not
+/// "not configured" and still fails the search; with an
+/// explicit `--instance` the skip does not apply.
+fn try_gitea_client<'a>(
+    http: &'a UreqClient,
+    debug: &Debug,
+    instance: Option<&str>,
+    skipped: &mut Vec<PersonBackend>,
+) -> Result<Option<GiteaClient<'a>>, GeectlError> {
+    let (base, resolve) = crate::cli_arms::gitea_base_and_credentials(instance)?;
+    let credentials = resolve?;
+    if instance.is_none() && matches!(credentials, Credentials::None) {
+        skipped.push(PersonBackend::Gitea);
+        return Ok(None);
+    }
+    Ok(Some(
+        GiteaClient::with_base(http, &base, credentials)
+            .map(|client| client.with_debug(debug.clone()))?,
+    ))
+}
+
+/// Why an unscoped search skipped an arm, for the payload and
+/// the text note: the arm had no credentials configured. The
+/// wording lives once in `crate::cli_arms::Arm`, shared with the
+/// `pull-request` search, so the two `skipped` payloads cannot drift.
+fn skipped_arm_reason(backend: PersonBackend) -> &'static str {
+    crate::cli_arms::Arm::from(backend).skipped_reason()
 }
 
 /// Run `f` with a `GiteaClient` for the configured instance. The
@@ -220,25 +287,38 @@ fn with_header(header: &str, text: String) -> String {
 fn render_search_text(
     query: &PersonSearch,
     result: &PersonSearchResult,
+    skipped: &[PersonBackend],
 ) -> Result<String, GeectlError> {
     let mut header = format!("query: {}", query.query);
     if let Some(backend) = query.backend {
         header.push_str(&format!(" backend: {}", backend.as_str()));
     }
     let mut sections = Vec::new();
-    if query.backend.is_none() || query.backend == Some(PersonBackend::Obs) {
+    if (query.backend.is_none() || query.backend == Some(PersonBackend::Obs))
+        && !skipped.contains(&PersonBackend::Obs)
+    {
         sections.push(format!(
             "OBS projects:\n{}",
             render_project_matches(&query.query, &result.projects)?
         ));
     }
-    if query.backend.is_none() || query.backend == Some(PersonBackend::Gitea) {
+    if (query.backend.is_none() || query.backend == Some(PersonBackend::Gitea))
+        && !skipped.contains(&PersonBackend::Gitea)
+    {
         sections.push(format!(
             "Gitea users:\n{}",
             render_users(&query.query, &result.users)?
         ));
     }
-    Ok(with_header(&header, sections.join("\n")))
+    let mut text = with_header(&header, sections.join("\n"));
+    for backend in skipped {
+        text.push_str(&format!(
+            "\nnote: skipped the {} arm: {}",
+            backend.as_str(),
+            skipped_arm_reason(*backend)
+        ));
+    }
+    Ok(text)
 }
 
 fn render_project_matches(term: &str, matches: &[ProjectMatch]) -> Result<String, GeectlError> {
@@ -414,8 +494,8 @@ mod tests {
             projects: vec![project("devel:languages:python", Some("Python"))],
             users: vec![user("alice", "Alice", "alice@example.com")],
         };
-        let text =
-            render_search_text(&query, &result).expect("the locally built rows match the headers");
+        let text = render_search_text(&query, &result, &[])
+            .expect("the locally built rows match the headers");
         let mut lines = text.lines();
         assert_eq!(lines.next().expect("a header line"), "query: alice");
         assert_eq!(lines.next().expect("an OBS section line"), "OBS projects:");
@@ -437,7 +517,7 @@ mod tests {
         assert_eq!(lines.next(), None);
         let empty = PersonSearchResult::default();
         assert_eq!(
-            render_search_text(&query, &empty)
+            render_search_text(&query, &empty, &[])
                 .expect("the locally built rows match the headers"),
             "query: alice\nOBS projects:\nno projects matching 'alice'\nGitea users:\nno users matching 'alice'"
         );
@@ -454,7 +534,8 @@ mod tests {
             users: vec![],
         };
         assert_eq!(
-            render_search_text(&query, &result).expect("the locally built rows match the headers"),
+            render_search_text(&query, &result, &[])
+                .expect("the locally built rows match the headers"),
             "query: alice backend: gitea\nGitea users:\nno users matching 'alice'"
         );
     }
@@ -469,8 +550,8 @@ mod tests {
             projects: vec![],
             users: vec![user("alice2", "", "")],
         };
-        let text =
-            render_search_text(&query, &result).expect("the locally built rows match the headers");
+        let text = render_search_text(&query, &result, &[])
+            .expect("the locally built rows match the headers");
         let row = text.lines().nth(3).expect("a row line");
         assert_eq!(
             row.split_whitespace().collect::<Vec<_>>(),

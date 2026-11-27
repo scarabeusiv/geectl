@@ -45,7 +45,7 @@
 //! title (long free text) and no review detail — those are a
 //! `show` call away.
 
-use crate::auth::{Credentials, EnvGiteaAuth, EnvObsAuth};
+use crate::auth::{Credentials, EnvGiteaAuth};
 use crate::config::{self, DEFAULT_GITEA_URL};
 use crate::debug::{strip_terminal_controls, strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
@@ -667,6 +667,7 @@ pub fn run_pull_request(
                         &PullRequestClient::new(Some(obs), None),
                         &query,
                         &coordinates,
+                        &[],
                     )
                 }),
                 Some(PullRequestBackend::Gitea) => with_gitea(debug, instance, |gitea| {
@@ -674,17 +675,28 @@ pub fn run_pull_request(
                         &PullRequestClient::new(None, Some(gitea)),
                         &query,
                         &coordinates,
+                        &[],
                     )
                 }),
-                None => with_obs(debug, true, instance, |obs| {
-                    with_gitea(debug, instance, |gitea| {
-                        search_with(
-                            &PullRequestClient::new(Some(obs), Some(gitea)),
-                            &query,
-                            &coordinates,
-                        )
-                    })
-                }),
+                None => {
+                    // Each arm builds lazily: an arm without
+                    // credentials is skipped and the search runs
+                    // on the other arm, instead of failing the
+                    // whole search on the missing one. With
+                    // neither arm the library fails closed naming
+                    // the missing credentials.
+                    let obs_http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+                    let gitea_http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+                    let mut skipped = Vec::new();
+                    let obs = try_obs_client(&obs_http, debug, instance, &mut skipped)?;
+                    let gitea = try_gitea_client(&gitea_http, debug, instance, &mut skipped)?;
+                    search_with(
+                        &PullRequestClient::new(obs.as_ref(), gitea.as_ref()),
+                        &query,
+                        &coordinates,
+                        &skipped,
+                    )
+                }
             }
         }
     }
@@ -707,23 +719,31 @@ fn with_obs<T>(
     f: impl FnOnce(&ObsClient) -> Result<T, GeectlError>,
 ) -> Result<T, GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let path = config::config_path()?;
-    let file_config = config::load_config_at(&path)?;
-    let base = config::obs_base_url(instance, &file_config)?;
-    // With `--instance` the error propagates even in dry-run: the
-    // flagged instance's credentials are strict, and a dry run
-    // must not silently plan against an instance it cannot use.
-    let resolve = match instance {
-        Some(alias) => EnvObsAuth::credentials_for_instance(alias, &file_config.instances),
-        None => EnvObsAuth::credentials_for_url(&base, &base, &file_config.instances),
-    };
+    let client = obs_client_from(&http, debug, live, instance)?;
+    f(&client)
+}
+
+/// The OBS client build behind `with_obs`: the configured base
+/// URL and its environment credentials, with the dry-run
+/// leniency `with_obs` documents.
+fn obs_client_from<'a>(
+    http: &'a UreqClient,
+    debug: &Debug,
+    live: bool,
+    instance: Option<&str>,
+) -> Result<ObsClient<'a>, GeectlError> {
+    let (base, resolve) = crate::cli_arms::obs_base_and_credentials(instance)?;
     let credentials = match resolve {
         Ok(credentials) => credentials,
         Err(err) if !live && instance.is_none() => {
             // The dry run prints the plan without credentials, but
             // the failure must not be silent: the same credentials
             // would fail a `--live` run, so the error goes on the
-            // debug channel and as a stderr warning.
+            // debug channel and as a stderr warning. With
+            // `--instance` the error propagates even in dry-run:
+            // the flagged instance's credentials are strict, and
+            // a dry run must not silently plan against an
+            // instance it cannot use.
             debug.emit(&format!(
                 "ignoring credential resolution error in dry-run mode: {err}"
             ));
@@ -732,9 +752,104 @@ fn with_obs<T>(
         }
         Err(err) => return Err(err),
     };
-    let client =
-        ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
-    f(&client)
+    Ok(ObsClient::with_base_and_credentials(http, &base, credentials)?.with_debug(debug.clone()))
+}
+
+/// The OBS client for a Gitea merge's forward, or `None` when
+/// no OBS credentials are configured: the merge's own arm is
+/// Gitea, so the OBS client only verifies the forward. The
+/// library skips the forward preflight in dry-run without one
+/// and fails closed live, so the absence is carried, not papered
+/// over with a credential-less client. A credential resolution
+/// error still fails the merge — except without `--instance` in
+/// dry-run, where the unconfigured arm is simply absent and the
+/// failure goes on the debug channel, like the old dry-run
+/// leniency did.
+fn merge_obs_client<'a>(
+    http: &'a UreqClient,
+    debug: &Debug,
+    live: bool,
+    instance: Option<&str>,
+) -> Result<Option<ObsClient<'a>>, GeectlError> {
+    let (base, resolve) = crate::cli_arms::obs_base_and_credentials(instance)?;
+    let credentials = match resolve {
+        Ok(credentials) => credentials,
+        Err(err) if !live && instance.is_none() => {
+            // The dry run prints the plan without credentials, but
+            // the failure must not be silent: the same credentials
+            // would fail a `--live` run, so the error goes on the
+            // debug channel and as a stderr warning. With
+            // `--instance` the error propagates even in dry-run:
+            // the flagged instance's credentials are strict, and
+            // a dry run must not silently plan against an
+            // instance it cannot use.
+            debug.emit(&format!(
+                "ignoring credential resolution error in dry-run mode: {err}"
+            ));
+            eprintln!("warning: ignoring credential resolution error in dry-run mode: {err}");
+            Credentials::None
+        }
+        Err(err) => return Err(err),
+    };
+    Ok(ObsClient::with_base_and_credentials(http, &base, credentials)?.with_debug(debug.clone()))
+}
+
+/// Build the OBS client for an unscoped search, or `None` when
+/// its credentials are not configured: the arm is skipped and
+/// the search runs on the other arm. A resolution failure is
+/// not "not configured" and still fails the search. With an
+/// explicit `--instance` the skip does not apply: the flagged
+/// account is the one asked for, so its client builds as usual
+/// (with `Credentials::None` when the account has none, and the
+/// library fails closed on the arm).
+fn try_obs_client<'a>(
+    http: &'a UreqClient,
+    debug: &Debug,
+    instance: Option<&str>,
+    skipped: &mut Vec<PullRequestBackend>,
+) -> Result<Option<ObsClient<'a>>, GeectlError> {
+    let (base, resolve) = crate::cli_arms::obs_base_and_credentials(instance)?;
+    let credentials = resolve?;
+    if instance.is_none() && matches!(credentials, Credentials::None) {
+        skipped.push(PullRequestBackend::Obs);
+        return Ok(None);
+    }
+    Ok(Some(
+        ObsClient::with_base_and_credentials(http, &base, credentials)?.with_debug(debug.clone()),
+    ))
+}
+
+/// Build the Gitea client for an unscoped search, or `None`
+/// when no token is configured: the arm is skipped and the
+/// search runs on the other arm. The resolution is the shared
+/// `crate::cli_arms::gitea_base_and_credentials`, without the
+/// build that fails closed on `Credentials::None`. A resolution
+/// failure is not "not configured" and still fails the search;
+/// with an explicit `--instance` the skip does not apply.
+fn try_gitea_client<'a>(
+    http: &'a UreqClient,
+    debug: &Debug,
+    instance: Option<&str>,
+    skipped: &mut Vec<PullRequestBackend>,
+) -> Result<Option<GiteaClient<'a>>, GeectlError> {
+    let (base, resolve) = crate::cli_arms::gitea_base_and_credentials(instance)?;
+    let credentials = resolve?;
+    if instance.is_none() && matches!(credentials, Credentials::None) {
+        skipped.push(PullRequestBackend::Gitea);
+        return Ok(None);
+    }
+    Ok(Some(
+        GiteaClient::with_base(http, &base, credentials)
+            .map(|client| client.with_debug(debug.clone()))?,
+    ))
+}
+
+/// Why an unscoped search skipped an arm, for the payload and
+/// the text note: the arm had no credentials configured. The
+/// wording lives once in `crate::cli_arms::Arm`, shared with the
+/// `person` search, so the two `skipped` payloads cannot drift.
+fn skipped_arm_reason(backend: PullRequestBackend) -> &'static str {
+    crate::cli_arms::Arm::from(backend).skipped_reason()
 }
 
 /// Run `f` with a `GiteaClient` for the configured instance. The
@@ -2567,6 +2682,7 @@ fn search_with(
     client: &PullRequestClient,
     query: &PullRequestSearch,
     coordinates: &str,
+    skipped: &[PullRequestBackend],
 ) -> Result<(Value, String), GeectlError> {
     let summaries = client.search(query)?;
     let mut items = Vec::new();
@@ -2576,8 +2692,18 @@ fn search_with(
     let payload = json!({
         "pull_requests": items,
         "count": summaries.len(),
+        "skipped": skipped
+            .iter()
+            .map(|backend| json!({
+                "backend": backend.as_str(),
+                "reason": skipped_arm_reason(*backend),
+            }))
+            .collect::<Vec<_>>(),
     });
-    Ok((payload, render_search_text(coordinates, &summaries)?))
+    Ok((
+        payload,
+        render_search_text(coordinates, &summaries, skipped)?,
+    ))
 }
 
 /// Serialize a pull-request shape to its JSON payload value.
@@ -2718,41 +2844,52 @@ fn search_header(coordinates: &str, count: usize) -> String {
 /// The search text: one header line echoing the coordinates, then
 /// the table (reference, state, author, source, target — plus an
 /// ACTIONS column only when some row carries more than one action)
-/// — or `no pull requests` under the header when nothing matched.
+/// — or `no pull requests` under the header when nothing matched —
+/// then a note per arm the search skipped for missing credentials.
 fn render_search_text(
     coordinates: &str,
     summaries: &[PullRequestSummary],
+    skipped: &[PullRequestBackend],
 ) -> Result<String, GeectlError> {
     let header = search_header(coordinates, summaries.len());
-    if summaries.is_empty() {
-        return Ok(format!("{header}\nno pull requests"));
+    let mut text = if summaries.is_empty() {
+        format!("{header}\nno pull requests")
+    } else {
+        // The ACTIONS column exists only when some row carries
+        // more than one action: a column of empty cells says
+        // nothing and changes the table shape for pre-existing
+        // consumers of single-action output.
+        let multi_action = summaries.iter().any(|summary| summary.action_count > 1);
+        let rows: Vec<Vec<String>> = summaries
+            .iter()
+            .map(|summary| {
+                let mut row = vec![
+                    summary.reference.to_string(),
+                    summary.status.as_str().to_string(),
+                    summary.author.clone(),
+                    endpoint_cell(&summary.source),
+                    endpoint_cell(&summary.target),
+                ];
+                if multi_action {
+                    row.push(summary.action_count.to_string());
+                }
+                row
+            })
+            .collect();
+        let mut headers = vec!["REFERENCE", "STATE", "AUTHOR", "SOURCE", "TARGET"];
+        if multi_action {
+            headers.push("ACTIONS");
+        }
+        format!("{header}\n{}", render_table(&headers, &rows)?)
+    };
+    for backend in skipped {
+        text.push_str(&format!(
+            "\nnote: skipped the {} arm: {}",
+            backend.as_str(),
+            skipped_arm_reason(*backend)
+        ));
     }
-    // The ACTIONS column exists only when some row carries
-    // more than one action: a column of empty cells says
-    // nothing and changes the table shape for pre-existing
-    // consumers of single-action output.
-    let multi_action = summaries.iter().any(|summary| summary.action_count > 1);
-    let rows: Vec<Vec<String>> = summaries
-        .iter()
-        .map(|summary| {
-            let mut row = vec![
-                summary.reference.to_string(),
-                summary.status.as_str().to_string(),
-                summary.author.clone(),
-                endpoint_cell(&summary.source),
-                endpoint_cell(&summary.target),
-            ];
-            if multi_action {
-                row.push(summary.action_count.to_string());
-            }
-            row
-        })
-        .collect();
-    let mut headers = vec!["REFERENCE", "STATE", "AUTHOR", "SOURCE", "TARGET"];
-    if multi_action {
-        headers.push("ACTIONS");
-    }
-    Ok(format!("{header}\n{}", render_table(&headers, &rows)?))
+    Ok(text)
 }
 
 /// One endpoint as a table cell: the repository, the branch in
@@ -3034,7 +3171,7 @@ mod tests {
         let gitea_pr: GiteaPullRequest = serde_json::from_str(PR_JSON).expect("fixture PR parses");
         let summary = PullRequestSummary::from_gitea("openSUSE", "geectl", &gitea_pr)
             .expect("fixture PR maps");
-        let text = render_search_text("", &[summary]).expect("table renders");
+        let text = render_search_text("", &[summary], &[]).expect("table renders");
         let mut lines = text.lines();
         let header = lines.next().expect("a header line");
         assert_eq!(header, "search (1 pull request)");
@@ -3055,7 +3192,7 @@ mod tests {
         assert!(row.contains("scarabeusiv/geectl (change-review-state)"));
         assert!(row.contains("openSUSE/geectl (main)"));
         assert_eq!(
-            render_search_text(" backend=gitea", &[]).expect("empty table renders"),
+            render_search_text(" backend=gitea", &[], &[]).expect("empty table renders"),
             "search backend=gitea (0 pull requests)\nno pull requests"
         );
     }
@@ -3086,7 +3223,7 @@ mod tests {
         let mut summary = PullRequestSummary::from_gitea("openSUSE", "geectl", &gitea_pr)
             .expect("fixture PR maps");
         summary.source.repository = String::new();
-        let table = render_search_text("", &[summary]).expect("table renders");
+        let table = render_search_text("", &[summary], &[]).expect("table renders");
         assert!(
             table.contains("(change-review-state)"),
             "the search table must name the deleted-fork branch:\n{table}"
@@ -3115,7 +3252,7 @@ mod tests {
         let request = parse_request(REQUEST_XML).expect("fixture request parses");
         let summary = PullRequestSummary::from_obs(&request).expect("fixture request maps");
         assert_eq!(summary.action_count, 2);
-        let table = render_search_text("", &[summary]).expect("table renders");
+        let table = render_search_text("", &[summary], &[]).expect("table renders");
         let row = table.lines().nth(2).expect("a row line");
         assert_eq!(row.split_whitespace().last(), Some("2"));
     }
