@@ -9970,6 +9970,34 @@ fn copy_package_to_apiurl_same_instance_refuses() {
 }
 
 #[test]
+fn request_list_warns_it_is_deprecated() {
+    // `request list` keeps working, but a successful run warns
+    // that `request search` is the leaf to use. The warning
+    // fires on success only: a failing run's stderr is the JSON
+    // error alone.
+    let addr = serve_once("<collection matches=\"0\"></collection>");
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "list"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("warning: `request list` is deprecated; use `request search` instead"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn request_supersede_without_live_prints_the_plan() {
     // Without --live the supersede prints its plan like every
     // mutation: no client is built, so no credentials or network

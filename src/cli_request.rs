@@ -152,10 +152,11 @@ pub enum RequestCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// List submit requests: the same search, with the states still
-    /// awaiting action (new, review) as the default. A thin wrapper
-    /// over the search operation: the flags select the same
-    /// server-side search.
+    /// Deprecated: use `request search`. List submit requests: the
+    /// same search, with the states still awaiting action (new,
+    /// review) as the default — `search` defaults to
+    /// new/review/declined. A thin wrapper over the search
+    /// operation: the flags select the same server-side search.
     List {
         /// Requests touching this project.
         #[arg(long)]
@@ -648,14 +649,23 @@ pub fn run(
                 limit,
             )?;
             search.match_expr()?;
-            with_client(debug, true, instance, |client| {
+            let result = with_client(debug, true, instance, |client| {
                 let requests = client.search_requests(&search)?;
                 let payload = json!({
                     "requests": requests.iter().map(request_json).collect::<Vec<_>>(),
                     "count": requests.len(),
                 });
                 Ok((payload, render_list_text(&coordinates, &requests)))
-            })
+            })?;
+            // Deprecated: `request search` is the same search with
+            // the wider default (new/review/declined). The warning
+            // goes to stderr on a successful run only: a failing
+            // run's stderr is the JSON error alone, and a warning
+            // line ahead of it would break that.
+            eprintln!(
+                "warning: `request list` is deprecated; use `request search` instead (search defaults to the new/review/declined states; list defaults to new/review)"
+            );
+            Ok(result)
         }
         RequestCommand::Diff { id, xml } => with_client(debug, true, instance, |client| {
             let diff = client.request_diff(&id, xml)?;
