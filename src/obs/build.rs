@@ -1293,9 +1293,14 @@ pub(crate) fn parse_job_history(body: &str) -> Result<Vec<JobHistoryEntry>, Geec
             verifymd5,
         });
     }
-    // The wire order is oldest-first, like the build history, so the
-    // newest job is first.
-    entries.reverse();
+    // The wire order is roughly oldest-first, but the backend does
+    // not guarantee it is strictly sorted (jobs from concurrent
+    // workers interleave), so reversing it does not put the newest
+    // job first. Sort by endtime descending instead, so the
+    // documented newest-first order holds; entries without an
+    // endtime sort last. The sort is stable, so equal endtimes keep
+    // wire order.
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.endtime));
     Ok(entries)
 }
 
@@ -6284,6 +6289,24 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].code, "succeeded");
         assert_eq!(parsed[1].code, "failed");
+    }
+
+    #[test]
+    fn parse_job_history_sorts_newest_first_despite_wire_inversion() {
+        // The wire order is only roughly oldest-first: jobs from
+        // concurrent workers interleave, so a later endtime can
+        // precede an earlier one. The result must still be strictly
+        // newest-first, not just the wire order reversed.
+        let parsed = parse_job_history(
+            "<jobhistlist><jobhist package=\"foo\" code=\"failed\" endtime=\"1700000100\"/><jobhist package=\"foo\" code=\"succeeded\" endtime=\"1700000300\"/><jobhist package=\"foo\" code=\"failed\" endtime=\"1700000200\"/><jobhist package=\"foo\" code=\"failed\"/></jobhistlist>",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0].endtime, Some(1_700_000_300));
+        assert_eq!(parsed[1].endtime, Some(1_700_000_200));
+        assert_eq!(parsed[2].endtime, Some(1_700_000_100));
+        // An entry without an endtime sorts last.
+        assert_eq!(parsed[3].endtime, None);
     }
 
     #[test]
