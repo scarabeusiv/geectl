@@ -58,7 +58,7 @@ pub enum BranchCommand {
     /// `--live` performs the branch.
     BranchPackage(BranchPackageArgs),
     /// Copy a package to another project (or another OBS instance
-    /// with `--to-apiurl`). A mutation: dry-run is the default.
+    /// with `--to-api-url`). A mutation: dry-run is the default.
     CopyPackage(CopyPackageArgs),
     /// Copy a whole project. A mutation: dry-run is the default.
     CopyProject(CopyProjectArgs),
@@ -152,13 +152,13 @@ pub struct BranchPackageArgs {
     #[arg(long)]
     revision: Option<String>,
     /// The link revision the branch records.
-    #[arg(long)]
+    #[arg(long = "link-rev", alias = "linkrev")]
     linkrev: Option<String>,
     /// A comment recorded on the branch.
     #[arg(long)]
     comment: Option<String>,
     /// Withhold the branch's read access to the source package's project.
-    #[arg(long)]
+    #[arg(long = "no-access", alias = "noaccess")]
     noaccess: bool,
     /// Add the source project's repositories to the branch project.
     #[arg(long)]
@@ -209,7 +209,7 @@ pub struct CopyPackageArgs {
     #[arg(long)]
     comment: Option<String>,
     /// Do not run source services on the copied files.
-    #[arg(long)]
+    #[arg(long = "no-service", alias = "noservice")]
     noservice: bool,
     /// Do not update the source package when copying a link onto its
     /// target.
@@ -229,7 +229,7 @@ pub struct CopyPackageArgs {
     /// credentials are never forwarded to the target. The copy is
     /// client-side and always expanded; `--keep-link` and the
     /// server-side copy options are refused with it.
-    #[arg(long)]
+    #[arg(long = "to-api-url", alias = "to-apiurl")]
     to_apiurl: Option<String>,
 }
 
@@ -255,7 +255,7 @@ pub struct CopyProjectArgs {
     #[arg(long)]
     make_origin_older: bool,
     /// Do not run source services on the copied files.
-    #[arg(long)]
+    #[arg(long = "no-service", alias = "noservice")]
     noservice: bool,
     /// Re-sign the copied project.
     #[arg(long)]
@@ -437,12 +437,12 @@ fn obs_client<'a>(
         .map(|client| client.with_debug(debug.clone()))
 }
 
-/// An `ObsClient` for another OBS instance (`--to-apiurl`) with
+/// An `ObsClient` for another OBS instance (`--to-api-url`) with
 /// that instance's own credentials, resolved by URL from the
 /// environment (the matching instance alias's variables, else a clear error naming them —
 /// the source instance's credentials are never forwarded to the
 /// target; see `auth::resolve_obs_for_url`). The base URL is
-/// validated here, so a malformed `--to-apiurl` fails fast — in
+/// validated here, so a malformed `--to-api-url` fails fast — in
 /// dry-run too, before any read.
 fn target_client<'a>(
     http: &'a dyn HttpClient,
@@ -453,10 +453,10 @@ fn target_client<'a>(
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
     // The source instance is the flagged one when `--instance` is
-    // set: the refusal compares `--to-apiurl` against it, and the
+    // set: the refusal compares `--to-api-url` against it, and the
     // target resolves against it as the default.
     let default_url = config::obs_base_url(instance, &file_config)?;
-    // `--to-apiurl` means another instance: pointing it at the
+    // `--to-api-url` means another instance: pointing it at the
     // configured instance would silently take the degraded
     // client-side copy (no server copy, `--keep-link`/`--comment`
     // refused) instead of the same-instance server copy. Refuse it
@@ -465,7 +465,7 @@ fn target_client<'a>(
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
             format!(
-                "--to-apiurl points at the configured instance ({default_url}); omit --to-apiurl for a same-instance copy"
+                "--to-api-url points at the configured instance ({default_url}); omit --to-api-url for a same-instance copy"
             ),
         ));
     }
@@ -1318,11 +1318,11 @@ mod tests {
             "--force",
             "--revision",
             "3",
-            "--linkrev",
+            "--link-rev",
             "2",
             "--comment",
             "branch",
-            "--noaccess",
+            "--no-access",
             "--add-repositories",
             "--add-repositories-block",
             "local",
@@ -1409,10 +1409,10 @@ mod tests {
             "--expand",
             "--comment",
             "copy",
-            "--noservice",
+            "--no-service",
             "--dont-update-source",
             "--with-vrev",
-            "--to-apiurl",
+            "--to-api-url",
             "https://api.example.org",
         ]) else {
             panic!("wrong variant");
@@ -1465,7 +1465,7 @@ mod tests {
             "--with-history",
             "--make-older",
             "--make-origin-older",
-            "--noservice",
+            "--no-service",
             "--resign",
             "--comment",
             "copy",
@@ -1481,6 +1481,63 @@ mod tests {
         assert!(args.resign);
         assert_eq!(args.comment.as_deref(), Some("copy"));
         assert!(args.no_delay);
+    }
+
+    #[test]
+    fn old_flag_spellings_still_parse() {
+        let BranchCommand::BranchPackage(args) = parse(&[
+            "geectl",
+            "branch",
+            "branch-package",
+            "--project",
+            "test:factory",
+            "--package",
+            "foo",
+            "--target-project",
+            "home:alice:branches:test:factory",
+            "--target-package",
+            "foo",
+            "--linkrev",
+            "2",
+            "--noaccess",
+        ]) else {
+            panic!("wrong variant");
+        };
+        assert_eq!(args.linkrev.as_deref(), Some("2"));
+        assert!(args.noaccess);
+        let BranchCommand::CopyPackage(args) = parse(&[
+            "geectl",
+            "branch",
+            "copy-package",
+            "--source-project",
+            "test:factory",
+            "--source-package",
+            "foo",
+            "--target-project",
+            "test:target",
+            "--target-package",
+            "foo",
+            "--noservice",
+            "--to-apiurl",
+            "https://api.example.org",
+        ]) else {
+            panic!("wrong variant");
+        };
+        assert!(args.noservice);
+        assert_eq!(args.to_apiurl.as_deref(), Some("https://api.example.org"));
+        let BranchCommand::CopyProject(args) = parse(&[
+            "geectl",
+            "branch",
+            "copy-project",
+            "--source-project",
+            "test:factory",
+            "--target-project",
+            "test:target",
+            "--noservice",
+        ]) else {
+            panic!("wrong variant");
+        };
+        assert!(args.noservice);
     }
 
     #[test]

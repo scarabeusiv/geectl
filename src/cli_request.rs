@@ -314,7 +314,12 @@ pub enum RequestCommand {
         /// The request id.
         id: String,
         /// The comment text. Values starting with `-` are taken literally: the body may open with a `- ` bullet.
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(
+            long = "comment",
+            alias = "body",
+            value_name = "COMMENT",
+            allow_hyphen_values = true
+        )]
         body: String,
         /// The comment being replied to, when this is a reply.
         #[arg(long)]
@@ -3396,6 +3401,16 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_add_comment_accepts_the_old_body_spelling() {
+        let cli =
+            TestCli::try_parse_from(["geectl", "add-comment", "42", "--body", "noted"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            RequestCommand::AddComment { body, .. } if body == "noted"
+        ));
     }
 
     #[test]

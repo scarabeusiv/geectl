@@ -128,7 +128,7 @@ pub enum LocalBuildCommand {
         #[arg(long)]
         project: String,
         /// The repository to build for (e.g. `standard`).
-        #[arg(long)]
+        #[arg(long = "repository", alias = "repo", value_name = "REPOSITORY")]
         repo: String,
         /// The architecture to build for; must equal the host arch.
         #[arg(long, default_value_t = std::env::consts::ARCH.to_string(), hide_default_value = true)]
@@ -164,7 +164,7 @@ pub enum LocalBuildCommand {
         /// immediately in the existing root. Needs an initialized
         /// root (a previous build wrote the rpmlist and
         /// buildconfig there).
-        #[arg(long)]
+        #[arg(long = "no-init", alias = "noinit")]
         noinit: bool,
         /// Use the preinstall image when the buildinfo offers one.
         /// Off by default: the engine extracts the image with
@@ -265,7 +265,7 @@ pub enum LocalBuildCommand {
         #[arg(long)]
         project: String,
         /// The repository the root was built for (e.g. `standard`).
-        #[arg(long)]
+        #[arg(long = "repository", alias = "repo", value_name = "REPOSITORY")]
         repo: String,
         /// The architecture the root was built for; defaults to the host arch.
         #[arg(long, default_value_t = std::env::consts::ARCH.to_string(), hide_default_value = true)]
@@ -1372,7 +1372,7 @@ mod tests {
             "/tmp/pkg",
             "--project",
             "home:foo",
-            "--repo",
+            "--repository",
             "standard",
         ]) {
             LocalBuildCommand::Build {
@@ -1408,7 +1408,7 @@ mod tests {
             "/tmp/pkg",
             "--project",
             "home:foo",
-            "--repo",
+            "--repository",
             "standard",
             "--arch",
             "x86_64",
@@ -1449,13 +1449,13 @@ mod tests {
             "/tmp/pkg",
             "--project",
             "home:foo",
-            "--repo",
+            "--repository",
             "standard",
             "--alternative-project",
             "openSUSE:Factory",
             "--root",
             "/tmp/custom-root",
-            "--noinit",
+            "--no-init",
             "--preinstall-image",
             "--keep-rpms",
             "/tmp/keep",
@@ -1487,7 +1487,7 @@ mod tests {
             "/tmp/pkg",
             "--project",
             "home:foo",
-            "--repo",
+            "--repository",
             "standard",
             "-k",
             "/tmp/keep",
@@ -1626,7 +1626,7 @@ mod tests {
             "/tmp/pkg",
             "--project",
             "home:foo",
-            "--repo",
+            "--repository",
             "standard",
         ]) {
             LocalBuildCommand::Chroot {
@@ -1653,7 +1653,7 @@ mod tests {
             "/tmp/pkg",
             "--project",
             "home:foo",
-            "--repo",
+            "--repository",
             "standard",
             "--arch",
             "x86_64",
@@ -2621,5 +2621,45 @@ mod tests {
         assert_eq!(payload["tail"], 50);
         assert_eq!(payload["full"], true);
         assert!(!text.contains("truncated"));
+    }
+
+    #[test]
+    fn old_flag_spellings_still_parse() {
+        match parse(&[
+            "geectl",
+            "local-build",
+            "build",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+            "--repo",
+            "standard",
+            "--noinit",
+        ]) {
+            LocalBuildCommand::Build {
+                project,
+                repo,
+                noinit,
+                ..
+            } => {
+                assert_eq!(project, "home:foo");
+                assert_eq!(repo, "standard");
+                assert!(noinit);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&[
+            "geectl",
+            "local-build",
+            "chroot",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+            "--repo",
+            "standard",
+        ]) {
+            LocalBuildCommand::Chroot { repo, .. } => assert_eq!(repo, "standard"),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

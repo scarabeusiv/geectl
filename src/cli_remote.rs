@@ -668,7 +668,7 @@ pub enum RemoteCommand {
         force: bool,
         /// A message recorded on the delete, sent as the server's
         /// `comment` query parameter.
-        #[arg(long)]
+        #[arg(long = "comment", alias = "message", value_name = "COMMENT")]
         message: Option<String>,
     },
     /// Delete a `_link` file from a package. A mutation: dry-run is
@@ -820,7 +820,7 @@ pub enum RemoteCommand {
         /// query parameter. A project lock records it; a package
         /// lock sends it but the server does not record it — there
         /// is no package-scope lock command.
-        #[arg(long)]
+        #[arg(long = "comment", alias = "message", value_name = "COMMENT")]
         message: Option<String>,
     },
     /// Unlock a project or a package. A mutation: dry-run is the
@@ -834,7 +834,7 @@ pub enum RemoteCommand {
         package: Option<String>,
         /// A message recorded on the unlock, sent as the server's
         /// `comment` query parameter.
-        #[arg(long)]
+        #[arg(long = "comment", alias = "message", value_name = "COMMENT")]
         message: String,
     },
     /// Add the channels defined for a project or a package. A
@@ -5645,7 +5645,7 @@ mod tests {
             "delete-package",
             "P",
             "K",
-            "--message",
+            "--comment",
             "cleanup",
         ]);
         assert!(matches!(
@@ -7245,7 +7245,7 @@ mod tests {
             "lock",
             "P",
             "K",
-            "--message",
+            "--comment",
             "freeze for release",
         ]);
         assert!(matches!(
@@ -7304,7 +7304,7 @@ mod tests {
             "unlock",
             "P",
             "K",
-            "--message",
+            "--comment",
             "release done",
         ]);
         assert!(matches!(
@@ -8927,5 +8927,33 @@ mod tests {
             assert!(text.contains(field), "search text misses {field}:\n{text}");
         }
         assert!(!text.contains("A very long description"));
+    }
+
+    #[test]
+    fn old_message_spelling_still_parses() {
+        match parse(&[
+            "geectl",
+            "remote",
+            "delete-package",
+            "P",
+            "K",
+            "--message",
+            "gone",
+        ]) {
+            RemoteCommand::DeletePackage { message, .. } => {
+                assert_eq!(message.as_deref(), Some("gone"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&["geectl", "remote", "lock", "P", "--message", "freeze"]) {
+            RemoteCommand::Lock { message, .. } => {
+                assert_eq!(message.as_deref(), Some("freeze"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&["geectl", "remote", "unlock", "P", "--message", "done"]) {
+            RemoteCommand::Unlock { message, .. } => assert_eq!(message, "done"),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

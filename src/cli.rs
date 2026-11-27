@@ -212,10 +212,23 @@ pub enum Command {
         /// The commit message.
         #[arg(long, short)]
         message: String,
-        /// Skip the service gate (source services and
-        /// `pre_checkin.sh`).
-        #[arg(long)]
+        /// Skip the local service gate and the server-side
+        /// services: the combined shorthand for
+        /// `--no-local-services` and `--no-server-services`.
+        #[arg(long = "no-service", alias = "noservice")]
         noservice: bool,
+        /// Skip the local service gate (source services and
+        /// `pre_checkin.sh`) only; the server still runs its
+        /// services for the commit.
+        #[arg(long)]
+        no_local_services: bool,
+        /// Skip the server-side services for the commit only
+        /// (`noservice=1` on the commit); the local service gate
+        /// still runs. OBS-native commits only: a git-backed
+        /// commit has no server-side services switch, so the
+        /// flag has no effect there.
+        #[arg(long)]
+        no_server_services: bool,
     },
     /// Pull a linked package to the link target's latest revision.
     Pull,
@@ -271,4 +284,21 @@ pub enum ConfigCommand {
 /// generator.
 pub fn cli_command() -> clap::Command {
     Cli::command()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_accepts_the_old_no_service_spelling() {
+        let cli = Cli::parse_from(["geectl", "commit", "--message", "x", "--noservice"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Commit {
+                noservice: true,
+                ..
+            })
+        ));
+    }
 }

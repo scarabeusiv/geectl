@@ -193,7 +193,7 @@ pub struct BuildRequest {
     /// instead of `project`. The root and sccache stay keyed by
     /// `project`: the root is local state, and the engine
     /// reinstalls the dep set from the fresh rpmlist on every
-    /// non-`--noinit` build.
+    /// non-`--no-init` build.
     pub alternative_project: Option<String>,
     /// A build root of its own, instead of the derived cache-dir
     /// root. Parallel builds of the same package do not share one.
@@ -1070,37 +1070,37 @@ pub fn validate_build_request(req: &BuildRequest) -> Result<(), GeectlError> {
             ),
         ));
     }
-    // `--clean` wipes the root `--noinit` needs to build in.
+    // `--clean` wipes the root `--no-init` needs to build in.
     if req.clean && req.noinit {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "--clean and --noinit conflict: a wiped root has nothing to build in without initialization",
+            "--clean and --no-init conflict: a wiped root has nothing to build in without initialization",
         ));
     }
-    // `--noinit` installs nothing, so `--prefer-packages` would be
+    // `--no-init` installs nothing, so `--prefer-packages` would be
     // a silent no-op: refuse the combination instead.
     if req.noinit && req.prefer_packages.is_some() {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "--noinit and --prefer-packages conflict: no deps are installed without initialization",
+            "--no-init and --prefer-packages conflict: no deps are installed without initialization",
         ));
     }
-    // `--noinit` installs nothing, so `--preinstall-image` would be
+    // `--no-init` installs nothing, so `--preinstall-image` would be
     // a silent no-op: refuse the combination instead.
     if req.noinit && req.preinstall_image {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "--noinit and --preinstall-image conflict: no deps are installed without initialization",
+            "--no-init and --preinstall-image conflict: no deps are installed without initialization",
         ));
     }
-    // `--noinit` builds in the existing root: the default rootless
+    // `--no-init` builds in the existing root: the default rootless
     // container discards its root with the container, so there is
     // no existing root to build in — pass `--privileged` to build
     // in a preserved root.
     if req.noinit && !req.privileged {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "--noinit needs a preserved root: the default rootless container discards its root — pass --privileged to build in a preserved root",
+            "--no-init needs a preserved root: the default rootless container discards its root — pass --privileged to build in a preserved root",
         ));
     }
     // `--privileged` is refused on macOS: the privileged shape
@@ -1357,7 +1357,7 @@ impl<'a> LocalBuild<'a> {
             });
         }
 
-        // `--noinit` builds in the existing root without installing
+        // `--no-init` builds in the existing root without installing
         // anything: it needs the rpmlist and buildconfig a previous
         // build wrote there (the existing tool refuses the same way
         // when no local buildinfo/buildconfig file exists). The check
@@ -1370,7 +1370,7 @@ impl<'a> LocalBuild<'a> {
                     return Err(GeectlError::new(
                         ErrorKind::InvalidInput,
                         format!(
-                            "--noinit needs an initialized root: {} is missing; run a normal build first",
+                            "--no-init needs an initialized root: {} is missing; run a normal build first",
                             root.join(file).display()
                         ),
                     ));
@@ -1501,11 +1501,11 @@ impl<'a> LocalBuild<'a> {
 
         // The deps go into the pkg cache, hdrmd5-verified on every
         // use, then the rpmlist names them for the engine.
-        // `--noinit` skips that: the engine installs nothing, so
+        // `--no-init` skips that: the engine installs nothing, so
         // the root's existing rpmlist and buildconfig (checked
         // above) are reused as-is and nothing is downloaded.
         // sccache is resolved in prepare_deps (normal path) or read
-        // from the reused rpmlist (`--noinit`, where the engine
+        // from the reused rpmlist (`--no-init`, where the engine
         // installs nothing and sccache is used only when the root
         // already carries it).
         let (cache, used_preinstall, sccache) = if req.noinit {
@@ -2763,8 +2763,8 @@ impl<'a> LocalBuild<'a> {
     /// optimization, and a bad image must never fail a build whose
     /// deps are fine. A root whose init already ran and the
     /// `_preinstallimage` package itself never select an image; a
-    /// `--noinit` build never reaches here (`prepare_deps` is
-    /// skipped under `--noinit`).
+    /// `--no-init` build never reaches here (`prepare_deps` is
+    /// skipped under `--no-init`).
     fn prepare_preinstall_image(
         &self,
         req: &BuildRequest,
@@ -5757,7 +5757,7 @@ fn rpm_package_name(filename: &str) -> Option<String> {
 /// Whether an rpmlist names sccache for the engine: a line
 /// starting with `sccache ` (the package name, a space, and the
 /// cached file path). An image-covered sccache leaves no such
-/// line (the image lines carry it), so a `--noinit` re-run in
+/// line (the image lines carry it), so a `--no-init` re-run in
 /// that case builds without sccache — correct, just uncached.
 /// Only the rpmlist's own entry is reported.
 fn rpmlist_has_sccache(rpmlist: &str) -> bool {
@@ -10847,7 +10847,7 @@ exit 0
             req.noinit = true;
             let err = validate_build_request(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
-            assert!(err.to_string().contains("--clean and --noinit conflict"));
+            assert!(err.to_string().contains("--clean and --no-init conflict"));
         }
 
         #[test]
@@ -10861,7 +10861,7 @@ exit 0
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(err
                 .to_string()
-                .contains("--noinit and --preinstall-image conflict"));
+                .contains("--no-init and --preinstall-image conflict"));
         }
 
         #[test]
@@ -10872,7 +10872,7 @@ exit 0
             req.noinit = true;
             let err = validate_build_request(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
-            assert!(err.to_string().contains("--noinit needs a preserved root"));
+            assert!(err.to_string().contains("--no-init needs a preserved root"));
         }
 
         #[test]
@@ -11041,7 +11041,7 @@ exit 0
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(err
                 .to_string()
-                .contains("--noinit and --prefer-packages conflict"));
+                .contains("--no-init and --prefer-packages conflict"));
         }
 
         #[test]
@@ -11209,7 +11209,7 @@ exit 0
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(err
                 .to_string()
-                .contains("--noinit needs an initialized root"));
+                .contains("--no-init needs an initialized root"));
             assert!(setup.http.get_calls().is_empty());
             // The refusal fires before the root is created.
             assert!(!root.exists());

@@ -116,11 +116,11 @@ pub enum BuildCommand {
         #[arg(long, allow_hyphen_values = true)]
         start: Option<i64>,
         /// The last build's log instead of the current one. Cannot
-        /// combine with `--lastsucceeded`.
+        /// combine with `--last-succeeded`.
         #[arg(long, conflicts_with = "lastsucceeded")]
         last: bool,
         /// The last succeeded build's log. Cannot combine with `--last`.
-        #[arg(long)]
+        #[arg(long = "last-succeeded", alias = "lastsucceeded")]
         lastsucceeded: bool,
         /// Only this multibuild flavor's log: appends `:FLAVOR` to
         /// the package. Refused when the package already carries a
@@ -414,10 +414,10 @@ pub struct ResultsQueryArgs {
     #[arg(long)]
     multibuild: bool,
     /// Follow local links when expanding multibuild flavors.
-    #[arg(long)]
+    #[arg(long = "local-link", alias = "locallink")]
     locallink: bool,
     /// The last build's results instead of the current state.
-    #[arg(long)]
+    #[arg(long = "last-build", alias = "lastbuild")]
     lastbuild: bool,
 }
 
@@ -4592,7 +4592,7 @@ mod tests {
             "a",
             "--start",
             "-5",
-            "--lastsucceeded",
+            "--last-succeeded",
         ]) {
             BuildCommand::BuildLog {
                 start,
@@ -4601,6 +4601,21 @@ mod tests {
             } => {
                 assert_eq!(start, Some(-5));
                 assert!(lastsucceeded);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_old_flag_spellings_still_parse() {
+        match parse_build(&["build-log", "p", "k", "r", "a", "--lastsucceeded"]) {
+            BuildCommand::BuildLog { lastsucceeded, .. } => assert!(lastsucceeded),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse_build(&["results", "openSUSE:Factory", "--lastbuild", "--locallink"]) {
+            BuildCommand::Results { query, .. } => {
+                assert!(query.lastbuild);
+                assert!(query.locallink);
             }
             other => panic!("unexpected: {other:?}"),
         }

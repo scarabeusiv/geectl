@@ -123,9 +123,20 @@ fn run(
         Some(Command::Add { files }) => geectl::cli_working_copy::add(&files, debug, cli.live)?,
         Some(Command::Rm { files }) => geectl::cli_working_copy::rm(&files, debug, cli.live)?,
         Some(Command::Addremove) => geectl::cli_working_copy::addremove(debug, cli.live)?,
-        Some(Command::Commit { message, noservice }) => {
-            geectl::cli_working_copy::commit(&message, noservice, debug, cli.live, instance)?
-        }
+        Some(Command::Commit {
+            message,
+            noservice,
+            no_local_services,
+            no_server_services,
+        }) => geectl::cli_working_copy::commit(
+            &message,
+            noservice,
+            no_local_services,
+            no_server_services,
+            debug,
+            cli.live,
+            instance,
+        )?,
         Some(Command::Pull) => geectl::cli_working_copy::pull(debug, cli.live, instance)?,
         Some(Command::Resolve) => geectl::cli_working_copy::resolve(debug, cli.live)?,
         Some(Command::Prjconf { command }) => {

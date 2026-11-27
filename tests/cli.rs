@@ -3670,7 +3670,7 @@ fn remote_unlock_live_with_half_set_credentials_fails_with_config_error() {
             "remote",
             "unlock",
             "openSUSE:Factory",
-            "--message",
+            "--comment",
             "unlocking",
         ])
         .env("GEECTL_OBS_USERNAME", "alice")
@@ -4731,7 +4731,7 @@ fn remote_lock_dry_run_ignores_half_set_credentials() {
             "lock",
             "openSUSE:Factory",
             "vim",
-            "--message",
+            "--comment",
             "freeze for release",
         ])
         .env("GEECTL_OBS_USERNAME", "alice")
@@ -4785,7 +4785,7 @@ fn remote_unlock_dry_run_ignores_half_set_credentials() {
             "unlock",
             "openSUSE:Factory",
             "vim",
-            "--message",
+            "--comment",
             "release done",
         ])
         .env("GEECTL_OBS_USERNAME", "alice")
@@ -4815,7 +4815,7 @@ fn remote_unlock_empty_message_fails_with_invalid_input() {
     // promise an unlock the server would refuse.
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
-        .args(["remote", "unlock", "openSUSE:Factory", "--message", ""])
+        .args(["remote", "unlock", "openSUSE:Factory", "--comment", ""])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
@@ -5695,7 +5695,7 @@ fn copy_package_to_apiurl_dry_run() {
             "test:target",
             "--target-package",
             "foo",
-            "--to-apiurl",
+            "--to-api-url",
             "http://127.0.0.1:3000",
         ],
     );
@@ -5959,7 +5959,7 @@ fn copy_package_to_apiurl_rejects_a_malformed_url_in_dry_run() {
             "test:target",
             "--target-package",
             "foo",
-            "--to-apiurl",
+            "--to-api-url",
             "notaurl",
         ])
         .output()
@@ -5989,7 +5989,7 @@ fn copy_package_to_apiurl_dry_run_text_echoes_the_target_instance() {
             "test:target",
             "--target-package",
             "foo",
-            "--to-apiurl",
+            "--to-api-url",
             "http://127.0.0.1:3000",
         ])
         .output()
@@ -9300,14 +9300,14 @@ fn build_log_last_and_lastsucceeded_conflict() {
             "standard",
             "x86_64",
             "--last",
-            "--lastsucceeded",
+            "--last-succeeded",
         ])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("lastsucceeded"),
+        String::from_utf8_lossy(&out.stderr).contains("last-succeeded"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -9767,7 +9767,7 @@ fn local_build_chroot_dry_run_reads_commands_from_stdin() {
             source.to_str().unwrap(),
             "--project",
             "testproject",
-            "--repo",
+            "--repository",
             "standard",
         ])
         .stdin(std::process::Stdio::piped())
@@ -9815,7 +9815,7 @@ fn copy_package_to_apiurl_with_plain_credentials_fails_clearly() {
             "test:target",
             "--target-package",
             "foo",
-            "--to-apiurl",
+            "--to-api-url",
             "http://127.0.0.1:3000",
         ])
         .env("GEECTL_OBS_USERNAME", "plain-user")
@@ -9864,7 +9864,7 @@ fn copy_package_to_apiurl_with_alias_defined_but_unset_names_the_alias_vars() {
             "test:target",
             "--target-package",
             "foo",
-            "--to-apiurl",
+            "--to-api-url",
             "http://127.0.0.1:3000",
         ])
         .env("GEECTL_OBS_USERNAME", "plain-user")
@@ -9913,7 +9913,7 @@ fn copy_package_to_apiurl_with_alias_credentials_dry_runs() {
             "test:target",
             "--target-package",
             "foo",
-            "--to-apiurl",
+            "--to-api-url",
             "http://127.0.0.1:3000",
         ])
         .env("GEECTL_OBS_USERNAME_TARGET", "target-user")
@@ -9950,7 +9950,7 @@ fn copy_package_to_apiurl_same_instance_refuses() {
             "test:target",
             "--target-package",
             "foo",
-            "--to-apiurl",
+            "--to-api-url",
             "https://api.opensuse.org",
         ])
         .output()
@@ -9963,7 +9963,7 @@ fn copy_package_to_apiurl_same_instance_refuses() {
         value["error"]["context"]
             .as_str()
             .unwrap()
-            .contains("omit --to-apiurl"),
+            .contains("omit --to-api-url"),
         "{}",
         value["error"]["context"]
     );

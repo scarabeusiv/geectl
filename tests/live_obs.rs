@@ -97,6 +97,7 @@ use geectl::pull_request::{
     OpinionState, PullRequestClient, PullRequestRef, PullRequestStatus, SubmitTarget,
 };
 use geectl::working_copy;
+use geectl::working_copy::ServiceSkips;
 
 /// A temp dir under the system temp dir, removed on drop. The name
 /// carries the same unique suffix as the live projects, so parallel
@@ -8257,7 +8258,7 @@ fn live_working_copy_checkout_edit_commit_update() {
         &client,
         &Config::default(),
         "Update to version 2",
-        false,
+        ServiceSkips::none(),
         None,
         &DryRun::new(false),
     )
@@ -8334,7 +8335,7 @@ fn live_working_copy_submit_files_a_request() {
         &client,
         &Config::default(),
         "Update to version 2",
-        false,
+        ServiceSkips::none(),
         None,
         &DryRun::new(false),
     )
@@ -8407,7 +8408,7 @@ fn live_pull_request_submit_cli_files_a_request() {
         &client,
         &Config::default(),
         "Update to version 2",
-        false,
+        ServiceSkips::none(),
         None,
         &DryRun::new(false),
     )

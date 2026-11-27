@@ -253,7 +253,12 @@ pub struct ReviewActArgs {
     reference: String,
     /// The message left with the review. Values starting with `-`
     /// are taken literally: a message may open with a `- ` bullet.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(
+        long = "comment",
+        alias = "message",
+        value_name = "COMMENT",
+        allow_hyphen_values = true
+    )]
     message: Option<String>,
     /// Pin the review to this head commit (Gitea only): the
     /// review is recorded against it server-side, and is refused
@@ -285,7 +290,12 @@ pub struct CommentArgs {
     reference: String,
     /// The comment text. Values starting with `-` are taken
     /// literally: the body may open with a `- ` bullet.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(
+        long = "comment",
+        alias = "body",
+        value_name = "COMMENT",
+        allow_hyphen_values = true
+    )]
     body: String,
     /// The comment being replied to, when this is a reply (OBS
     /// only; refused on a Gitea ref).
@@ -319,7 +329,12 @@ pub struct MergeArgs {
     reference: String,
     /// The message left with the merge. Values starting with `-`
     /// are taken literally: a message may open with a `- ` bullet.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(
+        long = "comment",
+        alias = "message",
+        value_name = "COMMENT",
+        allow_hyphen_values = true
+    )]
     message: Option<String>,
     /// The changes entry for the forwarded request, overriding
     /// the original description on the OBS arm and the pull
@@ -351,7 +366,12 @@ pub struct LevelCommentArgs {
     /// The reason for the decline or withdrawal. Values starting
     /// with `-` are taken literally: a message may open with a
     /// `- ` bullet.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(
+        long = "comment",
+        alias = "message",
+        value_name = "COMMENT",
+        allow_hyphen_values = true
+    )]
     message: Option<String>,
 }
 
@@ -4593,5 +4613,57 @@ mod tests {
             let err = parse_gitea_full_name(malformed, "gitea:pool/systemd#7").unwrap_err();
             assert_eq!(err.kind(), ErrorKind::ServerError, "{malformed}: {err}");
         }
+    }
+
+    #[test]
+    fn old_comment_spellings_still_parse() {
+        use clap::FromArgMatches;
+        let command = PullRequestCommand::augment_subcommands(clap::Command::new("pull-request"));
+        let matches = command
+            .clone()
+            .try_get_matches_from(["pull-request", "merge", "obs:1", "--message", "done"])
+            .unwrap();
+        assert!(matches!(
+            PullRequestCommand::from_arg_matches(&matches).unwrap(),
+            PullRequestCommand::Merge(MergeArgs {
+                message: Some(_),
+                ..
+            })
+        ));
+        let matches = command
+            .clone()
+            .try_get_matches_from([
+                "pull-request",
+                "approve",
+                "obs:1",
+                "--message",
+                "looks good",
+            ])
+            .unwrap();
+        assert!(matches!(
+            PullRequestCommand::from_arg_matches(&matches).unwrap(),
+            PullRequestCommand::Approve(ReviewActArgs {
+                message: Some(_),
+                ..
+            })
+        ));
+        let matches = command
+            .clone()
+            .try_get_matches_from(["pull-request", "decline", "obs:1", "--message", "not yet"])
+            .unwrap();
+        assert!(matches!(
+            PullRequestCommand::from_arg_matches(&matches).unwrap(),
+            PullRequestCommand::Decline(LevelCommentArgs {
+                message: Some(_),
+                ..
+            })
+        ));
+        let matches = command
+            .try_get_matches_from(["pull-request", "comment", "obs:1", "--body", "noted"])
+            .unwrap();
+        assert!(matches!(
+            PullRequestCommand::from_arg_matches(&matches).unwrap(),
+            PullRequestCommand::Comment(CommentArgs { body, .. }) if body == "noted"
+        ));
     }
 }
