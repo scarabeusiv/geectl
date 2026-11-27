@@ -19,10 +19,11 @@
 //!
 //! Documented omissions (not gaps): `list` text carries
 //! no parameter values beyond `name=value` pairs (the full values
-//! are in the JSON payload); `state` text carries the error
-//! (multi-line server text, terminal control characters stripped)
-//! but no md5s beyond the two the state itself names. The JSON
-//! payload remains the complete record in every case.
+//! are in the JSON payload); `state` text carries the code and
+//! the error (multi-line server text, terminal control
+//! characters stripped) but no checksums: the checksums are
+//! JSON-only. The JSON payload remains the complete record in
+//! every case.
 //!
 //! Credentials in dry-run: the reads need none, but credentials
 //! resolve up front (see `docs/cli.md`) — a half-configured pair
@@ -273,23 +274,16 @@ fn render_comment(name: &str, comment: &str) -> String {
     out
 }
 
-/// The service state as `key: value` lines: the run code, the two
-/// md5s when the listing carries them, and the error when the run
-/// failed, terminal control characters stripped. The md5s are
-/// exactly 32 hex digits, validated at parse, so what renders here
-/// is a checksum, never verbatim server text. `None` means the
-/// listing carries no service state at all.
+/// The service state as `key: value` lines: the run code and
+/// the error when the run failed, terminal control characters
+/// stripped. The two checksums stay JSON-only: they are
+/// verification values, not a state a human reads. `None` means
+/// the listing carries no service state at all.
 fn render_service_state(state: &Option<ServiceState>) -> String {
     match state {
         None => "no service state".to_string(),
         Some(state) => {
             let mut lines = vec![format!("code: {}", state.code)];
-            if let Some(xsrcmd5) = &state.xsrcmd5 {
-                lines.push(format!("xsrcmd5: {xsrcmd5}"));
-            }
-            if let Some(lsrcmd5) = &state.lsrcmd5 {
-                lines.push(format!("lsrcmd5: {lsrcmd5}"));
-            }
             if let Some(error) = &state.error {
                 // Terminal control characters are stripped at the
                 // render too: this is the terminal boundary, and a
@@ -518,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn state_renders_code_md5s_and_error() {
+    fn state_text_renders_code_and_error_md5s_stay_json_only() {
         let state = ServiceState {
             code: ServiceCode::Failed,
             xsrcmd5: Some("abcd1234".to_string()),
@@ -527,7 +521,7 @@ mod tests {
         };
         let text = render_service_state(&Some(state.clone()));
         assert!(text.contains("code: failed"));
-        assert!(text.contains("xsrcmd5: abcd1234"));
+        assert!(!text.contains("xsrcmd5"));
         assert!(!text.contains("lsrcmd5"));
         assert!(text.contains("error: download failed\nsecond line"));
         let payload = service_state_json(&state);
@@ -615,8 +609,8 @@ mod tests {
 
     /// The agreement test: every identifying field the JSON payload
     /// carries — service name, mode, `name=value` parameters, and
-    /// comments; state code, md5s, and error — appears in the text
-    /// rendering.
+    /// comments; state code and error (the checksums are
+    /// JSON-only) — appears in the text rendering.
     /// The expected fields come from the payload itself, not from
     /// literals repeated from the rendering tests, so a payload field
     /// the text drops fails here.
@@ -687,13 +681,19 @@ mod tests {
             )),
             "state text misses code:\n{text}"
         );
-        for field in ["xsrcmd5", "lsrcmd5", "error"] {
-            let value = payload[field].as_str().expect("field is a string");
+        // The checksums stay JSON-only: the text carries the code
+        // and the error, never the verification values.
+        for field in ["xsrcmd5", "lsrcmd5"] {
             assert!(
-                text.contains(&format!("{field}: {value}")),
-                "state text misses {field}: {value}:\n{text}"
+                !text.contains(field),
+                "state text carries {field}, which is JSON-only:\n{text}"
             );
         }
+        let value = payload["error"].as_str().expect("error is a string");
+        assert!(
+            text.contains(&format!("error: {value}")),
+            "state text misses error: {value}:\n{text}"
+        );
     }
 
     /// The trigger agreement test: the service name, the triggered

@@ -175,7 +175,7 @@ pub enum Command {
         project: String,
         /// The OBS package. The whole project when omitted.
         package: Option<String>,
-        /// The revision to check out (a number or a source md5).
+        /// The revision to check out (a revision number or a srcmd5 (the source checksum of a revision, as `remote package-log` reports it in JSON)).
         /// The latest when omitted. Needs a package.
         #[arg(long)]
         rev: Option<String>,
@@ -183,7 +183,7 @@ pub enum Command {
     /// Update the working copy in the current directory to the
     /// latest base.
     Update {
-        /// The revision to update to (a number or a source md5).
+        /// The revision to update to (a revision number or a srcmd5 (the source checksum of a revision, as `remote package-log` reports it in JSON)).
         /// The latest when omitted.
         #[arg(long)]
         rev: Option<String>,

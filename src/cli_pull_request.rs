@@ -81,16 +81,17 @@ pub enum PullRequestCommand {
         reference: String,
     },
     /// Show the diff of a pull request: the unified diff, like
-    /// `request diff`. With `--xml` the OBS arm renders the
-    /// request XML with the diff injected; `--xml` is refused on
-    /// a Gitea pull request, which has no request XML. A read,
-    /// always live.
+    /// `request diff`. `--xml` is the OBS-only escape hatch: the
+    /// OBS arm renders the request XML with the diff injected,
+    /// and `--xml` is refused on a Gitea pull request, which has
+    /// no request XML. A read, always live.
     Diff {
         /// The pull-request handle: `obs:<id>` or
         /// `gitea:<owner>/<repo>#<number>`.
         reference: String,
         /// Render the OBS request XML with the diff injected,
-        /// instead of the bare diff. Refused on a Gitea ref.
+        /// instead of the bare diff — the OBS-only escape hatch.
+        /// Refused on a Gitea ref.
         #[arg(long)]
         xml: bool,
     },
@@ -1171,7 +1172,7 @@ fn refuse_factory_base(base: &str) -> Result<(), GeectlError> {
     if base.eq_ignore_ascii_case("factory") {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "the factory branch does not take pull requests: target the devel branch with --base instead, and file the Factory leg as an OBS submit request (`osc sr`)",
+            "the factory branch does not take pull requests: target the devel branch with --base instead, and file the Factory leg as an OBS submit request (`pull-request submit` or `request file`)",
         ));
     }
     Ok(())
@@ -4206,7 +4207,10 @@ mod tests {
                 .contains("the factory branch does not take pull requests"),
             "err: {err}"
         );
-        assert!(err.to_string().contains("osc sr"), "err: {err}");
+        assert!(
+            err.to_string().contains("pull-request submit"),
+            "err: {err}"
+        );
     }
 
     #[test]

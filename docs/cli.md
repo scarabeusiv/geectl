@@ -212,7 +212,7 @@ directory's `.env` only.
 - `geectl request log <ID>` — Show one submit request's history: creation, then each state change.
 - `geectl request search` — List the submit requests matching the filters: a typed search; key flags: --creator <CREATOR>, --reviewer <REVIEWER>, --state <STATE>, --project <PROJECT>, --package <PACKAGE>, --type <TYPES>, --since <SINCE>, --limit <LIMIT>
 - `geectl request list` — Deprecated: use `request search`. List submit requests: the same search, with the states still awaiting action (new, review) as the default; key flags: --project <PROJECT>, --package <PACKAGE>, --state <STATE>, --since <SINCE>, --limit <LIMIT>
-- `geectl request diff <ID>` — Show the diff of a submit request: the unified diff, or the request XML with the diff injected with `--xml`; key flags: --xml
+- `geectl request diff <ID>` — Show the diff of a submit request: the unified diff, or the request XML with the diff injected with `--xml` (the OBS-only escape hatch); key flags: --xml
 - `geectl request list-comments <ID>` — List the comments on a submit request, in id order; a comment on a diff carries its target, file, and line.
 - `geectl request accept <ID>` — Accept a submit request, with a comment as the message left with the accept. An accepted request is forwarded to its link parent unless `--no-forward` is given; a target without a link forwards to openSUSE:Factory when the Factory package records it as its devel; a refused forward is reported and the accepted request stands, with the work staying queued in the devel project; key flags: --comment <COMMENT>, --force, --forward-message <FORWARD_MESSAGE>, --no-forward
 - `geectl request decline <ID>` — Decline a submit request, with a comment as the reason; key flags: --comment <COMMENT>
@@ -330,7 +330,7 @@ without evaluating trust.
 ## `pull-request` — unified pull-request read and act
 
 - `geectl pull-request show <REFERENCE>` — Show one pull request: `obs:<id>` or `gitea:<owner>/<repo>#<number>`.
-- `geectl pull-request diff <REFERENCE>` — Show the diff of a pull request: the unified diff, like `request diff`; key flags: --xml
+- `geectl pull-request diff <REFERENCE>` — Show the diff of a pull request: the unified diff, like `request diff`; `--xml` is the OBS-only escape hatch; key flags: --xml
 - `geectl pull-request search` — Search pull requests: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea; key flags: --backend <BACKEND>, --state <STATE>, --creator <CREATOR>, --reviewer <REVIEWER>, --repo <REPO>
 - `geectl pull-request approve <REFERENCE>` — Approve a pull request as the review asked of the target: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea); key flags: --comment <COMMENT>, --commit <COMMIT>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
 - `geectl pull-request request-changes <REFERENCE>` — Ask for changes on a pull request, as `approve` but with the review declined instead of accepted; key flags: --comment <COMMENT>, --commit <COMMIT>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>

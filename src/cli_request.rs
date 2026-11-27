@@ -177,12 +177,13 @@ pub enum RequestCommand {
         limit: Option<usize>,
     },
     /// Show the diff of a submit request: the unified diff, or the
-    /// request XML with the diff injected with `--xml`.
+    /// request XML with the diff injected with `--xml` — the
+    /// OBS-only escape hatch.
     Diff {
         /// The request id.
         id: String,
         /// Render the request XML with the diff injected, instead of
-        /// the unified diff.
+        /// the unified diff — the OBS-only escape hatch.
         #[arg(long)]
         xml: bool,
     },

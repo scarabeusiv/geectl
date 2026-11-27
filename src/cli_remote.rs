@@ -116,7 +116,7 @@ pub enum RemoteCommand {
         /// The file to print.
         file: String,
         /// Print the file as of this revision (default: latest):
-        /// a revision number or a srcmd5.
+        /// a revision number or a srcmd5 (the source checksum of a revision, as `remote package-log` reports it in JSON).
         #[arg(long)]
         rev: Option<String>,
     },
@@ -133,8 +133,8 @@ pub enum RemoteCommand {
         package: String,
         /// The file to download.
         file: String,
-        /// Download the file as of this revision: a revision number
-        /// or a srcmd5 (default: latest).
+        /// Download the file as of this revision (default: latest):
+        /// a revision number or a srcmd5 (the source checksum of a revision, as `remote package-log` reports it in JSON).
         #[arg(long)]
         rev: Option<String>,
         /// Where to write the downloaded bytes.
@@ -148,7 +148,7 @@ pub enum RemoteCommand {
         /// The package to list.
         package: String,
         /// List the files as of this revision (default: latest):
-        /// a revision number or a srcmd5.
+        /// a revision number or a srcmd5 (the source checksum of a revision, as `remote package-log` reports it in JSON).
         #[arg(long)]
         rev: Option<String>,
         /// Include files from deleted revisions in the listing: the
@@ -198,7 +198,7 @@ pub enum RemoteCommand {
         /// The package to show the history of.
         package: String,
         /// Only entries in this revision range (`FROM:TO`, either side
-        /// may be empty; a side is a revision number or a srcmd5).
+        /// may be empty; a side is a revision number or a srcmd5 (the source checksum of a revision, as `remote package-log` reports it in JSON)).
         #[arg(long)]
         range: Option<String>,
         /// At most this many entries.
@@ -666,8 +666,7 @@ pub enum RemoteCommand {
         /// Delete even when open submit requests involve the package.
         #[arg(long)]
         force: bool,
-        /// A message recorded on the delete, sent as the server's
-        /// `comment` query parameter.
+        /// A message recorded on the delete.
         #[arg(long = "comment", alias = "message", value_name = "COMMENT")]
         message: Option<String>,
     },
@@ -816,10 +815,9 @@ pub enum RemoteCommand {
         project: String,
         /// The package to lock. Omit to lock the whole project.
         package: Option<String>,
-        /// A message for the lock, sent as the server's `comment`
-        /// query parameter. A project lock records it; a package
-        /// lock sends it but the server does not record it — there
-        /// is no package-scope lock command.
+        /// A message for the lock. A project lock records it; a
+        /// package lock's message is not recorded — there is no
+        /// package-scope lock command.
         #[arg(long = "comment", alias = "message", value_name = "COMMENT")]
         message: Option<String>,
     },
@@ -832,8 +830,7 @@ pub enum RemoteCommand {
         project: String,
         /// The package to unlock. Omit to unlock the whole project.
         package: Option<String>,
-        /// A message recorded on the unlock, sent as the server's
-        /// `comment` query parameter.
+        /// A message recorded on the unlock.
         #[arg(long = "comment", alias = "message", value_name = "COMMENT")]
         message: String,
     },

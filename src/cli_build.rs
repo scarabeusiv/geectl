@@ -71,9 +71,9 @@ pub enum BuildCommand {
         /// The build-results query filters.
         #[command(flatten)]
         query: ResultsQueryArgs,
-        /// Poll for changes since this state hash (from a previous
-        /// run). Only `results` takes it: `wait-for-results` polls
-        /// plainly.
+        /// Poll for changes since this state hash — a polling
+        /// token from a previous `results` run's payload. Only
+        /// `results` takes it: `wait-for-results` polls plainly.
         #[arg(long)]
         oldstate: Option<String>,
         /// Merge the results from every configured instance into
@@ -102,8 +102,8 @@ pub enum BuildCommand {
         /// which case the other coordinates are omitted. The URL
         /// form takes an API log URL
         /// (`http(s)://<api-host>/build/<project>/<repository>/<arch>/<package>/_log`)
-        /// or a web-UI log URL
-        /// (`http(s)://build.opensuse.org/package/live_build_log/<project>/<package>/<repository>/<arch>`).
+        /// or a web-UI live-build-log URL
+        /// (`http(s)://<web-host>/package/live_build_log/<project>/<package>/<repository>/<arch>`).
         project: String,
         /// The package to read the log for. Omit with a URL.
         package: Option<String>,

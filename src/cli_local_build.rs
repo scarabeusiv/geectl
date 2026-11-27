@@ -167,17 +167,14 @@ pub enum LocalBuildCommand {
         #[arg(long = "no-init", alias = "noinit")]
         noinit: bool,
         /// Use the preinstall image when the buildinfo offers one.
-        /// Off by default: the engine extracts the image with
-        /// bsdtar `--chroot` plus device nodes, which need root.
-        /// The engine always runs as container root, so the image
-        /// is always selectable.
+        /// Off by default: extracting the image needs root. The
+        /// engine always runs as container root, so the image is
+        /// always selectable.
         #[arg(long)]
         preinstall_image: bool,
-        /// Run the build container privileged (the engine's own
-        /// privileged podman mode, like upstream's
-        /// `VM_TYPE_PRIVILEGED` opt-in): the default is rootless,
-        /// with a cap list only and the build root inside the
-        /// disposable container.
+        /// Run the build container privileged: the default is
+        /// rootless, with a cap list only and the build root inside
+        /// the disposable container.
         #[arg(long)]
         privileged: bool,
         /// Save the built RPMs into this directory (created when
