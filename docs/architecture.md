@@ -62,6 +62,21 @@ things (an OBS project listing vs a Gitea repo listing;
 `gitea maintainers` reads the repo's `_maintainership.json`),
 so a shared name would hide the difference.
 
+## Pull-request handles
+
+The unified pull-request surface addresses a pull request
+with one text form, and the prefix is the scheme — not a
+convention: `obs:<id>` for an OBS submit request,
+`gitea:<owner>/<repo>#<number>` for a Gitea pull request.
+`PullRequestRef` parses it (`Display`/`FromStr` round-trip)
+and carries the backend as the variant, never as a string the
+consumer parses; a bare id or any other form is an invalid
+input naming the handle. The search leaves scope with
+`--backend obs|gitea` instead of a handle: with no
+`--backend` both arms run, OBS first then Gitea, and the
+reference column of the search table prints the handle in
+this form. Errors name the backend the handle selected.
+
 ## The error store (`src/error.rs`)
 
 Every error geectl can produce is defined in one place: `ErrorKind`, with
