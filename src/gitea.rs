@@ -5484,6 +5484,12 @@ mod tests {
         )
     }
 
+    /// Fifty issue-search items, numbered `0` ... `49` — the full
+    /// page the pagination tests fill.
+    fn fifty_issues() -> Vec<String> {
+        (0..50).map(|n| issue_json(n, "open", false)).collect()
+    }
+
     /// A review JSON body, shaped like Gitea 1.24.7 answers.
     fn review_json(login: &str, state: &str, body: &str) -> String {
         format!(
@@ -6892,6 +6898,31 @@ mod tests {
             .pr_search_scoped(GiteaPullRequestState::Closed, None, None)
             .unwrap();
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn pr_search_reads_past_the_500_bound() {
+        // Ten full pages (500 issues) and page 11 still has one
+        // more: the instance-wide search cannot be narrowed per
+        // repo, so it reads past the bound and returns the full
+        // list — the same full list the OBS arm returns.
+        let page = format!("[{}]", fifty_issues().join(","));
+        let mut http = FakeHttp::new();
+        for n in 1..=10 {
+            http = http.with_get(
+                &format!("https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&page={n}&limit=50"),
+                &page,
+            );
+        }
+        http = http.with_get(
+            "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&page=11&limit=50",
+            &format!("[{}]", issue_json(500, "open", false)),
+        );
+        let items = client(&http)
+            .pr_search(GiteaPullRequestState::Open)
+            .unwrap();
+        assert_eq!(items.len(), 501);
+        assert_eq!(items[500].number, 500);
     }
 
     /// A user-search JSON body, shaped like Gitea 1.24.7 answers
