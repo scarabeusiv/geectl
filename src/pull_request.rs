@@ -1817,10 +1817,11 @@ impl<'a> PullRequestClient<'a> {
 
     /// Decline a pull request. On OBS this changes the request
     /// state to declined; on Gitea it closes the pull request —
-    /// Gitea has no declined state, so the close is the whole act
-    /// and the reason is posted as an issue comment first, when
-    /// one was given, so it stays visible. Returns the unified
-    /// status after the decline, or `None` in dry-run.
+    /// Gitea has no declined state, so the close is the whole act,
+    /// and the outcome is recorded in the posted comment
+    /// (`Declined: <reason>`, or `Declined.` when no reason was
+    /// given), so it stays recoverable after the fact. Returns the
+    /// unified status after the decline, or `None` in dry-run.
     pub fn decline(
         &self,
         reference: &PullRequestRef,
@@ -1838,7 +1839,7 @@ impl<'a> PullRequestClient<'a> {
                 repo,
                 number,
             } => {
-                self.close_gitea(owner, repo, *number, comment, dry_run)?;
+                self.close_gitea(owner, repo, *number, "Declined", comment, dry_run)?;
                 self.status_after_act(reference, dry_run)
             }
         }
@@ -1847,9 +1848,11 @@ impl<'a> PullRequestClient<'a> {
     /// Withdraw a pull request. On OBS this revokes the request —
     /// the creator's withdrawal; on Gitea it closes the pull
     /// request, like `decline`: Gitea has no withdrawn state, so
-    /// the close is the whole act and the reason is posted as an
-    /// issue comment first, when one was given. Returns the
-    /// unified status after the withdrawal, or `None` in dry-run.
+    /// the close is the whole act, and the outcome is recorded in
+    /// the posted comment (`Withdrawn: <reason>`, or `Withdrawn.`
+    /// when no reason was given), so it stays recoverable after
+    /// the fact. Returns the unified status after the withdrawal,
+    /// or `None` in dry-run.
     pub fn withdraw(
         &self,
         reference: &PullRequestRef,
@@ -1867,7 +1870,7 @@ impl<'a> PullRequestClient<'a> {
                 repo,
                 number,
             } => {
-                self.close_gitea(owner, repo, *number, comment, dry_run)?;
+                self.close_gitea(owner, repo, *number, "Withdrawn", comment, dry_run)?;
                 self.status_after_act(reference, dry_run)
             }
         }
@@ -1972,21 +1975,28 @@ impl<'a> PullRequestClient<'a> {
         Ok(Some(self.show(reference)?.status))
     }
 
-    /// Close a Gitea pull request, posting `comment` as an issue
-    /// comment first when one was given: the close carries no
-    /// reason of its own.
+    /// Close a Gitea pull request, recording which close it is
+    /// in the posted comment: the close carries no reason of its
+    /// own, and Gitea has no declined/withdrawn state, so the
+    /// outcome is written in parseable form — `{outcome}:
+    /// <reason>`, the outcome alone when no reason was given —
+    /// and stays recoverable from the issue comments after the
+    /// fact.
     fn close_gitea(
         &self,
         owner: &str,
         repo: &str,
         number: u64,
+        outcome: &str,
         comment: Option<&str>,
         dry_run: &DryRun,
     ) -> Result<Option<GiteaIssue>, GeectlError> {
         let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
-        if let Some(comment) = comment.filter(|comment| !comment.is_empty()) {
-            gitea.pr_comment_add(owner, repo, number, comment, dry_run)?;
-        }
+        let body = match comment.filter(|comment| !comment.is_empty()) {
+            Some(reason) => format!("{outcome}: {reason}"),
+            None => format!("{outcome}."),
+        };
+        gitea.pr_comment_add(owner, repo, number, &body, dry_run)?;
         gitea.pr_close(owner, repo, number, dry_run)
     }
 
@@ -4991,7 +5001,7 @@ please fix this</comment></comments>"#,
         let http = FakeHttp::new()
             .with_post(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
-                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Declined: Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
             )
             .with_patch(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
@@ -5013,7 +5023,7 @@ please fix this</comment></comments>"#,
         assert_eq!(status, PullRequestStatus::Closed);
         let posts = http.post_calls();
         assert_eq!(posts.len(), 1);
-        assert_eq!(posts[0].1, r#"{"body":"Not now."}"#);
+        assert_eq!(posts[0].1, r#"{"body":"Declined: Not now."}"#);
         let patches = http.patch_calls();
         assert_eq!(patches.len(), 1);
         assert_eq!(patches[0].1, r#"{"state":"closed"}"#);
@@ -5045,8 +5055,12 @@ please fix this</comment></comments>"#,
     }
 
     #[test]
-    fn decline_gitea_without_a_comment_only_closes() {
+    fn decline_gitea_without_a_comment_posts_the_outcome() {
         let http = FakeHttp::new()
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Declined.", "created_at": "2026-11-22T19:52:58Z"}"#,
+            )
             .with_patch(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
                 &issue_json(122, "closed", false, "scarabeusiv"),
@@ -5065,7 +5079,9 @@ please fix this</comment></comments>"#,
             .unwrap()
             .unwrap();
         assert_eq!(status, PullRequestStatus::Closed);
-        assert!(http.post_calls().is_empty());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, r#"{"body":"Declined."}"#);
         assert_eq!(http.patch_calls().len(), 1);
     }
 
@@ -5074,7 +5090,7 @@ please fix this</comment></comments>"#,
         let http = FakeHttp::new()
             .with_post(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
-                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Declined: Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
             )
             .with_patch(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
@@ -5121,8 +5137,12 @@ please fix this</comment></comments>"#,
     }
 
     #[test]
-    fn withdraw_gitea_closes_and_re_reads_closed() {
+    fn withdraw_gitea_posts_the_outcome_then_closes_and_re_reads_closed() {
         let http = FakeHttp::new()
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Withdrawn.", "created_at": "2026-11-22T19:52:58Z"}"#,
+            )
             .with_patch(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
                 &issue_json(122, "closed", false, "scarabeusiv"),
@@ -5141,7 +5161,9 @@ please fix this</comment></comments>"#,
             .unwrap()
             .unwrap();
         assert_eq!(status, PullRequestStatus::Closed);
-        assert!(http.post_calls().is_empty());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, r#"{"body":"Withdrawn."}"#);
         assert_eq!(http.patch_calls().len(), 1);
         assert_eq!(
             http.get_calls()
@@ -5242,7 +5264,7 @@ please fix this</comment></comments>"#,
         let http = FakeHttp::new()
             .with_post(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
-                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Declined: Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
             )
             .with_patch_error(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
@@ -5882,5 +5904,43 @@ please fix this</comment></comments>"#,
         let client = PullRequestClient::new(None, Some(&gitea));
         let pr = client.show(&gitea_ref()).unwrap();
         assert_eq!(pr.action_count, 1);
+    }
+
+    #[test]
+    fn withdraw_gitea_with_a_comment_posts_the_outcome() {
+        // The outcome is recorded in the posted comment in
+        // parseable form, so a closed pull request still says
+        // whether it was withdrawn.
+        let http = FakeHttp::new()
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Withdrawn: Going another way.", "created_at": "2026-11-22T19:52:58Z"}"#,
+            )
+            .with_patch(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
+                &issue_json(122, "closed", false, "scarabeusiv"),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &pr_json_with_state("closed", false),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = gitea_client(&http);
+        let status = act_client(None, Some(&gitea))
+            .withdraw(
+                &gitea_ref(),
+                Some("Going another way."),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, PullRequestStatus::Closed);
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, r#"{"body":"Withdrawn: Going another way."}"#);
+        assert_eq!(http.patch_calls().len(), 1);
     }
 }

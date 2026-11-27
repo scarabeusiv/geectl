@@ -181,7 +181,9 @@ a `show` call away.
 
 A Gitea close reads as `Closed`. Decline and withdrawal are separate
 operations with separate OBS mappings; the Gitea side closes the pull
-request for both.
+request for both, and records which it was in the posted close comment
+(`Declined: <reason>` / `Withdrawn: <reason>`, the outcome alone when no
+reason was given), recoverable from the issue comments.
 
 `ReviewOpinion` is one review on the pull request: `reviewer: String` (the
 asked-of target on OBS — user, group, project, or package; the reviewer
