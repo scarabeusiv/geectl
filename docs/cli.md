@@ -249,7 +249,7 @@ directory's `.env` only.
 
 - `geectl build results <PROJECT>` — Read the build-results matrix for a project; key flags: --package <PACKAGE>, --repository <REPOSITORY>, --arch <ARCH>, --code <CODE>, --multibuild, --lastbuild, --oldstate <OLDSTATE>, --all-instances; a partially-failing `--all-instances` read exits 0 with per-instance errors in the view
 - `geectl build wait-for-results --deadline-secs <DEADLINE_SECS> <PROJECT>` — Poll the build results until they settle, or the deadline passes; key flags: --package <PACKAGE>, --repository <REPOSITORY>, --arch <ARCH>, --code <CODE>, --multibuild, --lastbuild
-- `geectl build build-log <PROJECT> [PACKAGE] [REPOSITORY] [ARCH]` — Read the build log for a package; key flags: --start <START>, --last, --lastsucceeded, --multibuild <FLAVOR>, --strip-time
+- `geectl build build-log <PROJECT> [PACKAGE] [REPOSITORY] [ARCH]` — Read the build log for a package; the default read is the last 4 MiB with `truncated` in the payload, like the local log leaf; key flags: --start <START>, --tail <N>, --full, --last, --lastsucceeded, --multibuild <FLAVOR>, --strip-time
 - `geectl build build-status <PROJECT> <PACKAGE> <REPOSITORY> <ARCH>` — Read the build status code for a package.
 - `geectl build job-status <PROJECT> <PACKAGE> <REPOSITORY> <ARCH>` — Read the running build job for a package, if any.
 - `geectl build rebuild-package <PROJECT> <PACKAGE> <REPOSITORY> <ARCH>` — Rebuild a package: rerun a build without touching the sources.
