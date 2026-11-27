@@ -25,10 +25,17 @@
 //! coordinates (`query: …`, plus `backend: …` when scoped).
 //! Tables stay as designed; the header is the only addition.
 //!
-//! Documented omissions (not gaps): the user table carries no
-//! avatar URL (a URL, not an identifier); the project table
-//! carries no description (long free text — titles stay). The
-//! JSON payload remains the complete record in every case.
+//! One result list, not two: the JSON payload carries a single
+//! `results` array, each entry naming its `source` (`obs` or
+//! `gitea`) and its `kind` (`project` or `user`), and the text
+//! renders one table with SOURCE/KIND/NAME/DETAIL columns. A
+//! scoped search returns only its arm's entries; with no
+//! `--backend` both arms run, OBS first then Gitea.
+//!
+//! Documented omissions (not gaps): the unified table carries no
+//! avatar URL (a URL, not an identifier) and no project
+//! description (long free text — titles stay). The JSON payload
+//! remains the complete record in every case.
 
 use crate::auth::{EnvGiteaAuth, EnvObsAuth};
 use crate::config::{self, DEFAULT_GITEA_URL};
@@ -46,8 +53,9 @@ use serde_json::{json, Value};
 #[derive(Debug, Subcommand)]
 pub enum PersonCommand {
     /// Search for a person: the OBS projects naming the login,
-    /// and the Gitea users matching the keyword. With no
-    /// `--backend` both arms run, OBS first then Gitea.
+    /// and the Gitea users matching the keyword — one list of
+    /// results, each naming its source. With no `--backend` both
+    /// arms run, OBS first then Gitea.
     Search(SearchArgs),
 }
 
@@ -105,19 +113,21 @@ pub fn run_person(
 
 /// Search for a person through the uniform client: the JSON
 /// payload carries the query, the backend (`null` when both arms
-/// run), and both arms' lists (the arm that did not run leaves
-/// its list empty); the text is the header plus one section per
-/// arm that ran.
+/// run), and one `results` list — the OBS projects then the
+/// Gitea users, each entry naming its source and kind (an arm
+/// that did not run contributes nothing); the text is the header
+/// plus the one unified table.
 fn search_with(
     client: &PersonClient,
     query: &PersonSearch,
 ) -> Result<(Value, String), GeectlError> {
     let result = client.search(query)?;
+    let mut results: Vec<Value> = result.projects.iter().map(project_match_json).collect();
+    results.extend(result.users.iter().map(gitea_user_json));
     let payload = json!({
         "query": query.query,
         "backend": query.backend.map(|backend| backend.as_str()),
-        "projects": result.projects.iter().map(project_match_json).collect::<Vec<_>>(),
-        "users": result.users.iter().map(gitea_user_json).collect::<Vec<_>>(),
+        "results": results,
     });
     Ok((payload, render_search_text(query, &result)?))
 }
@@ -195,6 +205,8 @@ fn with_gitea<T>(
 
 fn project_match_json(match_: &ProjectMatch) -> Value {
     json!({
+        "source": "obs",
+        "kind": "project",
         "name": match_.name,
         "title": match_.title,
         "description": match_.description,
@@ -203,6 +215,8 @@ fn project_match_json(match_: &ProjectMatch) -> Value {
 
 fn gitea_user_json(user: &GiteaUser) -> Value {
     json!({
+        "source": "gitea",
+        "kind": "user",
         "login": user.login,
         "full_name": user.full_name,
         "email": user.email,
@@ -213,10 +227,11 @@ fn with_header(header: &str, text: String) -> String {
     format!("{header}\n{text}")
 }
 
-/// The search text: the coordinate header, then one section per
-/// arm that ran — the OBS projects, then the Gitea users. An arm
-/// that did not run has no section; an arm that ran and matched
-/// nothing names the empty case.
+/// The search text: the coordinate header, then one table over
+/// both arms' results — SOURCE/KIND/NAME/DETAIL, OBS projects
+/// first then Gitea users. A scoped search shows only its arm's
+/// entries; a search that matched nothing names the empty case
+/// once, not once per arm.
 fn render_search_text(
     query: &PersonSearch,
     result: &PersonSearchResult,
@@ -225,74 +240,57 @@ fn render_search_text(
     if let Some(backend) = query.backend {
         header.push_str(&format!(" backend: {}", backend.as_str()));
     }
-    let mut sections = Vec::new();
-    if query.backend.is_none() || query.backend == Some(PersonBackend::Obs) {
-        sections.push(format!(
-            "OBS projects:\n{}",
-            render_project_matches(&query.query, &result.projects)?
-        ));
-    }
-    if query.backend.is_none() || query.backend == Some(PersonBackend::Gitea) {
-        sections.push(format!(
-            "Gitea users:\n{}",
-            render_users(&query.query, &result.users)?
-        ));
-    }
-    Ok(with_header(&header, sections.join("\n")))
+    Ok(with_header(&header, render_results(query, result)?))
 }
 
-fn render_project_matches(term: &str, matches: &[ProjectMatch]) -> Result<String, GeectlError> {
-    if matches.is_empty() {
-        return Ok(format!("no projects matching '{term}'"));
-    }
-    let rows: Vec<Vec<String>> = matches
-        .iter()
-        .map(|match_| {
-            vec![
+fn render_results(
+    query: &PersonSearch,
+    result: &PersonSearchResult,
+) -> Result<String, GeectlError> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    if query.backend.is_none() || query.backend == Some(PersonBackend::Obs) {
+        for match_ in &result.projects {
+            rows.push(vec![
+                "obs".to_string(),
+                "project".to_string(),
                 match_.name.clone(),
                 match_
                     .title
                     .as_deref()
                     .map(strip_terminal_controls_marked)
                     .unwrap_or_else(|| "-".to_string()),
-            ]
-        })
-        .collect();
-    render_table(&["NAME", "TITLE"], &rows)
+            ]);
+        }
+    }
+    if query.backend.is_none() || query.backend == Some(PersonBackend::Gitea) {
+        for user in &result.users {
+            rows.push(vec![
+                "gitea".to_string(),
+                "user".to_string(),
+                user.login.clone(),
+                user_detail(user),
+            ]);
+        }
+    }
+    if rows.is_empty() {
+        return Ok(format!("no results matching '{}'", query.query));
+    }
+    render_table(&["SOURCE", "KIND", "NAME", "DETAIL"], &rows)
 }
 
-fn render_users(term: &str, users: &[GiteaUser]) -> Result<String, GeectlError> {
-    if users.is_empty() {
-        return Ok(format!("no users matching '{term}'"));
+/// A user's detail: the full name, with the email in angle
+/// brackets when present. Either part empty on its own renders
+/// as the other; both empty render as `-`, like a missing title:
+/// a blank cell would read as a missing column.
+fn user_detail(user: &GiteaUser) -> String {
+    let full_name = strip_terminal_controls_marked(&user.full_name);
+    let email = strip_terminal_controls_marked(&user.email);
+    match (full_name.is_empty(), email.is_empty()) {
+        (true, true) => "-".to_string(),
+        (false, true) => full_name,
+        (true, false) => email,
+        (false, false) => format!("{full_name} <{email}>"),
     }
-    // Empty full names and emails render as `-`, like a missing
-    // title in the project table: a blank cell would read as a
-    // missing column.
-    let rows: Vec<Vec<String>> = users
-        .iter()
-        .map(|user| {
-            vec![
-                user.login.clone(),
-                {
-                    let full_name = strip_terminal_controls_marked(&user.full_name);
-                    if full_name.is_empty() {
-                        "-".to_string()
-                    } else {
-                        full_name
-                    }
-                },
-                {
-                    let email = strip_terminal_controls_marked(&user.email);
-                    if email.is_empty() {
-                        "-".to_string()
-                    } else {
-                        email
-                    }
-                },
-            ]
-        })
-        .collect();
-    render_table(&["LOGIN", "FULL NAME", "EMAIL"], &rows)
 }
 
 /// A table with a header and space-aligned columns. A row with the
@@ -405,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn search_text_renders_both_sections_and_names_the_empty_case() {
+    fn search_text_renders_one_table_and_names_the_empty_case_once() {
         let query = PersonSearch {
             query: "alice".to_string(),
             backend: None,
@@ -418,33 +416,31 @@ mod tests {
             render_search_text(&query, &result).expect("the locally built rows match the headers");
         let mut lines = text.lines();
         assert_eq!(lines.next().expect("a header line"), "query: alice");
-        assert_eq!(lines.next().expect("an OBS section line"), "OBS projects:");
         let columns = lines.next().expect("a column header line");
+        assert!(columns.contains("SOURCE"));
+        assert!(columns.contains("KIND"));
         assert!(columns.contains("NAME"));
-        assert!(columns.contains("TITLE"));
-        let row = lines.next().expect("a row line");
+        assert!(columns.contains("DETAIL"));
+        let row = lines.next().expect("a project row line");
+        assert!(row.contains("obs"));
+        assert!(row.contains("project"));
         assert!(row.contains("devel:languages:python"));
         assert!(row.contains("Python"));
-        assert_eq!(lines.next().expect("a Gitea section line"), "Gitea users:");
-        let columns = lines.next().expect("a column header line");
-        assert!(columns.contains("LOGIN"));
-        assert!(columns.contains("FULL NAME"));
-        assert!(columns.contains("EMAIL"));
-        let row = lines.next().expect("a row line");
+        let row = lines.next().expect("a user row line");
+        assert!(row.contains("gitea"));
+        assert!(row.contains("user"));
         assert!(row.contains("alice"));
-        assert!(row.contains("Alice"));
-        assert!(row.contains("alice@example.com"));
+        assert!(row.contains("Alice <alice@example.com>"));
         assert_eq!(lines.next(), None);
         let empty = PersonSearchResult::default();
         assert_eq!(
-            render_search_text(&query, &empty)
-                .expect("the locally built rows match the headers"),
-            "query: alice\nOBS projects:\nno projects matching 'alice'\nGitea users:\nno users matching 'alice'"
+            render_search_text(&query, &empty).expect("the locally built rows match the headers"),
+            "query: alice\nno results matching 'alice'"
         );
     }
 
     #[test]
-    fn search_text_scoped_to_one_arm_shows_only_that_section() {
+    fn search_text_scoped_to_one_arm_shows_only_that_arms_entries() {
         let query = PersonSearch {
             query: "alice".to_string(),
             backend: Some(PersonBackend::Gitea),
@@ -455,7 +451,7 @@ mod tests {
         };
         assert_eq!(
             render_search_text(&query, &result).expect("the locally built rows match the headers"),
-            "query: alice backend: gitea\nGitea users:\nno users matching 'alice'"
+            "query: alice backend: gitea\nno results matching 'alice'"
         );
     }
 
@@ -471,11 +467,11 @@ mod tests {
         };
         let text =
             render_search_text(&query, &result).expect("the locally built rows match the headers");
-        let row = text.lines().nth(3).expect("a row line");
+        let row = text.lines().nth(2).expect("a row line");
         assert_eq!(
             row.split_whitespace().collect::<Vec<_>>(),
-            ["alice2", "-", "-"],
-            "empty full name and email render as dashes, not blanks:\n{text}"
+            ["gitea", "user", "alice2", "-"],
+            "empty full name and email render as one dash, not blanks:\n{text}"
         );
     }
 
@@ -493,9 +489,13 @@ mod tests {
         // is covered by the library tests and the integration
         // tests, which run the whole leaf.
         let project_json = project_match_json(&project("devel:languages:python", Some("Python")));
+        assert_eq!(project_json["source"], "obs");
+        assert_eq!(project_json["kind"], "project");
         assert_eq!(project_json["name"], "devel:languages:python");
         assert_eq!(project_json["title"], "Python");
         let user_json = gitea_user_json(&user("alice", "Alice", "alice@example.com"));
+        assert_eq!(user_json["source"], "gitea");
+        assert_eq!(user_json["kind"], "user");
         assert_eq!(user_json["login"], "alice");
         assert_eq!(user_json["full_name"], "Alice");
         assert_eq!(user_json["email"], "alice@example.com");
@@ -509,21 +509,33 @@ mod tests {
         // leaving a marker where characters were removed, while a
         // name that is empty still renders as `-`. A name of only
         // removed characters renders as the marker itself.
-        let projects = vec![project("devel:languages:python", Some("Py\u{1b}[2Jthon"))];
-        let text = render_project_matches("alice", &projects).unwrap();
-        assert!(!text.contains('\u{1b}'), "text: {text}");
-        assert!(text.contains("Py…[2Jthon"), "text: {text}");
-        let users = vec![
-            user("alice", "Al\u{7}ice\u{202e}", "alice@example.com"),
-            user("bob", "\u{7}", ""),
-        ];
-        let text = render_users("alice", &users).unwrap();
+        let query = PersonSearch {
+            query: "alice".to_string(),
+            backend: None,
+        };
+        let result = PersonSearchResult {
+            projects: vec![project("devel:languages:python", Some("Py\u{1b}[2Jthon"))],
+            users: vec![
+                user("alice", "Al\u{7}ice\u{202e}", "alice@example.com"),
+                user("bob", "\u{7}", ""),
+            ],
+        };
+        let text = render_results(&query, &result).unwrap();
         assert!(!text.contains('\u{1b}'), "text: {text}");
         assert!(!text.contains('\u{7}'), "text: {text}");
         assert!(!text.contains('\u{202e}'), "text: {text}");
+        assert!(text.contains("Py…[2Jthon"), "text: {text}");
         assert!(text.contains("Al…ice…"), "text: {text}");
         assert!(text.contains("bob"), "text: {text}");
-        let text = render_users("bob", &[user("bob", "\u{7}", "")]).unwrap();
+        let query = PersonSearch {
+            query: "bob".to_string(),
+            backend: Some(PersonBackend::Gitea),
+        };
+        let result = PersonSearchResult {
+            projects: vec![],
+            users: vec![user("bob", "\u{7}", "")],
+        };
+        let text = render_results(&query, &result).unwrap();
         assert!(text.contains("…"), "text: {text}");
     }
 }

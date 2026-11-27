@@ -2629,10 +2629,11 @@ fn remote_search_packages_by_person_with_half_set_credentials_fails_with_config_
 }
 
 #[test]
-fn person_search_both_arms_returns_projects_and_users() {
+fn person_search_both_arms_returns_one_unified_list() {
     // Both arms run against fixture servers: the OBS
     // person-match answers one project, the Gitea user search
-    // one user. The JSON payload carries both lists.
+    // one user. The JSON payload carries one list, each entry
+    // naming its source and kind, OBS first then Gitea.
     let obs_addr = serve_once(
         "<collection matches=\"1\"><project name=\"devel:languages:python\"><title>Python</title><description>Python packages</description></project></collection>",
     );
@@ -2658,15 +2659,24 @@ fn person_search_both_arms_returns_projects_and_users() {
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(value["query"], "alice");
     assert!(value["backend"].is_null());
-    assert_eq!(value["projects"][0]["name"], "devel:languages:python");
-    assert_eq!(value["projects"][0]["title"], "Python");
-    assert_eq!(value["users"][0]["login"], "alice");
-    assert_eq!(value["users"][0]["full_name"], "Alice");
-    assert_eq!(value["users"][0]["email"], "alice@example.com");
+    assert!(value.get("projects").is_none());
+    assert!(value.get("users").is_none());
+    let results = value["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["source"], "obs");
+    assert_eq!(results[0]["kind"], "project");
+    assert_eq!(results[0]["name"], "devel:languages:python");
+    assert_eq!(results[0]["title"], "Python");
+    assert_eq!(results[0]["description"], "Python packages");
+    assert_eq!(results[1]["source"], "gitea");
+    assert_eq!(results[1]["kind"], "user");
+    assert_eq!(results[1]["login"], "alice");
+    assert_eq!(results[1]["full_name"], "Alice");
+    assert_eq!(results[1]["email"], "alice@example.com");
 }
 
 #[test]
-fn person_search_text_mode_renders_both_sections() {
+fn person_search_text_mode_renders_one_unified_table() {
     let obs_addr = serve_once(
         "<collection matches=\"1\"><project name=\"devel:languages:python\"><title>Python</title><description>Python packages</description></project></collection>",
     );
@@ -2690,12 +2700,14 @@ fn person_search_text_mode_renders_both_sections() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("query: alice"), "stdout: {stdout}");
-    assert!(stdout.contains("OBS projects:"), "stdout: {stdout}");
+    assert!(!stdout.contains("OBS projects:"), "stdout: {stdout}");
+    assert!(!stdout.contains("Gitea users:"), "stdout: {stdout}");
+    assert!(stdout.contains("SOURCE"), "stdout: {stdout}");
+    assert!(stdout.contains("KIND"), "stdout: {stdout}");
     assert!(
         stdout.contains("devel:languages:python"),
         "stdout: {stdout}"
     );
-    assert!(stdout.contains("Gitea users:"), "stdout: {stdout}");
     assert!(stdout.contains("alice@example.com"), "stdout: {stdout}");
 }
 
@@ -2769,10 +2781,11 @@ fn person_search_both_arms_with_only_a_gitea_token_fails_on_obs_credentials() {
 }
 
 #[test]
-fn person_search_obs_scoped_returns_only_projects() {
+fn person_search_obs_scoped_returns_only_obs_entries() {
     // Scoped to OBS, the Gitea arm never runs: no token is
     // configured, and its construction would fail if touched.
-    // The payload names the backend and carries only the OBS list.
+    // The payload names the backend and carries only the OBS
+    // entries.
     let obs_addr = serve_once(
         "<collection matches=\"1\"><project name=\"devel:languages:python\"><title>Python</title><description>Python packages</description></project></collection>",
     );
@@ -2793,16 +2806,20 @@ fn person_search_obs_scoped_returns_only_projects() {
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(value["query"], "alice");
     assert_eq!(value["backend"], "obs");
-    assert_eq!(value["projects"][0]["name"], "devel:languages:python");
-    assert_eq!(value["projects"][0]["title"], "Python");
-    assert!(value["users"].as_array().unwrap().is_empty());
+    let results = value["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["source"], "obs");
+    assert_eq!(results[0]["kind"], "project");
+    assert_eq!(results[0]["name"], "devel:languages:python");
+    assert_eq!(results[0]["title"], "Python");
 }
 
 #[test]
-fn person_search_gitea_scoped_returns_only_users() {
+fn person_search_gitea_scoped_returns_only_gitea_entries() {
     // Scoped to Gitea, the OBS arm never runs: no OBS credentials
     // are configured, and its arm would fail if touched. The
-    // payload names the backend and carries only the Gitea list.
+    // payload names the backend and carries only the Gitea
+    // entries.
     let gitea_addr = serve_once(
         r#"{"ok": true, "data": [{"login": "alice", "full_name": "Alice", "email": "alice@example.com"}]}"#,
     );
@@ -2822,10 +2839,13 @@ fn person_search_gitea_scoped_returns_only_users() {
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(value["query"], "alice");
     assert_eq!(value["backend"], "gitea");
-    assert_eq!(value["users"][0]["login"], "alice");
-    assert_eq!(value["users"][0]["full_name"], "Alice");
-    assert_eq!(value["users"][0]["email"], "alice@example.com");
-    assert!(value["projects"].as_array().unwrap().is_empty());
+    let results = value["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["source"], "gitea");
+    assert_eq!(results[0]["kind"], "user");
+    assert_eq!(results[0]["login"], "alice");
+    assert_eq!(results[0]["full_name"], "Alice");
+    assert_eq!(results[0]["email"], "alice@example.com");
 }
 
 #[test]
@@ -11938,7 +11958,7 @@ fn instance_flag_person_search_gitea_uses_the_alias_token() {
     );
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
-    assert_eq!(value["users"][0]["login"], "alice");
+    assert_eq!(value["results"][0]["login"], "alice");
 }
 
 #[test]

@@ -345,7 +345,7 @@ without evaluating trust.
 
 ## `person` — unified person search
 
-- `geectl person search <QUERY>` — Search for a person: the OBS projects naming the login, and the Gitea users matching the keyword; key flags: --backend <BACKEND>
+- `geectl person search <QUERY>` — Search for a person: the OBS projects naming the login, and the Gitea users matching the keyword; one list of results, each naming its `source` (`obs` or `gitea`) and `kind` (`project` or `user`); key flags: --backend <BACKEND>
 
 ## `meta` — unified meta write
 
