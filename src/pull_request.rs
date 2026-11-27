@@ -611,7 +611,7 @@ fn endpoints_for_action(action: &RequestAction) -> (PullRequestEndpoint, PullReq
             target_package,
             ..
         } => (
-            obs_source_endpoint(source_project, source_package, None),
+            obs_endpoint(source_project, source_package.as_deref()),
             obs_endpoint(target_project, target_package.as_deref()),
         ),
     }
@@ -2291,6 +2291,17 @@ mod tests {
   <state name="declined" when="2010-12-27T01:36:29" who="abc" />
 </request>"#;
 
+    const INCIDENT_REQUEST_XML: &str = r#"<request creator="adrianSuSE" id="107538">
+  <action type="maintenance_incident">
+    <source project="home:adrianSuSE:branches:OBS_Maintained:build" />
+    <target project="openSUSE:Maintenance" />
+    <options>
+      <sourceupdate>cleanup</sourceupdate>
+    </options>
+  </action>
+  <state name="superseded" when="2016-04-15T06:32:27" who="adrianSuSE" />
+</request>"#;
+
     /// A pull-request JSON body, shaped like Gitea 1.24.7 answers.
     const PR_JSON: &str = r#"{"number": 122, "user": {"login": "scarabeusiv"}, "title": "change_review_state", "body": "A test PR body.", "labels": [{"name": "bug"}], "state": "open", "draft": false, "merged": false, "mergeable": true, "head": {"label": "scarabeusiv:change-review-state", "ref": "change-review-state", "sha": "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa", "repo": {"full_name": "scarabeusiv/geectl"}}, "base": {"label": "main", "ref": "main", "sha": "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa", "repo": {"full_name": "openSUSE/geectl"}}}"#;
 
@@ -2542,6 +2553,33 @@ mod tests {
     }
 
     #[test]
+    fn search_obs_pages_past_the_result_limit() {
+        // The default OBS search is too broad for the server's
+        // configured result limit, so the arm pages: the first
+        // round trip is refused, then one 1000-row page carries
+        // the single match.
+        let collection = format!("<collection matches=\"1\">\n{REQUEST_XML}\n</collection>");
+        let http = FakeHttp::new()
+            .with_get_error(
+                "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%20or%20%40name%3D%27declined%27%5D",
+                ErrorKind::ResultLimitExceeded,
+            )
+            .with_get(
+                "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%20or%20%40name%3D%27declined%27%5D&limit=1000&offset=0",
+                &collection,
+            );
+        let obs = obs_client(&http);
+        let client = PullRequestClient::new(Some(&obs), None);
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Obs),
+            ..Default::default()
+        };
+        let summaries = client.search(&query).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].reference, PullRequestRef::Obs(123));
+    }
+
+    #[test]
     fn search_obs_maps_open_to_new_and_review() {
         let collection = format!("<collection matches=\"1\">\n{REQUEST_XML}\n</collection>");
         let http = FakeHttp::new().with_get(
@@ -2598,6 +2636,35 @@ mod tests {
         let summaries = client.search(&query).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].status, PullRequestStatus::Declined);
+    }
+
+    #[test]
+    fn search_obs_reads_a_project_only_incident() {
+        // A superseded maintenance incident over a whole project
+        // names no source package (request 107538, live): the
+        // search parses it and reports the project as the source.
+        let collection =
+            format!("<collection matches=\"1\">\n{INCIDENT_REQUEST_XML}\n</collection>");
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27superseded%27%5D",
+            &collection,
+        );
+        let obs = obs_client(&http);
+        let client = PullRequestClient::new(Some(&obs), None);
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Obs),
+            states: vec![PullRequestStatus::Superseded],
+            ..Default::default()
+        };
+        let summaries = client.search(&query).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].reference, PullRequestRef::Obs(107538));
+        assert_eq!(summaries[0].status, PullRequestStatus::Superseded);
+        assert_eq!(
+            summaries[0].source.repository,
+            "home:adrianSuSE:branches:OBS_Maintained:build"
+        );
+        assert_eq!(summaries[0].target.repository, "openSUSE:Maintenance");
     }
 
     #[test]
