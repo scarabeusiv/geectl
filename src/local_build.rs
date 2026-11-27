@@ -769,8 +769,9 @@ pub struct PrecheckinOutcome {
 
 /// The record of one precommit run: the service run in `precommit`
 /// mode, then `pre_checkin.sh` when the source directory carries
-/// one. A failing service or a failing `pre_checkin.sh` fails the
-/// whole run with [`ErrorKind::ServiceFailed`].
+/// one. A failing service fails the whole run with
+/// [`ErrorKind::ServiceFailed`]; a failing `pre_checkin.sh` with
+/// [`ErrorKind::PrecheckinFailed`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PrecommitRecord {
     pub services: ServiceRunRecord,
@@ -7732,9 +7733,9 @@ impl<'a> LocalBuild<'a> {
     /// `pre_checkin.sh` when the source directory carries one.
     /// The script step is part of the gate, not of the service
     /// mode: the mode filter alone runs services only. Both steps
-    /// share one timeout budget. A failing service or a failing
-    /// `pre_checkin.sh` fails the whole run with
-    /// [`ErrorKind::ServiceFailed`]. A dry run returns the plan
+    /// share one timeout budget. A failing service fails the whole
+    /// run with [`ErrorKind::ServiceFailed`]; a failing
+    /// `pre_checkin.sh` with [`ErrorKind::PrecheckinFailed`]. A dry run returns the plan
     /// and touches nothing. `project` names the OBS project the
     /// services validate against, from `--project`; `None`
     /// resolves it from the checkout.
@@ -7805,7 +7806,7 @@ impl<'a> LocalBuild<'a> {
     /// Run `spec-cleaner` on `spec` in the container. `spec` is a
     /// path inside `source_dir` (relative, or absolute under it).
     /// `extra_args` pass through to the binary as argv elements.
-    /// A non-zero exit fails with [`ErrorKind::ServiceFailed`].
+    /// A non-zero exit fails with [`ErrorKind::SpecCleanerFailed`].
     /// A dry run returns the plan and touches nothing.
     pub fn spec_cleaner(
         &self,
@@ -7901,7 +7902,7 @@ impl<'a> LocalBuild<'a> {
         )?;
         if !install.status.success() {
             return Err(GeectlError::new(
-                ErrorKind::ServiceFailed,
+                ErrorKind::SpecCleanerFailed,
                 format!(
                     "cannot install spec-cleaner in the service container: {}",
                     last_lines(&String::from_utf8_lossy(&install.stderr), 20).join("\n")
@@ -7913,7 +7914,7 @@ impl<'a> LocalBuild<'a> {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.status.success() {
             return Err(GeectlError::new(
-                ErrorKind::ServiceFailed,
+                ErrorKind::SpecCleanerFailed,
                 format!(
                     "spec-cleaner failed with exit {}: {}",
                     output.status.code().unwrap_or(-1),
@@ -8138,7 +8139,7 @@ impl<'a> LocalBuild<'a> {
     /// Run `pre_checkin.sh` in the container when the source
     /// directory carries one. A missing script is not an error:
     /// most packages carry none. A failing script fails with
-    /// [`ErrorKind::ServiceFailed`]. The script runs under `bash`
+    /// [`ErrorKind::PrecheckinFailed`]. The script runs under `bash`
     /// with the source directory as its working directory, in the
     /// bare base image: no packages are installed for it, so a
     /// script needing tools beyond the base image fails. A script
@@ -8192,7 +8193,7 @@ impl<'a> LocalBuild<'a> {
         let exit_code = output.status.code().unwrap_or(-1);
         if !output.status.success() {
             return Err(GeectlError::new(
-                ErrorKind::ServiceFailed,
+                ErrorKind::PrecheckinFailed,
                 format!(
                     "pre_checkin.sh failed with exit {exit_code}: {}",
                     last_lines(&stderr, 20).join("\n")
@@ -19279,9 +19280,10 @@ if [ "$1" = "exec" ]; then
   # The install exec elevates via setpriv: skip the prefix to
   # reach the installed command.
   if [ "$1" = "setpriv" ]; then shift 4; fi
-  if [ "$1" = "zypper" ]; then exit 0; fi
+  if [ "$1" = "zypper" ]; then if [ -f "{DIR}/fail-spec-cleaner-install" ]; then echo "cannot install spec-cleaner" >&2; exit 1; fi; exit 0; fi
   if [ "$1" = "bash" ]; then cd "{SRC}" && bash ./pre_checkin.sh; exit $?; fi
   if [ "$1" = "spec-cleaner" ]; then
+    if [ -f "{DIR}/fail-spec-cleaner-binary" ]; then echo "spec-cleaner failed" >&2; exit 3; fi
     for last; do true; done
     echo "# spec-cleaner ran" >> "{SRC}/$last"
     exit 0
@@ -19310,7 +19312,8 @@ fi
 exit 0
 "##
             .replace("{CALL_LOG}", &call_log.display().to_string())
-            .replace("{SRC}", &src.display().to_string());
+            .replace("{SRC}", &src.display().to_string())
+            .replace("{DIR}", &dir.display().to_string());
             write_script(&script, &body);
             (script, call_log)
         }
@@ -20432,7 +20435,7 @@ exit 0
             let client = client_with(&http);
             let vertical = vertical(&client, dir.path(), podman);
             let err = vertical.precommit(&src, None, 3600, false).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::ServiceFailed);
+            assert_eq!(err.kind(), ErrorKind::PrecheckinFailed);
             assert!(
                 err.context.contains("pre_checkin.sh"),
                 "got: {}",
@@ -20513,6 +20516,50 @@ exit 0
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(
                 err.context.contains("outside source directory"),
+                "got: {}",
+                err.context
+            );
+        }
+
+        #[test]
+        fn spec_cleaner_install_failure_maps_to_spec_cleaner_failed() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(src.join("foo.spec"), "Name: foo\n").unwrap();
+            fs::write(dir.path().join("fail-spec-cleaner-install"), "").unwrap();
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), podman);
+            let err = vertical
+                .spec_cleaner(&src, Path::new("foo.spec"), &[], 3600, false)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::SpecCleanerFailed);
+            assert!(
+                err.context.contains("cannot install spec-cleaner"),
+                "got: {}",
+                err.context
+            );
+        }
+
+        #[test]
+        fn spec_cleaner_binary_failure_maps_to_spec_cleaner_failed() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(src.join("foo.spec"), "Name: foo\n").unwrap();
+            fs::write(dir.path().join("fail-spec-cleaner-binary"), "").unwrap();
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), podman);
+            let err = vertical
+                .spec_cleaner(&src, Path::new("foo.spec"), &[], 3600, false)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::SpecCleanerFailed);
+            assert!(
+                err.context.contains("spec-cleaner failed with exit 3"),
                 "got: {}",
                 err.context
             );
