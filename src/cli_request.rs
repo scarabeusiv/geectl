@@ -2379,7 +2379,8 @@ fn action_text(action: &RequestAction) -> String {
             acceptinfo,
         } => {
             let mut line = format!(
-                "maintenance_incident {source_project}/{source_package} -> {}",
+                "maintenance_incident {} -> {}",
+                target_text(Some(source_project), source_package.as_deref()),
                 target_text(Some(target_project), target_package.as_deref())
             );
             if let Some(update) = sourceupdate {
@@ -2403,7 +2404,8 @@ fn action_text(action: &RequestAction) -> String {
             acceptinfo,
         } => {
             let mut line = format!(
-                "maintenance_release {source_project}/{source_package} -> {}",
+                "maintenance_release {} -> {}",
+                target_text(Some(source_project), source_package.as_deref()),
                 target_text(Some(target_project), target_package.as_deref())
             );
             if let Some(update) = sourceupdate {
@@ -2427,7 +2429,8 @@ fn action_text(action: &RequestAction) -> String {
             acceptinfo,
         } => {
             let mut line = format!(
-                "release {source_project}/{source_package} -> {}",
+                "release {} -> {}",
+                target_text(Some(source_project), source_package.as_deref()),
                 target_text(Some(target_project), target_package.as_deref())
             );
             if let Some(update) = sourceupdate {
@@ -2494,13 +2497,36 @@ fn action_summary(action: &RequestAction) -> String {
         RequestAction::ChangeDevel { source_package, .. } => {
             format!("change_devel {source_package}")
         }
-        RequestAction::MaintenanceIncident { source_package, .. } => {
-            format!("maintenance_incident {source_package}")
+        RequestAction::MaintenanceIncident {
+            source_project,
+            source_package,
+            ..
+        } => {
+            format!(
+                "maintenance_incident {}",
+                source_package.as_deref().unwrap_or(source_project)
+            )
         }
-        RequestAction::MaintenanceRelease { source_package, .. } => {
-            format!("maintenance_release {source_package}")
+        RequestAction::MaintenanceRelease {
+            source_project,
+            source_package,
+            ..
+        } => {
+            format!(
+                "maintenance_release {}",
+                source_package.as_deref().unwrap_or(source_project)
+            )
         }
-        RequestAction::Release { source_package, .. } => format!("release {source_package}"),
+        RequestAction::Release {
+            source_project,
+            source_package,
+            ..
+        } => {
+            format!(
+                "release {}",
+                source_package.as_deref().unwrap_or(source_project)
+            )
+        }
     }
 }
 

@@ -446,8 +446,10 @@ pub enum RequestAction {
     MaintenanceIncident {
         /// The project the incident comes from.
         source_project: String,
-        /// The package the incident is built from.
-        source_package: String,
+        /// The package the incident is built from, when the action
+        /// names one: an incident over a whole project names no
+        /// package.
+        source_package: Option<String>,
         /// The maintenance project the incident goes to.
         target_project: String,
         /// The package in the target project, when the action names
@@ -465,8 +467,10 @@ pub enum RequestAction {
     MaintenanceRelease {
         /// The project the release comes from.
         source_project: String,
-        /// The package the release is built from.
-        source_package: String,
+        /// The package the release is built from, when the action
+        /// names one: a release over a whole project names no
+        /// package.
+        source_package: Option<String>,
         /// The project the release goes to.
         target_project: String,
         /// The package in the target project, when the action names
@@ -484,8 +488,9 @@ pub enum RequestAction {
     Release {
         /// The project the release comes from.
         source_project: String,
-        /// The package being released.
-        source_package: String,
+        /// The package being released, when the action names one:
+        /// a release over a whole project names no package.
+        source_package: Option<String>,
         /// The project the release goes to.
         target_project: String,
         /// The package in the target project, when the action names
@@ -1060,6 +1065,37 @@ fn action_source(element: &Element<'_>) -> Option<(String, String, Option<String
     source
 }
 
+/// Parse the `<source>` child of an incident, release, or
+/// maintenance-release action: the project is required, the
+/// package is not — an action over a whole project names no
+/// package, and the server renders such requests. Exactly one
+/// source; a missing or duplicated one fails. An empty package
+/// reads as no package, like an absent one.
+fn action_source_opt_package(
+    element: &Element<'_>,
+) -> Option<(String, Option<String>, Option<String>)> {
+    let mut source: Option<(String, Option<String>, Option<String>)> = None;
+    for child in child_elements(element.inner)? {
+        if child.name != "source" {
+            continue;
+        }
+        if source.is_some() {
+            return None;
+        }
+        let project = attr_value(child.attrs, "project")?;
+        if project.is_empty() {
+            return None;
+        }
+        let package = attr_value(child.attrs, "package").filter(|package| !package.is_empty());
+        source = Some((
+            project.to_string(),
+            package.map(str::to_string),
+            attr_value(child.attrs, "rev").map(str::to_string),
+        ));
+    }
+    source
+}
+
 /// A target reference: the project, the package (when the action
 /// names one), and the repository (when it pins one).
 type TargetRef = (String, Option<String>, Option<String>);
@@ -1397,7 +1433,7 @@ fn parse_source_target_action(element: &Element<'_>, action_type: &str) -> Optio
             _ => return None,
         }
     }
-    let (source_project, source_package, _) = action_source(element)?;
+    let (source_project, source_package, _) = action_source_opt_package(element)?;
     let (target_project, target_package, _) = action_target(element)??;
     match action_type {
         "maintenance_incident" => Some(RequestAction::MaintenanceIncident {
@@ -1470,7 +1506,12 @@ fn parse_state(element: &Element<'_>) -> Option<RequestStateInfo> {
     }
     let created = attr_value(element.attrs, "created").map(str::to_string);
     let superseded_by = match attr_value(element.attrs, "superseded_by") {
-        Some(value) => Some(value.parse::<u64>().ok().filter(|id| *id > 0)?),
+        // The server writes 0 when no request superseded this one;
+        // that reads as absent, not as a malformed id.
+        Some(value) => {
+            let id = value.parse::<u64>().ok()?;
+            Some(id).filter(|id| *id > 0)
+        }
         None => None,
     };
     let approver = attr_value(element.attrs, "approver").map(str::to_string);
@@ -1637,7 +1678,7 @@ fn action_to_xml(action: &RequestAction) -> String {
             out.push_str("  <action type=\"submit\">\n");
             out.push_str(&source_to_xml(
                 source_project,
-                source_package,
+                Some(source_package),
                 source_rev.as_deref(),
             ));
             if let Some(target_project) = target_project {
@@ -1736,7 +1777,7 @@ fn action_to_xml(action: &RequestAction) -> String {
             target_package,
         } => {
             out.push_str("  <action type=\"change_devel\">\n");
-            out.push_str(&source_to_xml(source_project, source_package, None));
+            out.push_str(&source_to_xml(source_project, Some(source_package), None));
             out.push_str(&target_to_xml(target_project, Some(target_package), None));
             out.push_str("  </action>\n");
         }
@@ -1768,7 +1809,11 @@ fn action_to_xml(action: &RequestAction) -> String {
             acceptinfo,
         } => {
             out.push_str(&format!("  <action type=\"{}\">\n", action.type_name()));
-            out.push_str(&source_to_xml(source_project, source_package, None));
+            out.push_str(&source_to_xml(
+                source_project,
+                source_package.as_deref(),
+                None,
+            ));
             out.push_str(&target_to_xml(
                 target_project,
                 target_package.as_deref(),
@@ -1798,12 +1843,13 @@ fn action_to_xml(action: &RequestAction) -> String {
 
 /// Render a `<source>` element: `project`, then `package`, then
 /// `rev` when one is pinned.
-fn source_to_xml(project: &str, package: &str, rev: Option<&str>) -> String {
-    let mut out = format!(
-        "    <source project=\"{}\" package=\"{}\"",
-        xml_escape(project),
-        xml_escape(package)
-    );
+/// Render a `<source>` element: `project`, then `package` and
+/// `rev`, each only when present.
+fn source_to_xml(project: &str, package: Option<&str>, rev: Option<&str>) -> String {
+    let mut out = format!("    <source project=\"{}\"", xml_escape(project));
+    if let Some(package) = package {
+        out.push_str(&format!(" package=\"{}\"", xml_escape(package)));
+    }
     if let Some(rev) = rev {
         out.push_str(&format!(" rev=\"{}\"", xml_escape(rev)));
     }
@@ -1946,6 +1992,28 @@ pub fn parse_request_collection(body: &str) -> Option<Vec<Request>> {
 /// exactly `min(matches, limit)` requests instead of requiring
 /// `parsed == matches`. Without a limit the strict form applies.
 pub fn parse_request_collection_limited(body: &str, limit: Option<usize>) -> Option<Vec<Request>> {
+    parse_request_collection_checked(body, limit, true)
+}
+
+/// Parse one page of a `<collection>` of requests: like
+/// [`parse_request_collection_limited`], but a page may hold fewer
+/// rows than the window asks for — the last page ends the list —
+/// so the parse accepts up to `min(matches, limit)` requests
+/// instead of exactly that many. More rows than the window asks
+/// for still fails: the server answered a different window than
+/// the one asked for.
+pub fn parse_request_collection_page(body: &str, limit: usize) -> Option<Vec<Request>> {
+    parse_request_collection_checked(body, Some(limit), false)
+}
+
+/// The shared collection parse: `exact` requires exactly
+/// `min(matches, limit)` rows, the page form accepts up to that
+/// many.
+fn parse_request_collection_checked(
+    body: &str,
+    limit: Option<usize>,
+    exact: bool,
+) -> Option<Vec<Request>> {
     // A limit of 0 asks for no rows. The search layers refuse it as
     // InvalidInput before parsing; the parser rejects it too, so a
     // zero limit never parses as an empty result.
@@ -1984,7 +2052,10 @@ pub fn parse_request_collection_limited(body: &str, limit: Option<usize>) -> Opt
         Some(limit) => (matches as usize).min(limit),
         None => matches as usize,
     };
-    if parsed != expected {
+    if exact && parsed != expected {
+        return None;
+    }
+    if !exact && parsed > expected {
         return None;
     }
     Some(requests)
@@ -4824,7 +4895,14 @@ impl<'a> ObsClient<'a> {
     /// full, so the caller can filter further without another round
     /// trip. Requires credentials; without them the call fails loudly
     /// before any request. An unexpected response is an error, never
-    /// an empty list.
+    /// an empty list. When the server refuses the search for
+    /// exceeding its configured result limit, the search is re-read
+    /// page by page (`limit` and `offset`), so a broad search
+    /// returns every match instead of failing; a caller-set limit
+    /// still caps the total read. Without a caller-set limit the
+    /// re-read is bounded by [`Self::SEARCH_PAGE_CAP`] pages and
+    /// fails naming the match to narrow instead of reading
+    /// unboundedly.
     pub fn search_requests(&self, search: &RequestSearch) -> Result<Vec<Request>, GeectlError> {
         let match_expr = search.match_expr()?;
         if let Some(limit) = search.limit_value() {
@@ -4853,17 +4931,134 @@ impl<'a> ObsClient<'a> {
             query.push(("limit", limit));
         }
         let url = build_url(&self.base, &["search", "request"], &query);
+        match self.http.get_with(&url, &self.credentials) {
+            Ok(body) => {
+                let parsed = match search.limit_value() {
+                    Some(limit) => parse_request_collection_limited(&body, Some(limit)),
+                    None => parse_request_collection(&body),
+                };
+                parsed.ok_or_else(|| {
+                    GeectlError::new(
+                        ErrorKind::ServerError,
+                        "unexpected OBS request search response",
+                    )
+                })
+            }
+            Err(err) if err.kind() == ErrorKind::ResultLimitExceeded => {
+                self.search_requests_paged(search, &match_expr)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The page size the result-limit fallback reads with: the
+    /// server answers a `limit` page even when the unpaged search
+    /// exceeds its configured result limit.
+    const SEARCH_PAGE_SIZE: usize = 1000;
+
+    /// The page cap on the result-limit fallback when the caller
+    /// sets no limit: past this many pages the search fails
+    /// naming the match to narrow instead of reading unboundedly.
+    /// The default search is 39 pages today, so 100 leaves room
+    /// for the match set to grow while bounding the worst case to
+    /// 100,000 rows. A caller-set limit is the caller's own bound
+    /// and is not capped here.
+    const SEARCH_PAGE_CAP: usize = 100;
+
+    /// Re-read a search the server refused for exceeding its
+    /// configured result limit, page by page (`limit` and `offset`
+    /// — the paging the refusal itself names): the first round trip
+    /// already proved the match is too broad to answer whole, so
+    /// each page asks for at most [`Self::SEARCH_PAGE_SIZE`] rows,
+    /// and at most the rows still missing under a caller-set limit,
+    /// so the total never overshoots the cap. The read ends when
+    /// the rows reach the match count or the caller-set limit; a
+    /// short page before either is a truncated answer and fails,
+    /// never a silent completion.
+    fn search_requests_paged(
+        &self,
+        search: &RequestSearch,
+        match_expr: &str,
+    ) -> Result<Vec<Request>, GeectlError> {
+        let cap = search.limit_value().unwrap_or(usize::MAX);
+        let page_size = cap.min(Self::SEARCH_PAGE_SIZE);
+        let mut requests = Vec::new();
+        let mut offset = 0usize;
+        let mut pages = 0usize;
+        loop {
+            if search.limit_value().is_none() && pages >= Self::SEARCH_PAGE_CAP {
+                return Err(GeectlError::new(
+                    ErrorKind::SearchTooBroad,
+                    format!(
+                        "the request search for {match_expr} exceeds the bounded read of {} pages of {} rows; narrow the search (a state, a creator, or a limit) and retry",
+                        Self::SEARCH_PAGE_CAP,
+                        Self::SEARCH_PAGE_SIZE
+                    ),
+                ));
+            }
+            // Each page asks for at most the rows still missing
+            // under the cap: a full page of `page_size` rows would
+            // carry the total past the cap whenever the cap is not
+            // a multiple of the page size.
+            let limit = page_size.min(cap - requests.len());
+            let (page, matches) = self.search_requests_page(search, match_expr, limit, offset)?;
+            pages += 1;
+            let page_len = page.len();
+            requests.extend(page);
+            if requests.len() >= matches as usize || requests.len() >= cap {
+                break;
+            }
+            if page_len < limit {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "the OBS request search ended early: {matches} matches advertised but only {} rows read (offset {offset}, page {page_len} of {limit} rows)",
+                        requests.len()
+                    ),
+                ));
+            }
+            offset += page_len;
+        }
+        Ok(requests)
+    }
+
+    /// One page of a search (`GET /search/request` with `limit` and
+    /// `offset`): the page rows plus the full match count the server
+    /// reports, so the caller knows when the list ends. A page body
+    /// that does not parse is a server error, never a short page.
+    fn search_requests_page(
+        &self,
+        search: &RequestSearch,
+        match_expr: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Request>, u32), GeectlError> {
+        let limit_param = limit.to_string();
+        let offset_param = offset.to_string();
+        let mut query: Vec<(&str, &str)> = vec![("match", match_expr)];
+        if search.wants_history() {
+            query.push(("withhistory", "1"));
+        }
+        if search.wants_full_history() {
+            query.push(("withfullhistory", "1"));
+        }
+        query.push(("limit", &limit_param));
+        query.push(("offset", &offset_param));
+        let url = build_url(&self.base, &["search", "request"], &query);
         let body = self.http.get_with(&url, &self.credentials)?;
-        let parsed = match search.limit_value() {
-            Some(limit) => parse_request_collection_limited(&body, Some(limit)),
-            None => parse_request_collection(&body),
-        };
-        parsed.ok_or_else(|| {
+        let matches = parse_search_matches(&body).ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ServerError,
                 "unexpected OBS request search response",
             )
-        })
+        })?;
+        let requests = parse_request_collection_page(&body, limit).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                "unexpected OBS request search response",
+            )
+        })?;
+        Ok((requests, matches))
     }
 }
 
@@ -6874,10 +7069,114 @@ description</description>
             request.actions[0],
             RequestAction::MaintenanceIncident {
                 source_project: "home:alice:branches:openSUSE:Maintenance".to_string(),
-                source_package: "foo".to_string(),
+                source_package: Some("foo".to_string()),
                 target_project: "openSUSE:Maintenance".to_string(),
                 target_package: None,
                 sourceupdate: Some(SourceUpdate::Cleanup),
+                makeoriginolder: false,
+                acceptinfo: None,
+            }
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_action_from_xml_maintenance_incident_without_source_package_parses() {
+        // A maintenance incident over a whole project names no
+        // source package (request 107538, live): the parser
+        // accepts the project-only source, and the round trip
+        // keeps it project-only.
+        let xml = request_document_with_action(
+            "<action type=\"maintenance_incident\">\n  <source project=\"home:adrianSuSE:branches:OBS_Maintained:build\" />\n  <target project=\"openSUSE:Maintenance\" />\n  <options>\n    <sourceupdate>cleanup</sourceupdate>\n  </options>\n</action>",
+        );
+        let request = parse_request(&xml).expect("a project-only incident parses");
+        assert_eq!(
+            request.actions[0],
+            RequestAction::MaintenanceIncident {
+                source_project: "home:adrianSuSE:branches:OBS_Maintained:build".to_string(),
+                source_package: None,
+                target_project: "openSUSE:Maintenance".to_string(),
+                target_package: None,
+                sourceupdate: Some(SourceUpdate::Cleanup),
+                makeoriginolder: false,
+                acceptinfo: None,
+            }
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_action_from_xml_release_without_source_package_parses() {
+        // A release over a whole project names no source package:
+        // the parser accepts the project-only source, and the
+        // round trip keeps it project-only.
+        let xml = request_document_with_action(
+            "<action type=\"release\">\n  <source project=\"home:alice\" />\n  <target project=\"openSUSE:Maintenance\" />\n</action>",
+        );
+        let request = parse_request(&xml).expect("a project-only release parses");
+        assert_eq!(
+            request.actions[0],
+            RequestAction::Release {
+                source_project: "home:alice".to_string(),
+                source_package: None,
+                target_project: "openSUSE:Maintenance".to_string(),
+                target_package: None,
+                sourceupdate: None,
+                makeoriginolder: false,
+                acceptinfo: None,
+            }
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_action_from_xml_maintenance_release_without_source_package_parses() {
+        // A maintenance release over a whole project names no
+        // source package: the parser accepts the project-only
+        // source, and the round trip keeps it project-only.
+        let xml = request_document_with_action(
+            "<action type=\"maintenance_release\">\n  <source project=\"home:alice\" />\n  <target project=\"openSUSE:Maintenance\" />\n</action>",
+        );
+        let request = parse_request(&xml).expect("a project-only maintenance release parses");
+        assert_eq!(
+            request.actions[0],
+            RequestAction::MaintenanceRelease {
+                source_project: "home:alice".to_string(),
+                source_package: None,
+                target_project: "openSUSE:Maintenance".to_string(),
+                target_package: None,
+                sourceupdate: None,
+                makeoriginolder: false,
+                acceptinfo: None,
+            }
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_with_superseded_by_zero_parses() {
+        // The server writes superseded_by="0" when no request
+        // superseded the request (142144, live): the parser reads
+        // that as absent instead of refusing the whole request.
+        let xml = r#"<request creator="jmcdough" id="142144">
+  <action type="maintenance_incident">
+    <source project="home:jmcdough:branches:openSUSE:12.1:Update" package="libssh" rev="e11aab1e0b5b71331e16c00cb0c2eb34" />
+    <target project="openSUSE:Maintenance" releaseproject="openSUSE:12.1:Update" />
+  </action>
+  <state name="superseded" who="jmcdough" when="2012-11-21T13:08:22" created="2012-11-20T15:47:10" superseded_by="0" />
+</request>"#;
+        let request = parse_request(xml).expect("superseded_by 0 parses");
+        assert_eq!(request.id, 142144);
+        assert_eq!(request.state.name, RequestState::Superseded);
+        assert_eq!(request.state.superseded_by, None);
+        assert_eq!(
+            request.actions[0],
+            RequestAction::MaintenanceIncident {
+                source_project: "home:jmcdough:branches:openSUSE:12.1:Update".to_string(),
+                source_package: Some("libssh".to_string()),
+                target_project: "openSUSE:Maintenance".to_string(),
+                target_package: None,
+                sourceupdate: None,
                 makeoriginolder: false,
                 acceptinfo: None,
             }
@@ -6895,7 +7194,7 @@ description</description>
             request.actions[0],
             RequestAction::Release {
                 source_project: "home:alice".to_string(),
-                source_package: "foo".to_string(),
+                source_package: Some("foo".to_string()),
                 target_project: "openSUSE:Maintenance".to_string(),
                 target_package: Some("foo".to_string()),
                 sourceupdate: None,
@@ -6918,7 +7217,7 @@ description</description>
             request.actions[0],
             RequestAction::MaintenanceIncident {
                 source_project: "home:alice:branches:openSUSE:Maintenance".to_string(),
-                source_package: "foo".to_string(),
+                source_package: Some("foo".to_string()),
                 target_project: "openSUSE:Maintenance".to_string(),
                 target_package: None,
                 sourceupdate: None,
@@ -6950,7 +7249,7 @@ description</description>
             request.actions[0],
             RequestAction::MaintenanceRelease {
                 source_project: "home:alice".to_string(),
-                source_package: "foo".to_string(),
+                source_package: Some("foo".to_string()),
                 target_project: "openSUSE:Maintenance".to_string(),
                 target_package: Some("foo".to_string()),
                 sourceupdate: Some(SourceUpdate::Cleanup),
@@ -9015,7 +9314,7 @@ description</description>
             requests[0].actions[0],
             RequestAction::MaintenanceIncident {
                 source_project: "home:alice:branches:openSUSE:Maintenance".to_string(),
-                source_package: "foo".to_string(),
+                source_package: Some("foo".to_string()),
                 target_project: "openSUSE:Maintenance".to_string(),
                 target_package: None,
                 sourceupdate: Some(SourceUpdate::Cleanup),
@@ -9204,6 +9503,283 @@ description</description>
         let requests = obs.search_requests(&search).expect("limited search parses");
         assert_eq!(requests.len(), 2);
         assert_eq!(http.get_calls()[0].0, url);
+    }
+
+    #[test]
+    fn search_requests_pages_past_the_result_limit() {
+        // A search too broad for the server's configured result
+        // limit is re-read page by page instead of failing: the
+        // first round trip is refused, then two 1000-row pages
+        // carry the 1001 matches. The row count is what pins the
+        // paging — the rows repeat one fixture.
+        let match_expr = "state%5B%40name%3D%27declined%27%5D";
+        let first = format!("https://api.opensuse.org/search/request?match={match_expr}");
+        let page0 = format!(
+            "https://api.opensuse.org/search/request?match={match_expr}&limit=1000&offset=0"
+        );
+        let page1 = format!(
+            "https://api.opensuse.org/search/request?match={match_expr}&limit=1000&offset=1000"
+        );
+        let page0_body = format!(
+            "<collection matches=\"1001\">{}</collection>",
+            REQUEST1_XML.repeat(1000)
+        );
+        let page1_body = format!("<collection matches=\"1001\">{REQUEST1_XML}</collection>");
+        let http = FakeHttp::new()
+            .with_get_error(&first, ErrorKind::ResultLimitExceeded)
+            .with_get(&page0, &page0_body)
+            .with_get(&page1, &page1_body);
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search = RequestSearch::new().states(vec![RequestState::Declined]);
+        let requests = obs
+            .search_requests(&search)
+            .expect("a refused search pages");
+        assert_eq!(requests.len(), 1001);
+        assert_eq!(
+            http.get_calls(),
+            vec![(first, true), (page0, true), (page1, true),]
+        );
+    }
+
+    #[test]
+    fn search_requests_pages_stop_at_a_caller_limit() {
+        // A caller-set limit caps the paged re-read too: the first
+        // round trip carries the limit and is refused anyway, so
+        // the fallback reads one page of exactly the limit and
+        // stops.
+        let match_expr = "state%5B%40name%3D%27declined%27%5D";
+        let first = format!("https://api.opensuse.org/search/request?match={match_expr}&limit=2");
+        let page0 =
+            format!("https://api.opensuse.org/search/request?match={match_expr}&limit=2&offset=0");
+        let page0_body =
+            format!("<collection matches=\"5\">{REQUEST1_XML}{REQUEST2_XML}</collection>");
+        let http = FakeHttp::new()
+            .with_get_error(&first, ErrorKind::ResultLimitExceeded)
+            .with_get(&page0, &page0_body);
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search = RequestSearch::new()
+            .states(vec![RequestState::Declined])
+            .limit(2);
+        let requests = obs
+            .search_requests(&search)
+            .expect("a refused search pages");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(http.get_calls().len(), 2);
+    }
+
+    #[test]
+    fn search_requests_pages_stop_at_a_caller_limit_across_pages() {
+        // A caller-set limit above one page caps the total across
+        // pages too: with a limit of 1500 over 2500 matches, the
+        // second page asks for only the 500 rows still missing, not
+        // another full 1000-row page.
+        let match_expr = "state%5B%40name%3D%27declined%27%5D";
+        let first =
+            format!("https://api.opensuse.org/search/request?match={match_expr}&limit=1500");
+        let page0 = format!(
+            "https://api.opensuse.org/search/request?match={match_expr}&limit=1000&offset=0"
+        );
+        let page1 = format!(
+            "https://api.opensuse.org/search/request?match={match_expr}&limit=500&offset=1000"
+        );
+        // The overshooting second page the bug used to request, so a
+        // pre-fix run returns 2000 rows instead of failing on a
+        // missing stub.
+        let page1_overshoot = format!(
+            "https://api.opensuse.org/search/request?match={match_expr}&limit=1000&offset=1000"
+        );
+        let page0_body = format!(
+            "<collection matches=\"2500\">{}</collection>",
+            REQUEST1_XML.repeat(1000)
+        );
+        let page1_body = format!(
+            "<collection matches=\"2500\">{}</collection>",
+            REQUEST1_XML.repeat(500)
+        );
+        let page1_overshoot_body = format!(
+            "<collection matches=\"2500\">{}</collection>",
+            REQUEST1_XML.repeat(1000)
+        );
+        let http = FakeHttp::new()
+            .with_get_error(&first, ErrorKind::ResultLimitExceeded)
+            .with_get(&page0, &page0_body)
+            .with_get(&page1, &page1_body)
+            .with_get(&page1_overshoot, &page1_overshoot_body);
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search = RequestSearch::new()
+            .states(vec![RequestState::Declined])
+            .limit(1500);
+        let requests = obs
+            .search_requests(&search)
+            .expect("a refused search pages");
+        assert_eq!(requests.len(), 1500);
+        assert_eq!(
+            http.get_calls(),
+            vec![(first, true), (page0, true), (page1, true),]
+        );
+    }
+
+    #[test]
+    fn search_requests_stops_on_an_exactly_full_multiple() {
+        // The loop ends on the match count, not on a short page:
+        // with 2000 matches over two full 1000-row pages there is
+        // no third request and no hang.
+        let match_expr = "state%5B%40name%3D%27declined%27%5D";
+        let first = format!("https://api.opensuse.org/search/request?match={match_expr}");
+        let page0 = format!(
+            "https://api.opensuse.org/search/request?match={match_expr}&limit=1000&offset=0"
+        );
+        let page1 = format!(
+            "https://api.opensuse.org/search/request?match={match_expr}&limit=1000&offset=1000"
+        );
+        let page0_body = format!(
+            "<collection matches=\"2000\">{}</collection>",
+            REQUEST1_XML.repeat(1000)
+        );
+        let page1_body = format!(
+            "<collection matches=\"2000\">{}</collection>",
+            REQUEST1_XML.repeat(1000)
+        );
+        let http = FakeHttp::new()
+            .with_get_error(&first, ErrorKind::ResultLimitExceeded)
+            .with_get(&page0, &page0_body)
+            .with_get(&page1, &page1_body);
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search = RequestSearch::new().states(vec![RequestState::Declined]);
+        let requests = obs
+            .search_requests(&search)
+            .expect("a search ending on a full page completes");
+        assert_eq!(requests.len(), 2000);
+        assert_eq!(
+            http.get_calls(),
+            vec![(first, true), (page0, true), (page1, true),]
+        );
+    }
+
+    #[test]
+    fn search_requests_paged_fails_past_the_page_cap() {
+        // Without a caller-set limit the re-read stops at the page
+        // cap instead of reading unboundedly: 100 full pages in,
+        // the 101st page is never fetched and the search fails
+        // naming the match to narrow.
+        let match_expr = "state%5B%40name%3D%27declined%27%5D";
+        let first = format!("https://api.opensuse.org/search/request?match={match_expr}");
+        let mut http = FakeHttp::new().with_get_error(&first, ErrorKind::ResultLimitExceeded);
+        let mut pages = vec![(first, true)];
+        for page in 0..100 {
+            let offset = page * 1000;
+            let url = format!(
+                "https://api.opensuse.org/search/request?match={match_expr}&limit=1000&offset={offset}"
+            );
+            let body = format!(
+                "<collection matches=\"200000\">{}</collection>",
+                REQUEST1_XML.repeat(1000)
+            );
+            http = http.with_get(&url, &body);
+            pages.push((url, true));
+        }
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search = RequestSearch::new().states(vec![RequestState::Declined]);
+        let err = obs.search_requests(&search).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::SearchTooBroad);
+        assert!(
+            err.to_string().contains("state[@name='declined']"),
+            "the cap error must name the match to narrow: {err}"
+        );
+        assert_eq!(http.get_calls(), pages);
+    }
+
+    #[test]
+    fn search_requests_paged_fails_on_a_short_page() {
+        // A short page before the match count is a truncated
+        // answer, not a completion: 1000 rows read of 2500
+        // advertised, the second page ends early, and no third
+        // page is fetched.
+        let match_expr = "state%5B%40name%3D%27declined%27%5D";
+        let first = format!("https://api.opensuse.org/search/request?match={match_expr}");
+        let page0 = format!(
+            "https://api.opensuse.org/search/request?match={match_expr}&limit=1000&offset=0"
+        );
+        let page1 = format!(
+            "https://api.opensuse.org/search/request?match={match_expr}&limit=1000&offset=1000"
+        );
+        let page0_body = format!(
+            "<collection matches=\"2500\">{}</collection>",
+            REQUEST1_XML.repeat(1000)
+        );
+        let page1_body = format!(
+            "<collection matches=\"2500\">{}</collection>",
+            REQUEST1_XML.repeat(300)
+        );
+        let http = FakeHttp::new()
+            .with_get_error(&first, ErrorKind::ResultLimitExceeded)
+            .with_get(&page0, &page0_body)
+            .with_get(&page1, &page1_body);
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search = RequestSearch::new().states(vec![RequestState::Declined]);
+        let err = obs.search_requests(&search).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert_eq!(
+            http.get_calls(),
+            vec![(first, true), (page0, true), (page1, true),]
+        );
+    }
+
+    #[test]
+    fn search_requests_paged_fails_on_an_empty_page() {
+        // An empty page advertising matches is a truncated
+        // answer, not an empty list.
+        let match_expr = "state%5B%40name%3D%27declined%27%5D";
+        let first = format!("https://api.opensuse.org/search/request?match={match_expr}");
+        let page0 = format!(
+            "https://api.opensuse.org/search/request?match={match_expr}&limit=1000&offset=0"
+        );
+        let page0_body = "<collection matches=\"5\"></collection>";
+        let http = FakeHttp::new()
+            .with_get_error(&first, ErrorKind::ResultLimitExceeded)
+            .with_get(&page0, page0_body);
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search = RequestSearch::new().states(vec![RequestState::Declined]);
+        let err = obs.search_requests(&search).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert_eq!(http.get_calls(), vec![(first, true), (page0, true),]);
+    }
+
+    #[test]
+    fn search_requests_other_errors_do_not_page() {
+        // Only the result-limit refusal pages: any other failure
+        // surfaces as-is, with no further round trip.
+        let url =
+            "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27declined%27%5D";
+        let http = FakeHttp::new().with_get_error(url, ErrorKind::ServerError);
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search = RequestSearch::new().states(vec![RequestState::Declined]);
+        let err = obs.search_requests(&search).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert_eq!(http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn parse_request_collection_page_accepts_a_short_last_page() {
+        // A page may hold fewer rows than the window asks for: the
+        // last page ends the list.
+        let collection = format!("<collection matches=\"5\">\n{REQUEST1_XML}\n</collection>");
+        let requests =
+            parse_request_collection_page(&collection, 1000).expect("a short last page parses");
+        assert_eq!(requests.len(), 1);
+        // An empty page parses as an empty list.
+        let empty = "<collection matches=\"5\"></collection>";
+        assert_eq!(
+            parse_request_collection_page(empty, 1000)
+                .expect("an empty page parses")
+                .len(),
+            0
+        );
+        // More rows than the window asks for still fails.
+        let over = format!(
+            "<collection matches=\"3\">\n{REQUEST1_XML}\n{REQUEST2_XML}\n{REQUEST1_XML}\n</collection>"
+        );
+        assert_eq!(parse_request_collection_page(&over, 2), None);
     }
 
     #[test]

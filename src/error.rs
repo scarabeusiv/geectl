@@ -11,12 +11,13 @@
 //! path itself is tested: every kind must render to JSON and to Display
 //! without panicking.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// The kinds of error geectl can produce. One variant per failure mode;
 /// new failure modes get a new variant here, never a free-text string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
     /// The requested resource does not exist (OBS project/package/request).
     NotFound,
@@ -30,6 +31,12 @@ pub enum ErrorKind {
     /// distinct, actionable state: the caller narrows the search,
     /// not an auth failure — the credentials are fine.
     ResultLimitExceeded,
+    /// A search matches more results than the bounded read allows
+    /// (the OBS paged re-read past its page cap, or the global
+    /// Gitea search past its read-back cap). A distinct, actionable
+    /// state: the caller narrows the search, like the server's
+    /// result limit — the credentials are fine.
+    SearchTooBroad,
     /// The caller's input is invalid (bad package/project name, bad flag).
     InvalidInput,
     /// A resource with that name already exists (a fork, a repo). A
@@ -117,6 +124,7 @@ impl ErrorKind {
             ErrorKind::AuthFailed => "auth_failed",
             ErrorKind::ServerError => "server_error",
             ErrorKind::ResultLimitExceeded => "result_limit_exceeded",
+            ErrorKind::SearchTooBroad => "search_too_broad",
             ErrorKind::InvalidInput => "invalid_input",
             ErrorKind::AlreadyExists => "already_exists",
             ErrorKind::Timeout => "timeout",
@@ -157,6 +165,9 @@ impl ErrorKind {
             ErrorKind::ServerError => "the server returned an error",
             ErrorKind::ResultLimitExceeded => {
                 "the search returned more results than the server allows"
+            }
+            ErrorKind::SearchTooBroad => {
+                "the search matches more results than the bounded read allows"
             }
             ErrorKind::InvalidInput => "the input is invalid",
             ErrorKind::AlreadyExists => "the resource already exists",
@@ -204,6 +215,9 @@ impl ErrorKind {
             ErrorKind::ServerError => "retry later; if it persists, the server is at fault",
             ErrorKind::ResultLimitExceeded => {
                 "narrow the search (fewer states, a project or package filter), or fetch ids only via the /search/.../id endpoint"
+            }
+            ErrorKind::SearchTooBroad => {
+                "narrow the search (fewer states, a creator, a reviewer, a repo, or a limit) and retry"
             }
             ErrorKind::InvalidInput => "fix the input and retry; see --help for the expected form",
             ErrorKind::AlreadyExists => {
@@ -292,6 +306,7 @@ impl ErrorKind {
             ErrorKind::Timeout => 5,
             ErrorKind::ServerError => 6,
             ErrorKind::ResultLimitExceeded => 23,
+            ErrorKind::SearchTooBroad => 36,
             ErrorKind::NetworkError => 7,
             ErrorKind::TlsError => 8,
             ErrorKind::ConfigError => 9,
@@ -332,6 +347,7 @@ impl ErrorKind {
             ErrorKind::AuthFailed,
             ErrorKind::ServerError,
             ErrorKind::ResultLimitExceeded,
+            ErrorKind::SearchTooBroad,
             ErrorKind::InvalidInput,
             ErrorKind::AlreadyExists,
             ErrorKind::Timeout,
