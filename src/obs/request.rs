@@ -9,6 +9,7 @@ use super::parse_status_ok;
 use super::parse_submit_request_ids;
 use super::parse_submit_request_ids_for_creator;
 use super::parse_submit_request_ids_for_forward_hop;
+use super::payload::{change_devel_remediation, NoRecordedDevel};
 use super::remote::is_md5;
 use super::remote::parse_linkinfo;
 use super::valid_obs_name;
@@ -3864,7 +3865,11 @@ impl<'a> ObsClient<'a> {
                 remaining.join(", ")
             )),
         }
-        GeectlError::new(err.kind(), message)
+        // A wrapped error keeps its per-instance remediation: the
+        // new context names the failure, the remediation still
+        // names the fix.
+        let remediation = err.remediation_opt().map(str::to_string);
+        GeectlError::new(err.kind(), message).with_remediation_opt(remediation)
     }
 
     /// Verify a request can be forwarded: resolve each submit
@@ -3984,7 +3989,9 @@ impl<'a> ObsClient<'a> {
         // must be the package's devel project and package as OBS
         // records them in the link parent's package meta. A
         // different recorded devel, or none, refuses the forward —
-        // and so does a link-parent package that does not exist
+        // the no-devel refusal names the change-devel command that
+        // records the source as the devel (#588) — and so does a
+        // link-parent package that does not exist
         // yet: with no meta there is no recorded devel to verify
         // against, so the forward is refused fail-closed instead
         // of proceeding on an unverified origin. The read is
@@ -4019,7 +4026,16 @@ impl<'a> ObsClient<'a> {
                         format!(
                             "refusing to forward {target_project}/{target_package}: {parent_project}/{parent_package} records no devel project"
                         ),
-                    ));
+                    )
+                    .with_remediation(change_devel_remediation(
+                        &NoRecordedDevel::new(
+                            target_project,
+                            target_package,
+                            &parent_project,
+                            &parent_package,
+                        ),
+                        "record the devel project first:",
+                    )));
                 }
             },
         }
@@ -5918,9 +5934,74 @@ mod tests {
             .forward_request("1398492", None, &dry_run)
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // The refusal names the change-devel command that records
+        // the source as the devel: the command is the error's
+        // per-instance remediation, not text buried in the refusal.
         assert!(
-            err.to_string().contains("records no devel project"),
+            err.to_string().contains(
+                "refusing to forward devel:languages:python/foo: openSUSE:Factory/foo records no devel project"
+            ),
             "error: {err}"
+        );
+        assert!(
+            !err.to_string().contains("remediation:"),
+            "the hint leaks into the refusal: {err}"
+        );
+        assert_eq!(
+            err.remediation(),
+            "record the devel project first: geectl request file-change-devel --source-project 'devel:languages:python' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:languages:python as the devel project of openSUSE:Factory/foo' --live"
+        );
+        assert_eq!(
+            err.to_json()["error"]["remediation"],
+            "record the devel project first: geectl request file-change-devel --source-project 'devel:languages:python' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:languages:python as the devel project of openSUSE:Factory/foo' --live"
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn forward_package_refuses_a_link_parent_with_no_devel_recorded_and_names_no_proposed_devel_for_a_home_source(
+    ) {
+        // A home/branch source is not a devel project: the
+        // link-path refusal names the change-devel command with
+        // the placeholder instead of a proposed devel.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:alice:branches:openSUSE:Factory/foo?rev=latest",
+                FORWARD_DIR_FACTORY,
+            )
+            .with_get(
+                FORWARD_FACTORY_META_URL,
+                "<package name=\"foo\" project=\"openSUSE:Factory\"></package>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(true);
+        let err = client
+            .forward_package(
+                "home:alice:branches:openSUSE:Factory",
+                "foo",
+                FORWARD_PACKAGE_DESCRIPTION,
+                FORWARD_PACKAGE_CHANGES_ENTRY,
+                &dry_run,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains(
+                "refusing to forward home:alice:branches:openSUSE:Factory/foo: openSUSE:Factory/foo records no devel project"
+            ),
+            "error: {err}"
+        );
+        assert!(
+            !err.to_string().contains("remediation:"),
+            "the hint leaks into the refusal: {err}"
+        );
+        assert_eq!(
+            err.remediation(),
+            "record the devel project first: geectl request file-change-devel --source-project '<devel-project>' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record the devel project of openSUSE:Factory/foo' --live"
+        );
+        assert_eq!(
+            err.to_json()["error"]["remediation"],
+            "record the devel project first: geectl request file-change-devel --source-project '<devel-project>' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record the devel project of openSUSE:Factory/foo' --live"
         );
         assert!(http.post_calls().is_empty());
     }
@@ -5945,6 +6026,21 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(
             err.to_string().contains("does not exist yet"),
+            "error: {err}"
+        );
+        // No recorded devel exists to name a command for: the
+        // refusal carries no per-instance remediation, and no
+        // change-devel command appears in any rendering of it.
+        assert!(err.remediation_opt().is_none(), "error: {err}");
+        assert!(
+            !err.to_string().contains("file-change-devel"),
+            "error: {err}"
+        );
+        assert!(
+            !err.to_json()["error"]["remediation"]
+                .as_str()
+                .unwrap()
+                .contains("file-change-devel"),
             "error: {err}"
         );
         assert!(http.post_calls().is_empty());

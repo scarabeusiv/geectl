@@ -28,7 +28,9 @@ The library modules:
 Every error geectl can produce is defined in one place: `ErrorKind`, with
 a stable code, a human message, a remediation, and an exit code per kind.
 `GeectlError` is a kind plus the context of the instance (what resource,
-what request) — the kind is the match key.
+what request) — the kind is the match key. An instance may also carry its
+own remediation, which replaces the kind's generic remediation in both
+renderings — one authoritative hint, never both.
 
 Rules:
 

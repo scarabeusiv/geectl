@@ -402,7 +402,7 @@ fn credentials_status(credentials: Result<Credentials, GeectlError>) -> serde_js
             "status": "error",
             "code": e.kind().code(),
             "message": e.context,
-            "remediation": e.kind().remediation(),
+            "remediation": e.remediation(),
         }),
     }
 }
@@ -726,9 +726,11 @@ fn write_error(err: &GeectlError, format: Format) {
 }
 
 /// The text rendering of an error: `error: <message>` plus
-/// `remediation: <...>` lines. The message is the error's context
-/// when it names the failure, else the kind's one-sentence message.
-/// The exit code is unchanged.
+/// one `remediation: <...>` line. The message is the error's
+/// context when it names the failure, else the kind's one-sentence
+/// message. The remediation is the error's own when one was
+/// attached, else the kind's generic one — never both. The exit
+/// code is unchanged.
 fn render_error_text(err: &GeectlError) -> String {
     let message = if err.context.is_empty() {
         err.kind.message().to_string()
@@ -738,7 +740,7 @@ fn render_error_text(err: &GeectlError) -> String {
     format!(
         "error: {message}
 remediation: {}",
-        err.kind.remediation()
+        err.remediation()
     )
 }
 
@@ -945,6 +947,22 @@ mod tests {
         let text = render_error_text(&err);
         assert!(text.starts_with("error: bad name"));
         assert!(text.contains("remediation: fix the input and retry"));
+    }
+
+    #[test]
+    fn text_error_uses_per_instance_remediation_once() {
+        // A per-instance remediation replaces the kind's generic
+        // line: exactly one `remediation:` line, carrying the
+        // instance hint and never the generic text.
+        let err = GeectlError::new(ErrorKind::InvalidInput, "refusing to forward a/b")
+            .with_remediation("record the devel project first: geectl request file-change-devel");
+        let text = render_error_text(&err);
+        assert_eq!(
+            text,
+            "error: refusing to forward a/b
+remediation: record the devel project first: geectl request file-change-devel"
+        );
+        assert_eq!(text.matches("remediation:").count(), 1);
     }
 
     #[test]

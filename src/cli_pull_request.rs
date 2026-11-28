@@ -1560,10 +1560,15 @@ fn merge_obs(
     // Live: the merge landed; forward the now-merged request.
     let (forward_payload, forward_text) =
         crate::cli_request::forward(debug, id, forward_message, live, instance).map_err(|err| {
+            // The wrapped error keeps the forward failure's
+            // per-instance remediation: the merge context names
+            // the failure, the remediation still names the fix.
+            let remediation = err.remediation_opt().map(str::to_string);
             GeectlError::new(
                 err.kind(),
                 format!("merged request {id}, but the forward failed: {err}"),
             )
+            .with_remediation_opt(remediation)
         })?;
     if let Value::Object(map) = &mut payload {
         map.insert("forward".to_string(), forward_payload);
@@ -1669,10 +1674,15 @@ fn merge_gitea(
     // Live: the merge landed; forward the merged pull request.
     let (forward_payload, forward_text) =
         forward_gitea(debug, reference, forward_message, instance).map_err(|err| {
+            // The wrapped error keeps the forward failure's
+            // per-instance remediation: the merge context names
+            // the failure, the remediation still names the fix.
+            let remediation = err.remediation_opt().map(str::to_string);
             GeectlError::new(
                 err.kind(),
                 format!("merged {reference}, but the forward failed: {err}"),
             )
+            .with_remediation_opt(remediation)
         })?;
     if let Value::Object(map) = &mut payload {
         map.insert("forward".to_string(), forward_payload);
