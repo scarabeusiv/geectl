@@ -5490,7 +5490,7 @@ fn branch_live_servers() -> (
         &[
             (
                 "GET",
-                "/public/source/games/descent3/_meta",
+                "/source/games/descent3/_meta",
                 &[(200, package_meta.as_str())],
             ),
             (
