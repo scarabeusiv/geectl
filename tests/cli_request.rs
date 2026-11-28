@@ -1991,6 +1991,85 @@ fn request_accept_live_forward_refused_with_no_devel_names_the_change_devel_comm
 }
 
 #[test]
+fn request_accept_live_forward_refused_with_other_devel_names_the_change_devel_command() {
+    // The link parent records devel:languages:ruby, not the
+    // forwarding source devel:languages:python: the accept lands,
+    // the forward refuses, and the refusal names the change-devel
+    // command that records the source as the devel.
+    let (addr, seen) = serve_accept_forward_with_parent_meta(Some(("devel:languages:ruby", "foo")));
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "request", "accept", "42"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the refused accept exited 0: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(out.status.code(), Some(2));
+    // JSON surface (the default format): the refusal is
+    // `error.context` and the change-devel command is the
+    // structured `error.remediation` field, never buried in the
+    // context and never alongside the generic remediation.
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).expect("stderr is JSON");
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        "accepted request 42, but the forward failed: invalid_input: the input is invalid (refusing to forward devel:languages:python/foo: openSUSE:Factory/foo records devel devel:languages:ruby/foo, not devel:languages:python/foo)"
+    );
+    assert_eq!(
+        value["error"]["remediation"],
+        "change the devel project: geectl request file-change-devel --source-project 'devel:languages:python' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:languages:python as the devel project of openSUSE:Factory/foo' --live"
+    );
+    // Text surface: the same refusal and hint, as `error:` lines.
+    let out = geectl_isolated(&dir)
+        .args(["--live", "--format", "text", "request", "accept", "42"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("refusing to forward devel:languages:python/foo: openSUSE:Factory/foo records devel devel:languages:ruby/foo, not devel:languages:python/foo"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("remediation: change the devel project: geectl request file-change-devel --source-project 'devel:languages:python' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:languages:python as the devel project of openSUSE:Factory/foo' --live"),
+        "stderr: {stderr}"
+    );
+    // One authoritative hint: a single `remediation:` line, and
+    // never the kind's generic "fix the input" line.
+    assert_eq!(
+        stderr.matches("remediation:").count(),
+        1,
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("fix the input and retry"),
+        "stderr: {stderr}"
+    );
+    {
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|r| r.contains("changestate") && r.contains("newstate=accepted")),
+            "no accept changestate recorded: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("cmd=create")),
+            "a forward was filed after the refusal: {seen:?}"
+        );
+    }
+}
+
+#[test]
 fn request_accept_live_transient_check_failure_accepts_and_reports() {
     // The same refused fixture shape, but the hop read fails
     // transiently (500) instead of refusing: the accept lands,

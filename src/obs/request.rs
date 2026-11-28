@@ -3989,12 +3989,12 @@ impl<'a> ObsClient<'a> {
         // must be the package's devel project and package as OBS
         // records them in the link parent's package meta. A
         // different recorded devel, or none, refuses the forward —
-        // the no-devel refusal names the change-devel command that
-        // records the source as the devel (#588) — and so does a
-        // link-parent package that does not exist
-        // yet: with no meta there is no recorded devel to verify
-        // against, so the forward is refused fail-closed instead
-        // of proceeding on an unverified origin. The read is
+        // both refusals name the change-devel command that records
+        // the source as the devel. A link-parent
+        // package that does not exist yet refuses too, but names
+        // no command: with no meta there is no recorded devel to
+        // verify against, so the forward is refused fail-closed
+        // instead of proceeding on an unverified origin. The read is
         // authenticated: a hidden parent still answers, so the
         // check runs; only a genuinely absent package answers
         // NotFound.
@@ -4018,7 +4018,16 @@ impl<'a> ObsClient<'a> {
                         format!(
                             "refusing to forward {target_project}/{target_package}: {parent_project}/{parent_package} records devel {recorded_project}/{recorded_package}, not {target_project}/{target_package}"
                         ),
-                    ));
+                    )
+                    .with_remediation(change_devel_remediation(
+                        &NoRecordedDevel::new(
+                            target_project,
+                            target_package,
+                            &parent_project,
+                            &parent_package,
+                        ),
+                        "change the devel project:",
+                    )));
                 }
                 None => {
                     return Err(GeectlError::new(
@@ -5554,10 +5563,28 @@ mod tests {
             .forward_request("1398492", None, &dry_run)
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // The refusal names the change-devel command that records
+        // the source as the devel: the command is the error's
+        // per-instance remediation, not text buried in the
+        // refusal. A different devel already exists, so the
+        // lead-in says to change it, not to record one first.
         assert!(
-            err.to_string().contains("devel:languages:python")
-                && err.to_string().contains("devel:languages:ruby"),
+            err.to_string().contains(
+                "refusing to forward devel:languages:python/foo: openSUSE:Factory/foo records devel devel:languages:ruby/foo, not devel:languages:python/foo"
+            ),
             "error: {err}"
+        );
+        assert!(
+            !err.to_string().contains("remediation:"),
+            "the hint leaks into the refusal: {err}"
+        );
+        assert_eq!(
+            err.remediation(),
+            "change the devel project: geectl request file-change-devel --source-project 'devel:languages:python' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:languages:python as the devel project of openSUSE:Factory/foo' --live"
+        );
+        assert_eq!(
+            err.to_json()["error"]["remediation"],
+            "change the devel project: geectl request file-change-devel --source-project 'devel:languages:python' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:languages:python as the devel project of openSUSE:Factory/foo' --live"
         );
         assert!(http.post_calls().is_empty());
     }
