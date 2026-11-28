@@ -2206,7 +2206,8 @@ pub fn checkout(
             ),
         ));
     }
-    let meta = client.package_meta(project, package)?;
+    // The public route omits `<scmsync>`; the scmsync read needs the authenticated twin.
+    let meta = client.package_meta_authenticated(project, package)?;
     if rev.is_some() && meta.scmsync.is_some() {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
@@ -7189,7 +7190,7 @@ mod tests {
     fn checkout_http() -> FakeHttp {
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -7244,7 +7245,7 @@ mod tests {
         };
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -7296,7 +7297,7 @@ mod tests {
         };
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -7365,7 +7366,7 @@ mod tests {
                 project_listing,
             )
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -7381,7 +7382,7 @@ mod tests {
                 b"",
             )
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/bar/_meta",
+                "https://api.opensuse.org/source/home:alice/bar/_meta",
                 "<package name=\"bar\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -7697,7 +7698,7 @@ mod tests {
         );
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -7741,7 +7742,7 @@ mod tests {
         );
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -7772,7 +7773,7 @@ mod tests {
         );
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -7811,7 +7812,7 @@ mod tests {
             </directory>";
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -7841,7 +7842,7 @@ mod tests {
         );
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -7878,7 +7879,7 @@ mod tests {
         );
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -7919,7 +7920,7 @@ mod tests {
         );
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -8588,7 +8589,7 @@ mod tests {
     fn linked_checkout_http() -> FakeHttp {
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo-link/_meta",
+                "https://api.opensuse.org/source/home:alice/foo-link/_meta",
                 "<package name=\"foo-link\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -8631,7 +8632,7 @@ mod tests {
     fn chained_checkout_http() -> FakeHttp {
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo-link/_meta",
+                "https://api.opensuse.org/source/home:alice/foo-link/_meta",
                 "<package name=\"foo-link\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -8690,7 +8691,7 @@ mod tests {
     fn baserevless_checkout_http() -> FakeHttp {
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo-link/_meta",
+                "https://api.opensuse.org/source/home:alice/foo-link/_meta",
                 "<package name=\"foo-link\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -8732,7 +8733,7 @@ mod tests {
     fn cyclic_checkout_http() -> FakeHttp {
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo-link/_meta",
+                "https://api.opensuse.org/source/home:alice/foo-link/_meta",
                 "<package name=\"foo-link\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -8889,7 +8890,7 @@ mod tests {
         );
         let http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -8927,7 +8928,7 @@ mod tests {
         );
         let http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -8966,7 +8967,7 @@ mod tests {
         );
         let http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -9022,7 +9023,7 @@ mod tests {
     fn checkout_succeeds_for_an_empty_package() {
         let http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -9603,7 +9604,7 @@ mod tests {
         );
         let http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -9678,7 +9679,7 @@ mod tests {
         let listing = listing_rev1();
         let http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get_sequence(
@@ -9740,7 +9741,7 @@ mod tests {
         // commit time: the server moved past the checkout's base.
         let http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get_sequence(
@@ -10872,7 +10873,7 @@ mod tests {
     fn checkout_removes_a_partial_target_on_failure() {
         let http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -11150,7 +11151,7 @@ mod tests {
     /// the origin's HTTP URL, on branch `main`.
     fn git_checkout_http(origin_url: &str) -> FakeHttp {
         FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+            "https://api.opensuse.org/source/home:alice/foo/_meta",
             &format!(
                 "<package name=\"foo\" project=\"home:alice\"><scmsync>{origin_url}#main</scmsync></package>",
             ),
@@ -11386,7 +11387,7 @@ mod tests {
         let (port, rx) = header_recorder();
         let other = format!("http://127.0.0.1:{port}/other");
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+            "https://api.opensuse.org/source/home:alice/foo/_meta",
             &format!(
                 "<package name=\"foo\" project=\"home:alice\"><scmsync>{other}</scmsync></package>"
             ),
@@ -11417,7 +11418,7 @@ mod tests {
         let (port, rx) = header_recorder();
         let repo = format!("http://127.0.0.1:{port}/repo");
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+            "https://api.opensuse.org/source/home:alice/foo/_meta",
             &format!(
                 "<package name=\"foo\" project=\"home:alice\"><scmsync>{repo}</scmsync></package>"
             ),
@@ -11462,7 +11463,7 @@ mod tests {
         // clone never runs.
         let dir = TempDirGuard::new("git-checkout-dash");
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+            "https://api.opensuse.org/source/home:alice/foo/_meta",
             "<package name=\"foo\" project=\"home:alice\"><scmsync>--upload-pack=touch /tmp/geectl-pwn#main</scmsync></package>",
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
@@ -11524,7 +11525,7 @@ mod tests {
         // An empty fragment names no branch: the clone takes the
         // origin's default, like a URL with no fragment at all.
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+            "https://api.opensuse.org/source/home:alice/foo/_meta",
             &format!(
                 "<package name=\"foo\" project=\"home:alice\"><scmsync>{}#</scmsync></package>",
                 origin.url
@@ -11560,6 +11561,61 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         let _ = origin;
+    }
+
+    #[test]
+    fn checkout_reads_the_package_meta_from_the_authenticated_endpoint() {
+        // The public route omits `<scmsync>`, so the meta must come from the authenticated endpoint.
+        let dir = TempDirGuard::new("git-checkout-auth-meta");
+        let origin = git_origin(&dir.path);
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:alice/foo/_meta",
+            &format!(
+                "<package name=\"foo\" project=\"home:alice\"><scmsync>{}#main</scmsync></package>",
+                origin.url
+            ),
+        );
+        let wc = do_git_checkout(&http, &dir);
+        assert_eq!(wc.backend, Backend::Git);
+        // The meta came from the authenticated endpoint, with credentials — never from the public route.
+        assert!(http.get_calls().contains(&(
+            "https://api.opensuse.org/source/home:alice/foo/_meta".to_string(),
+            true
+        )));
+        assert!(
+            !http.get_calls().iter().any(
+                |(url, _)| url == "https://api.opensuse.org/public/source/home:alice/foo/_meta"
+            ),
+            "the scmsync detection read must not use the public route: {:?}",
+            http.get_calls()
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn checkout_refuses_without_obs_credentials_in_live_and_dry_run() {
+        // Checkout needs OBS credentials for the meta read in both modes; without them it fails before any request.
+        for dry_run in [false, true] {
+            let dir = TempDirGuard::new("checkout-no-credentials");
+            let http = FakeHttp::new().with_get(
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            );
+            let client = ObsClient::new(&http);
+            let err = checkout(
+                &client,
+                "home:alice",
+                "foo",
+                None,
+                &dir.path,
+                None,
+                &DryRun::new(dry_run),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ConfigError);
+            assert!(err.context.contains("GEECTL_OBS_USERNAME"));
+            assert!(http.get_calls().is_empty());
+        }
     }
 
     #[test]
@@ -12103,7 +12159,7 @@ mod tests {
         let final_url = "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=test&user=scarabeus_iv&keeplink=1&noservice=1";
         FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -12995,7 +13051,7 @@ mod tests {
         );
         let http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -13370,7 +13426,7 @@ mod tests {
         );
         let http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
             .with_get(
@@ -15398,7 +15454,7 @@ mod tests {
         ] {
             let dir = TempDirGuard::new("git-bad-scheme");
             let http = FakeHttp::new().with_get(
-                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
                 &format!(
                     "<package name=\"foo\" project=\"home:alice\"><scmsync>{url}</scmsync></package>",
                 ),

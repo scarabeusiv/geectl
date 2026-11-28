@@ -4123,7 +4123,7 @@ mod tests {
     use crate::auth::EnvObsAuth;
     use crate::error::ErrorKind;
     use crate::obs::parse_project_meta;
-    use crate::obs::test_support::{basic_credentials, FakeHttp};
+    use crate::obs::test_support::{basic_credentials, FakeHttp, OBS_ENV_LOCK};
 
     #[test]
     fn parse_directory_entry_names_accepts_an_xml_prolog() {
@@ -4794,6 +4794,8 @@ mod tests {
 
     #[test]
     fn results_across_instances_records_a_malformed_url_as_that_instances_error() {
+        // The closure reads OBS credentials from the process environment (see OBS_ENV_LOCK).
+        let _lock = OBS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A malformed `[instances]` URL fails when that instance
         // is read, not at load: each broken instance records its
         // own error — naming the bad URL's shape, never echoing

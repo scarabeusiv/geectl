@@ -61,28 +61,29 @@ fn endpoints(instance: Option<&str>) -> Result<Endpoints, GeectlError> {
     })
 }
 
-/// Whether the leaf needs OBS credentials: `pull` reads the
-/// authed expanded routes (`directory_listing_expanded`,
-/// `download_source_expanded_to_file`) and `commit` mutates; the
-/// rest read public routes. A leaf that needs credentials and
-/// does not ask for them 401s — `pull` did, until this table
-/// said so. The single source of truth for the credential
-/// wiring, pinned by the `leaf_credential_wiring` test; read
-/// only through `obs_client`, which is the single choke point.
-fn needs_obs_credentials(leaf: &str) -> bool {
-    matches!(leaf, "pull" | "commit")
+/// Whether the leaf resolves OBS credentials for this run:
+/// `pull` and `checkout` read authed routes even in dry-run
+/// (their plans are read-only), `commit` mutates and resolves
+/// only when live; the rest read public routes. The single
+/// source of truth for the credential wiring, pinned by the
+/// `leaf_credential_wiring` test; read only through `obs_client`,
+/// which is the single choke point.
+fn resolves_obs_credentials(leaf: &str, live: bool) -> bool {
+    match leaf {
+        "pull" | "checkout" => true,
+        "commit" => live,
+        _ => false,
+    }
 }
 
 /// An OBS client on `http`: the per-instance OBS credentials for
-/// a leaf that needs them, when live. The leaf name is the only
-/// input — `obs_client` does the `needs_obs_credentials` lookup
-/// itself, so the wiring is pinned by the
-/// `leaf_credential_wiring` test by construction. The CLI-wide
-/// rule is that a dry-run resolves no credentials, except `pull`:
-/// its dry-run plan reads the authed expanded routes, and the
-/// plan is read-only, so it resolves credentials in dry-run too
-/// (a dry-run pull without them 401s on exactly the servers the
-/// credential fix was for).
+/// a leaf that needs them, per `resolves_obs_credentials` — the
+/// leaf name and liveness are the only inputs, so the wiring is
+/// pinned by the `leaf_credential_wiring` test by construction.
+/// A dry-run resolves no credentials except for `pull` and
+/// `checkout`, whose plans read authed routes (a dry-run pull
+/// without them 401s on exactly the servers the credential fix
+/// was for).
 fn obs_client<'a>(
     http: &'a dyn HttpClient,
     endpoints: &Endpoints,
@@ -90,7 +91,7 @@ fn obs_client<'a>(
     live: bool,
     debug: &Debug,
 ) -> Result<ObsClient<'a>, GeectlError> {
-    let credentials = if needs_obs_credentials(leaf) && (live || leaf == "pull") {
+    let credentials = if resolves_obs_credentials(leaf, live) {
         // With `--instance` the flagged instance's credentials
         // resolve strictly from the alias's own variables.
         match &endpoints.instance {
@@ -906,7 +907,7 @@ fn resolve_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::obs::test_support::FakeHttp;
+    use crate::obs::test_support::{FakeHttp, OBS_ENV_LOCK};
     use crate::working_copy::StatusEntry;
 
     fn wc() -> WorkingCopy {
@@ -1209,18 +1210,85 @@ mod tests {
 
     #[test]
     fn leaf_credential_wiring_pins_which_leaves_need_credentials() {
-        // `pull` reads the authed expanded routes and `commit`
-        // mutates: without credentials both 401. `checkout`,
-        // `update`, and `diff` read public routes only. `obs_client`
-        // is the single choke point for the table, so this pins the
-        // wiring: a leaf names itself there, and the table
-        // decides.
-        assert!(needs_obs_credentials("pull"));
-        assert!(needs_obs_credentials("commit"));
-        assert!(!needs_obs_credentials("checkout"));
-        assert!(!needs_obs_credentials("update"));
-        assert!(!needs_obs_credentials("status"));
-        assert!(!needs_obs_credentials("diff"));
+        // `pull` and `checkout` read authed routes even in dry-run; `commit` mutates, so it resolves only when live.
+        for leaf in ["pull", "checkout"] {
+            assert!(resolves_obs_credentials(leaf, true));
+            assert!(resolves_obs_credentials(leaf, false));
+        }
+        assert!(resolves_obs_credentials("commit", true));
+        assert!(!resolves_obs_credentials("commit", false));
+        for leaf in ["update", "status", "diff"] {
+            assert!(!resolves_obs_credentials(leaf, true));
+            assert!(!resolves_obs_credentials(leaf, false));
+        }
+    }
+
+    /// An environment variable restored (or removed) on drop: the OBS credential variables are process-wide.
+    struct RestoreVar(&'static str, Option<std::ffi::OsString>);
+
+    impl RestoreVar {
+        fn set(name: &'static str, value: &str) -> Self {
+            let old = std::env::var_os(name);
+            std::env::set_var(name, value);
+            RestoreVar(name, old)
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let old = std::env::var_os(name);
+            std::env::remove_var(name);
+            RestoreVar(name, old)
+        }
+    }
+
+    impl Drop for RestoreVar {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(old) => std::env::set_var(self.0, old),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    #[test]
+    fn obs_client_resolves_credentials_in_dry_run_for_checkout_and_pull() {
+        // `checkout` and `pull` resolve OBS credentials even in dry-run; `diff` reads public routes only.
+        let _lock = OBS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _user = RestoreVar::set("GEECTL_OBS_USERNAME", "alice");
+        let _pass = RestoreVar::set("GEECTL_OBS_PASSWORD", "secret");
+        // An ambient API key or password file would refuse the Basic pair; keep them out.
+        let _api_key = RestoreVar::remove("GEECTL_OBS_APIKEY");
+        let _api_key_file = RestoreVar::remove("GEECTL_OBS_APIKEY_FILE");
+        let _pass_file = RestoreVar::remove("GEECTL_OBS_PASSWORD_FILE");
+        let http = FakeHttp::new();
+        let endpoints = Endpoints {
+            obs_base: "https://api.example.org".to_string(),
+            instances: vec![],
+            instance: None,
+            config: config::Config {
+                obs_url: None,
+                gitea_url: None,
+                format: None,
+                identity: None,
+                instances: vec![],
+                build_cache_dir: None,
+                build_cache_cap_gib: None,
+            },
+        };
+        assert!(
+            obs_client(&http, &endpoints, "checkout", false, &Debug::disabled())
+                .unwrap()
+                .has_auth()
+        );
+        assert!(
+            obs_client(&http, &endpoints, "pull", false, &Debug::disabled())
+                .unwrap()
+                .has_auth()
+        );
+        assert!(
+            !obs_client(&http, &endpoints, "diff", false, &Debug::disabled())
+                .unwrap()
+                .has_auth()
+        );
     }
 
     #[test]

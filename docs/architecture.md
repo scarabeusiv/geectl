@@ -384,10 +384,10 @@ buildinfo, the dependency info, a download, and a fileinfo. A
 malformed document is a server error.
 
 Credentials: the public reads (devel project, devel version, file
-and directory reads (except the deleted-package listing), meta, link target, project diff (unannotated), package diff, revision patch, repository list)
+and directory reads (except the deleted-package listing), meta (public route), link target, project diff (unannotated), package diff, revision patch, repository list)
 run credential-free; the package log, the top-level project listing, the
 maintained-instances listing, the open-SR search, the package and project
-search, the owner search, and reading a person, plus the filing POST,
+search, the owner search, and reading a person, plus the authenticated meta read and the filing POST,
 superseding, deleting, creating, and uploading, repository add and
 remove, and every `/build` read,
 and every request read and act (show, log, search, state change,
