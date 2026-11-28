@@ -3597,6 +3597,18 @@ _arguments "${_arguments_options[@]}" : \
 '::package -- The OBS package. The whole project when omitted:_default' \
 && ret=0
 ;;
+(checkout-pr)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':reference -- The pull-request handle\: `gitea\:<owner>/<repo>#<number>`:_default' \
+&& ret=0
+;;
 (update)
 _arguments "${_arguments_options[@]}" : \
 '--rev=[The revision to update to (a number or a source md5). The latest when omitted]:REV:_default' \
@@ -4646,6 +4658,10 @@ esac
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(checkout-pr)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (update)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -4741,6 +4757,7 @@ _geectl_commands() {
 'meta:Set the meta of an OBS project, an OBS package, or a Gitea repository as one operation\: the target selects the backend' \
 'changelog:Validate and generate \`.changes\` entries in a package directory, pre-file' \
 'checkout:Check out a package into a git working copy, under the current directory. Without a package, every package in the project, one working copy each' \
+'checkout-pr:Check out a Gitea pull request into a git working copy, under the current directory\: the pull request'\''s head repo at its head branch, into \`<owner>/<repo>/\`' \
 'update:Update the working copy in the current directory to the latest base' \
 'status:Show the working copy'\''s state against the base' \
 'diff:Show the diff of the worktree and the index against the base, plus the link diff on a linked checkout' \
@@ -5235,6 +5252,11 @@ _geectl__subcmd__checkout_commands() {
     local commands; commands=()
     _describe -t commands 'geectl checkout commands' commands "$@"
 }
+(( $+functions[_geectl__subcmd__checkout-pr_commands] )) ||
+_geectl__subcmd__checkout-pr_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl checkout-pr commands' commands "$@"
+}
 (( $+functions[_geectl__subcmd__commit_commands] )) ||
 _geectl__subcmd__commit_commands() {
     local commands; commands=()
@@ -5505,6 +5527,7 @@ _geectl__subcmd__help_commands() {
 'meta:Set the meta of an OBS project, an OBS package, or a Gitea repository as one operation\: the target selects the backend' \
 'changelog:Validate and generate \`.changes\` entries in a package directory, pre-file' \
 'checkout:Check out a package into a git working copy, under the current directory. Without a package, every package in the project, one working copy each' \
+'checkout-pr:Check out a Gitea pull request into a git working copy, under the current directory\: the pull request'\''s head repo at its head branch, into \`<owner>/<repo>/\`' \
 'update:Update the working copy in the current directory to the latest base' \
 'status:Show the working copy'\''s state against the base' \
 'diff:Show the diff of the worktree and the index against the base, plus the link diff on a linked checkout' \
@@ -5755,6 +5778,11 @@ _geectl__subcmd__help__subcmd__changelog__subcmd__validate_commands() {
 _geectl__subcmd__help__subcmd__checkout_commands() {
     local commands; commands=()
     _describe -t commands 'geectl help checkout commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__help__subcmd__checkout-pr_commands] )) ||
+_geectl__subcmd__help__subcmd__checkout-pr_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help checkout-pr commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help__subcmd__commit_commands] )) ||
 _geectl__subcmd__help__subcmd__commit_commands() {

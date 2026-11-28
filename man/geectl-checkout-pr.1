@@ -1,0 +1,18 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-checkout-pr 1  "geectl-checkout-pr 0.3.0" 
+.SH NAME
+geectl\-checkout\-pr \- Check out a Gitea pull request into a git working copy, under the current directory: the pull request\*(Aqs head repo at its head branch, into `<owner>/<repo>/`
+.SH SYNOPSIS
+\fBgeectl checkout\-pr\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
+.SH DESCRIPTION
+Check out a Gitea pull request into a git working copy, under the current directory: the pull request\*(Aqs head repo at its head branch, into `<owner>/<repo>/`
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREFERENCE\fR>
+The pull\-request handle: `gitea:<owner>/<repo>#<number>`
+.SH VERSION
+v0.3.0

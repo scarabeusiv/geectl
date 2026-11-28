@@ -1,5 +1,6 @@
-//! Working-copy CLI leaves (`geectl checkout`, `update`, `status`,
-//! `diff`, `add`, `rm`, `addremove`, `commit`, `pull`, `resolve`).
+//! Working-copy CLI leaves (`geectl checkout`, `checkout-pr`,
+//! `update`, `status`, `diff`, `add`, `rm`, `addremove`, `commit`,
+//! `pull`, `resolve`).
 //!
 //! Top-level leaves, not a group: the working copy is the agent's
 //! checkout, and the leaves read like verbs. Each leaf operates on
@@ -22,8 +23,10 @@ use crate::auth::{Credentials, EnvGiteaAuth, EnvObsAuth};
 use crate::config::{self, DEFAULT_GITEA_URL};
 use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
+use crate::gitea::GiteaClient;
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{DryRun, ObsClient, RevisionSpec, OBS_API_BASE};
+use crate::pull_request::PullRequestRef;
 use crate::working_copy::{
     self, Backend, CheckoutProjectReport, CommitReport, PullReport, StatusCode, UpdateReport,
     WorkingCopy,
@@ -113,14 +116,25 @@ fn obs_client<'a>(
 /// configured: a public git-backed checkout needs none, and the
 /// push is what fails closed without one. The URL scopes the token
 /// (see `working_copy::GiteaAuth`): git only sends it to that
-/// instance.
-fn gitea_auth(endpoints: &Endpoints) -> Result<Option<(String, String)>, GeectlError> {
+/// instance. With `--instance`, strictly the flagged alias's
+/// variables (see `resolve_gitea_for_instance`), like the Gitea
+/// client — the clone authenticates as the same alias the API
+/// calls use, and a missing alias token fails the call instead of
+/// borrowing the plain token or cloning anonymously.
+fn gitea_auth(
+    endpoints: &Endpoints,
+    instance: Option<&str>,
+) -> Result<Option<(String, String)>, GeectlError> {
     let url = endpoints
         .config
         .gitea_url
         .clone()
         .unwrap_or_else(|| DEFAULT_GITEA_URL.to_string());
-    match EnvGiteaAuth::credentials_for_url(&url, &url, &endpoints.instances)? {
+    let credentials = match instance {
+        Some(alias) => EnvGiteaAuth::credentials_for_instance(alias, &endpoints.instances)?,
+        None => EnvGiteaAuth::credentials_for_url(&url, &url, &endpoints.instances)?,
+    };
+    match credentials {
         Credentials::Bearer { token } => Ok(Some((token, url))),
         _ => Ok(None),
     }
@@ -254,7 +268,11 @@ pub fn checkout(
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     // A dry-run checkout clones nothing: resolving the Gitea
     // token here would resolve credentials for a plan.
-    let auth = if live { gitea_auth(&endpoints)? } else { None };
+    let auth = if live {
+        gitea_auth(&endpoints, instance)?
+    } else {
+        None
+    };
     let auth = gitea_auth_ref(&auth);
     let rev = rev.map(RevisionSpec::parse).transpose()?;
     let dir = current_dir()?;
@@ -409,6 +427,171 @@ fn checkout_project_result(
     mutation_result(payload, header, result_line, dry_run, plan)
 }
 
+/// The refusal for an OBS handle: `checkout-pr` checks out a
+/// Gitea pull request, never an OBS submit request. Refused by the
+/// public leaf before any resolution and again in the cores, as
+/// enforcement — the pull-request group's `build-comment` refuses
+/// its OBS handle the same way.
+fn obs_reference_error(id: u64) -> GeectlError {
+    GeectlError::new(
+        ErrorKind::InvalidInput,
+        format!("checkout-pr checks out a Gitea pull request; {id} is an OBS submit request"),
+    )
+}
+
+/// Check out the Gitea pull request `reference` into
+/// `<owner>/<repo>/` under the current directory: the head repo at
+/// its head branch, with the handle and the head repo and branch
+/// recorded in `geectl.pr-ref`, `geectl.pr-head-repo`, and
+/// `geectl.pr-head-branch`. Dry-run by default: the plan names the
+/// reference and the target, and clones nothing — the head repo and
+/// branch are known only after `pr_get`, so they are live-only
+/// detail, and a dry-run resolves no clients or credentials.
+/// `--live` builds the Gitea client (which fails closed without a
+/// token, like the pull-request group's Gitea arm) and clones.
+pub fn checkout_pr(
+    reference: &str,
+    debug: &Debug,
+    live: bool,
+    instance: Option<&str>,
+) -> Result<(Value, String), GeectlError> {
+    // The handle is parsed before any credential resolution, so an
+    // invalid handle fails as InvalidInput whether or not
+    // credentials are configured (the pull-request group parses its
+    // handles the same way).
+    let reference: PullRequestRef = reference.parse()?;
+    if let PullRequestRef::Obs(id) = &reference {
+        return Err(obs_reference_error(*id));
+    }
+    let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+    let endpoints = endpoints(instance)?;
+    let dry_run = DryRun::new(!live).with_debug(debug.clone());
+    let dir = current_dir()?;
+    if live {
+        let obs = obs_client(&http, &endpoints, "checkout-pr", live, debug)?;
+        let gitea = crate::cli_gitea::gitea_client(&http, debug, instance)?;
+        // A live checkout-pr clones: resolving the Gitea token
+        // here is live-only, like `checkout`.
+        let auth = gitea_auth(&endpoints, instance)?;
+        let auth = gitea_auth_ref(&auth);
+        checkout_pr_with(&obs, &gitea, &reference, &dir, auth.as_ref())
+    } else {
+        // A dry-run checkout-pr clones nothing and resolves no
+        // clients or credentials: the plan names only the
+        // reference and the target.
+        checkout_pr_dry_run(&reference, &dir, &dry_run)
+    }
+}
+
+/// The live `checkout-pr` core over the clients the public leaf
+/// builds: the OBS client names the instance the record is
+/// associated with, the Gitea client resolves the pull request.
+/// The OBS handle is refused again here, as enforcement.
+pub(crate) fn checkout_pr_with(
+    obs: &ObsClient,
+    gitea: &GiteaClient,
+    reference: &PullRequestRef,
+    dir: &Path,
+    auth: Option<&working_copy::GiteaAuth<'_>>,
+) -> Result<(Value, String), GeectlError> {
+    let (owner, repo) = match reference {
+        PullRequestRef::Gitea { owner, repo, .. } => (owner.as_str(), repo.as_str()),
+        PullRequestRef::Obs(id) => return Err(obs_reference_error(*id)),
+    };
+    let target = working_copy::checkout_target(dir, owner, repo)?;
+    let wc = working_copy::checkout_pull_request(obs, gitea, reference, dir, auth)?;
+    Ok(checkout_pr_result(
+        reference,
+        owner,
+        repo,
+        &target,
+        Some(&wc),
+        false,
+        None,
+    ))
+}
+
+/// The dry-run `checkout-pr`: the plan names the reference and the
+/// target. The head repo and branch are known only after `pr_get`,
+/// so they are live-only detail — the plan stays honest about what
+/// a dry-run knows.
+fn checkout_pr_dry_run(
+    reference: &PullRequestRef,
+    dir: &Path,
+    dry_run: &DryRun,
+) -> Result<(Value, String), GeectlError> {
+    let (owner, repo) = match reference {
+        PullRequestRef::Gitea { owner, repo, .. } => (owner.as_str(), repo.as_str()),
+        PullRequestRef::Obs(id) => return Err(obs_reference_error(*id)),
+    };
+    let target = working_copy::checkout_target(dir, owner, repo)?;
+    dry_run.allow(&format!("check out {reference} into {}", target.display()));
+    Ok(checkout_pr_result(
+        reference,
+        owner,
+        repo,
+        &target,
+        None,
+        true,
+        plan_of(dry_run),
+    ))
+}
+
+/// The `checkout-pr` result: the checkout record when live, the
+/// target path when dry-run. The header echoes the pull-request
+/// handle; the payload carries the recorded head repo and branch.
+fn checkout_pr_result(
+    reference: &PullRequestRef,
+    project: &str,
+    package: &str,
+    target: &Path,
+    wc: Option<&WorkingCopy>,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let header = format!("pull request: {reference}");
+    match wc {
+        Some(wc) => {
+            let payload = json!({
+                "reference": reference.to_string(),
+                "project": project,
+                "package": package,
+                "dir": wc.root.to_string_lossy(),
+                "backend": backend_name(wc.backend),
+                "base_rev": wc.base_rev,
+                "pr_head_repo": wc.pr_head_repo,
+                "pr_head_branch": wc.pr_head_branch,
+            });
+            let result_line = match (wc.pr_head_repo.as_deref(), wc.pr_head_branch.as_deref()) {
+                (Some(head_repo), Some(head_branch)) => format!(
+                    "checked out {reference} into {} (git base {}, head {head_repo}@{head_branch})",
+                    wc.root.display(),
+                    wc.base_rev,
+                ),
+                _ => format!(
+                    "checked out {reference} into {} (git base {})",
+                    wc.root.display(),
+                    wc.base_rev,
+                ),
+            };
+            mutation_result(payload, header, result_line, dry_run, plan)
+        }
+        None => {
+            let payload = json!({
+                "reference": reference.to_string(),
+                "project": project,
+                "package": package,
+                "dir": target.to_string_lossy(),
+            });
+            let result_line = format!(
+                "dry-run: would check out {reference} into {}",
+                target.display()
+            );
+            mutation_result(payload, header, result_line, dry_run, plan)
+        }
+    }
+}
+
 /// Update the working copy in the current directory to the latest
 /// base (or to `--rev`).
 pub fn update(
@@ -423,7 +606,11 @@ pub fn update(
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     // A dry-run update fetches nothing: resolving the Gitea
     // token here would resolve credentials for a plan.
-    let auth = if live { gitea_auth(&endpoints)? } else { None };
+    let auth = if live {
+        gitea_auth(&endpoints, instance)?
+    } else {
+        None
+    };
     let auth = gitea_auth_ref(&auth);
     let mut wc = open_working_copy(live, Some(&client))?;
     let report = working_copy::update(&mut wc, &client, rev, auth.as_ref(), &dry_run)?;
@@ -703,7 +890,11 @@ pub fn commit(
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     // A dry-run commit pushes nothing: resolving the Gitea
     // token here would resolve credentials for a plan.
-    let auth = if live { gitea_auth(&endpoints)? } else { None };
+    let auth = if live {
+        gitea_auth(&endpoints, instance)?
+    } else {
+        None
+    };
     let auth = gitea_auth_ref(&auth);
     let mut wc = open_working_copy(live, Some(&client))?;
     let report = working_copy::commit(
@@ -921,6 +1112,9 @@ mod tests {
             mtimes: Vec::new(),
             scmsync_url: None,
             scmsync_branch: None,
+            pr_ref: None,
+            pr_head_repo: None,
+            pr_head_branch: None,
         }
     }
 
@@ -976,6 +1170,9 @@ mod tests {
             mtimes: Vec::new(),
             scmsync_url: None,
             scmsync_branch: None,
+            pr_ref: None,
+            pr_head_repo: None,
+            pr_head_branch: None,
         }
     }
 
@@ -1211,13 +1408,15 @@ mod tests {
     fn leaf_credential_wiring_pins_which_leaves_need_credentials() {
         // `pull` reads the authed expanded routes and `commit`
         // mutates: without credentials both 401. `checkout`,
-        // `update`, and `diff` read public routes only. `obs_client`
+        // `checkout-pr`, `update`, and `diff` read public routes
+        // only. `obs_client`
         // is the single choke point for the table, so this pins the
         // wiring: a leaf names itself there, and the table
         // decides.
         assert!(needs_obs_credentials("pull"));
         assert!(needs_obs_credentials("commit"));
         assert!(!needs_obs_credentials("checkout"));
+        assert!(!needs_obs_credentials("checkout-pr"));
         assert!(!needs_obs_credentials("update"));
         assert!(!needs_obs_credentials("status"));
         assert!(!needs_obs_credentials("diff"));
@@ -1261,6 +1460,171 @@ mod tests {
         assert_eq!(
             text,
             "project: home:alice package: foo\ndry_run: true\nstaged foo.spec in home:alice/foo\nstage foo.spec"
+        );
+    }
+
+    fn wc_pr() -> WorkingCopy {
+        WorkingCopy {
+            root: PathBuf::from("/tmp/alice/foo"),
+            project: "alice".to_string(),
+            package: "foo".to_string(),
+            apiurl: "https://api.opensuse.org".to_string(),
+            backend: Backend::Git,
+            base_rev: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            base_srcmd5: String::new(),
+            mtimes: Vec::new(),
+            scmsync_url: None,
+            scmsync_branch: None,
+            pr_ref: Some("gitea:alice/foo#7".to_string()),
+            pr_head_repo: Some("bob/foo".to_string()),
+            pr_head_branch: Some("feature".to_string()),
+        }
+    }
+
+    fn pr_reference() -> PullRequestRef {
+        PullRequestRef::Gitea {
+            owner: "alice".to_string(),
+            repo: "foo".to_string(),
+            number: 7,
+        }
+    }
+
+    #[test]
+    fn checkout_pr_result_live_carries_the_record() {
+        let dir = PathBuf::from("/tmp");
+        let wc = wc_pr();
+        let target = dir.join("alice").join("foo");
+        let (payload, text) = checkout_pr_result(
+            &pr_reference(),
+            "alice",
+            "foo",
+            &target,
+            Some(&wc),
+            false,
+            None,
+        );
+        assert_eq!(payload["reference"], json!("gitea:alice/foo#7"));
+        assert_eq!(payload["project"], json!("alice"));
+        assert_eq!(payload["package"], json!("foo"));
+        assert_eq!(payload["backend"], json!("git"));
+        assert_eq!(
+            payload["base_rev"],
+            json!("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(payload["pr_head_repo"], json!("bob/foo"));
+        assert_eq!(payload["pr_head_branch"], json!("feature"));
+        assert_eq!(payload["dry_run"], json!(false));
+        assert!(text.contains("pull request: gitea:alice/foo#7"));
+        assert!(text.contains("dry_run: false"));
+        assert!(text.contains(&format!(
+            "checked out gitea:alice/foo#7 into {} (git base 0123456789abcdef0123456789abcdef01234567, head bob/foo@feature)",
+            wc.root.display()
+        )));
+    }
+
+    #[test]
+    fn checkout_pr_result_dry_run_carries_the_target_and_the_plan() {
+        let dir = PathBuf::from("/tmp");
+        let target = dir.join("alice").join("foo");
+        let target_text = target.display().to_string();
+        let (payload, text) = checkout_pr_result(
+            &pr_reference(),
+            "alice",
+            "foo",
+            &target,
+            None,
+            true,
+            Some(vec![format!(
+                "[dry-run] would: check out gitea:alice/foo#7 into {target_text}"
+            )]),
+        );
+        assert_eq!(payload["reference"], json!("gitea:alice/foo#7"));
+        assert_eq!(payload["dir"], json!(target_text));
+        assert_eq!(payload["dry_run"], json!(true));
+        assert_eq!(
+            payload["plan"],
+            json!([format!(
+                "[dry-run] would: check out gitea:alice/foo#7 into {target_text}"
+            )])
+        );
+        assert!(text.contains(&format!(
+            "dry-run: would check out gitea:alice/foo#7 into {target_text}"
+        )));
+    }
+
+    #[test]
+    fn checkout_pr_dry_run_prints_the_plan() {
+        let dir = PathBuf::from("/tmp");
+        // The separators are the platform's: the plan names the
+        // target as the platform spells it.
+        let target_text = dir.join("alice").join("foo").display().to_string();
+        let dry_run = DryRun::new(true);
+        let (payload, text) = checkout_pr_dry_run(&pr_reference(), &dir, &dry_run).unwrap();
+        assert_eq!(payload["reference"], json!("gitea:alice/foo#7"));
+        assert_eq!(payload["dry_run"], json!(true));
+        assert_eq!(
+            payload["plan"],
+            json!([format!(
+                "[dry-run] would: check out gitea:alice/foo#7 into {target_text}"
+            )])
+        );
+        assert!(text.contains("pull request: gitea:alice/foo#7"));
+        assert!(text.contains(&format!(
+            "dry-run: would check out gitea:alice/foo#7 into {target_text}"
+        )));
+    }
+
+    #[test]
+    fn checkout_pr_with_refuses_an_obs_reference() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_base_and_credentials(
+            &http,
+            "https://api.opensuse.org",
+            Credentials::None,
+        )
+        .unwrap();
+        let gitea = GiteaClient::with_base(
+            &http,
+            "https://src.opensuse.org",
+            Credentials::Bearer {
+                token: "test-token".to_string(),
+            },
+        )
+        .unwrap();
+        let err = checkout_pr_with(
+            &obs,
+            &gitea,
+            &PullRequestRef::Obs(123),
+            Path::new("/tmp"),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("is an OBS submit request"),
+            "message: {err}"
+        );
+    }
+
+    #[test]
+    fn checkout_pr_refuses_an_obs_reference_before_any_resolution() {
+        // The refusal fires before any config or credential
+        // resolution: it is reachable with no config at all.
+        let err = checkout_pr("obs:123", &Debug::disabled(), false, None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("is an OBS submit request"),
+            "message: {err}"
+        );
+    }
+
+    #[test]
+    fn checkout_pr_refuses_an_invalid_handle_before_any_resolution() {
+        let err = checkout_pr("nonsense", &Debug::disabled(), false, None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("invalid pull-request handle"),
+            "message: {err}"
         );
     }
 }

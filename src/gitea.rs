@@ -1445,6 +1445,13 @@ impl<'a> GiteaClient<'a> {
             .unwrap_or(&self.base)
     }
 
+    /// The configured base URL (scheme + host, no trailing
+    /// slash), for building the clone URL of a pull-request head
+    /// repo.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
     /// Read a repository (`GET /api/v1/repos/{owner}/{repo}`).
     /// The read the other operations build on: it resolves the
     /// default branch and verifies a fork's parent by re-reading.
@@ -4752,8 +4759,41 @@ fn validate_gitea_team_name(name: &str) -> Result<(), GeectlError> {
 /// exactly it. The server is the authority on the rest (slashes
 /// are legal in branch names, so they are allowed here, unlike in
 /// a repo name).
-fn validate_git_branch_name(branch: &str) -> Result<(), GeectlError> {
-    let valid = !branch.is_empty()
+pub(crate) fn validate_git_branch_name(branch: &str) -> Result<(), GeectlError> {
+    if !valid_git_branch_name(branch, false) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid git branch name: {branch:?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// A git branch name for a branch that is checked out, never
+/// embedded in a scmsync URL fragment: the git-check-ref-format
+/// rules above, with `#` allowed — it is legal in git, and it
+/// travels as `--branch=<branch>`, never inside a `#fragment`,
+/// so it cannot truncate one. The other rules are shared with
+/// `validate_git_branch_name`.
+pub(crate) fn validate_git_branch_name_for_clone(branch: &str) -> Result<(), GeectlError> {
+    if !valid_git_branch_name(branch, true) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid git branch name: {branch:?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// The git-check-ref-format rules for a branch name: no control
+/// characters, whitespace, `~`, `^`, `:`, `?`, `*`, `[`, or
+/// `\\`; no `..`; no `@{`; no leading or trailing `/`, no `//`;
+/// no component starting with `.` or ending with `.lock`; not
+/// `@` alone; no trailing `.`. `#` is refused unless
+/// `allow_hash`: it is legal in git, but a branch embedded
+/// verbatim in a `#fragment` would truncate the scmsync URL.
+fn valid_git_branch_name(branch: &str, allow_hash: bool) -> bool {
+    !branch.is_empty()
         && branch != "@"
         && !branch.ends_with('.')
         && !branch.contains("..")
@@ -4764,18 +4804,12 @@ fn validate_git_branch_name(branch: &str) -> Result<(), GeectlError> {
         && branch.chars().all(|c| {
             !c.is_control()
                 && !c.is_whitespace()
-                && !matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\' | '#')
+                && !matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+                && (allow_hash || c != '#')
         })
         && branch
             .split('/')
-            .all(|component| !component.starts_with('.') && !component.ends_with(".lock"));
-    if !valid {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            format!("invalid git branch name: {branch:?}"),
-        ));
-    }
-    Ok(())
+            .all(|component| !component.starts_with('.') && !component.ends_with(".lock"))
 }
 
 /// A raw-file path: slash-separated parts, none empty, no `.`
@@ -5667,6 +5701,17 @@ mod tests {
                 "{invalid:?} should be invalid"
             );
         }
+    }
+
+    #[test]
+    fn git_branch_name_for_clone_allows_a_hash() {
+        // `#` is legal in git and travels as `--branch=<branch>`:
+        // only the scmsync-fragment form refuses it.
+        assert!(validate_git_branch_name_for_clone("fix#1").is_ok());
+        assert!(validate_git_branch_name("fix#1").is_err());
+        // The other rules are shared: `..` is refused by both.
+        assert!(validate_git_branch_name_for_clone("foo..bar").is_err());
+        assert!(validate_git_branch_name_for_clone("").is_err());
     }
 
     #[test]

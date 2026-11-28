@@ -10,8 +10,9 @@
 //! agent edits files, stages with `add`, and commits with `commit`:
 //! the OBS-native commit sends the index state against the base
 //! through the `commitfilelist` protocol, the git-backed commit
-//! pushes the local commits and polls the OBS side until the sync
-//! picks the pushed head up.
+//! pushes the local commits and, for a checkout with a scmsync URL
+//! recorded, polls the OBS side until the sync picks the pushed
+//! head up.
 //!
 //! The checkout record lives in the repository's own git config
 //! (`geectl.*`): the API URL, the project, the package, the backend
@@ -29,13 +30,14 @@ use crate::changelog::changes::normalize_changes_content;
 use crate::changelog::validate::{validate, PackageSnapshot, ValidateOptions};
 use crate::config::{Config, Identity};
 use crate::error::{ErrorKind, GeectlError};
-use crate::gitea::{validate_gitea_name, GiteaClient};
+use crate::gitea::{validate_git_branch_name_for_clone, validate_gitea_name, GiteaClient};
 use crate::local_build::LocalBuild;
 use crate::obs::common::parse_obsinfo_commit;
 use crate::obs::{
-    valid_obs_filename, CommitFileEntry, CommitFilelistOptions, DirectoryListing, DryRun,
-    ObsClient, RevisionSpec, ServiceCode,
+    build_url, valid_obs_filename, CommitFileEntry, CommitFilelistOptions, DirectoryListing,
+    DryRun, ObsClient, RevisionSpec, ServiceCode,
 };
+use crate::pull_request::PullRequestRef;
 use crate::xml::XmlDoc;
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
@@ -174,6 +176,17 @@ pub struct WorkingCopy {
     /// present and non-empty: the branch the checkout tracks, and
     /// the pull-request base it defaults to. None otherwise.
     pub scmsync_branch: Option<String>,
+    /// The pull-request handle (`gitea:owner/repo#number`) the
+    /// checkout came from. `Some` only for a checkout of a pull
+    /// request's head branch: an OBS or scmsync checkout has none.
+    pub pr_ref: Option<String>,
+    /// The head repo (`owner/name`) of the pull request the
+    /// checkout came from. `Some` only for a pull-request checkout.
+    pub pr_head_repo: Option<String>,
+    /// The head branch of the pull request the checkout came from:
+    /// the branch the checkout tracks, and the branch a commit
+    /// pushes to. `Some` only for a pull-request checkout.
+    pub pr_head_branch: Option<String>,
 }
 
 impl WorkingCopy {
@@ -1849,6 +1862,9 @@ fn open_inner(dir: &Path, heal: bool) -> Result<WorkingCopy, GeectlError> {
         mtimes,
         scmsync_url: git_config_get(dir, "scmsync-url")?,
         scmsync_branch: git_config_get(dir, "scmsync-branch")?.filter(|branch| !branch.is_empty()),
+        pr_ref: git_config_get(dir, "pr-ref")?.filter(|value| !value.is_empty()),
+        pr_head_repo: git_config_get(dir, "pr-head-repo")?.filter(|value| !value.is_empty()),
+        pr_head_branch: git_config_get(dir, "pr-head-branch")?.filter(|value| !value.is_empty()),
     };
     if backend == Backend::Obs {
         let root = root_commit(dir)?;
@@ -2169,6 +2185,28 @@ fn check_file_names(names: &[&str]) -> Result<(), GeectlError> {
     Ok(())
 }
 
+/// Refuse a checkout target that already exists: a checkout
+/// never overwrites one. An existing working copy recorded from
+/// another instance refuses with the apiurl mismatch, naming
+/// both URLs: the generic exists error would hide the cause.
+/// Anything that is not a readable working copy keeps the
+/// generic refusal.
+fn refuse_existing_checkout_target(client: &ObsClient, target: &Path) -> Result<(), GeectlError> {
+    if target.exists() {
+        if let Ok(existing) = open_read(target) {
+            existing.check_apiurl(&client.base)?;
+        }
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "checkout target already exists: {}; on a case-insensitive filesystem a checkout with the same name in different case counts as existing",
+                target.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Check out package `package` in project `project` into
 /// `<dir>/<project>/<package>/`. A git-backed package (its `_meta`
 /// carries a scmsync URL) is cloned; an OBS-native package is
@@ -2189,23 +2227,7 @@ pub fn checkout(
     // project would otherwise put the target (and the failure
     // cleanup below) outside `dir`.
     let target = checkout_target(dir, project, package)?;
-    if target.exists() {
-        // An existing working copy recorded from another
-        // instance refuses with the apiurl mismatch, naming both
-        // URLs: the generic exists error would hide the cause.
-        // Anything that is not a readable working copy keeps the
-        // generic refusal.
-        if let Ok(existing) = open_read(&target) {
-            existing.check_apiurl(&client.base)?;
-        }
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            format!(
-                "checkout target already exists: {}; on a case-insensitive filesystem a checkout with the same name in different case counts as existing",
-                target.display()
-            ),
-        ));
-    }
+    refuse_existing_checkout_target(client, &target)?;
     let meta = client.package_meta(project, package)?;
     if rev.is_some() && meta.scmsync.is_some() {
         return Err(GeectlError::new(
@@ -2619,6 +2641,9 @@ fn checkout_obs(
         mtimes,
         scmsync_url: None,
         scmsync_branch: None,
+        pr_ref: None,
+        pr_head_repo: None,
+        pr_head_branch: None,
     })
 }
 
@@ -2631,34 +2656,28 @@ fn split_scmsync_url(url: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The git-backed checkout: clone the scmsync repository. The
-/// clone's HEAD is the base. The scmsync URL and the branch its
-/// fragment names are recorded, so the checkout remembers which
-/// branch it tracks.
-fn checkout_git(
-    client: &ObsClient,
-    project: &str,
-    package: &str,
-    url: &str,
+/// Clone a git repository over http(s) into `target`, checking
+/// out `branch` when one is named, and return the cloned HEAD:
+/// the base of the checkout the caller records. Only http(s) is
+/// accepted: a `file://` URL, a local path, `ssh://` (the user's
+/// keys and agent), or `git://` would hand the clone to a
+/// transport the checkout never asked for. The refusal runs before
+/// anything is created on disk. The branch travels as
+/// `--branch=<branch>`, never as a separate argument: a
+/// server-named branch starting with `-` is a value, never an
+/// option.
+fn clone_git(
+    label: &str,
+    clone_url: &str,
+    branch: Option<&str>,
+    target: &Path,
     dir: &Path,
     gitea_auth: Option<&GiteaAuth<'_>>,
-) -> Result<WorkingCopy, GeectlError> {
-    let target = checkout_target(dir, project, package)?;
-    // The `#branch` fragment names the branch to check out, but
-    // git does not understand it: passing it to `git clone` makes
-    // the fragment part of the path, and the clone fails. Strip it
-    // and check the branch out with `--branch` instead.
-    let (clone_url, branch) = split_scmsync_url(url);
-    // A scmsync URL comes from the server (`_meta`), so it is
-    // maintainer-controlled: only http(s) is accepted. A `file://`
-    // URL, a local path, `ssh://` (the user's keys and agent), or
-    // `git://` would hand the clone to a transport the checkout
-    // never asked for. The refusal runs before anything is created
-    // on disk.
+) -> Result<String, GeectlError> {
     if !(clone_url.starts_with("http://") || clone_url.starts_with("https://")) {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            format!("refusing to clone a scmsync URL that is not http(s): {clone_url:?}"),
+            format!("refusing to clone a {label} that is not http(s): {clone_url:?}"),
         ));
     }
     std::fs::create_dir_all(target.parent().unwrap_or(dir)).map_err(|e| {
@@ -2682,10 +2701,11 @@ fn checkout_git(
     env.push(("GIT_ALLOW_PROTOCOL", "http:https"));
     let target_str = target.to_string_lossy().into_owned();
     let mut args: Vec<&str> = Vec::new();
+    let branch_arg;
     if let Some(branch) = branch {
         if !branch.is_empty() {
-            args.push("--branch");
-            args.push(branch);
+            branch_arg = format!("--branch={branch}");
+            args.push(&branch_arg);
         }
     }
     // The `--` keeps the URL a repository, never an option: the
@@ -2696,9 +2716,29 @@ fn checkout_git(
     args.push(clone_url);
     args.push(&target_str);
     git_network(dir, "clone", &args, &env)?;
-    let head = git(&target, "rev-parse", &["HEAD"], &[])?
-        .trim()
-        .to_string();
+    let head = git(target, "rev-parse", &["HEAD"], &[])?.trim().to_string();
+    Ok(head)
+}
+
+/// The git-backed checkout: clone the scmsync repository. The
+/// clone's HEAD is the base. The scmsync URL and the branch its
+/// fragment names are recorded, so the checkout remembers which
+/// branch it tracks.
+fn checkout_git(
+    client: &ObsClient,
+    project: &str,
+    package: &str,
+    url: &str,
+    dir: &Path,
+    gitea_auth: Option<&GiteaAuth<'_>>,
+) -> Result<WorkingCopy, GeectlError> {
+    let target = checkout_target(dir, project, package)?;
+    // The `#branch` fragment names the branch to check out, but
+    // git does not understand it: passing it to `git clone` makes
+    // the fragment part of the path, and the clone fails. Strip it
+    // and check the branch out with `--branch` instead.
+    let (clone_url, branch) = split_scmsync_url(url);
+    let head = clone_git("scmsync URL", clone_url, branch, &target, dir, gitea_auth)?;
     let mtimes = write_record(
         &target,
         &client.base,
@@ -2723,6 +2763,144 @@ fn checkout_git(
         scmsync_branch: branch
             .filter(|branch| !branch.is_empty())
             .map(str::to_string),
+        pr_ref: None,
+        pr_head_repo: None,
+        pr_head_branch: None,
+    })
+}
+
+/// The pull-request checkout: clone the head branch of a Gitea
+/// pull request into `<dir>/<owner>/<repo>/`, recording the
+/// handle and the head repo and branch. There is no OBS package
+/// behind a pull request, so no scmsync URL is recorded and a
+/// later commit returns once the push lands, without polling the
+/// OBS side. An existing target is refused and a failed checkout
+/// leaves no partial target behind, like `checkout`. An OBS
+/// reference is refused: there is no Gitea pull request behind it.
+pub fn checkout_pull_request(
+    client: &ObsClient,
+    gitea: &GiteaClient<'_>,
+    reference: &PullRequestRef,
+    dir: &Path,
+    gitea_auth: Option<&GiteaAuth<'_>>,
+) -> Result<WorkingCopy, GeectlError> {
+    let (owner, repo, number) = match reference {
+        PullRequestRef::Gitea {
+            owner,
+            repo,
+            number,
+        } => (owner, repo, number),
+        PullRequestRef::Obs(id) => {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "checkout_pull_request checks out a Gitea pull request; {id} is an OBS submit request"
+                ),
+            ));
+        }
+    };
+    // The target refusal runs before the pull-request read: the
+    // read is wasted work when the checkout cannot land.
+    let target = checkout_target(dir, owner, repo)?;
+    refuse_existing_checkout_target(client, &target)?;
+    match checkout_pull_request_inner(
+        client, gitea, reference, owner, repo, *number, &target, dir, gitea_auth,
+    ) {
+        Ok(wc) => Ok(wc),
+        Err(err) => {
+            // A failed checkout leaves no partial target behind:
+            // the target did not exist on entry (refused above),
+            // so anything there on failure is this call's, and
+            // the next attempt must not trip over it.
+            let _ = std::fs::remove_dir_all(&target);
+            Err(err)
+        }
+    }
+}
+
+/// Resolve the pull request, clone its head repo at its head
+/// branch, and record the handle plus the head repo and branch.
+/// The clone URL is the Gitea instance's canonical `.git` URL
+/// for the head repo, built with the single URL builder. The
+/// recorded base is the cloned branch tip: the branch can advance
+/// between the `pr_get` read and the clone, and the checkout
+/// records what it actually cloned, not the head SHA the read
+/// returned. The recorded project and package are the pull
+/// request's repo (owner and name): the checkout is that repo at
+/// the head branch. The recorded apiurl is the OBS instance the
+/// caller works against, so the existing commit machinery (the
+/// apiurl check, the service gate) runs unchanged; the Gitea
+/// instance is the one the Gitea client points at.
+#[allow(clippy::too_many_arguments)]
+fn checkout_pull_request_inner(
+    client: &ObsClient,
+    gitea: &GiteaClient<'_>,
+    reference: &PullRequestRef,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    target: &Path,
+    dir: &Path,
+    gitea_auth: Option<&GiteaAuth<'_>>,
+) -> Result<WorkingCopy, GeectlError> {
+    let pr = gitea.pr_get(owner, repo, number)?;
+    let head = pr.head;
+    let head_repo = head.repo.as_ref().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::NotFound,
+            format!("pull request {reference} has no head repo: the fork it came from was deleted"),
+        )
+    })?;
+    let (head_owner, head_name) = head_repo.full_name.split_once('/').ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected Gitea pull-request response: head repo {:?} is not owner/repo",
+                head_repo.full_name
+            ),
+        )
+    })?;
+    validate_gitea_name(head_owner, "head owner")?;
+    validate_gitea_name(head_name, "head repo")?;
+    validate_git_branch_name_for_clone(&head.branch)?;
+    let repo_name = format!("{head_name}.git");
+    let clone_url = build_url(gitea.base_url(), &[head_owner, &repo_name], &[]);
+    let head_sha = clone_git(
+        "pull-request head URL",
+        &clone_url,
+        Some(&head.branch),
+        target,
+        dir,
+        gitea_auth,
+    )?;
+    let mtimes = write_record(
+        target,
+        &client.base,
+        owner,
+        repo,
+        Backend::Git,
+        &head_sha,
+        "",
+        None,
+        None,
+    )?;
+    git_config_set(target, "pr-ref", &reference.to_string())?;
+    git_config_set(target, "pr-head-repo", &head_repo.full_name)?;
+    git_config_set(target, "pr-head-branch", &head.branch)?;
+    Ok(WorkingCopy {
+        root: target.to_path_buf(),
+        project: owner.to_string(),
+        package: repo.to_string(),
+        apiurl: client.base.clone(),
+        backend: Backend::Git,
+        base_rev: head_sha,
+        base_srcmd5: String::new(),
+        mtimes,
+        scmsync_url: None,
+        scmsync_branch: None,
+        pr_ref: Some(reference.to_string()),
+        pr_head_repo: Some(head_repo.full_name.clone()),
+        pr_head_branch: Some(head.branch.clone()),
     })
 }
 
@@ -5173,8 +5351,10 @@ fn commit_obs(
     })
 }
 
-/// The git-backed commit: commit staged changes, push, and poll the
-/// OBS side until the synced commit matches the pushed head. The
+/// The git-backed commit: commit staged changes, push, and — for
+/// a checkout with a scmsync URL recorded — poll the OBS side
+/// until the synced commit matches the pushed head. A checkout
+/// with no scmsync URL recorded returns once the push lands. The
 /// refusals run before the service gate, in order: the remote has
 /// commits the checkout lacks, conflicts, nothing to commit. The
 /// gate runs last of the checks, and its outputs are staged into
@@ -5299,41 +5479,50 @@ fn commit_git(
         git_network(&wc.root, "push", &["--no-verify", "origin", "HEAD"], &env)?;
         head
     };
-    // The push landed; the OBS side picks it up through scmsync.
-    // Poll `_scmsync.obsinfo` until its `commit:` matches the
-    // pushed head, bounded: a sync that never arrives is a timeout,
-    // not a successful commit. A read that fails (a 401 or 404
-    // while the sync is pending) is kept, not swallowed: the
-    // timeout names the last failure instead of hiding it.
-    let deadline = Instant::now() + POLL_TIMEOUT;
-    let mut last_err: Option<String>;
-    loop {
-        match client.cat(&wc.project, &wc.package, "_scmsync.obsinfo", None) {
-            Ok(body) => {
-                // A successful read clears the last error: a stale
-                // one would otherwise name a read that recovered.
-                last_err = None;
-                if parse_obsinfo_commit(&body).as_deref() == Some(head.as_str()) {
-                    break;
-                }
-            }
-            Err(e) => last_err = Some(e.to_string()),
-        }
-        if Instant::now() >= deadline {
-            return Err(GeectlError::new(
-                ErrorKind::Timeout,
-                match last_err {
-                    Some(last) => format!(
-                        "the OBS side did not sync the pushed head within 60 seconds; the last sync read failed: {last}"
-                    ),
-                    None => {
-                        "the OBS side did not sync the pushed head within 60 seconds"
-                            .to_string()
+    // The push landed. A pull-request checkout has no OBS side
+    // to sync: the push landing is the commit, and there is
+    // nothing to poll. Any other git-backed checkout is
+    // OBS/scmsync-backed, so the OBS side picks the push up
+    // through scmsync: poll `_scmsync.obsinfo` until its
+    // `commit:` matches the pushed head, bounded: a sync that
+    // never arrives is a timeout, not a successful commit. A read
+    // that fails (a 401 or 404 while the sync is pending) is kept,
+    // not swallowed: the timeout names the last failure instead
+    // of hiding it. The gate is the pull-request identity, not
+    // the scmsync URL: a checkout recorded before `scmsync-url`
+    // existed is still OBS/scmsync-backed, and skipping its poll
+    // would report success without verifying synchronization.
+    if wc.pr_ref.as_deref().is_none_or(|pr| pr.is_empty()) {
+        let deadline = Instant::now() + POLL_TIMEOUT;
+        let mut last_err: Option<String>;
+        loop {
+            match client.cat(&wc.project, &wc.package, "_scmsync.obsinfo", None) {
+                Ok(body) => {
+                    // A successful read clears the last error: a stale
+                    // one would otherwise name a read that recovered.
+                    last_err = None;
+                    if parse_obsinfo_commit(&body).as_deref() == Some(head.as_str()) {
+                        break;
                     }
-                },
-            ));
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+            if Instant::now() >= deadline {
+                return Err(GeectlError::new(
+                    ErrorKind::Timeout,
+                    match last_err {
+                        Some(last) => format!(
+                            "the OBS side did not sync the pushed head within 60 seconds; the last sync read failed: {last}"
+                        ),
+                        None => {
+                            "the OBS side did not sync the pushed head within 60 seconds"
+                                .to_string()
+                        }
+                    },
+                ));
+            }
+            std::thread::sleep(POLL_INTERVAL);
         }
-        std::thread::sleep(POLL_INTERVAL);
     }
     let old_base = wc.base_rev.clone();
     // The push landed: a failure here must name the pushed head,
@@ -11540,6 +11729,546 @@ mod tests {
         assert_eq!(wc.scmsync_url.as_deref(), Some(expected_url.as_str()));
         assert_eq!(wc.scmsync_branch, None);
         let _ = origin;
+    }
+
+    /// A Gitea origin for pull-request checkout tests: a bare repo
+    /// at `<dir>/bob/foo.git` (the head repo's two-segment path,
+    /// stored with the `.git` suffix the way Gitea stores it),
+    /// served over HTTP like `git_origin`, with a `feature` branch
+    /// at the head the PR names. `feature` carries its own commit,
+    /// so the checkout pins the branch instead of the shared
+    /// `main` commit.
+    struct GitPrOrigin {
+        path: PathBuf,
+        base: String,
+        head: String,
+        _server: HttpBackendServer,
+    }
+
+    fn git_pr_origin(dir: &Path) -> GitPrOrigin {
+        let repo = dir.join("bob").join("foo.git");
+        git(dir, "init", &["--bare", "-b", "main", "bob/foo.git"], &[]).unwrap();
+        git(&repo, "config", &["http.receivepack", "true"], &[]).unwrap();
+        let work = dir.join("work");
+        git(dir, "clone", &["--quiet", "bob/foo.git", "work"], &[]).unwrap();
+        git(&work, "config", &["--local", "user.name", "geectl"], &[]).unwrap();
+        git(
+            &work,
+            "config",
+            &["--local", "user.email", "geectl@localhost"],
+            &[],
+        )
+        .unwrap();
+        write_file(&work, "foo.spec", "Name: foo\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "initial"]);
+        git_ok(&work, &["push", "--quiet", "origin", "main"]);
+        git_ok(&work, &["checkout", "-b", "feature"]);
+        write_file(&work, "feature.txt", "feature\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "feature"]);
+        git_ok(&work, &["push", "--quiet", "origin", "feature"]);
+        let head = git(&work, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let server = HttpBackendServer::new(dir.to_path_buf());
+        let base = format!("http://127.0.0.1:{}", server.port);
+        GitPrOrigin {
+            path: repo,
+            base,
+            head,
+            _server: server,
+        }
+    }
+
+    /// The Gitea pull-request JSON for `pr_get`: head repo
+    /// `bob/foo` at branch `feature`, base repo `alice/foo`.
+    fn pr_checkout_json(head_sha: &str) -> String {
+        pr_checkout_json_for("bob/foo", "feature", head_sha)
+    }
+
+    /// The Gitea pull-request JSON for `pr_get`, with the head
+    /// repo and branch given.
+    fn pr_checkout_json_for(head_repo: &str, branch: &str, head_sha: &str) -> String {
+        format!(
+            r#"{{"id": 7, "number": 7, "user": {{"login": "alice"}}, "title": "trivial fix", "body": null, "labels": [], "state": "open", "draft": false, "merged": false, "mergeable": true, "head": {{"label": "bob:{branch}", "ref": "{branch}", "sha": "{head_sha}", "repo": {{"full_name": "{head_repo}"}}}}, "base": {{"label": "alice:main", "ref": "main", "sha": "{head_sha}", "repo": {{"full_name": "alice/foo"}}}}, "future_field": "tolerated"}}"#
+        )
+    }
+
+    /// The pull-request handle the checkout tests resolve: PR 7
+    /// on `alice/foo`.
+    fn pr_reference() -> PullRequestRef {
+        PullRequestRef::Gitea {
+            owner: "alice".to_string(),
+            repo: "foo".to_string(),
+            number: 7,
+        }
+    }
+
+    /// The clients a pull-request checkout test resolves and
+    /// commits with: the OBS client names the instance the record
+    /// is associated with, the Gitea client points at the local
+    /// origin server.
+    fn pr_clients<'a>(http: &'a FakeHttp, base: &'a str) -> (ObsClient<'a>, GiteaClient<'a>) {
+        let client = ObsClient::with_credentials(http, basic_credentials()).unwrap();
+        let gitea = GiteaClient::with_base(
+            http,
+            base,
+            Credentials::Bearer {
+                token: "SECRET".to_string(),
+            },
+        )
+        .unwrap();
+        (client, gitea)
+    }
+
+    #[test]
+    fn checkout_pull_request_clones_the_head_branch() {
+        let dir = TempDirGuard::new("pr-checkout");
+        let origin = git_pr_origin(&dir.path);
+        let pr_url = format!("{}/api/v1/repos/alice/foo/pulls/7", origin.base);
+        let http = FakeHttp::new().with_get(&pr_url, &pr_checkout_json(&origin.head));
+        let (client, gitea) = pr_clients(&http, &origin.base);
+        let auth = GiteaAuth {
+            token: "SECRET",
+            url: origin.base.as_str(),
+        };
+        let wc = checkout_pull_request(&client, &gitea, &pr_reference(), &dir.path, Some(&auth))
+            .unwrap();
+        assert_eq!(wc.project, "alice");
+        assert_eq!(wc.package, "foo");
+        assert_eq!(wc.backend, Backend::Git);
+        assert_eq!(wc.apiurl, "https://api.opensuse.org");
+        assert_eq!(wc.base_rev, origin.head);
+        assert_eq!(wc.base_srcmd5, "");
+        assert_eq!(wc.scmsync_url, None);
+        assert_eq!(wc.scmsync_branch, None);
+        assert_eq!(wc.pr_ref.as_deref(), Some("gitea:alice/foo#7"));
+        assert_eq!(wc.pr_head_repo.as_deref(), Some("bob/foo"));
+        assert_eq!(wc.pr_head_branch.as_deref(), Some("feature"));
+        assert_eq!(wc.root, dir.path.join("alice").join("foo"));
+        assert_eq!(read_file(&wc.root, "foo.spec"), "Name: foo\n");
+        // `feature.txt` exists only on the head branch: the
+        // checkout pinned the branch, not the shared `main` tip.
+        assert_eq!(read_file(&wc.root, "feature.txt"), "feature\n");
+        // The record round-trips: a later open reads the same
+        // pull-request keys.
+        let reopened = open(&wc.root).unwrap();
+        assert_eq!(reopened.pr_ref, wc.pr_ref);
+        assert_eq!(reopened.pr_head_repo, wc.pr_head_repo);
+        assert_eq!(reopened.pr_head_branch, wc.pr_head_branch);
+        // A reopened checkout still records no scmsync URL: the
+        // commit on it must skip the OBS poll, not time out on it.
+        assert_eq!(reopened.scmsync_url, None);
+        assert_eq!(reopened.scmsync_branch, None);
+        let _ = dir;
+    }
+
+    /// The CLI leaf's live path over the same fixtures: the
+    /// library leaf is already pinned above, so this pins the
+    /// wiring only — the clients, the handle, and the result
+    /// rendering. It lives here because the served-origin fixtures
+    /// live here. It asserts the payload and the text the agent
+    /// sees, plus the files the checkout holds.
+    #[test]
+    fn checkout_pr_cli_clones_the_head_branch() {
+        let dir = TempDirGuard::new("pr-checkout-cli");
+        let origin = git_pr_origin(&dir.path);
+        let pr_url = format!("{}/api/v1/repos/alice/foo/pulls/7", origin.base);
+        let http = FakeHttp::new().with_get(&pr_url, &pr_checkout_json(&origin.head));
+        let (client, gitea) = pr_clients(&http, &origin.base);
+        let auth = GiteaAuth {
+            token: "test-token",
+            url: origin.base.as_str(),
+        };
+        let (payload, text) = crate::cli_working_copy::checkout_pr_with(
+            &client,
+            &gitea,
+            &pr_reference(),
+            &dir.path,
+            Some(&auth),
+        )
+        .unwrap();
+        let target = dir.path.join("alice").join("foo");
+        let target_text = target.to_string_lossy();
+        assert_eq!(payload["reference"].as_str(), Some("gitea:alice/foo#7"));
+        assert_eq!(payload["project"].as_str(), Some("alice"));
+        assert_eq!(payload["package"].as_str(), Some("foo"));
+        assert_eq!(payload["dir"].as_str(), Some(&*target_text));
+        assert_eq!(payload["backend"].as_str(), Some("git"));
+        assert_eq!(payload["base_rev"].as_str(), Some(origin.head.as_str()));
+        assert_eq!(payload["pr_head_repo"].as_str(), Some("bob/foo"));
+        assert_eq!(payload["pr_head_branch"].as_str(), Some("feature"));
+        assert_eq!(payload["dry_run"].as_bool(), Some(false));
+        assert!(text.contains("pull request: gitea:alice/foo#7"));
+        assert!(text.contains("dry_run: false"));
+        assert!(text.contains(&format!(
+            "checked out gitea:alice/foo#7 into {} (git base {}, head bob/foo@feature)",
+            target.display(),
+            origin.head,
+        )));
+        assert_eq!(read_file(&target, "foo.spec"), "Name: foo\n");
+        // `feature.txt` exists only on the head branch: the CLI
+        // leaf pinned the branch, not the shared `main` tip.
+        assert_eq!(read_file(&target, "feature.txt"), "feature\n");
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_pull_request_commit_pushes_without_an_obs_poll() {
+        // No `_scmsync.obsinfo` is registered: had the commit
+        // polled the OBS side, the read would fail and the poll
+        // would time out after 60 seconds. The commit returns
+        // once the push lands.
+        let dir = TempDirGuard::new("pr-checkout-push");
+        let origin = git_pr_origin(&dir.path);
+        let pr_url = format!("{}/api/v1/repos/alice/foo/pulls/7", origin.base);
+        let http = FakeHttp::new().with_get(&pr_url, &pr_checkout_json(&origin.head));
+        let (client, gitea) = pr_clients(&http, &origin.base);
+        let auth = GiteaAuth {
+            token: "SECRET",
+            url: origin.base.as_str(),
+        };
+        let wc = checkout_pull_request(&client, &gitea, &pr_reference(), &dir.path, Some(&auth))
+            .unwrap();
+        // The consumer reopens the checkout before committing, so
+        // the push proves the poll skip for a reopened record.
+        let mut wc = open(&wc.root).unwrap();
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.pushed_head, Some(head.clone()));
+        assert_eq!(report.rev, None);
+        // The commit moves the base but keeps the pull-request
+        // record: the checkout still names its pull request.
+        let reopened = open(&wc.root).unwrap();
+        assert_eq!(reopened.base_rev, head);
+        assert_eq!(reopened.pr_ref, wc.pr_ref);
+        assert_eq!(reopened.pr_head_repo, wc.pr_head_repo);
+        assert_eq!(reopened.pr_head_branch, wc.pr_head_branch);
+        // The push landed on the head branch in the origin.
+        let origin_head = git(&origin.path, "rev-parse", &["feature"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, head);
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_pull_request_update_moves_the_base_and_keeps_the_pr_record() {
+        let dir = TempDirGuard::new("pr-checkout-update");
+        let origin = git_pr_origin(&dir.path);
+        let pr_url = format!("{}/api/v1/repos/alice/foo/pulls/7", origin.base);
+        let http = FakeHttp::new().with_get(&pr_url, &pr_checkout_json(&origin.head));
+        let (client, gitea) = pr_clients(&http, &origin.base);
+        let auth = GiteaAuth {
+            token: "pr-update-fixture",
+            url: origin.base.as_str(),
+        };
+        let wc = checkout_pull_request(&client, &gitea, &pr_reference(), &dir.path, Some(&auth))
+            .unwrap();
+        // The head branch moves: a new commit lands on `feature`
+        // in the origin.
+        let work = dir.path.join("work");
+        write_file(&work, "foo.spec", "Name: remote\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "remote change"]);
+        git_ok(&work, &["push", "--quiet", "origin", "feature"]);
+        let new_head = git(&work, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        // The consumer reopens the checkout before updating, so
+        // the update proves the base move for a reopened record.
+        let mut wc = open(&wc.root).unwrap();
+        let report = update(&mut wc, &client, None, Some(&auth), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.updated);
+        assert_eq!(report.new_base_rev, new_head);
+        assert!(report.conflicts.is_empty());
+        assert_eq!(read_file(&wc.root, "foo.spec"), "Name: remote\n");
+        // The update moved the base but kept the pull-request
+        // record: the checkout still names its pull request, and
+        // still records no scmsync URL.
+        let reopened = open(&wc.root).unwrap();
+        assert_eq!(reopened.base_rev, new_head);
+        assert_eq!(reopened.pr_ref, wc.pr_ref);
+        assert_eq!(reopened.pr_head_repo, wc.pr_head_repo);
+        assert_eq!(reopened.pr_head_branch, wc.pr_head_branch);
+        assert_eq!(reopened.scmsync_url, None);
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_git_polls_the_sync_on_a_legacy_checkout_without_a_scmsync_url() {
+        // A git-backed checkout recorded before `scmsync-url`
+        // existed: unset the key after checkout, then commit. The
+        // checkout is still OBS/scmsync-backed, so the commit
+        // polls `_scmsync.obsinfo` — the OBS side already synced
+        // the pushed head, and the poll finds it on the first
+        // read. Skipping the poll here would report success
+        // without verifying synchronization.
+        let dir = TempDirGuard::new("git-commit-legacy-scmsync");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        git_ok(
+            &wc.root,
+            &["config", "--local", "--unset", "geectl.scmsync-url"],
+        );
+        // The reopened record carries no scmsync URL: the commit
+        // below runs on the legacy record, not the fresh one.
+        let mut wc = open(&wc.root).unwrap();
+        assert_eq!(wc.scmsync_url, None);
+        assert_eq!(wc.pr_ref, None);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        // The OBS side already synced the pushed head: the poll
+        // finds it on the first read.
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.pushed_head, Some(head.clone()));
+        assert_eq!(open(&wc.root).unwrap().base_rev, head);
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, head);
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_pull_request_refuses_an_obs_reference() {
+        let dir = TempDirGuard::new("pr-checkout-obs");
+        let http = FakeHttp::new();
+        let (client, gitea) = pr_clients(&http, "https://src.opensuse.org");
+        let err =
+            checkout_pull_request(&client, &gitea, &PullRequestRef::Obs(123), &dir.path, None)
+                .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("is an OBS submit request"),
+            "message: {err}"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_pull_request_refuses_a_deleted_head_repo() {
+        let dir = TempDirGuard::new("pr-checkout-no-head");
+        let json = r#"{"id": 7, "number": 7, "user": {"login": "alice"}, "title": "trivial fix", "body": null, "labels": [], "state": "open", "draft": false, "merged": false, "mergeable": true, "head": {"label": "bob:feature", "ref": "feature", "sha": "e490820bfabf010f5f267335067a52757aca72af2", "repo": null}, "base": {"label": "alice:main", "ref": "main", "sha": "e490820bfabf010f5f267335067a52757aca72af2", "repo": {"full_name": "alice/foo"}}, "future_field": "tolerated"}"#;
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/alice/foo/pulls/7",
+            json,
+        );
+        let (client, gitea) = pr_clients(&http, "https://src.opensuse.org");
+        let err =
+            checkout_pull_request(&client, &gitea, &pr_reference(), &dir.path, None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains("has no head repo"),
+            "message: {err}"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_pull_request_refuses_an_invalid_head_branch() {
+        let dir = TempDirGuard::new("pr-checkout-bad-branch");
+        let json = r#"{"id": 7, "number": 7, "user": {"login": "alice"}, "title": "trivial fix", "body": null, "labels": [], "state": "open", "draft": false, "merged": false, "mergeable": true, "head": {"label": "bob:feature", "ref": "foo..bar", "sha": "e490820bfabf010f5f267335067a52757aca72af2", "repo": {"full_name": "bob/foo"}}, "base": {"label": "alice:main", "ref": "main", "sha": "e490820bfabf010f5f267335067a52757aca72af2", "repo": {"full_name": "alice/foo"}}, "future_field": "tolerated"}"#;
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/alice/foo/pulls/7",
+            json,
+        );
+        let (client, gitea) = pr_clients(&http, "https://src.opensuse.org");
+        let err =
+            checkout_pull_request(&client, &gitea, &pr_reference(), &dir.path, None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("invalid git branch name"),
+            "message: {err}"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_pull_request_refuses_an_existing_target() {
+        let dir = TempDirGuard::new("pr-checkout-existing");
+        let origin = git_pr_origin(&dir.path);
+        let pr_url = format!("{}/api/v1/repos/alice/foo/pulls/7", origin.base);
+        let http = FakeHttp::new().with_get(&pr_url, &pr_checkout_json(&origin.head));
+        let (client, gitea) = pr_clients(&http, &origin.base);
+        let auth = GiteaAuth {
+            token: "SECRET",
+            url: origin.base.as_str(),
+        };
+        // The target already exists — an empty directory, which
+        // a bare clone would otherwise adopt.
+        let target = dir.path.join("alice").join("foo");
+        std::fs::create_dir_all(&target).unwrap();
+        let err = checkout_pull_request(&client, &gitea, &pr_reference(), &dir.path, Some(&auth))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("checkout target already exists"),
+            "message: {err}"
+        );
+        // The refusal leaves the existing directory alone.
+        assert!(target.is_dir());
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_pull_request_cleans_up_after_a_failed_clone() {
+        // The head repo is gone from the fixture server: the
+        // clone fails, and no partial target is left behind for
+        // the next attempt to trip over.
+        let dir = TempDirGuard::new("pr-checkout-failed-clone");
+        let origin = git_pr_origin(&dir.path);
+        let pr_url = format!("{}/api/v1/repos/alice/foo/pulls/7", origin.base);
+        let http = FakeHttp::new().with_get(
+            &pr_url,
+            &pr_checkout_json_for("bob/missing", "feature", &origin.head),
+        );
+        let (client, gitea) = pr_clients(&http, &origin.base);
+        let auth = GiteaAuth {
+            token: "SECRET",
+            url: origin.base.as_str(),
+        };
+        let err = checkout_pull_request(&client, &gitea, &pr_reference(), &dir.path, Some(&auth))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InternalError);
+        let target = dir.path.join("alice").join("foo");
+        assert!(!target.exists());
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_pull_request_clones_a_hash_branch() {
+        // `#` is legal in git: the head branch is checked out
+        // with `--branch=`, never embedded in a scmsync fragment,
+        // so the fragment restriction does not apply here.
+        let dir = TempDirGuard::new("pr-checkout-hash-branch");
+        let origin = git_pr_origin(&dir.path);
+        let work = dir.path.join("work");
+        git_ok(&work, &["checkout", "-b", "fix#1"]);
+        write_file(&work, "fix.txt", "fix\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "fix"]);
+        git_ok(&work, &["push", "--quiet", "origin", "fix#1"]);
+        let head = git(&work, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let pr_url = format!("{}/api/v1/repos/alice/foo/pulls/7", origin.base);
+        let http =
+            FakeHttp::new().with_get(&pr_url, &pr_checkout_json_for("bob/foo", "fix#1", &head));
+        let (client, gitea) = pr_clients(&http, &origin.base);
+        let auth = GiteaAuth {
+            token: "SECRET",
+            url: origin.base.as_str(),
+        };
+        let wc = checkout_pull_request(&client, &gitea, &pr_reference(), &dir.path, Some(&auth))
+            .unwrap();
+        assert_eq!(wc.base_rev, head);
+        assert_eq!(wc.pr_head_branch.as_deref(), Some("fix#1"));
+        assert_eq!(read_file(&wc.root, "fix.txt"), "fix\n");
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_pull_request_resolve_adopts_the_new_base_and_keeps_the_pr_record() {
+        let dir = TempDirGuard::new("pr-checkout-resolve");
+        let origin = git_pr_origin(&dir.path);
+        let pr_url = format!("{}/api/v1/repos/alice/foo/pulls/7", origin.base);
+        let http = FakeHttp::new().with_get(&pr_url, &pr_checkout_json(&origin.head));
+        let (client, gitea) = pr_clients(&http, &origin.base);
+        let auth = GiteaAuth {
+            token: "SECRET",
+            url: origin.base.as_str(),
+        };
+        let mut wc =
+            checkout_pull_request(&client, &gitea, &pr_reference(), &dir.path, Some(&auth))
+                .unwrap();
+        // The head branch moves on the same line the local commit
+        // changed, and adds bar.txt on its own: the rebase stops
+        // with the conflict.
+        let work = dir.path.join("work");
+        write_file(&work, "foo.spec", "Name: remote\n");
+        write_file(&work, "bar.txt", "bar\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "remote change"]);
+        git_ok(&work, &["push", "--quiet", "origin", "feature"]);
+        let new_head = git(&work, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let report = update(&mut wc, &client, None, Some(&auth), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.conflicts, vec!["foo.spec".to_string()]);
+        write_file(&wc.root, "foo.spec", "Name: resolved\n");
+        let resolved = resolve(&mut wc, &DryRun::new(false)).unwrap().unwrap();
+        assert_eq!(resolved, vec!["foo.spec".to_string()]);
+        assert!(!rebase_in_progress(&wc).unwrap());
+        // The record adopted the new base and kept the
+        // pull-request record: the checkout still names its pull
+        // request, and still records no scmsync URL.
+        let reopened = open(&wc.root).unwrap();
+        assert_eq!(reopened.base_rev, new_head);
+        assert_eq!(wc.base_rev, new_head);
+        assert_eq!(reopened.pr_ref, wc.pr_ref);
+        assert_eq!(reopened.pr_head_repo, wc.pr_head_repo);
+        assert_eq!(reopened.pr_head_branch, wc.pr_head_branch);
+        assert_eq!(reopened.scmsync_url, None);
+        let _ = dir;
     }
 
     #[test]
