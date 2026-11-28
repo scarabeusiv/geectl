@@ -921,6 +921,9 @@ mod tests {
             mtimes: Vec::new(),
             scmsync_url: None,
             scmsync_branch: None,
+            pr_ref: None,
+            pr_head_repo: None,
+            pr_head_branch: None,
         }
     }
 
@@ -976,6 +979,9 @@ mod tests {
             mtimes: Vec::new(),
             scmsync_url: None,
             scmsync_branch: None,
+            pr_ref: None,
+            pr_head_repo: None,
+            pr_head_branch: None,
         }
     }
 
