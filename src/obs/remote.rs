@@ -2,6 +2,7 @@ use super::build::xml_attr;
 use super::build::xml_split_element;
 use super::build_link_meta;
 use super::build_url;
+use super::common::parse_obsinfo_scmsync;
 use super::element_text;
 use super::elements;
 use super::filter_history;
@@ -3727,6 +3728,134 @@ impl<'a> ObsClient<'a> {
         parse_package_meta(&body)
     }
 
+    /// The scmsync URL a package is synced from, if it is
+    /// git-backed: the package meta's `<scmsync>` when the caller
+    /// already read one, else the `_scmsync.obsinfo` `url` +
+    /// `revision` — Factory packages carry no `<scmsync>` in
+    /// meta, so meta-only detection misses them. The meta read
+    /// stays the caller's own (public or authenticated, as its
+    /// hidden-404 handling requires); only the obsinfo read is
+    /// added here, and it is the authenticated one. Detection
+    /// still needs the caller's meta read to succeed first, so a
+    /// caller that reads meta on the public route still misses a
+    /// hidden package at that read — the authenticated obsinfo
+    /// read only helps once the meta read succeeded. A blank
+    /// meta value counts as none. A missing obsinfo is `None`,
+    /// not an error; a present one without a usable
+    /// `url`/`revision` is a server error — a malformed record
+    /// must fail closed, never read as "not git-backed". Any
+    /// other read error propagates.
+    pub fn package_scmsync(
+        &self,
+        meta_scmsync: Option<String>,
+        project: &str,
+        package: &str,
+    ) -> Result<Option<String>, GeectlError> {
+        Ok(self
+            .package_scmsync_with_obsinfo(meta_scmsync, project, package)?
+            .map(|(url, _)| url))
+    }
+
+    /// The credential-free twin of [`ObsClient::package_scmsync`]:
+    /// the obsinfo fallback reads the public route, so checkout
+    /// and update stay credential-free — the authenticated read
+    /// would 401 without credentials. A hidden package's obsinfo
+    /// 404s on the public route and reads as not git-backed, the
+    /// same as its public meta read already does.
+    pub(crate) fn package_scmsync_public(
+        &self,
+        meta_scmsync: Option<String>,
+        project: &str,
+        package: &str,
+    ) -> Result<Option<String>, GeectlError> {
+        Ok(self
+            .package_scmsync_with_route(meta_scmsync, project, package, true)?
+            .map(|(url, _)| url))
+    }
+
+    /// The scmsync URL a package is synced from, plus the raw
+    /// `_scmsync.obsinfo` body when the URL came from that file:
+    /// callers that also need the file's `commit:` line (the
+    /// filing-path freshness check) reuse the body instead of
+    /// reading the file a second time. `None` for the body when
+    /// the URL came from the meta. `None` overall when neither
+    /// the meta nor the obsinfo carries a URL — a present
+    /// obsinfo without a usable `url`/`revision` is a server
+    /// error, not `None`.
+    pub(crate) fn package_scmsync_with_obsinfo(
+        &self,
+        meta_scmsync: Option<String>,
+        project: &str,
+        package: &str,
+    ) -> Result<Option<(String, Option<String>)>, GeectlError> {
+        self.package_scmsync_with_route(meta_scmsync, project, package, false)
+    }
+
+    /// The shared fallback: the meta's `<scmsync>` when present,
+    /// else the `_scmsync.obsinfo` on the route `public` selects.
+    fn package_scmsync_with_route(
+        &self,
+        meta_scmsync: Option<String>,
+        project: &str,
+        package: &str,
+        public: bool,
+    ) -> Result<Option<(String, Option<String>)>, GeectlError> {
+        match meta_scmsync {
+            Some(url) if !url.trim().is_empty() => Ok(Some((url, None))),
+            _ => Ok(self
+                .scmsync_from_obsinfo(project, package, public)?
+                .map(|(url, body)| (url, Some(body)))),
+        }
+    }
+
+    /// The scmsync URL from a package's `_scmsync.obsinfo`, as
+    /// `url#revision` when the file exists and carries both,
+    /// plus the raw body it was parsed from. `None` only when
+    /// the file is absent (a 404); a present file without a
+    /// usable `url`/`revision` is a server error. The read is
+    /// the public one, so checkout and update stay
+    /// credential-free: a hidden package's obsinfo 404s here
+    /// and reads as not git-backed, the same as its public
+    /// meta read already does.
+    pub(crate) fn scmsync_url_from_obsinfo_public(
+        &self,
+        project: &str,
+        package: &str,
+    ) -> Result<Option<(String, String)>, GeectlError> {
+        self.scmsync_from_obsinfo(project, package, true)
+    }
+
+    /// The obsinfo read behind both routes: a missing file is
+    /// `None`; a present file without a usable `url`/`revision`
+    /// fails closed as a server error — only a successful
+    /// absent record may mean "not git-backed". Any other read
+    /// error propagates.
+    fn scmsync_from_obsinfo(
+        &self,
+        project: &str,
+        package: &str,
+        public: bool,
+    ) -> Result<Option<(String, String)>, GeectlError> {
+        let result = if public {
+            self.cat(project, package, "_scmsync.obsinfo", None)
+        } else {
+            self.authed_cat(project, package, "_scmsync.obsinfo")
+        };
+        match result {
+            Ok(body) => match parse_obsinfo_scmsync(&body) {
+                Some(url) => Ok(Some((url, body))),
+                None => Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "{project}/{package} carries a _scmsync.obsinfo without a usable url and revision; refusing to treat it as not git-backed"
+                    ),
+                )),
+            },
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Search packages by substring (`GET
     /// /search/package?match=...`): the match is
     /// `contains(@name,'term') or contains(title,'term') or
@@ -3959,6 +4088,40 @@ impl<'a> ObsClient<'a> {
             GeectlError::new(
                 ErrorKind::ServerError,
                 format!("unexpected OBS package search response for scmsync URL {repo_url:?}"),
+            )
+        })
+    }
+
+    /// Search packages by exact name (`GET
+    /// /search/package?match=@name='...'`): the packages whose
+    /// name is exactly `name`. The forward-resolution discovery
+    /// arm for Factory packages: their meta carries no
+    /// `<scmsync>`, so the scmsync-prefix search cannot see
+    /// them, and the package name is the repo name by
+    /// convention — the caller verifies each hit against its
+    /// own `_scmsync.obsinfo` before trusting it. Requires
+    /// credentials; without them the search fails loudly
+    /// before any request. An unexpected response (no
+    /// `matches` count) is an error, never an empty list.
+    pub fn search_packages_by_name(&self, name: &str) -> Result<Vec<PackageMatch>, GeectlError> {
+        let name = validate_search_term(name)?;
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "searching packages by name requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        let match_expr = format!("@name='{name}'");
+        let url = build_url(
+            &self.base,
+            &["search", "package"],
+            &[("match", &match_expr)],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_package_search(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS package search response for name {name:?}"),
             )
         })
     }
@@ -13078,6 +13241,93 @@ mod tests {
             .unwrap();
         assert_eq!(matches.len(), 2);
         assert_eq!(http.get_calls(), vec![(url, true)]);
+    }
+
+    #[test]
+    fn search_packages_by_name_sends_the_exact_name_match_authed() {
+        let match_expr = "@name='libstrophe'";
+        let url = build_url(
+            "https://api.opensuse.org",
+            &["search", "package"],
+            &[("match", match_expr)],
+        );
+        let http = FakeHttp::new().with_get(&url, PACKAGE_SEARCH_FIXTURE);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let matches = client.search_packages_by_name("libstrophe").unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].name, "foo");
+        // The search carries credentials.
+        assert_eq!(http.get_calls(), vec![(url, true)]);
+    }
+
+    #[test]
+    fn scmsync_url_from_obsinfo_absent_is_none() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/libstrophe/_scmsync.obsinfo",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .scmsync_url_from_obsinfo_public("openSUSE:Factory", "libstrophe")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn scmsync_url_from_obsinfo_malformed_fails_closed() {
+        // A present file without a usable url/revision is a
+        // server error, never "not git-backed": callers must not
+        // classify a git-backed package as plain and skip checks.
+        for body in [
+            "mtime: 1774534342\nurl: https://src.opensuse.org/xmpp/libstrophe\n",
+            "mtime: 1774534342\nurl: https://src.opensuse.org/xmpp/libstrophe\nrevision: \n",
+            "mtime: 1774534342\ncommit: abcdef1234567890abcdef1234567890abcdef12\n",
+        ] {
+            let http = FakeHttp::new().with_get(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/libstrophe/_scmsync.obsinfo",
+                body,
+            );
+            let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+            let err = client
+                .scmsync_url_from_obsinfo_public("openSUSE:Factory", "libstrophe")
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError);
+            assert!(
+                err.to_string()
+                    .contains("without a usable url and revision"),
+                "refusal names the malformed record: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn scmsync_url_from_obsinfo_public_reads_the_public_route() {
+        let body = "mtime: 1774534342\ncommit: abcdef1234567890abcdef1234567890abcdef12\nurl: https://src.opensuse.org/xmpp/libstrophe\nrevision: main\n";
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/libstrophe/_scmsync.obsinfo",
+            body,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .scmsync_url_from_obsinfo_public("openSUSE:Factory", "libstrophe")
+                .unwrap(),
+            Some((
+                "https://src.opensuse.org/xmpp/libstrophe#main".to_string(),
+                body.to_string()
+            ))
+        );
+        // The public read carries no credentials.
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/libstrophe/_scmsync.obsinfo"
+                    .to_string(),
+                false
+            )]
+        );
     }
 
     #[test]

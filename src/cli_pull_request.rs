@@ -50,8 +50,8 @@ use crate::config::{self, DEFAULT_GITEA_URL};
 use crate::debug::{strip_terminal_controls, strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{
-    parse_gitea_repo, parse_scmsync_url, validate_gitea_base, GiteaClient, GiteaMergeMethod,
-    PrCreateOptions, ScmsyncUrl,
+    looks_like_commit_sha, parse_gitea_repo, parse_scmsync_url, validate_gitea_base, GiteaClient,
+    GiteaMergeMethod, PrCreateOptions, ScmsyncUrl,
 };
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::local_build::LocalBuild;
@@ -2143,18 +2143,25 @@ fn forward_gitea(
 }
 
 /// Resolve the OBS package synced from a Gitea repo and branch:
-/// search OBS packages by the scmsync repo URL, then verify each
-/// hit against its own `_meta` scmsync — the search is a prefix
-/// match, so a repo name that prefixes another matches both, and
-/// only a hit whose parsed scmsync names this repo and branch is
-/// the package. A hit with no branch named tracks the repo's
-/// default branch; a hit whose fragment pins a commit still
-/// tracks the branch its `trackingbranch` names. No hit is `None`
-/// (nothing to forward); more than one distinct package is an
-/// error — the forward must not guess which one the merge
-/// targeted. A hit whose scmsync does not parse is skipped, not
-/// an error: it cannot be verified as this repo, and the search
-/// prefix alone does not prove it is.
+/// search OBS packages by the scmsync repo URL and by the exact
+/// package name, then verify each hit against its own `_meta`
+/// scmsync — or its `_scmsync.obsinfo`, since Factory packages
+/// carry no `<scmsync>` in meta. Both searches run because the
+/// obsinfo fallback verifies candidates but cannot discover
+/// them: the scmsync-prefix search sees only packages whose meta
+/// carries `<scmsync>`, so a Factory package is found only by
+/// the name arm (the package name is the repo name by
+/// convention). The scmsync search is a prefix match, so a repo
+/// name that prefixes another matches both, and only a hit whose
+/// parsed scmsync names this repo and branch is the package. A
+/// hit with no branch named tracks the repo's default branch; a
+/// hit whose fragment pins a commit tracks the branch its
+/// `trackingbranch` names, or the default branch when none is
+/// named. No hit is `None` (nothing to forward); more than one
+/// distinct package is an error — the forward must not guess
+/// which one the merge targeted. A hit whose scmsync does not
+/// parse is skipped, not an error: it cannot be verified as
+/// this repo, and the search prefix alone does not prove it is.
 fn resolve_forward_package(
     obs: &ObsClient,
     repo_url: &str,
@@ -2163,14 +2170,27 @@ fn resolve_forward_package(
     branch: &str,
     default_branch: &str,
 ) -> Result<Option<(String, String)>, GeectlError> {
-    let candidates = obs.search_packages_by_scmsync(repo_url)?;
+    let mut candidates = obs.search_packages_by_scmsync(repo_url)?;
+    // The name arm discovers Factory packages, whose meta carries
+    // no `<scmsync>` for the prefix search to see; a hit the
+    // prefix search already found is verified once, not twice.
+    for found in obs.search_packages_by_name(repo)? {
+        if !candidates
+            .iter()
+            .any(|hit| hit.project == found.project && hit.name == found.name)
+        {
+            candidates.push(found);
+        }
+    }
     let mut matched: Vec<(String, String)> = Vec::new();
     for candidate in &candidates {
         let meta = obs.package_meta_authenticated(&candidate.project, &candidate.name)?;
-        let Some(scmsync) = &meta.scmsync else {
+        let Some(scmsync) =
+            obs.package_scmsync(meta.scmsync, &candidate.project, &candidate.name)?
+        else {
             continue;
         };
-        let Ok(parsed) = parse_scmsync_url(scmsync) else {
+        let Ok(parsed) = parse_scmsync_url(&scmsync) else {
             continue;
         };
         if parsed.owner != owner || parsed.repo != repo {
@@ -2201,27 +2221,20 @@ fn resolve_forward_package(
     }
 }
 
-/// Whether `value` pins a commit rather than naming a branch: a
-/// full SHA-1 (40 hex) or SHA-256 (64 hex) — the shapes the server
-/// writes into a scmsync fragment when it pins a revision. A branch
-/// literally named 40 or 64 hex digits would read as a pin; no
-/// such branch exists in practice, and the server's own fixtures
-/// pin full SHAs.
-fn is_commit_pin(value: &str) -> bool {
-    (value.len() == 40 || value.len() == 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 /// Whether a parsed scmsync URL tracks `branch`: the fragment
 /// wins — when it names a branch, only that branch matches, and
 /// the tracking branch does not. When the fragment pins a commit
-/// instead, it names no branch at all: only the tracking branch
-/// matches. With neither a fragment nor a tracking branch, the
-/// package tracks the repo's default branch.
+/// instead, it names no branch at all: the tracking branch
+/// matches when one is named, else the repo's default branch —
+/// the sync follows the default branch when no branch is named
+/// anywhere, pinned or not. With neither a fragment nor a
+/// tracking branch, the package tracks the repo's default branch.
 fn scmsync_branch_matches(parsed: &ScmsyncUrl, branch: &str, default_branch: &str) -> bool {
     match &parsed.branch {
-        Some(fragment) if is_commit_pin(fragment) => {
-            parsed.tracking_branch.as_deref() == Some(branch)
-        }
+        Some(fragment) if looks_like_commit_sha(fragment) => match &parsed.tracking_branch {
+            Some(tracked) => tracked.as_str() == branch,
+            None => branch == default_branch,
+        },
         Some(fragment) => fragment.as_str() == branch,
         None => branch == default_branch,
     }
@@ -4642,6 +4655,15 @@ mod tests {
         .expect("fixture scmsync parses");
         assert!(scmsync_branch_matches(&pinned, "factory", "factory"));
         assert!(!scmsync_branch_matches(&pinned, "main", "factory"));
+        // A pin with no tracking branch — the `_scmsync.obsinfo`
+        // shape, which carries no tracking-branch field — tracks
+        // the repo's default branch, like a URL with no fragment.
+        let pinned_bare = parse_scmsync_url(
+            "http://127.0.0.1:9/xmpp/libstrophe#345ba614c05cdf125665cd2733c7ba3873b9a9a9d9f46efdad002e3844e3bbf2",
+        )
+        .expect("fixture scmsync parses");
+        assert!(scmsync_branch_matches(&pinned_bare, "main", "main"));
+        assert!(!scmsync_branch_matches(&pinned_bare, "factory", "main"));
         let fragment_names_a_branch =
             parse_scmsync_url("http://127.0.0.1:9/pool/systemd?trackingbranch=factory#main")
                 .expect("fixture scmsync parses");
@@ -4665,6 +4687,106 @@ mod tests {
             parse_scmsync_url("http://127.0.0.1:9/pool/systemd").expect("fixture scmsync parses");
         assert!(scmsync_branch_matches(&bare, "factory", "factory"));
         assert!(!scmsync_branch_matches(&bare, "main", "factory"));
+    }
+
+    #[test]
+    fn resolve_forward_package_discovers_a_factory_package_by_name() {
+        // The live libstrophe shape: `openSUSE:Factory/libstrophe`
+        // carries no `<scmsync>` in meta, so the scmsync-prefix
+        // search answers empty — the name arm finds it, and the
+        // obsinfo fallback verifies repo and branch.
+        const SHA: &str = "345ba614c05cdf125665cd2733c7ba3873b9a9a9d9f46efdad002e3844e3bbf2";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/search/package?match=starts-with%28scmsync%2C%27https%3A%2F%2Fsrc.opensuse.org%2Fxmpp%2Flibstrophe%27%29",
+                "<collection matches=\"0\"></collection>",
+            )
+            .with_get(
+                "https://api.opensuse.org/search/package?match=%40name%3D%27libstrophe%27",
+                "<collection matches=\"1\"><package name=\"libstrophe\" project=\"openSUSE:Factory\"><title>libstrophe</title></package></collection>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/openSUSE:Factory/libstrophe/_meta",
+                "<package name=\"libstrophe\" project=\"openSUSE:Factory\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/openSUSE:Factory/libstrophe/_scmsync.obsinfo",
+                &format!(
+                    "mtime: 1774534342\ncommit: {SHA}\nurl: https://src.opensuse.org/xmpp/libstrophe\nrevision: main\n"
+                ),
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            resolve_forward_package(
+                &client,
+                "https://src.opensuse.org/xmpp/libstrophe",
+                "xmpp",
+                "libstrophe",
+                "main",
+                "main",
+            )
+            .unwrap(),
+            Some(("openSUSE:Factory".to_string(), "libstrophe".to_string()))
+        );
+        // Both searches ran: the prefix search alone would have
+        // resolved nothing.
+        assert!(
+            http.get_calls()
+                .iter()
+                .any(|(url, _)| url.contains("match=starts-with%28scmsync")),
+            "prefix search ran: {:?}",
+            http.get_calls()
+        );
+        assert!(
+            http.get_calls()
+                .iter()
+                .any(|(url, _)| url.contains("match=%40name%3D")),
+            "name search ran: {:?}",
+            http.get_calls()
+        );
+    }
+
+    #[test]
+    fn resolve_forward_package_deduplicates_a_hit_found_by_both_searches() {
+        // A devel package whose meta carries `<scmsync>` is found
+        // by both arms: it is verified once and resolves, not
+        // refused as ambiguous with itself.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/search/package?match=starts-with%28scmsync%2C%27https%3A%2F%2Fsrc.opensuse.org%2Fpool%2Fsystemd%27%29",
+                "<collection matches=\"1\"><package name=\"systemd\" project=\"devel:systemd\"><title>systemd</title></package></collection>",
+            )
+            .with_get(
+                "https://api.opensuse.org/search/package?match=%40name%3D%27systemd%27",
+                "<collection matches=\"1\"><package name=\"systemd\" project=\"devel:systemd\"><title>systemd</title></package></collection>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/devel:systemd/systemd/_meta",
+                "<package name=\"systemd\" project=\"devel:systemd\"><scmsync>https://src.opensuse.org/pool/systemd#factory</scmsync></package>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            resolve_forward_package(
+                &client,
+                "https://src.opensuse.org/pool/systemd",
+                "pool",
+                "systemd",
+                "factory",
+                "factory",
+            )
+            .unwrap(),
+            Some(("devel:systemd".to_string(), "systemd".to_string()))
+        );
+        // The meta was read once, not once per search arm.
+        assert_eq!(
+            http.get_calls()
+                .iter()
+                .filter(|(url, _)| url.ends_with("/_meta"))
+                .count(),
+            1,
+            "meta reads: {:?}",
+            http.get_calls()
+        );
     }
 
     #[test]
