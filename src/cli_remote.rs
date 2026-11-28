@@ -1137,8 +1137,11 @@ pub fn run_remote(
             let fields = project_meta_fields(&flags)?;
             validate_person_roles(&flags.add_person, &format!("project {project}"))?;
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            if live {
+                require_set_meta_credentials(&client, "project meta")?;
+            }
             let current = if live {
-                client.project_meta(&project)?
+                client.project_meta_authenticated(&project)?
             } else {
                 empty_project_meta(&project)
             };
@@ -1154,7 +1157,7 @@ pub fn run_remote(
             apply_project_person_changes(&client, &project, &removals, &flags, &dry_run)?;
             let result_meta = if flags.has_person_changes() {
                 if live {
-                    client.project_meta(&project)?
+                    client.project_meta_authenticated(&project)?
                 } else {
                     apply_person_adds(&mut merged.persons, &flags.add_person);
                     merged
@@ -1222,8 +1225,11 @@ pub fn run_remote(
             let fields = package_meta_fields(&flags)?;
             validate_person_roles(&flags.add_person, &format!("package {project}/{package}"))?;
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            if live {
+                require_set_meta_credentials(&client, "package meta")?;
+            }
             let current = if live {
-                client.package_meta(&project, &package)?
+                client.package_meta_authenticated(&project, &package)?
             } else {
                 empty_package_meta(&project, &package)
             };
@@ -1239,7 +1245,7 @@ pub fn run_remote(
             apply_package_person_changes(&client, &project, &package, &removals, &flags, &dry_run)?;
             let result_meta = if flags.has_person_changes() {
                 if live {
-                    client.package_meta(&project, &package)?
+                    client.package_meta_authenticated(&project, &package)?
                 } else {
                     apply_person_adds(&mut merged.persons, &flags.add_person);
                     merged
@@ -2877,6 +2883,18 @@ fn dry_run_meta_payload(mut payload: Value) -> Value {
         });
     }
     payload
+}
+
+/// Fail a live `set-*-meta` closed when no OBS credentials are
+/// configured: the authenticated reads and the writes need them.
+fn require_set_meta_credentials(client: &ObsClient<'_>, what: &str) -> Result<(), GeectlError> {
+    if client.has_auth() {
+        return Ok(());
+    }
+    Err(GeectlError::new(
+        ErrorKind::ConfigError,
+        format!("cannot set {what} without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"),
+    ))
 }
 
 /// The `set-project-meta` result: the payload carries the meta as

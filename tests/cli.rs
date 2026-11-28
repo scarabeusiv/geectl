@@ -143,6 +143,8 @@ fn geectl_isolated(dir: &TempDir) -> Command {
         .env_remove("GEECTL_OBS_USERNAME")
         .env_remove("GEECTL_OBS_PASSWORD")
         .env_remove("GEECTL_OBS_PASSWORD_FILE")
+        .env_remove("GEECTL_OBS_APIKEY")
+        .env_remove("GEECTL_OBS_APIKEY_FILE")
         .env_remove("GEECTL_GITEA_URL")
         .env_remove("GEECTL_GITEA_TOKEN")
         .env_remove("GEECTL_GITEA_TOKEN_FILE")
@@ -3643,6 +3645,400 @@ fn remote_set_package_meta_live_with_half_set_credentials_fails_with_config_erro
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
     assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_set_package_meta_live_keeps_scmsync() {
+    // The public route omits `<scmsync>`, so the live read must use the authenticated route.
+    let scmsync = "https://src.opensuse.org/jengelh/vim.git#master";
+    let public_meta =
+        "<package name=\"vim\" project=\"home:alice\"><title>Old title</title></package>";
+    let authed_meta = format!(
+        "<package name=\"vim\" project=\"home:alice\"><title>Old title</title><scmsync>{scmsync}</scmsync></package>"
+    );
+    let (addr, rx) = serve_routes_queued(
+        "application/xml",
+        &[
+            (
+                "GET",
+                "/public/source/home:alice/vim/_meta",
+                &[(200, public_meta)],
+            ),
+            (
+                "GET",
+                "/source/home:alice/vim/_meta",
+                &[(200, authed_meta.as_str())],
+            ),
+            (
+                "PUT",
+                "/source/home:alice/vim/_meta",
+                &[(200, "<status code=\"ok\" />")],
+            ),
+        ],
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "set-package-meta",
+            "home:alice",
+            "vim",
+            "--title",
+            "Vim",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], false, "payload: {value}");
+    assert_eq!(value["scmsync"], scmsync, "payload: {value}");
+    assert_eq!(value["title"], "Vim", "payload: {value}");
+    let requests: Vec<(String, String, String)> = rx.try_iter().collect();
+    assert!(
+        requests
+            .iter()
+            .all(|(_, target, _)| !target.starts_with("/public/")),
+        "no public read: {requests:?}"
+    );
+    let puts: Vec<String> = requests
+        .iter()
+        .filter(|(method, _, _)| method == "PUT")
+        .map(|(_, _, body)| body.clone())
+        .collect();
+    assert_eq!(puts.len(), 1, "PUT bodies: {puts:?}");
+    assert!(
+        puts[0].contains(&format!("<scmsync>{scmsync}</scmsync>")),
+        "PUT body: {}",
+        puts[0]
+    );
+}
+
+#[test]
+fn remote_set_project_meta_live_keeps_scmsync() {
+    // Same terms as the package half, for the project route.
+    let scmsync = "https://src.opensuse.org/adamm/git.git#main";
+    let public_meta = "<project name=\"home:alice\"><title>Old title</title></project>";
+    let authed_meta = format!(
+        "<project name=\"home:alice\"><title>Old title</title><scmsync>{scmsync}</scmsync></project>"
+    );
+    let (addr, rx) = serve_routes_queued(
+        "application/xml",
+        &[
+            (
+                "GET",
+                "/public/source/home:alice/_meta",
+                &[(200, public_meta)],
+            ),
+            (
+                "GET",
+                "/source/home:alice/_meta",
+                &[(200, authed_meta.as_str())],
+            ),
+            (
+                "PUT",
+                "/source/home:alice/_meta",
+                &[(200, "<status code=\"ok\" />")],
+            ),
+        ],
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--title",
+            "Alice",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], false, "payload: {value}");
+    assert_eq!(value["scmsync"], scmsync, "payload: {value}");
+    assert_eq!(value["title"], "Alice", "payload: {value}");
+    let requests: Vec<(String, String, String)> = rx.try_iter().collect();
+    assert!(
+        requests
+            .iter()
+            .all(|(_, target, _)| !target.starts_with("/public/")),
+        "no public read: {requests:?}"
+    );
+    let puts: Vec<String> = requests
+        .iter()
+        .filter(|(method, _, _)| method == "PUT")
+        .map(|(_, _, body)| body.clone())
+        .collect();
+    assert_eq!(puts.len(), 1, "PUT bodies: {puts:?}");
+    assert!(
+        puts[0].contains(&format!("<scmsync>{scmsync}</scmsync>")),
+        "PUT body: {}",
+        puts[0]
+    );
+}
+
+#[test]
+fn remote_set_project_meta_live_add_person_keeps_scmsync() {
+    // The result re-read after a person change uses the authenticated route too.
+    let scmsync = "https://src.opensuse.org/adamm/git.git#main";
+    let before = format!(
+        "<project name=\"home:alice\"><title>Old title</title><scmsync>{scmsync}</scmsync><person userid=\"bob\" role=\"maintainer\"/></project>"
+    );
+    let after = format!(
+        "<project name=\"home:alice\"><title>Old title</title><scmsync>{scmsync}</scmsync><person userid=\"bob\" role=\"maintainer\"/><person userid=\"carol\" role=\"reviewer\"/></project>"
+    );
+    let (addr, rx) = serve_routes_queued(
+        "application/xml",
+        &[
+            ("GET", "/public/source/home:alice/_meta", &[(404, "")]),
+            (
+                "GET",
+                "/source/home:alice/_meta",
+                &[
+                    (200, before.as_str()),
+                    (200, before.as_str()),
+                    (200, after.as_str()),
+                ],
+            ),
+            (
+                "PUT",
+                "/source/home:alice/_meta",
+                &[(200, "<status code=\"ok\" />")],
+            ),
+        ],
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--add-person",
+            "carol:reviewer",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], false, "payload: {value}");
+    assert_eq!(value["scmsync"], scmsync, "payload: {value}");
+    assert!(
+        value["persons"].as_array().is_some_and(|persons| persons
+            .iter()
+            .any(|person| person["name"] == "carol" && person["role"] == "reviewer")),
+        "payload: {value}"
+    );
+    let requests: Vec<(String, String, String)> = rx.try_iter().collect();
+    assert!(
+        requests
+            .iter()
+            .all(|(_, target, _)| !target.starts_with("/public/")),
+        "no public read: {requests:?}"
+    );
+    let puts: Vec<String> = requests
+        .iter()
+        .filter(|(method, _, _)| method == "PUT")
+        .map(|(_, _, body)| body.clone())
+        .collect();
+    assert_eq!(puts.len(), 1, "PUT bodies: {puts:?}");
+    assert!(puts[0].contains("carol"), "PUT body: {}", puts[0]);
+}
+
+#[test]
+fn remote_set_package_meta_live_add_person_keeps_scmsync() {
+    // Same terms as the project half, for the package route.
+    let scmsync = "https://src.opensuse.org/jengelh/vim.git#master";
+    let before = format!(
+        "<package name=\"vim\" project=\"home:alice\"><title>Old title</title><scmsync>{scmsync}</scmsync><person userid=\"bob\" role=\"maintainer\"/></package>"
+    );
+    let after = format!(
+        "<package name=\"vim\" project=\"home:alice\"><title>Old title</title><scmsync>{scmsync}</scmsync><person userid=\"bob\" role=\"maintainer\"/><person userid=\"carol\" role=\"reviewer\"/></package>"
+    );
+    let (addr, rx) = serve_routes_queued(
+        "application/xml",
+        &[
+            ("GET", "/public/source/home:alice/vim/_meta", &[(404, "")]),
+            (
+                "GET",
+                "/source/home:alice/vim/_meta",
+                &[
+                    (200, before.as_str()),
+                    (200, before.as_str()),
+                    (200, after.as_str()),
+                ],
+            ),
+            (
+                "PUT",
+                "/source/home:alice/vim/_meta",
+                &[(200, "<status code=\"ok\" />")],
+            ),
+        ],
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "set-package-meta",
+            "home:alice",
+            "vim",
+            "--add-person",
+            "carol:reviewer",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], false, "payload: {value}");
+    assert_eq!(value["scmsync"], scmsync, "payload: {value}");
+    assert!(
+        value["persons"].as_array().is_some_and(|persons| persons
+            .iter()
+            .any(|person| person["name"] == "carol" && person["role"] == "reviewer")),
+        "payload: {value}"
+    );
+    let requests: Vec<(String, String, String)> = rx.try_iter().collect();
+    assert!(
+        requests
+            .iter()
+            .all(|(_, target, _)| !target.starts_with("/public/")),
+        "no public read: {requests:?}"
+    );
+    let puts: Vec<String> = requests
+        .iter()
+        .filter(|(method, _, _)| method == "PUT")
+        .map(|(_, _, body)| body.clone())
+        .collect();
+    assert_eq!(puts.len(), 1, "PUT bodies: {puts:?}");
+    assert!(puts[0].contains("carol"), "PUT body: {}", puts[0]);
+}
+
+#[test]
+fn remote_set_package_meta_live_without_any_credentials_fails_with_config_error() {
+    // The guard fails closed before any read: the stub records zero requests.
+    let (addr, rx) = serve_routes_queued(
+        "application/xml",
+        &[
+            (
+                "GET",
+                "/public/source/home:alice/vim/_meta",
+                &[(
+                    200,
+                    "<package name=\"vim\" project=\"home:alice\"><title>Old title</title></package>",
+                )],
+            ),
+            (
+                "GET",
+                "/source/home:alice/vim/_meta",
+                &[(
+                    200,
+                    "<package name=\"vim\" project=\"home:alice\"><title>Old title</title></package>",
+                )],
+            ),
+        ],
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "set-package-meta",
+            "home:alice",
+            "vim",
+            "--title",
+            "Vim",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert_eq!(
+        value["error"]["context"],
+        "cannot set package meta without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"
+    );
+    let requests: Vec<(String, String, String)> = rx.try_iter().collect();
+    assert!(
+        requests.is_empty(),
+        "no request before the guard: {requests:?}"
+    );
+}
+
+#[test]
+fn remote_set_project_meta_live_without_any_credentials_fails_with_config_error() {
+    // Same terms as the package half: the stub records zero requests.
+    let (addr, rx) = serve_routes_queued(
+        "application/xml",
+        &[
+            (
+                "GET",
+                "/public/source/home:alice/_meta",
+                &[(
+                    200,
+                    "<project name=\"home:alice\"><title>Old title</title></project>",
+                )],
+            ),
+            (
+                "GET",
+                "/source/home:alice/_meta",
+                &[(
+                    200,
+                    "<project name=\"home:alice\"><title>Old title</title></project>",
+                )],
+            ),
+        ],
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--title",
+            "Alice",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert_eq!(
+        value["error"]["context"],
+        "cannot set project meta without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"
+    );
+    let requests: Vec<(String, String, String)> = rx.try_iter().collect();
+    assert!(
+        requests.is_empty(),
+        "no request before the guard: {requests:?}"
+    );
 }
 
 #[test]
