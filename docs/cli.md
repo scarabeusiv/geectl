@@ -3,7 +3,7 @@
 The command reference for the geectl binary: one subcommand per
 operation, grouped under a top-level noun (`remote`, `request`,
 `branch`, `build`, `local-build`, `maintenance`, `service`, `gitea`, `pull-request`, `person`, `meta`, `changelog`, `prjconf`), plus `version`
-and `config`, plus the ten working-copy leaves (`checkout`, `update`,
+and `config`, plus the eleven working-copy leaves (`checkout`, `checkout-pr`, `update`,
 `status`, `diff`, `add`, `rm`, `addremove`, `commit`, `pull`,
 `resolve`) that operate on the checkout in the current directory.
 The reference below lists every command with what it does
@@ -371,6 +371,7 @@ config (`geectl.apiurl`, `geectl.project`, `geectl.package`,
 `geectl.backend`, `geectl.base-rev`, `geectl.base-srcmd5`).
 
 - `geectl checkout <PROJECT> [PACKAGE]` — Check out a package into a git working copy, under the current directory; without a package, every package in the project; key flags: --rev <REV>
+- `geectl checkout-pr gitea:<owner>/<repo>#<number>` — Check out a Gitea pull request into a git working copy, under the current directory: the pull request's head repo at its head branch.
 - `geectl update` — Update the working copy in the current directory to the latest base; key flags: --rev <REV>
 - `geectl status` — Show the working copy's state against the base.
 - `geectl diff` — Show the diff of the worktree and the index against the base, plus the link diff on a linked checkout.

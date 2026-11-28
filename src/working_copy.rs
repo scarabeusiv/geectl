@@ -11865,6 +11865,56 @@ mod tests {
         let _ = dir;
     }
 
+    /// The CLI leaf's live path over the same fixtures: the
+    /// library leaf is already pinned above, so this pins the
+    /// wiring only — the clients, the handle, and the result
+    /// rendering. It lives here because the served-origin fixtures
+    /// live here. It asserts the payload and the text the agent
+    /// sees, plus the files the checkout holds.
+    #[test]
+    fn checkout_pr_cli_clones_the_head_branch() {
+        let dir = TempDirGuard::new("pr-checkout-cli");
+        let origin = git_pr_origin(&dir.path);
+        let pr_url = format!("{}/api/v1/repos/alice/foo/pulls/7", origin.base);
+        let http = FakeHttp::new().with_get(&pr_url, &pr_checkout_json(&origin.head));
+        let (client, gitea) = pr_clients(&http, &origin.base);
+        let auth = GiteaAuth {
+            token: "test-token",
+            url: origin.base.as_str(),
+        };
+        let (payload, text) = crate::cli_working_copy::checkout_pr_with(
+            &client,
+            &gitea,
+            &pr_reference(),
+            &dir.path,
+            Some(&auth),
+        )
+        .unwrap();
+        let target = dir.path.join("alice").join("foo");
+        let target_text = target.to_string_lossy();
+        assert_eq!(payload["reference"].as_str(), Some("gitea:alice/foo#7"));
+        assert_eq!(payload["project"].as_str(), Some("alice"));
+        assert_eq!(payload["package"].as_str(), Some("foo"));
+        assert_eq!(payload["dir"].as_str(), Some(&*target_text));
+        assert_eq!(payload["backend"].as_str(), Some("git"));
+        assert_eq!(payload["base_rev"].as_str(), Some(origin.head.as_str()));
+        assert_eq!(payload["pr_head_repo"].as_str(), Some("bob/foo"));
+        assert_eq!(payload["pr_head_branch"].as_str(), Some("feature"));
+        assert_eq!(payload["dry_run"].as_bool(), Some(false));
+        assert!(text.contains("pull request: gitea:alice/foo#7"));
+        assert!(text.contains("dry_run: false"));
+        assert!(text.contains(&format!(
+            "checked out gitea:alice/foo#7 into {} (git base {}, head bob/foo@feature)",
+            target.display(),
+            origin.head,
+        )));
+        assert_eq!(read_file(&target, "foo.spec"), "Name: foo\n");
+        // `feature.txt` exists only on the head branch: the CLI
+        // leaf pinned the branch, not the shared `main` tip.
+        assert_eq!(read_file(&target, "feature.txt"), "feature\n");
+        let _ = dir;
+    }
+
     #[test]
     fn checkout_pull_request_commit_pushes_without_an_obs_poll() {
         // No `_scmsync.obsinfo` is registered: had the commit

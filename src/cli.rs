@@ -180,6 +180,14 @@ pub enum Command {
         #[arg(long)]
         rev: Option<String>,
     },
+    /// Check out a Gitea pull request into a git working copy,
+    /// under the current directory: the pull request's head repo
+    /// at its head branch, into `<owner>/<repo>/`.
+    CheckoutPr {
+        /// The pull-request handle:
+        /// `gitea:<owner>/<repo>#<number>`.
+        reference: String,
+    },
     /// Update the working copy in the current directory to the
     /// latest base.
     Update {

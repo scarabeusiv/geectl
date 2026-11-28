@@ -115,6 +115,9 @@ fn run(
             cli.live,
             instance,
         )?,
+        Some(Command::CheckoutPr { reference }) => {
+            geectl::cli_working_copy::checkout_pr(&reference, debug, cli.live, instance)?
+        }
         Some(Command::Update { rev }) => {
             geectl::cli_working_copy::update(rev.as_deref(), debug, cli.live, instance)?
         }

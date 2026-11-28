@@ -6358,6 +6358,7 @@ fn top_help_lists_the_working_copy_leaves() {
     let text = String::from_utf8_lossy(&out.stdout);
     for name in [
         "checkout",
+        "checkout-pr",
         "update",
         "status",
         "diff",
@@ -6370,6 +6371,110 @@ fn top_help_lists_the_working_copy_leaves() {
     ] {
         assert!(text.contains(name), "top --help misses {name}");
     }
+}
+
+#[test]
+fn checkout_pr_help_names_the_reference() {
+    let out = geectl().args(["checkout-pr", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("gitea:"),
+        "checkout-pr --help misses the handle form"
+    );
+}
+
+#[test]
+fn checkout_pr_dry_run_without_credentials_prints_plan() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["checkout-pr", "gitea:alice/foo#7"])
+        .output()
+        .unwrap();
+    // A dry-run checkout-pr clones nothing and resolves no
+    // credentials: the plan names the reference and the target.
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["reference"], "gitea:alice/foo#7");
+    assert_eq!(value["project"], "alice");
+    assert_eq!(value["package"], "foo");
+    assert_eq!(value["dry_run"], true);
+    let target = value["dir"].as_str().unwrap();
+    let suffix = format!("alice{}foo", std::path::MAIN_SEPARATOR);
+    assert!(target.ends_with(&suffix), "dir: {target}");
+    let plan_line = format!("[dry-run] would: check out gitea:alice/foo#7 into {target}");
+    assert_eq!(value["plan"][0].as_str(), Some(plan_line.as_str()));
+}
+
+#[test]
+fn checkout_pr_text_dry_run_prints_the_header_and_the_plan() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "checkout-pr", "gitea:alice/foo#7"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("pull request: gitea:alice/foo#7"));
+    assert!(text.contains("dry_run: true"));
+    assert!(text.contains("dry-run: would check out gitea:alice/foo#7 into "));
+}
+
+#[test]
+fn checkout_pr_obs_reference_fails_without_credentials() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["checkout-pr", "obs:123"])
+        .output()
+        .unwrap();
+    // The OBS arm is refused before any credential resolution.
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    // The detail is in "context"; "message" is the generic kind text.
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("is an OBS submit request"),
+        "context: {}",
+        value["error"]["context"]
+    );
+}
+
+#[test]
+fn checkout_pr_invalid_handle_fails() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["checkout-pr", "nonsense"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    // The detail is in "context"; "message" is the generic kind text.
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("invalid pull-request handle"),
+        "context: {}",
+        value["error"]["context"]
+    );
 }
 
 #[test]

@@ -34,6 +34,9 @@ _geectl() {
             geectl,checkout)
                 cmd="geectl__subcmd__checkout"
                 ;;
+            geectl,checkout-pr)
+                cmd="geectl__subcmd__checkout__subcmd__pr"
+                ;;
             geectl,commit)
                 cmd="geectl__subcmd__commit"
                 ;;
@@ -447,6 +450,9 @@ _geectl() {
                 ;;
             geectl__subcmd__help,checkout)
                 cmd="geectl__subcmd__help__subcmd__checkout"
+                ;;
+            geectl__subcmd__help,checkout-pr)
+                cmd="geectl__subcmd__help__subcmd__checkout__subcmd__pr"
                 ;;
             geectl__subcmd__help,commit)
                 cmd="geectl__subcmd__help__subcmd__commit"
@@ -1694,7 +1700,7 @@ _geectl() {
 
     case "${cmd}" in
         geectl)
-            opts="-h -V --format --debug --debug-body --live --instance --help --version version config remote request branch build local-build maintenance service gitea pull-request person meta changelog checkout update status diff add rm addremove commit pull resolve prjconf help"
+            opts="-h -V --format --debug --debug-body --live --instance --help --version version config remote request branch build local-build maintenance service gitea pull-request person meta changelog checkout checkout-pr update status diff add rm addremove commit pull resolve prjconf help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3483,6 +3489,28 @@ _geectl() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        geectl__subcmd__checkout__subcmd__pr)
+            opts="-h --format --debug --debug-body --live --instance --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -W "json text" -- "${cur}"))
+                    return 0
+                    ;;
+                --instance)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         geectl__subcmd__commit)
             opts="-m -h --message --noservice --format --debug --debug-body --live --instance --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
@@ -4292,7 +4320,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__help)
-            opts="version config remote request branch build local-build maintenance service gitea pull-request person meta changelog checkout update status diff add rm addremove commit pull resolve prjconf help"
+            opts="version config remote request branch build local-build maintenance service gitea pull-request person meta changelog checkout checkout-pr update status diff add rm addremove commit pull resolve prjconf help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4852,6 +4880,20 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__help__subcmd__checkout)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__help__subcmd__checkout__subcmd__pr)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
