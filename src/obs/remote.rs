@@ -3439,8 +3439,8 @@ impl<'a> ObsClient<'a> {
     /// Read the history of package `package` in project `project`
     /// (`GET /source/<project>/<package>/_history`), optionally
     /// restricted to `range` and to the newest `limit` entries. The
-    /// history has no public route, so the read uses the client's
-    /// credentials (whatever they are — no fail-closed pre-check: a
+    /// read uses the client's credentials (whatever they are — no
+    /// fail-closed pre-check: a
     /// client without credentials gets the server's 401 as an error,
     /// like any other authenticated read). Entries come back newest
     /// first: the server lists them oldest first, so the log is
@@ -3504,6 +3504,70 @@ impl<'a> ObsClient<'a> {
             entries.truncate(limit as usize);
         }
         Ok(entries)
+    }
+
+    /// Resolve a source md5 to the (revision, md5) of its single history entry.
+    pub(crate) fn resolve_md5_to_rev(
+        &self,
+        project: &str,
+        package: &str,
+        md5: &str,
+    ) -> Result<(u64, String), GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if !is_md5(md5) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid source md5: {md5:?}"),
+            ));
+        }
+        let url = build_url(
+            &self.base,
+            &["public", "source", project, package, "_history"],
+            &[("rev", md5)],
+        );
+        let body = self.http.get_with(&url, &Credentials::None)?;
+        let entries = parse_history(&body)?;
+        let mut matches = entries.into_iter().filter(|entry| {
+            entry
+                .srcmd5
+                .as_deref()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(md5))
+        });
+        let Some(entry) = matches.next() else {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("no revision of {project}/{package} carries source md5 {md5}"),
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("more than one revision of {project}/{package} carries source md5 {md5}"),
+            ));
+        }
+        if entry.rev == 0 {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("the history entry for source md5 {md5} in {project}/{package} carries revision 0"),
+            ));
+        }
+        let srcmd5 = entry.srcmd5.clone().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "revision {} of {project}/{package} carries no source md5",
+                    entry.rev
+                ),
+            )
+        })?;
+        Ok((entry.rev, srcmd5))
     }
 
     /// The per-file diff of revision `rev` of package `package` in
@@ -12154,6 +12218,95 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn resolve_md5_to_rev_reads_the_numeric_revision_from_history() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_history?rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "<revisionlist><revision rev=\"3\" vrev=\"1\"><srcmd5>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</srcmd5><version>1.0</version><time>1282047302</time><user>alice</user><comment></comment><requestid>1</requestid></revision><revision rev=\"4\" vrev=\"1\"><srcmd5>bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb</srcmd5><version>1.1</version><time>1282047303</time><user>alice</user><comment></comment><requestid>2</requestid></revision></revisionlist>",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client
+                .resolve_md5_to_rev(
+                    "openSUSE:Factory",
+                    "foo",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                )
+                .unwrap(),
+            (3, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        );
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_history?rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                false
+            )]
+        );
+    }
+
+    #[test]
+    fn resolve_md5_to_rev_refuses_when_no_revision_carries_the_md5() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_history?rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "<revisionlist><revision rev=\"4\" vrev=\"1\"><srcmd5>bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb</srcmd5><version>1.1</version><time>1282047303</time><user>alice</user><comment></comment><requestid>2</requestid></revision></revisionlist>",
+        );
+        let client = ObsClient::new(&http);
+        let err = client
+            .resolve_md5_to_rev(
+                "openSUSE:Factory",
+                "foo",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn resolve_md5_to_rev_refuses_when_two_revisions_carry_the_md5() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_history?rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "<revisionlist><revision rev=\"3\" vrev=\"1\"><srcmd5>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</srcmd5><version>1.0</version><time>1282047302</time><user>alice</user><comment></comment><requestid>1</requestid></revision><revision rev=\"4\" vrev=\"1\"><srcmd5>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</srcmd5><version>1.1</version><time>1282047303</time><user>alice</user><comment></comment><requestid>2</requestid></revision></revisionlist>",
+        );
+        let client = ObsClient::new(&http);
+        let err = client
+            .resolve_md5_to_rev(
+                "openSUSE:Factory",
+                "foo",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn resolve_md5_to_rev_refuses_a_zero_revision() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_history?rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "<revisionlist><revision rev=\"0\" vrev=\"1\"><srcmd5>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</srcmd5><version>1.0</version><time>1282047302</time><user>alice</user><comment></comment><requestid>1</requestid></revision></revisionlist>",
+        );
+        let client = ObsClient::new(&http);
+        let err = client
+            .resolve_md5_to_rev(
+                "openSUSE:Factory",
+                "foo",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn resolve_md5_to_rev_refuses_an_invalid_md5_without_a_request() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let err = client
+            .resolve_md5_to_rev("openSUSE:Factory", "foo", "not-an-md5")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
     }
 
     fn patch_client() -> FakeHttp {

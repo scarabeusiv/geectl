@@ -2399,6 +2399,37 @@ struct CheckoutFile {
     pin: RevisionSpec,
 }
 
+/// Resolve an md5 echoed as a directory `rev` to the numeric revision it names.
+fn resolve_echoed_rev(
+    client: &ObsClient,
+    project: &str,
+    package: &str,
+    rev_number: &mut String,
+    srcmd5: &str,
+) -> Result<RevisionSpec, GeectlError> {
+    match RevisionSpec::parse(rev_number).map_err(|_| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("the server returned an invalid revision for {project}/{package}"),
+        )
+    })? {
+        RevisionSpec::Md5(md5) => {
+            let (rev, history_md5) = client.resolve_md5_to_rev(project, package, &md5)?;
+            if !history_md5.eq_ignore_ascii_case(srcmd5) {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "the history entry for {project}/{package} carries source md5 {history_md5}, but the directory listing carries {srcmd5}"
+                    ),
+                ));
+            }
+            *rev_number = rev.to_string();
+            Ok(RevisionSpec::Rev(rev))
+        }
+        spec => Ok(spec),
+    }
+}
+
 /// The files a checkout downloads, and the link package's own
 /// revision and srcmd5 (the recorded base). An unrevisioned
 /// checkout, or a package that is not a link at the pinned
@@ -2435,12 +2466,8 @@ fn checkout_file_plan(
             format!("the server did not return a source md5 for {project}/{package}"),
         )
     })?;
-    let own_pin = RevisionSpec::Rev(rev_number.parse::<u64>().map_err(|_| {
-        GeectlError::new(
-            ErrorKind::ServerError,
-            format!("the server returned a non-numeric revision for {project}/{package}"),
-        )
-    })?);
+    let mut rev_number = rev_number;
+    let own_pin = resolve_echoed_rev(client, project, package, &mut rev_number, &srcmd5)?;
     // The levels, outermost first: the own listing, then each
     // link target's listing in turn.
     let mut levels: Vec<(String, String, DirectoryListing, RevisionSpec)> =
@@ -5760,6 +5787,8 @@ fn record_update_plan(
                     ),
                 )
             })?;
+            let mut rev_number = rev_number;
+            resolve_echoed_rev(client, &wc.project, &wc.package, &mut rev_number, &srcmd5)?;
             dry_run.note(&format!(
                 "would update {}/{} to revision {} ({})",
                 wc.project, wc.package, rev_number, srcmd5
@@ -6103,6 +6132,8 @@ fn update_obs(
             ),
         )
     })?;
+    let mut rev_number = rev_number;
+    let pinned = resolve_echoed_rev(client, &wc.project, &wc.package, &mut rev_number, &srcmd5)?;
     if rev_number == wc.base_rev && srcmd5 == wc.base_srcmd5 {
         return Ok(UpdateReport {
             updated: false,
@@ -6118,16 +6149,6 @@ fn update_obs(
     // at the requested (or latest) spec: a revision landing
     // between the listing and the download would otherwise be
     // recorded under the older rev.
-    let pinned_rev = rev_number.parse::<u64>().map_err(|_| {
-        GeectlError::new(
-            ErrorKind::ServerError,
-            format!(
-                "the server returned a non-numeric revision for {}/{}",
-                wc.project, wc.package
-            ),
-        )
-    })?;
-    let pinned = RevisionSpec::Rev(pinned_rev);
     let tree = build_base_tree(
         client,
         wc,
@@ -8408,6 +8429,131 @@ mod tests {
     }
 
     #[test]
+    fn checkout_with_an_md5_revision_records_the_numeric_revision_as_the_base() {
+        // The checkout resolves the echoed md5 to the numeric revision it names.
+        let listing = format!(
+            "<directory name=\"foo\" rev=\"{SRCMD5_1}\" srcmd5=\"{SRCMD5_1}\">\
+            <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
+            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
+            </directory>"
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                &format!("https://api.opensuse.org/public/source/home:alice/foo?rev={SRCMD5_1}"),
+                &listing,
+            )
+            .with_get(
+                &format!("https://api.opensuse.org/public/source/home:alice/foo/_history?rev={SRCMD5_1}"),
+                &format!("<revisionlist><revision rev=\"1\" vrev=\"1\"><srcmd5>{SRCMD5_1}</srcmd5><version>1.0</version><time>1282047302</time><user>alice</user><comment></comment><requestid>1</requestid></revision></revisionlist>"),
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=1",
+                b"Name: foo\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=1",
+                b"",
+            );
+        let dir = TempDirGuard::new("checkout");
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let spec = RevisionSpec::parse(SRCMD5_1).unwrap();
+        let wc = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            Some(&spec),
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(read_file(&wc.root, "foo.spec"), "Name: foo\n");
+        assert_eq!(wc.base_rev, REV1);
+        assert_eq!(wc.base_srcmd5, SRCMD5_1);
+        let root = root_commit(&wc.root).unwrap();
+        assert_eq!(
+            root_message(&wc.root, &root).unwrap().trim(),
+            format!("geectl base {REV1} {SRCMD5_1}")
+        );
+        // The checkout opens again: the record round-trips.
+        let reopened = open(&wc.root).unwrap();
+        assert_eq!(reopened, wc);
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_after_an_md5_checkout_is_not_refused_as_outdated() {
+        // The md5 checkout is not refused as outdated while the server is at that revision.
+        let listing = format!(
+            "<directory name=\"foo\" rev=\"{SRCMD5_1}\" srcmd5=\"{SRCMD5_1}\">\
+            <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
+            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
+            </directory>"
+        );
+        let listing_rev1_srcmd5_2 = format!(
+            "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_2}\" vrev=\"1\">\
+            <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
+            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
+            </directory>"
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                &format!("https://api.opensuse.org/public/source/home:alice/foo?rev={SRCMD5_1}"),
+                &listing,
+            )
+            .with_get(
+                &format!("https://api.opensuse.org/public/source/home:alice/foo/_history?rev={SRCMD5_1}"),
+                &format!("<revisionlist><revision rev=\"1\" vrev=\"1\"><srcmd5>{SRCMD5_1}</srcmd5><version>1.0</version><time>1282047302</time><user>alice</user><comment></comment><requestid>1</requestid></revision></revisionlist>"),
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=1",
+                b"Name: foo\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=1",
+                b"",
+            )
+            .with_get_sequence(
+                "https://api.opensuse.org/public/source/home:alice/foo",
+                &[&listing_rev1(), &listing_rev2(), &listing_rev1_srcmd5_2],
+            );
+        let dir = TempDirGuard::new("checkout");
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let spec = RevisionSpec::parse(SRCMD5_1).unwrap();
+        let wc = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            Some(&spec),
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(wc.base_rev, REV1);
+        // The server is still at rev 1 / srcmd5_1: accepted.
+        refuse_when_outdated_obs(&wc, &client).unwrap();
+        // The server moved to rev 2: refused.
+        let err = refuse_when_outdated_obs(&wc, &client).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WorkingCopyOutdated);
+        // The server is still at rev 1 but the source md5 changed:
+        // refused.
+        let err = refuse_when_outdated_obs(&wc, &client).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WorkingCopyOutdated);
+        let _ = dir;
+    }
+
+    #[test]
     fn mtimes_encode_decode_round_trips() {
         let mtimes = vec![
             FileMtime {
@@ -9830,6 +9976,174 @@ mod tests {
         assert_eq!(open(&wc.root).unwrap().base_rev, "2");
         assert_eq!(wc.base_rev, "2");
         assert_eq!(wc.base_srcmd5, SRCMD5_2);
+        let _ = dir;
+    }
+
+    #[test]
+    fn update_to_an_md5_revision_records_the_numeric_revision_as_the_base() {
+        // The update resolves the echoed md5 to the numeric revision it names.
+        let listing = format!(
+            "<directory name=\"foo\" rev=\"{SRCMD5_2}\" srcmd5=\"{SRCMD5_2}\">\
+            <entry md5=\"d3fed47ff119d916236560718c57971c\" mtime=\"1282047303\" name=\"foo.spec\" size=\"13\" />\
+            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
+            </directory>"
+        );
+        let http = checkout_http()
+            .with_get(
+                &format!("https://api.opensuse.org/public/source/home:alice/foo?rev={SRCMD5_2}"),
+                &listing,
+            )
+            .with_get(
+                &format!("https://api.opensuse.org/public/source/home:alice/foo/_history?rev={SRCMD5_2}"),
+                &format!("<revisionlist><revision rev=\"2\" vrev=\"1\"><srcmd5>{SRCMD5_2}</srcmd5><version>1.1</version><time>1282047303</time><user>alice</user><comment></comment><requestid>2</requestid></revision></revisionlist>"),
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=2",
+                b"Name: server\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=2",
+                b"",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        let report = update(&mut wc, &client, Some(SRCMD5_2), None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.updated);
+        assert_eq!(report.old_base_rev, REV1);
+        assert_eq!(report.new_base_rev, "2");
+        assert!(report.conflicts.is_empty());
+        assert_eq!(read_file(&wc.root, "foo.spec"), "Name: server\n");
+        assert_eq!(open(&wc.root).unwrap().base_rev, "2");
+        assert_eq!(wc.base_rev, "2");
+        assert_eq!(wc.base_srcmd5, SRCMD5_2);
+        // The same md5 again: the base already is that revision.
+        let again = update(&mut wc, &client, Some(SRCMD5_2), None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(!again.updated);
+        assert_eq!(again.new_base_rev, "2");
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_with_an_md5_revision_refuses_when_no_revision_carries_the_md5() {
+        // The resolution fails closed when no revision carries the md5.
+        let listing = format!(
+            "<directory name=\"foo\" rev=\"{SRCMD5_1}\" srcmd5=\"{SRCMD5_1}\">\
+            <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
+            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
+            </directory>"
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                &format!("https://api.opensuse.org/public/source/home:alice/foo?rev={SRCMD5_1}"),
+                &listing,
+            )
+            .with_get(
+                &format!("https://api.opensuse.org/public/source/home:alice/foo/_history?rev={SRCMD5_1}"),
+                "<revisionlist><revision rev=\"4\" vrev=\"1\"><srcmd5>bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb</srcmd5><version>1.1</version><time>1282047303</time><user>alice</user><comment></comment><requestid>2</requestid></revision></revisionlist>",
+            );
+        let dir = TempDirGuard::new("checkout");
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let spec = RevisionSpec::parse(SRCMD5_1).unwrap();
+        let err = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            Some(&spec),
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(
+            err.to_string()
+                .contains("no revision of home:alice/foo carries source md5"),
+            "error: {err}"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_with_an_md5_revision_refuses_when_the_listing_srcmd5_differs() {
+        // The listing echoes one md5 as `rev` but carries another as `srcmd5`.
+        let listing = format!(
+            "<directory name=\"foo\" rev=\"{SRCMD5_1}\" srcmd5=\"{SRCMD5_2}\">\
+            <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
+            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
+            </directory>"
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                &format!("https://api.opensuse.org/public/source/home:alice/foo?rev={SRCMD5_1}"),
+                &listing,
+            )
+            .with_get(
+                &format!("https://api.opensuse.org/public/source/home:alice/foo/_history?rev={SRCMD5_1}"),
+                &format!("<revisionlist><revision rev=\"1\" vrev=\"1\"><srcmd5>{SRCMD5_1}</srcmd5><version>1.0</version><time>1282047302</time><user>alice</user><comment></comment><requestid>1</requestid></revision></revisionlist>"),
+            );
+        let dir = TempDirGuard::new("checkout");
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let spec = RevisionSpec::parse(SRCMD5_1).unwrap();
+        let err = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            Some(&spec),
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(
+            err.to_string().contains("carries source md5"),
+            "error: {err}"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn update_dry_run_plan_names_the_numeric_revision_for_an_md5_target() {
+        // The plan names the numeric revision the md5 target resolves to.
+        let listing = format!(
+            "<directory name=\"foo\" rev=\"{SRCMD5_2}\" srcmd5=\"{SRCMD5_2}\">\
+            <entry md5=\"d3fed47ff119d916236560718c57971c\" mtime=\"1282047303\" name=\"foo.spec\" size=\"13\" />\
+            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
+            </directory>"
+        );
+        let http = checkout_http()
+            .with_get(
+                &format!("https://api.opensuse.org/public/source/home:alice/foo?rev={SRCMD5_2}"),
+                &listing,
+            )
+            .with_get(
+                &format!("https://api.opensuse.org/public/source/home:alice/foo/_history?rev={SRCMD5_2}"),
+                &format!("<revisionlist><revision rev=\"2\" vrev=\"1\"><srcmd5>{SRCMD5_2}</srcmd5><version>1.1</version><time>1282047303</time><user>alice</user><comment></comment><requestid>2</requestid></revision></revisionlist>"),
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        let dry_run = DryRun::new(true);
+        let report = update(&mut wc, &client, Some(SRCMD5_2), None, &dry_run);
+        assert!(report.unwrap().is_none());
+        assert!(
+            dry_run.plan().iter().any(|line| line.contains(&format!(
+                "would update home:alice/foo to revision 2 ({SRCMD5_2})"
+            ))),
+            "plan: {:?}",
+            dry_run.plan()
+        );
         let _ = dir;
     }
 
@@ -12339,11 +12653,7 @@ mod tests {
 
     #[test]
     fn pull_pins_the_expanded_downloads_by_an_md5_revision() {
-        // The expanded listing of a linked package carries the
-        // expanded content's md5 as its revision, not a number:
-        // the pull pins the expanded downloads by revision spec,
-        // which accepts the md5, and the `_link` download stays
-        // pinned to the link package's own numeric revision.
+        // The pull pins expanded downloads by revision spec, which accepts the md5.
         let md5_expanded = format!(
             "<directory name=\"foo\" rev=\"{EXPANDED_SRCMD5}\" srcmd5=\"{EXPANDED_SRCMD5}\" vrev=\"1\">\
             <entry md5=\"cf0d04a286833ebd00a5f5b2d54474a9\" mtime=\"1282047303\" name=\"bar.spec\" size=\"10\" />\
