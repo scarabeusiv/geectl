@@ -1599,6 +1599,93 @@ pub struct FiledRequest {
     pub superseded: Vec<String>,
 }
 
+/// The change-devel coordinates: the proposed devel project and
+/// package, and the package whose devel changes. The command that
+/// records the devel is rendered from these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoRecordedDevel {
+    /// The project proposed as the devel.
+    pub source_project: String,
+    /// The package proposed as the devel.
+    pub source_package: String,
+    /// The project whose devel changes.
+    pub target_project: String,
+    /// The package whose devel changes.
+    pub target_package: String,
+}
+
+impl NoRecordedDevel {
+    /// The coordinates of a change-devel outcome.
+    pub fn new(
+        source_project: &str,
+        source_package: &str,
+        target_project: &str,
+        target_package: &str,
+    ) -> Self {
+        NoRecordedDevel {
+            source_project: source_project.to_string(),
+            source_package: source_package.to_string(),
+            target_project: target_project.to_string(),
+            target_package: target_package.to_string(),
+        }
+    }
+
+    /// The devel project the change-devel command proposes: the
+    /// source project, unless it is a home/branch project, which
+    /// is not a devel project — then there is no proposal and the
+    /// command names a placeholder instead.
+    pub fn proposed_devel_project(&self) -> Option<&str> {
+        if self.source_project.starts_with("home:") || self.source_project.starts_with("branches:")
+        {
+            None
+        } else {
+            Some(&self.source_project)
+        }
+    }
+}
+
+/// Quote one word for a shell command: single-quote it, escaping
+/// an embedded single quote, so a value can never split into
+/// words or redirect.
+pub(crate) fn shell_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// The exact change-devel command that records the proposed
+/// devel: complete and shell-safe, with the description the leaf
+/// requires and `--live` so it files. The proposed devel is the
+/// source project, or the `<devel-project>` placeholder when the
+/// source is a home/branch project and proposes none.
+pub(crate) fn change_devel_command(data: &NoRecordedDevel) -> String {
+    let source_project = data.proposed_devel_project().unwrap_or("<devel-project>");
+    let description = match data.proposed_devel_project() {
+        Some(proposed) => format!(
+            "Record {proposed} as the devel project of {}/{}",
+            data.target_project, data.target_package
+        ),
+        None => format!(
+            "Record the devel project of {}/{}",
+            data.target_project, data.target_package
+        ),
+    };
+    format!(
+        "geectl request file-change-devel --source-project {} --source-package {} --target-project {} --target-package {} --description {} --live",
+        shell_quote(source_project),
+        shell_quote(&data.source_package),
+        shell_quote(&data.target_project),
+        shell_quote(&data.target_package),
+        shell_quote(&description),
+    )
+}
+
+/// The remediation line for a change-devel refusal: the exact
+/// command, with a lead-in naming the state it fixes. The returned
+/// text carries no `remediation:` prefix; the error renderer
+/// supplies it.
+pub(crate) fn change_devel_remediation(data: &NoRecordedDevel, lead: &str) -> String {
+    format!("{lead} {}", change_devel_command(data))
+}
+
 /// The outcome of the Factory devel-record check: the target
 /// package records the source as its devel, or the target package
 /// does not exist yet and the first submission proceeds.
@@ -2838,6 +2925,44 @@ mod tests {
         .expect("test incident payload");
         assert!(payload.to_xml().contains("Fix foo &amp; bar &lt;baz&gt;"));
         assert!(payload.validate_xml().is_ok());
+    }
+
+    #[test]
+    fn change_devel_command_is_complete_and_shell_safe() {
+        let data = NoRecordedDevel::new("devel:tools", "foo", "openSUSE:Factory", "foo");
+        assert_eq!(
+            change_devel_command(&data),
+            "geectl request file-change-devel --source-project 'devel:tools' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:tools as the devel project of openSUSE:Factory/foo' --live"
+        );
+        // A home/branch source proposes no devel: the placeholder
+        // is quoted, so it cannot parse as a redirection.
+        let home = NoRecordedDevel::new(
+            "home:alice:branches:openSUSE:Factory",
+            "foo",
+            "openSUSE:Factory",
+            "foo",
+        );
+        assert_eq!(
+            change_devel_command(&home),
+            "geectl request file-change-devel --source-project '<devel-project>' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record the devel project of openSUSE:Factory/foo' --live"
+        );
+        // Each refusal state names its own lead-in: recording a
+        // missing devel happens first, changing a recorded one
+        // replaces it.
+        assert_eq!(
+            change_devel_remediation(&data, "record the devel project first:"),
+            "record the devel project first: geectl request file-change-devel --source-project 'devel:tools' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:tools as the devel project of openSUSE:Factory/foo' --live"
+        );
+        assert_eq!(
+            change_devel_remediation(&data, "change the devel project:"),
+            "change the devel project: geectl request file-change-devel --source-project 'devel:tools' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:tools as the devel project of openSUSE:Factory/foo' --live"
+        );
+    }
+
+    #[test]
+    fn shell_quote_escapes_a_single_quote() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]

@@ -1836,6 +1836,239 @@ fn request_accept_live_accepts_when_the_forward_is_refused() {
     }
 }
 
+/// A routing stub OBS server for a live accept whose forward is
+/// refused: the link parent's package meta records `devel` as its
+/// devel, or no devel at all when `devel` is `None`. The request
+/// read answers the post-accept state, like the live server would
+/// after the accept lands. The seen request lines are recorded so
+/// the test can prove the accept landed and nothing was declined
+/// or filed.
+fn serve_accept_forward_with_parent_meta(
+    devel: Option<(&str, &str)>,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_thread = std::sync::Arc::clone(&seen);
+    let request_xml = "<request id=\"42\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"accepted\" who=\"alice\" when=\"2026-11-24T00:00:00Z\" /><description>Update foo to 2.0</description></request>";
+    let directory_xml =
+        "<directory><linkinfo project=\"openSUSE:Factory\" package=\"foo\" /></directory>";
+    let meta_xml = match devel {
+        Some((project, package)) => format!(
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"{project}\" package=\"{package}\"/></package>"
+        ),
+        None => "<package name=\"foo\" project=\"openSUSE:Factory\"></package>".to_string(),
+    };
+    let empty_collection = "<collection matches=\"0\"></collection>";
+    let ok = "<status code=\"ok\" />";
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            seen_in_thread
+                .lock()
+                .unwrap()
+                .push(text.lines().next().unwrap_or("").to_string());
+            let mut parts = text.lines().next().unwrap_or("").split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let (status, body) = if method == "POST" && target.contains("changestate") {
+                (200, ok.to_string())
+            } else if method == "POST" && target.contains("cmd=create") {
+                (
+                    200,
+                    "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+                )
+            } else if is_project_meta_url(target) {
+                (200, PROJECT_META_XML.to_string())
+            } else if target.contains("/_meta") {
+                (200, meta_xml.to_string())
+            } else if target.contains("search/project/id") || target.contains("search/request") {
+                (200, empty_collection.to_string())
+            } else if target.starts_with("/source/") {
+                (200, directory_xml.to_string())
+            } else if target.starts_with("/request/") {
+                (200, request_xml.to_string())
+            } else {
+                (404, "<status code=\"not_found\" />".to_string())
+            };
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, seen)
+}
+
+#[test]
+fn request_accept_live_forward_refused_with_no_devel_names_the_change_devel_command() {
+    // The link parent records no devel at all: the accept lands,
+    // the forward refuses, and the refusal names the change-devel
+    // command that records the source as the devel.
+    let (addr, seen) = serve_accept_forward_with_parent_meta(None);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "request", "accept", "42"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the refused accept exited 0: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(out.status.code(), Some(2));
+    // JSON surface (the default format): the refusal is
+    // `error.context` and the change-devel command is the
+    // structured `error.remediation` field, never buried in the
+    // context and never alongside the generic remediation.
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).expect("stderr is JSON");
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        "accepted request 42, but the forward failed: invalid_input: the input is invalid (refusing to forward devel:languages:python/foo: openSUSE:Factory/foo records no devel project)"
+    );
+    assert_eq!(
+        value["error"]["remediation"],
+        "record the devel project first: geectl request file-change-devel --source-project 'devel:languages:python' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:languages:python as the devel project of openSUSE:Factory/foo' --live"
+    );
+    // Text surface: the same refusal and hint, as `error:` lines.
+    let out = geectl_isolated(&dir)
+        .args(["--live", "--format", "text", "request", "accept", "42"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("refusing to forward devel:languages:python/foo: openSUSE:Factory/foo records no devel project"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("remediation: record the devel project first: geectl request file-change-devel --source-project 'devel:languages:python' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:languages:python as the devel project of openSUSE:Factory/foo' --live"),
+        "stderr: {stderr}"
+    );
+    // One authoritative hint: a single `remediation:` line, and
+    // never the kind's generic "fix the input" line.
+    assert_eq!(
+        stderr.matches("remediation:").count(),
+        1,
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("fix the input and retry"),
+        "stderr: {stderr}"
+    );
+    {
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|r| r.contains("changestate") && r.contains("newstate=accepted")),
+            "no accept changestate recorded: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("cmd=create")),
+            "a forward was filed after the refusal: {seen:?}"
+        );
+    }
+}
+
+#[test]
+fn request_accept_live_forward_refused_with_other_devel_names_the_change_devel_command() {
+    // The link parent records devel:languages:ruby, not the
+    // forwarding source devel:languages:python: the accept lands,
+    // the forward refuses, and the refusal names the change-devel
+    // command that records the source as the devel.
+    let (addr, seen) = serve_accept_forward_with_parent_meta(Some(("devel:languages:ruby", "foo")));
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "request", "accept", "42"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the refused accept exited 0: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(out.status.code(), Some(2));
+    // JSON surface (the default format): the refusal is
+    // `error.context` and the change-devel command is the
+    // structured `error.remediation` field, never buried in the
+    // context and never alongside the generic remediation.
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).expect("stderr is JSON");
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        "accepted request 42, but the forward failed: invalid_input: the input is invalid (refusing to forward devel:languages:python/foo: openSUSE:Factory/foo records devel devel:languages:ruby/foo, not devel:languages:python/foo)"
+    );
+    assert_eq!(
+        value["error"]["remediation"],
+        "change the devel project: geectl request file-change-devel --source-project 'devel:languages:python' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:languages:python as the devel project of openSUSE:Factory/foo' --live"
+    );
+    // Text surface: the same refusal and hint, as `error:` lines.
+    let out = geectl_isolated(&dir)
+        .args(["--live", "--format", "text", "request", "accept", "42"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("refusing to forward devel:languages:python/foo: openSUSE:Factory/foo records devel devel:languages:ruby/foo, not devel:languages:python/foo"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("remediation: change the devel project: geectl request file-change-devel --source-project 'devel:languages:python' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:languages:python as the devel project of openSUSE:Factory/foo' --live"),
+        "stderr: {stderr}"
+    );
+    // One authoritative hint: a single `remediation:` line, and
+    // never the kind's generic "fix the input" line.
+    assert_eq!(
+        stderr.matches("remediation:").count(),
+        1,
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("fix the input and retry"),
+        "stderr: {stderr}"
+    );
+    {
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|r| r.contains("changestate") && r.contains("newstate=accepted")),
+            "no accept changestate recorded: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("cmd=create")),
+            "a forward was filed after the refusal: {seen:?}"
+        );
+    }
+}
+
 #[test]
 fn request_accept_live_transient_check_failure_accepts_and_reports() {
     // The same refused fixture shape, but the hop read fails

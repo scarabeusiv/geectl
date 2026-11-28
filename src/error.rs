@@ -379,6 +379,15 @@ pub struct GeectlError {
     /// `to_json()` omits it when empty; there is no serde field attribute
     /// here because `Serialize` is implemented manually (see below).
     pub context: String,
+    /// The remediation for this instance: the one action that
+    /// fixes this failure, when it is known. `None` falls back to
+    /// the kind's generic remediation. Set only when the instance
+    /// knows better than the kind — a refusal that names the exact
+    /// command that unblocks it, for example. Never contains a
+    /// credential. Rendered as the single `remediation` line in
+    /// text and the `remediation` field in JSON, never alongside
+    /// the kind's generic line.
+    pub remediation: Option<String>,
 }
 
 impl GeectlError {
@@ -386,7 +395,38 @@ impl GeectlError {
         GeectlError {
             kind,
             context: context.into(),
+            remediation: None,
         }
+    }
+
+    /// Attach this instance's remediation: the one action that
+    /// fixes this failure. It replaces the kind's generic
+    /// remediation in both renderings; the generic line never
+    /// prints alongside it.
+    pub fn with_remediation(self, remediation: impl Into<String>) -> Self {
+        self.with_remediation_opt(Some(remediation.into()))
+    }
+
+    /// Attach this instance's remediation when there is one;
+    /// `None` keeps the kind's generic remediation. The shape
+    /// error-wrapping call sites use to carry a wrapped error's
+    /// remediation through a new context.
+    pub fn with_remediation_opt(mut self, remediation: Option<String>) -> Self {
+        self.remediation = remediation;
+        self
+    }
+
+    /// This instance's remediation, when one was attached.
+    pub fn remediation_opt(&self) -> Option<&str> {
+        self.remediation.as_deref()
+    }
+
+    /// The remediation to render: this instance's, else the kind's
+    /// generic one.
+    pub fn remediation(&self) -> &str {
+        self.remediation
+            .as_deref()
+            .unwrap_or_else(|| self.kind.remediation())
     }
 
     pub fn kind(&self) -> ErrorKind {
@@ -400,11 +440,14 @@ impl GeectlError {
     /// The JSON payload written to stdout on failure. The shape is stable:
     /// `{"error": {"code": ..., "message": ..., "remediation": ...,
     /// "context": ...}}`. `context` is omitted when empty.
+    /// `remediation` is this instance's remediation when one was
+    /// attached, else the kind's generic remediation — one field,
+    /// never both.
     pub fn to_json(&self) -> serde_json::Value {
         let mut error = serde_json::json!({
             "code": self.kind.code(),
             "message": self.kind.message(),
-            "remediation": self.kind.remediation(),
+            "remediation": self.remediation(),
         });
         if !self.context.is_empty() {
             error["context"] = serde_json::Value::String(self.context.clone());
@@ -473,6 +516,37 @@ mod tests {
             err.to_string(),
             "not_found: the requested resource does not exist"
         );
+    }
+
+    #[test]
+    fn per_instance_remediation_replaces_the_kind_default() {
+        // One authoritative hint: the instance remediation is the
+        // JSON `remediation` field and the kind's generic line is
+        // gone, not buried in `context` or printed alongside.
+        let err = GeectlError::new(ErrorKind::InvalidInput, "refusing to forward a/b")
+            .with_remediation("record the devel project first: geectl request file-change-devel");
+        assert_eq!(
+            err.remediation(),
+            "record the devel project first: geectl request file-change-devel"
+        );
+        let json = err.to_json();
+        assert_eq!(
+            json["error"]["remediation"],
+            "record the devel project first: geectl request file-change-devel"
+        );
+        assert!(!json["error"]["remediation"]
+            .as_str()
+            .unwrap()
+            .contains("fix the input"));
+        assert_eq!(json["error"]["context"], "refusing to forward a/b");
+        assert!(!err.to_string().contains("record the devel project"));
+        // Without an instance remediation the kind default stands,
+        // and `with_remediation_opt(None)` keeps it.
+        let bare = GeectlError::new(ErrorKind::InvalidInput, "bad name");
+        assert_eq!(bare.remediation(), ErrorKind::InvalidInput.remediation());
+        let kept = bare.with_remediation_opt(None);
+        assert_eq!(kept.remediation(), ErrorKind::InvalidInput.remediation());
+        assert!(kept.remediation_opt().is_none());
     }
 
     #[test]

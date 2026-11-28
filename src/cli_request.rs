@@ -1580,10 +1580,15 @@ fn accept(
     // Live: the accept landed; forward the now-accepted request.
     let (forward_payload, forward_text) = forward(debug, id, forward_message, live, instance)
         .map_err(|err| {
+            // The wrapped error keeps the forward failure's
+            // per-instance remediation: the accept context names
+            // the failure, the remediation still names the fix.
+            let remediation = err.remediation_opt().map(str::to_string);
             GeectlError::new(
                 err.kind(),
                 format!("accepted request {id}, but the forward failed: {err}"),
             )
+            .with_remediation_opt(remediation)
         })?;
     if let Value::Object(map) = &mut payload {
         map.insert("forward".to_string(), forward_payload);
