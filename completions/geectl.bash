@@ -2472,13 +2472,17 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__build__subcmd__build__subcmd__log)
-            opts="-h --start --last --lastsucceeded --multibuild --strip-time --format --debug --debug-body --live --instance --help"
+            opts="-h --start --last --lastsucceeded --tail --full --multibuild --strip-time --format --debug --debug-body --live --instance --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
                 --start)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --tail)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -3484,7 +3488,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__commit)
-            opts="-m -h --message --noservice --format --debug --debug-body --live --instance --help"
+            opts="-m -h --message --noservice --no-local-services --no-server-services --format --debug --debug-body --live --instance --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

@@ -64,15 +64,19 @@ pub enum LocalBuildCommand {
         /// The source directory carrying the `_service` file.
         directory: PathBuf,
         /// The run mode: run, manualrun, precommit, localrun,
-        /// disabledrun.
+        /// disabledrun. `precommit` selects only the
+        /// trylocal/localonly services; it is not the precommit
+        /// gate and does not run `pre_checkin.sh` — use the
+        /// `precommit` leaf for the gate.
         #[arg(
             long,
             default_value = "run",
             value_parser = ["run", "manualrun", "precommit", "localrun", "disabledrun"]
         )]
         mode: String,
-        /// Run only this service, with the run mode forced as its
-        /// mode.
+        /// Run only this service: it must be defined in the
+        /// `_service` file and selected by the run mode — naming
+        /// a service selects it, it does not force its mode.
         #[arg(long)]
         service: Option<String>,
         /// The OBS project the services validate against: in a
@@ -307,6 +311,22 @@ pub enum LocalBuildCommand {
     },
 }
 
+/// The warning `service-run --mode precommit` carries: the mode
+/// selects the precommit services only, while the `precommit` leaf
+/// runs those services plus `pre_checkin.sh`. Same token, two
+/// coverages — the leaf says so instead of letting the run read
+/// as the gate. `None` for every other mode.
+fn service_run_precommit_warning(mode: ServiceRunMode) -> Option<&'static str> {
+    match mode {
+        ServiceRunMode::Precommit => Some(
+            "service-run --mode precommit runs only the precommit-mode services; \
+            it is not the precommit gate and does not run pre_checkin.sh — \
+            use `geectl local-build precommit` for the gate",
+        ),
+        _ => None,
+    }
+}
+
 /// Run a `local-build` command, returning the JSON payload and its
 /// text rendering.
 pub fn run_local_build(
@@ -346,6 +366,9 @@ pub fn run_local_build(
             timeout_secs,
         } => {
             let mode = ServiceRunMode::from_command_name(&mode)?;
+            if let Some(warning) = service_run_precommit_warning(mode) {
+                eprintln!("warning: {warning}");
+            }
             let mut req = ServiceRunRequest::new(directory.clone(), mode);
             req.service = service.clone();
             req.project = project;
@@ -441,13 +464,12 @@ pub fn run_local_build(
         } => {
             // One invocation does the whole loop: the run-mode
             // service run fetches the sources, the precommit gate
-            // runs the precommit-mode services and pre_checkin.sh,
-            // then the engine builds. A failing pre-step fails the
-            // command before the build runs. The run-mode step
-            // already covers trylocal/localonly services, so the
-            // precommit step runs them a second time; services
-            // regenerate their outputs, so the repeat is a second
-            // run of the same generation, not a second effect.
+            // runs pre_checkin.sh, then the engine builds. A
+            // failing pre-step fails the command before the build
+            // runs. The run-mode step already covers
+            // trylocal/localonly services, so the gate skips them
+            // (see `skip_services`): the union runs once, and the
+            // record names the skipped services.
             // The request is built and validated first: a bad
             // coordinate (project, repo, arch, timeout) fails
             // before any service runs or script executes — the
@@ -505,6 +527,7 @@ pub fn run_local_build(
                 timeout_secs,
                 deadline,
                 !live,
+                true,
             )?;
             let record = vertical.build_with_deadline(&build_req, deadline)?;
             let mut header = format!(
@@ -793,6 +816,13 @@ fn render_service_run(record: &ServiceRunRecord) -> String {
 /// not evaluated on a dry run.
 fn render_precommit(record: &PrecommitRecord) -> String {
     let mut text = render_service_run(&record.services);
+    if !record.services_skipped.is_empty() {
+        text.push('\n');
+        text.push_str(&format!(
+            "services skipped (already ran in the run-mode step): {}",
+            record.services_skipped.join(", ")
+        ));
+    }
     let line = if record.dry_run {
         "pre_checkin.sh: not evaluated (dry run)".to_string()
     } else if record.pre_checkin.ran {
@@ -1290,6 +1320,37 @@ mod tests {
                 assert_eq!(timeout_secs, 3600);
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn service_run_precommit_mode_warns_and_other_modes_do_not() {
+        let warning = service_run_precommit_warning(ServiceRunMode::Precommit).unwrap();
+        assert!(
+            warning.contains("pre_checkin.sh"),
+            "the precommit warning names the missing script step"
+        );
+        // One clean line: no doubled spaces from a wrapped
+        // literal, no newline.
+        assert!(
+            !warning.contains("  "),
+            "warning carries doubled spaces: {warning:?}"
+        );
+        assert!(!warning.contains('\n'), "warning spans lines: {warning:?}");
+        assert!(
+            warning.starts_with(
+                "service-run --mode precommit runs only the precommit-mode services; it is not"
+            ),
+            "got: {warning:?}"
+        );
+        assert!(warning.ends_with("for the gate"), "got: {warning:?}");
+        for mode in [
+            ServiceRunMode::Run,
+            ServiceRunMode::ManualRun,
+            ServiceRunMode::LocalRun,
+            ServiceRunMode::DisabledRun,
+        ] {
+            assert_eq!(service_run_precommit_warning(mode), None, "{mode:?} warns");
         }
     }
 
@@ -2078,6 +2139,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
             },
+            services_skipped: vec![],
             dry_run: true,
         };
         let text = render_precommit(&record);
@@ -2098,6 +2160,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
             },
+            services_skipped: vec![],
             dry_run: false,
         };
         let text = render_precommit(&record);
@@ -2113,11 +2176,32 @@ mod tests {
                 plan: None,
             },
             pre_checkin: PrecheckinOutcome {
+                ran: true,
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            services_skipped: vec!["beta".to_string()],
+            dry_run: false,
+        };
+        assert!(render_precommit(&record)
+            .contains("services skipped (already ran in the run-mode step): beta"));
+        let record = PrecommitRecord {
+            services: ServiceRunRecord {
+                mode: "precommit".to_string(),
+                project: None,
+                ran: vec![],
+                image_digest: None,
+                dry_run: false,
+                plan: None,
+            },
+            pre_checkin: PrecheckinOutcome {
                 ran: false,
                 exit_code: None,
                 stdout: String::new(),
                 stderr: String::new(),
             },
+            services_skipped: vec![],
             dry_run: false,
         };
         assert!(render_precommit(&record).contains("pre_checkin.sh: not present"));

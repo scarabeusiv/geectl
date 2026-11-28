@@ -73,6 +73,7 @@ use std::time::UNIX_EPOCH;
 
 use fs2::FileExt;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::auth::{split_api_url, Credentials};
 use crate::config::Config;
@@ -530,7 +531,8 @@ pub enum ServiceRunMode {
     /// `manualrun`: services with mode `manual` only.
     ManualRun,
     /// `precommit`: services with mode `trylocal` or `localonly`
-    /// only — the set a commit runs.
+    /// only — the services the precommit gate runs, before it runs
+    /// `pre_checkin.sh`. The mode alone is not the gate.
     Precommit,
     /// `localrun`: `run` plus services with mode `serveronly`.
     LocalRun,
@@ -595,8 +597,12 @@ pub struct ServiceRunRequest {
     pub source_dir: PathBuf,
     /// The mode filter.
     pub mode: ServiceRunMode,
-    /// Run only this service, with its stored mode forced to the
-    /// run mode. `None` runs every service the mode selects.
+    /// Run only this service: it must be defined in the
+    /// `_service` file, and its stored mode must be one the run
+    /// mode selects. Naming a service selects it; it does not
+    /// force its mode — like the server trigger, which fails
+    /// closed on an undefined name. `None` runs every service the
+    /// mode selects.
     pub service: Option<String>,
     /// The OBS project the services validate against, from
     /// `--project`: in a git checkout it names the parent
@@ -768,12 +774,20 @@ pub struct PrecheckinOutcome {
 
 /// The record of one precommit run: the service run in `precommit`
 /// mode, then `pre_checkin.sh` when the source directory carries
-/// one. A failing service or a failing `pre_checkin.sh` fails the
-/// whole run with [`ErrorKind::ServiceFailed`].
+/// one. A failing service fails the whole run with
+/// [`ErrorKind::ServiceFailed`]; a failing `pre_checkin.sh` with
+/// [`ErrorKind::PrecheckinFailed`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PrecommitRecord {
     pub services: ServiceRunRecord,
     pub pre_checkin: PrecheckinOutcome,
+    /// Precommit-mode services the gate did not re-run because the
+    /// caller already ran them in an earlier run-mode step: the
+    /// run-mode selection covers `trylocal`/`localonly`, so the
+    /// build leaf's gate skips them instead of running the union
+    /// twice. Empty on a standalone gate run.
+    #[serde(default)]
+    pub services_skipped: Vec<String>,
     /// True for a dry run: nothing was touched.
     pub dry_run: bool,
 }
@@ -1027,6 +1041,19 @@ fn check_clean_custom_root(root: &Path) -> Result<(), GeectlError> {
 /// the spec and flavor checks need the source directory, so they
 /// stay in `build`. The CLI calls this before the pre-steps, so a
 /// bad coordinate fails before any service runs or script executes.
+/// The error `--privileged` raises on macOS, worded once:
+/// validation refuses it early, and `BuildContainer::start`
+/// refuses it as the shared gate no caller can bypass — the shell
+/// always uses the privileged shape, so without the gate
+/// `build-shell`/`chroot` would silently run the exact shape
+/// `build --privileged` refuses.
+fn privileged_on_macos_error() -> GeectlError {
+    GeectlError::new(
+        ErrorKind::InvalidInput,
+        "--privileged is refused on macOS: the privileged shape mounts the build root from the host and macOS file sharing breaks dependency installation — use the rootless shape",
+    )
+}
+
 pub fn validate_build_request(req: &BuildRequest) -> Result<(), GeectlError> {
     if !valid_obs_name(&req.project) {
         return Err(GeectlError::new(
@@ -1093,23 +1120,28 @@ pub fn validate_build_request(req: &BuildRequest) -> Result<(), GeectlError> {
             "--noinit and --preinstall-image conflict: no deps are installed without initialization",
         ));
     }
+    // The platform check runs first: a `--noinit` build on
+    // macOS must not prescribe `--privileged` and then have the
+    // platform refuse it — `--noinit` is impossible there, and
+    // the error says so instead of sending the caller in a circle.
+    if req.privileged && std::env::consts::OS == "macos" {
+        return Err(privileged_on_macos_error());
+    }
     // `--noinit` builds in the existing root: the default rootless
     // container discards its root with the container, so there is
     // no existing root to build in — pass `--privileged` to build
-    // in a preserved root.
+    // in a preserved root. On macOS that shape is refused, so
+    // `--noinit` has no remediation there.
     if req.noinit && !req.privileged {
+        if std::env::consts::OS == "macos" {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "--noinit is unavailable on macOS: it needs a preserved root, and --privileged — the preserved-root shape — is refused on macOS",
+            ));
+        }
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
             "--noinit needs a preserved root: the default rootless container discards its root — pass --privileged to build in a preserved root",
-        ));
-    }
-    // `--privileged` is refused on macOS: the privileged shape
-    // mounts the build root from the host, and macOS file sharing
-    // breaks dependency installation — use the rootless shape.
-    if req.privileged && std::env::consts::OS == "macos" {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--privileged is refused on macOS: the privileged shape mounts the build root from the host and macOS file sharing breaks dependency installation — use the rootless shape",
         ));
     }
     // A custom root is a user directory, not a cache dir: `--clean`
@@ -4624,6 +4656,11 @@ impl BuildContainer {
         privileged: bool,
         deadline: std::time::Instant,
     ) -> Result<Self, GeectlError> {
+        // The shared gate: `--privileged` is refused on macOS at
+        // every entry, not only in `validate_build_request`.
+        if privileged && std::env::consts::OS == "macos" {
+            return Err(privileged_on_macos_error());
+        }
         // The mounts carry the cache dir (the root, the pkg cache,
         // the sccache store) and the workdir (the source dir for a
         // build, the root itself for a shell), all at their host
@@ -4635,8 +4672,6 @@ impl BuildContainer {
         // shape mounts no root: the engine builds in the
         // in-container root (see `engine_root`), and the results
         // are copied out to the host root.
-        check_mount_source(&vertical.cache_dir)?;
-        check_mount_source(workdir)?;
         let podman = which(&vertical.podman).ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ImageUnavailable,
@@ -4652,27 +4687,12 @@ impl BuildContainer {
             .saturating_duration_since(std::time::Instant::now())
             .as_secs()
             .max(1);
-        let mut mounts: Vec<String> = vec![
-            format!(
-                "type=bind,src={},target={}",
-                vertical.cache_dir.display(),
-                vertical.cache_dir.display()
-            ),
-            format!(
-                "type=bind,src={},target={}",
-                workdir.display(),
-                workdir.display()
-            ),
+        let mut mounts: Vec<(PathBuf, PathBuf)> = vec![
+            (vertical.cache_dir.clone(), vertical.cache_dir.clone()),
+            (workdir.to_path_buf(), workdir.to_path_buf()),
         ];
-        if privileged {
-            check_mount_source(root)?;
-            if !root.starts_with(&vertical.cache_dir) && root != workdir {
-                mounts.push(format!(
-                    "type=bind,src={},target={}",
-                    root.display(),
-                    root.display()
-                ));
-            }
+        if privileged && !root.starts_with(&vertical.cache_dir) && root != workdir {
+            mounts.push((root.to_path_buf(), root.to_path_buf()));
         }
         // The engine mounts dev, proc, and sys inside the build
         // root, and the default cap set denies those mounts, so
@@ -4688,8 +4708,8 @@ impl BuildContainer {
         let mut cmd = Command::new(&podman);
         cmd.arg("run");
         cmd.args(run_args);
-        for mount in &mounts {
-            cmd.args(["--mount", mount]);
+        for (src, target) in &mounts {
+            cmd.args(bind_mount_args(src, target)?);
         }
         cmd.args([
             "-w",
@@ -7145,7 +7165,10 @@ impl<'a> LocalBuild<'a> {
         // so the container's workdir is the root itself — and so
         // the shell always uses the privileged shape: the rootless
         // shape discards its root with the container, and there
-        // is no preserved root to enter.
+        // is no preserved root to enter. That shape is refused on
+        // macOS by the shared gate in `BuildContainer::start`, so
+        // the shell refuses there instead of silently running the
+        // shape `build --privileged` refuses.
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
         let container = BuildContainer::start(self, &root, &root, true, deadline)?;
         container.install_engine(deadline)?;
@@ -7731,9 +7754,9 @@ impl<'a> LocalBuild<'a> {
     /// `pre_checkin.sh` when the source directory carries one.
     /// The script step is part of the gate, not of the service
     /// mode: the mode filter alone runs services only. Both steps
-    /// share one timeout budget. A failing service or a failing
-    /// `pre_checkin.sh` fails the whole run with
-    /// [`ErrorKind::ServiceFailed`]. A dry run returns the plan
+    /// share one timeout budget. A failing service fails the whole
+    /// run with [`ErrorKind::ServiceFailed`]; a failing
+    /// `pre_checkin.sh` with [`ErrorKind::PrecheckinFailed`]. A dry run returns the plan
     /// and touches nothing. `project` names the OBS project the
     /// services validate against, from `--project`; `None`
     /// resolves it from the checkout.
@@ -7751,7 +7774,7 @@ impl<'a> LocalBuild<'a> {
             ));
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-        self.precommit_with_deadline(source_dir, project, timeout_secs, deadline, dry_run)
+        self.precommit_with_deadline(source_dir, project, timeout_secs, deadline, dry_run, false)
     }
 
     /// The precommit gate against a fixed deadline: the caller
@@ -7760,7 +7783,11 @@ impl<'a> LocalBuild<'a> {
     /// build, so a slow service run leaves less time for the
     /// script instead of the gate taking a fresh full timeout.
     /// `timeout_secs` is the whole-run budget the
-    /// exhausted-budget message names.
+    /// exhausted-budget message names. `skip_services` runs the
+    /// gate after an earlier run-mode service run: the run-mode
+    /// selection already covers `trylocal`/`localonly`, so the
+    /// gate runs no service twice — it records the skipped names
+    /// in `services_skipped` and runs only `pre_checkin.sh`.
     pub fn precommit_with_deadline(
         &self,
         source_dir: &Path,
@@ -7768,6 +7795,7 @@ impl<'a> LocalBuild<'a> {
         timeout_secs: u64,
         deadline: std::time::Instant,
         dry_run: bool,
+        skip_services: bool,
     ) -> Result<PrecommitRecord, GeectlError> {
         if timeout_secs == 0 {
             return Err(GeectlError::new(
@@ -7775,21 +7803,60 @@ impl<'a> LocalBuild<'a> {
                 "precommit timeout must be greater than 0 seconds",
             ));
         }
-        let req = ServiceRunRequest {
-            source_dir: source_dir.to_path_buf(),
-            mode: ServiceRunMode::Precommit,
-            service: None,
-            project: project.map(str::to_string),
-            timeout_secs,
-            dry_run,
+        let (services, services_skipped) = if skip_services {
+            // The run-mode step already ran these services: the
+            // selection still reads, so the record names what was
+            // skipped instead of silently dropping the step. The
+            // project resolves first, like a real run — a bad
+            // project refuses before any service work.
+            let source_dir = std::path::absolute(source_dir).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "cannot resolve source directory {}: {e}",
+                        source_dir.display()
+                    ),
+                )
+            })?;
+            let context = resolve_service_context(&source_dir, project)?;
+            let definitions = read_local_services(&source_dir)?;
+            let skipped = select_services(&definitions, ServiceRunMode::Precommit, None)?
+                .into_iter()
+                .map(|service| service.name)
+                .collect::<Vec<_>>();
+            let services = ServiceRunRecord {
+                mode: ServiceRunMode::Precommit.command_name().to_string(),
+                project: context.project,
+                ran: Vec::new(),
+                image_digest: None,
+                dry_run,
+                plan: if dry_run {
+                    Some(ServiceRunPlan {
+                        image: DEFAULT_IMAGE.to_string(),
+                        services: Vec::new(),
+                    })
+                } else {
+                    None
+                },
+            };
+            (services, skipped)
+        } else {
+            let req = ServiceRunRequest {
+                source_dir: source_dir.to_path_buf(),
+                mode: ServiceRunMode::Precommit,
+                service: None,
+                project: project.map(str::to_string),
+                timeout_secs,
+                dry_run,
+            };
+            (self.service_run_with_deadline(&req, deadline)?, Vec::new())
         };
-        let services = self.service_run_with_deadline(&req, deadline)?;
-        let source_dir = std::path::absolute(&req.source_dir).map_err(|e| {
+        let source_dir = std::path::absolute(source_dir).map_err(|e| {
             GeectlError::new(
                 ErrorKind::InvalidInput,
                 format!(
                     "cannot resolve source directory {}: {e}",
-                    req.source_dir.display()
+                    source_dir.display()
                 ),
             )
         })?;
@@ -7797,6 +7864,7 @@ impl<'a> LocalBuild<'a> {
         Ok(PrecommitRecord {
             services,
             pre_checkin,
+            services_skipped,
             dry_run,
         })
     }
@@ -7804,7 +7872,7 @@ impl<'a> LocalBuild<'a> {
     /// Run `spec-cleaner` on `spec` in the container. `spec` is a
     /// path inside `source_dir` (relative, or absolute under it).
     /// `extra_args` pass through to the binary as argv elements.
-    /// A non-zero exit fails with [`ErrorKind::ServiceFailed`].
+    /// A non-zero exit fails with [`ErrorKind::SpecCleanerFailed`].
     /// A dry run returns the plan and touches nothing.
     pub fn spec_cleaner(
         &self,
@@ -7889,7 +7957,7 @@ impl<'a> LocalBuild<'a> {
             });
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-        check_mount_source(&source_dir)?;
+        mount_source(&self.cache_dir, &source_dir)?;
         let image = self.resolve_image(false, timeout_secs, deadline)?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let container =
@@ -7900,7 +7968,7 @@ impl<'a> LocalBuild<'a> {
         )?;
         if !install.status.success() {
             return Err(GeectlError::new(
-                ErrorKind::ServiceFailed,
+                ErrorKind::SpecCleanerFailed,
                 format!(
                     "cannot install spec-cleaner in the service container: {}",
                     last_lines(&String::from_utf8_lossy(&install.stderr), 20).join("\n")
@@ -7912,7 +7980,7 @@ impl<'a> LocalBuild<'a> {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.status.success() {
             return Err(GeectlError::new(
-                ErrorKind::ServiceFailed,
+                ErrorKind::SpecCleanerFailed,
                 format!(
                     "spec-cleaner failed with exit {}: {}",
                     output.status.code().unwrap_or(-1),
@@ -8022,7 +8090,7 @@ impl<'a> LocalBuild<'a> {
                 plan: None,
             });
         }
-        check_mount_source(&source_dir).inspect_err(|_| {
+        mount_source(&self.cache_dir, &source_dir).inspect_err(|_| {
             remove_stash(&stash, &self.debug);
         })?;
         let image = self
@@ -8137,7 +8205,7 @@ impl<'a> LocalBuild<'a> {
     /// Run `pre_checkin.sh` in the container when the source
     /// directory carries one. A missing script is not an error:
     /// most packages carry none. A failing script fails with
-    /// [`ErrorKind::ServiceFailed`]. The script runs under `bash`
+    /// [`ErrorKind::PrecheckinFailed`]. The script runs under `bash`
     /// with the source directory as its working directory, in the
     /// bare base image: no packages are installed for it, so a
     /// script needing tools beyond the base image fails. A script
@@ -8173,7 +8241,7 @@ impl<'a> LocalBuild<'a> {
                 "precommit budget exhausted before pre_checkin.sh; the services ran, the script did not",
             ));
         }
-        check_mount_source(source_dir)?;
+        mount_source(&self.cache_dir, source_dir)?;
         let image = self.resolve_image(false, remaining.as_secs(), deadline)?;
         self.debug.emit(&format!(
             "precommit image: {} digest {}",
@@ -8191,7 +8259,7 @@ impl<'a> LocalBuild<'a> {
         let exit_code = output.status.code().unwrap_or(-1);
         if !output.status.success() {
             return Err(GeectlError::new(
-                ErrorKind::ServiceFailed,
+                ErrorKind::PrecheckinFailed,
                 format!(
                     "pre_checkin.sh failed with exit {exit_code}: {}",
                     last_lines(&stderr, 20).join("\n")
@@ -8245,8 +8313,9 @@ const SERVICE_CONTAINER_PIDS_LIMIT: &str = "1024";
 /// a service run with a project known. No CPU cap
 /// is set: the wall-clock timeout already bounds CPU time, and a
 /// fixed CPU count does not scale portably across hosts.
-/// A `,` in the source path is refused: the `--mount` form
-/// splits on `,` with no escape, so the mount cannot carry it.
+/// A `,` in the source path mounts through a stable symlink
+/// instead (see `mount_source`): the `--mount` form splits on
+/// `,` with no escape, so the mount cannot carry the raw path.
 struct ServiceContainer {
     podman: PathBuf,
     name: String,
@@ -8273,14 +8342,31 @@ fn service_install_argv(packages: &[String]) -> Vec<String> {
     argv
 }
 
-/// A source directory the `--mount` form can carry: it holds
-/// no `,`, which splits the comma-separated value with no
-/// escape — podman refuses the fragment as an invalid mount
-/// option. Refusing here names the path instead of letting
-/// the container fail to start. Shared by the service and build
-/// containers.
-fn check_mount_source(source_dir: &Path) -> Result<(), GeectlError> {
-    if source_dir.to_string_lossy().contains(',') {
+/// The mount source for a source directory: the directory itself,
+/// unless it holds a `,`, which splits the comma-separated
+/// `--mount` value with no escape. A comma path mounts through a
+/// stable symlink instead: the link lives under
+/// `<cache>/mount-links/` — inside the cache dir so podman can
+/// see it on every host, including a Mac podman machine, which
+/// shares the home directory but not the temp dir — and is named
+/// by the sha256 of the canonical path, so the same directory
+/// always mounts through the same link and two directories never
+/// share one. The link is created when missing and replaced when
+/// it points anywhere else. The symlink mount covers macOS/Linux
+/// only: on Windows a comma path is refused, as before — every
+/// Windows path carries a drive colon, so neither mount form
+/// carries it anyway.
+fn mount_source(cache_dir: &Path, source_dir: &Path) -> Result<PathBuf, GeectlError> {
+    if !source_dir.to_string_lossy().contains(',') {
+        return Ok(source_dir.to_path_buf());
+    }
+    #[cfg(unix)]
+    {
+        mount_source_symlink(cache_dir, source_dir)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cache_dir;
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
             format!(
@@ -8289,7 +8375,134 @@ fn check_mount_source(source_dir: &Path) -> Result<(), GeectlError> {
             ),
         ));
     }
-    Ok(())
+}
+
+/// The symlink half of [`mount_source`], on a host that has
+/// symlinks: the stable link for a comma path, under
+/// `<cache>/mount-links/`, named by the sha256 of the canonical
+/// path. A link whose target is the cache dir itself would carry
+/// the comma too, so a comma in the cache dir is refused naming
+/// it — there is no comma-free mount path for that directory.
+#[cfg(unix)]
+fn mount_source_symlink(cache_dir: &Path, source_dir: &Path) -> Result<PathBuf, GeectlError> {
+    let canonical = fs::canonicalize(source_dir)
+        .or_else(|_| std::path::absolute(source_dir))
+        .map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot resolve source directory {}: {e}",
+                    source_dir.display()
+                ),
+            )
+        })?;
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    let name: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let link = cache_dir.join("mount-links").join(name);
+    if link.to_string_lossy().contains(',') {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "source directory {} contains a ',' and the cache directory {} does too, so no comma-free mount path exists for it",
+                source_dir.display(),
+                cache_dir.display()
+            ),
+        ));
+    }
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!(
+                    "cannot create the mount-link directory {}: {e}",
+                    parent.display()
+                ),
+            )
+        })?;
+    }
+    if let Ok(metadata) = fs::symlink_metadata(&link) {
+        let points_at_canonical = metadata.file_type().is_symlink()
+            && fs::read_link(&link)
+                .map(|target| target == canonical)
+                .unwrap_or(false);
+        if points_at_canonical {
+            return Ok(link);
+        }
+        fs::remove_file(&link).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot replace the mount link {}: {e}", link.display()),
+            )
+        })?;
+    }
+    match std::os::unix::fs::symlink(&canonical, &link) {
+        Ok(()) => Ok(link),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A concurrent first use created the link first: take
+            // it when it points at the same directory, and refuse
+            // when it points anywhere else.
+            if fs::read_link(&link)
+                .map(|target| target == canonical)
+                .unwrap_or(false)
+            {
+                Ok(link)
+            } else {
+                Err(GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!(
+                        "the mount link {} points at another directory, not {}",
+                        link.display(),
+                        source_dir.display()
+                    ),
+                ))
+            }
+        }
+        Err(e) => Err(GeectlError::new(
+            ErrorKind::InternalError,
+            format!(
+                "cannot create the mount link {} for {}: {e}",
+                link.display(),
+                source_dir.display()
+            ),
+        )),
+    }
+}
+
+/// One bind mount for a `podman run` line: the `--mount` form or
+/// the `-v` form. `--mount` splits its value on `,`, so a path
+/// with a `,` rides as `-v` instead — `-v` splits on `:` and
+/// tolerates commas; a path with both `,` and `:` rides on
+/// neither, and is refused naming both. The build container
+/// mounts at the host paths, so its mounts keep the real paths
+/// as both ends — only the form changes.
+fn bind_mount_args(src: &Path, target: &Path) -> Result<Vec<String>, GeectlError> {
+    let has_comma = src.to_string_lossy().contains(',') || target.to_string_lossy().contains(',');
+    let has_colon = src.to_string_lossy().contains(':') || target.to_string_lossy().contains(':');
+    if has_comma && has_colon {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "mount paths {} and {} contain both ',' and ':'; neither the --mount form nor -v carries both",
+                src.display(),
+                target.display()
+            ),
+        ));
+    }
+    if has_comma {
+        Ok(vec![
+            "-v".to_string(),
+            format!("{}:{}", src.display(), target.display()),
+        ])
+    } else {
+        Ok(vec![
+            "--mount".to_string(),
+            format!(
+                "type=bind,src={},target={}",
+                src.display(),
+                target.display()
+            ),
+        ])
+    }
 }
 
 impl ServiceContainer {
@@ -8302,7 +8515,8 @@ impl ServiceContainer {
     ) -> Result<Self, GeectlError> {
         // Checked at the entry points before any image work; kept
         // here so a future caller cannot build the mount unchecked.
-        check_mount_source(source_dir)?;
+        // A comma path mounts through its stable symlink.
+        let mount_src = mount_source(&vertical.cache_dir, source_dir)?;
         let podman = which(&vertical.podman).ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ImageUnavailable,
@@ -8359,7 +8573,7 @@ impl ServiceContainer {
             "-e",
             &osc_version,
             "--mount",
-            &format!("type=bind,src={},target=/work", source_dir.display()),
+            &format!("type=bind,src={},target=/work", mount_src.display()),
             "-w",
             "/work",
             image,
@@ -8501,10 +8715,14 @@ fn read_local_services(source_dir: &Path) -> Result<Vec<ServiceDef>, GeectlError
 }
 
 /// Select the services a run executes, in file order. A
-/// single-service run executes only that service: when the file
-/// defines it, with its parameters and the run mode forced as its
-/// mode; when it does not, with no parameters and the run mode as
-/// its mode. Any other run filters the file's services by the run
+/// single-service run executes only that service: it must be
+/// defined in the file, with its parameters and its stored mode —
+/// naming a service selects it, it does not force its mode, so
+/// the mode filter applies to the named service exactly as to
+/// every other service. An undefined name fails closed, like the
+/// server trigger; a named service the mode would not select
+/// refuses instead of running under a forced mode or running
+/// nothing. Any other run filters the file's services by the run
 /// mode.
 fn select_services(
     definitions: &[ServiceDef],
@@ -8519,18 +8737,30 @@ fn select_services(
                 format!("invalid service name {name:?}: at least 3 characters, no '/'",),
             ));
         }
-        let effective_mode = callmode.unwrap_or_default().to_string();
-        if let Some(def) = definitions.iter().find(|d| d.name == name) {
-            return Ok(vec![SelectedService {
-                name: def.name.clone(),
-                effective_mode,
-                params: def.params.clone(),
-            }]);
+        let Some(def) = definitions.iter().find(|d| d.name == name) else {
+            return Err(GeectlError::new(
+                ErrorKind::NotFound,
+                format!("service {name} is not defined in the _service file"),
+            ));
+        };
+        if !service_selected(&def.mode, callmode) {
+            let stored = if def.mode.is_empty() {
+                "no stored mode".to_string()
+            } else {
+                format!("stored mode {:?}", def.mode)
+            };
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "service {name} has {stored} and a `{}` does not select it: the mode filter applies to the named service too",
+                    mode.command_name()
+                ),
+            ));
         }
         return Ok(vec![SelectedService {
-            name: name.to_string(),
-            effective_mode,
-            params: Vec::new(),
+            name: def.name.clone(),
+            effective_mode: def.mode.clone(),
+            params: def.params.clone(),
         }]);
     }
     Ok(definitions
@@ -10814,6 +11044,66 @@ exit 0
         }
 
         #[test]
+        fn build_container_mount_uses_v_for_a_comma_workdir() {
+            // A comma in the workdir switches that mount to -v,
+            // which splits on `:` and tolerates commas; the cache
+            // mount stays on --mount.
+            let dir = TempDir::new();
+            let (podman, call_log, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), podman);
+            let workdir = dir.path().join("wo,rkdir");
+            fs::create_dir_all(&workdir).unwrap();
+            let root = dir.path().join("root");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let _container =
+                BuildContainer::start(&vertical, &workdir, &root, false, deadline).unwrap();
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            let run_line = log
+                .lines()
+                .find(|l| l.starts_with("run "))
+                .expect("no run call in log");
+            assert!(
+                run_line.contains(&format!("-v {}:{}", workdir.display(), workdir.display())),
+                "run line carries no -v mount for the comma workdir: {run_line}"
+            );
+            assert!(
+                !run_line.contains(&format!(
+                    "src={},target={}",
+                    workdir.display(),
+                    workdir.display()
+                )),
+                "run line still mounts the comma workdir with --mount: {run_line}"
+            );
+        }
+
+        #[test]
+        fn build_container_mount_refuses_a_comma_and_colon_workdir() {
+            // Neither mount form carries both characters, so the
+            // run is refused before any podman call, naming both.
+            let dir = TempDir::new();
+            let (podman, call_log, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), podman);
+            let workdir = dir.path().join("wo,:rkdir");
+            fs::create_dir_all(&workdir).unwrap();
+            let root = dir.path().join("root");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let err = BuildContainer::start(&vertical, &workdir, &root, false, deadline)
+                .map(|_| ())
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.context.contains("both"));
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            assert!(
+                !log.lines().any(|l| l.starts_with("run ")),
+                "podman ran before the refusal: {log}"
+            );
+        }
+
+        #[test]
         fn validate_build_request_rejects_a_bad_alternative_project() {
             let dir = TempDir::new();
             let source = write_source(dir.path(), "foo.spec");
@@ -10865,6 +11155,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn validate_build_request_rejects_rootless_noinit() {
             let dir = TempDir::new();
             let source = write_source(dir.path(), "foo.spec");
@@ -10873,6 +11164,26 @@ exit 0
             let err = validate_build_request(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(err.to_string().contains("--noinit needs a preserved root"));
+        }
+
+        #[test]
+        #[cfg(target_os = "macos")]
+        fn validate_build_request_rejects_noinit_on_macos() {
+            // On macOS the remediation does not exist: `--noinit`
+            // needs `--privileged`, which the platform refuses —
+            // so the error names the dead end instead of
+            // prescribing the refused flag.
+            let dir = TempDir::new();
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.noinit = true;
+            let err = validate_build_request(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.to_string().contains("--noinit is unavailable on macOS"),
+                "got: {}",
+                err
+            );
         }
 
         #[test]
@@ -13143,6 +13454,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn shell_wipe_and_log_round_trip() {
             let dir = TempDir::new();
             let (podman, _, argv_log) = stub_podman(dir.path(), true);
@@ -13632,6 +13944,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn build_shell_joins_commands_into_one_shell_fragment() {
             // Two commands reach the engine as one `--shell-cmd`
             // string joined by ` && `: a shell fragment for the
@@ -13663,6 +13976,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn build_shell_debug_line_redacts_the_shell_command() {
             // The fragments are free-form stdin: a pasted secret in
             // one must never reach `--debug`, so the debug line shows
@@ -13709,6 +14023,78 @@ exit 0
         }
 
         #[test]
+        #[cfg(target_os = "macos")]
+        fn build_shell_refuses_the_privileged_shape_on_macos() {
+            // The shell always uses the privileged shape, and the
+            // shared gate in `BuildContainer::start` refuses it on
+            // macOS — the shell fails closed instead of silently
+            // running the shape `build --privileged` refuses.
+            let dir = TempDir::new();
+            let (podman, _, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            vertical.build(&req).unwrap();
+            let err = vertical
+                .build_shell(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    &["echo hi".to_string()],
+                    60,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.to_string().contains("--privileged is refused on macOS"),
+                "got: {}",
+                err
+            );
+        }
+
+        #[test]
+        #[cfg(target_os = "macos")]
+        fn chroot_refuses_the_privileged_shape_on_macos() {
+            // The chroot enters the preserved root through the
+            // shell, which always uses the privileged shape, and
+            // the shared gate in `BuildContainer::start` refuses
+            // it on macOS — the chroot fails closed instead of
+            // silently running the shape `build --privileged`
+            // refuses.
+            let dir = TempDir::new();
+            let (podman, _, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
+            vertical.build(&req).unwrap();
+            let err = vertical
+                .build_chroot(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    &["false".to_string()],
+                    60,
+                    false,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.to_string().contains("--privileged is refused on macOS"),
+                "got: {}",
+                err
+            );
+        }
+
+        #[test]
+        #[cfg(not(target_os = "macos"))]
         fn chroot_live_round_trip_after_build() {
             // The shell runs the stdin commands in the preserved
             // root: two commands reach the engine as one
@@ -13764,6 +14150,7 @@ exit 0
         }
 
         #[test]
+        #[cfg(not(target_os = "macos"))]
         fn chroot_live_nonzero_exit_is_data_not_a_failure() {
             // A failing repro is data, not a failed command: the
             // engine exits 1, `build_chroot` still returns `Ok`,
@@ -14630,7 +15017,7 @@ exit 0
             let started = std::time::Instant::now();
             let err = (|| -> Result<BuildRecord, GeectlError> {
                 vertical.service_run_with_deadline(&service_req, deadline)?;
-                vertical.precommit_with_deadline(&src, None, 10, deadline, false)?;
+                vertical.precommit_with_deadline(&src, None, 10, deadline, false, false)?;
                 vertical.build_with_deadline(&build_req, deadline)
             })()
             .unwrap_err();
@@ -14672,7 +15059,7 @@ exit 0
             let started = std::time::Instant::now();
             let err = (|| -> Result<BuildRecord, GeectlError> {
                 vertical.service_run_with_deadline(&service_req, deadline)?;
-                vertical.precommit_with_deadline(&src, None, 10, deadline, false)?;
+                vertical.precommit_with_deadline(&src, None, 10, deadline, false, false)?;
                 vertical.build_with_deadline(&build_req, deadline)
             })()
             .unwrap_err();
@@ -19278,9 +19665,10 @@ if [ "$1" = "exec" ]; then
   # The install exec elevates via setpriv: skip the prefix to
   # reach the installed command.
   if [ "$1" = "setpriv" ]; then shift 4; fi
-  if [ "$1" = "zypper" ]; then exit 0; fi
+  if [ "$1" = "zypper" ]; then if [ -f "{DIR}/fail-spec-cleaner-install" ]; then echo "cannot install spec-cleaner" >&2; exit 1; fi; exit 0; fi
   if [ "$1" = "bash" ]; then cd "{SRC}" && bash ./pre_checkin.sh; exit $?; fi
   if [ "$1" = "spec-cleaner" ]; then
+    if [ -f "{DIR}/fail-spec-cleaner-binary" ]; then echo "spec-cleaner failed" >&2; exit 3; fi
     for last; do true; done
     echo "# spec-cleaner ran" >> "{SRC}/$last"
     exit 0
@@ -19309,7 +19697,8 @@ fi
 exit 0
 "##
             .replace("{CALL_LOG}", &call_log.display().to_string())
-            .replace("{SRC}", &src.display().to_string());
+            .replace("{SRC}", &src.display().to_string())
+            .replace("{DIR}", &dir.display().to_string());
             write_script(&script, &body);
             (script, call_log)
         }
@@ -19531,7 +19920,7 @@ exit 0
         }
 
         #[test]
-        fn select_services_filters_by_mode_and_forces_single() {
+        fn select_services_filters_by_mode_and_selects_single() {
             let defs = service_defs();
             let names = |services: Vec<SelectedService>| {
                 services.into_iter().map(|s| s.name).collect::<Vec<_>>()
@@ -19556,20 +19945,31 @@ exit 0
                 names(select_services(&defs, ServiceRunMode::LocalRun, None).unwrap()),
                 vec!["plain", "trylocalsvc", "serversvc"]
             );
-            // A single-service run forces the run mode, keeping the
-            // stored parameters: a manual service runs under a
-            // plain `run` when named.
-            let single = select_services(&defs, ServiceRunMode::Run, Some("manualsvc")).unwrap();
+            // A single-service run keeps the stored mode: a
+            // manual service runs under `manualrun` when named,
+            // with its stored mode, not the run mode forced.
+            let single =
+                select_services(&defs, ServiceRunMode::ManualRun, Some("manualsvc")).unwrap();
             assert_eq!(single.len(), 1);
             assert_eq!(single[0].name, "manualsvc");
-            assert_eq!(single[0].effective_mode, "");
-            // A service the file does not define runs with no
-            // parameters and the run mode as its mode.
-            let single = select_services(&defs, ServiceRunMode::ManualRun, Some("newsvc")).unwrap();
-            assert_eq!(single.len(), 1);
-            assert_eq!(single[0].name, "newsvc");
             assert_eq!(single[0].effective_mode, "manual");
-            assert!(single[0].params.is_empty());
+            // The mode filter applies to the named service too: a
+            // manual service under a plain `run` refuses instead
+            // of running under a forced mode.
+            let err = select_services(&defs, ServiceRunMode::Run, Some("manualsvc")).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("does not select it"), "got: {err}");
+            assert!(
+                err.to_string().contains("a `run` does not select it"),
+                "got: {err}"
+            );
+            // A service the file does not define fails closed,
+            // like the server trigger — no synthesis with empty
+            // parameters.
+            let err =
+                select_services(&defs, ServiceRunMode::ManualRun, Some("newsvc")).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotFound);
+            assert!(err.to_string().contains("not defined"), "got: {err}");
             // A short or slash-carrying name is a caller error.
             assert!(
                 select_services(&defs, ServiceRunMode::Run, Some("ab"))
@@ -20058,6 +20458,63 @@ exit 0
         }
 
         #[test]
+        fn mount_source_returns_a_comma_free_path_unchanged() {
+            let dir = TempDir::new();
+            let src = dir.path().join("plain");
+            assert_eq!(mount_source(dir.path(), &src).unwrap(), src);
+        }
+
+        #[test]
+        fn mount_source_links_a_comma_path_stably() {
+            let dir = TempDir::new();
+            let cache = dir.path().join("cache");
+            let src = dir.path().join("so,urce");
+            fs::create_dir_all(&src).unwrap();
+            let first = mount_source(&cache, &src).unwrap();
+            assert_ne!(first, src);
+            assert!(!first.to_string_lossy().contains(','));
+            assert_eq!(
+                fs::read_link(&first).unwrap(),
+                fs::canonicalize(&src).unwrap()
+            );
+            // The same directory always mounts through the same
+            // link, and a different comma directory gets its own.
+            assert_eq!(mount_source(&cache, &src).unwrap(), first);
+            let other = dir.path().join("an,other");
+            fs::create_dir_all(&other).unwrap();
+            assert_ne!(mount_source(&cache, &other).unwrap(), first);
+        }
+
+        #[test]
+        fn bind_mount_args_choose_the_form_by_characters() {
+            let plain = Path::new("/a/b");
+            assert_eq!(
+                bind_mount_args(plain, plain).unwrap(),
+                vec![
+                    "--mount".to_string(),
+                    "type=bind,src=/a/b,target=/a/b".to_string(),
+                ]
+            );
+            let comma = Path::new("/a,b");
+            assert_eq!(
+                bind_mount_args(comma, comma).unwrap(),
+                vec!["-v".to_string(), "/a,b:/a,b".to_string(),]
+            );
+            let colon = Path::new("/a:b");
+            assert_eq!(
+                bind_mount_args(colon, colon).unwrap(),
+                vec![
+                    "--mount".to_string(),
+                    "type=bind,src=/a:b,target=/a:b".to_string(),
+                ]
+            );
+            let both = Path::new("/a,:b");
+            let err = bind_mount_args(both, both).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.context.contains("both"));
+        }
+
+        #[test]
         fn service_container_mount_survives_a_colon_in_the_source_path() {
             // The `--mount` form carries the path as one value, so
             // a `:` in the source path cannot split the mount.
@@ -20105,11 +20562,11 @@ exit 0
         }
 
         #[test]
-        fn service_container_mount_refuses_a_comma_in_the_source_path() {
+        fn service_container_mount_symlinks_a_comma_in_the_source_path() {
             // The `--mount` value is comma-separated with no
             // escape: a `,` in the source path splits the mount
-            // and podman refuses the fragment. The run is refused
-            // before any podman call, naming the path.
+            // and podman refuses the fragment. The run mounts the
+            // path through its stable symlink instead, so it runs.
             let dir = TempDir::new();
             let src = dir.path().join("so,urce");
             fs::create_dir_all(&src).unwrap();
@@ -20118,27 +20575,71 @@ exit 0
                 "<services><service name=\"alpha\"/></services>",
             )
             .unwrap();
-            fs::write(src.join("_service:alpha:old"), "stale").unwrap();
             let (podman, call_log) = stub_service_podman(dir.path(), &src);
             let http = FakeHttp::new();
             let client = client_with(&http);
             let vertical = vertical(&client, dir.path(), podman);
             let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
-            let err = vertical.service_run(&req).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
-            assert!(
-                err.context.contains(&src.display().to_string()),
-                "refusal names no path: {err}"
-            );
+            let record = vertical.service_run(&req).unwrap();
+            assert_eq!(record.ran.len(), 1);
             let log = fs::read_to_string(&call_log).unwrap_or_default();
-            assert!(
-                !log.lines()
-                    .any(|l| l.starts_with("run ") || l.starts_with("image ")),
-                "podman ran before the refusal: {log}"
+            let run_line = log.lines().find(|l| l.starts_with("run "));
+            let Some(run_line) = run_line else {
+                panic!("no run call in log: {log}");
+            };
+            // The mount carries the stable link, not the raw comma
+            // path — and still the --mount form, no -v.
+            let link = mount_source(&vertical.cache_dir, &src).unwrap();
+            assert_ne!(link, src);
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                fs::canonicalize(&src).unwrap()
             );
             assert!(
-                !src.join(".geectl-service-old").exists(),
-                "refusal left the moved-aside stash behind"
+                run_line.contains(&format!(
+                    "--mount type=bind,src={},target=/work",
+                    link.display()
+                )),
+                "run line carries no symlinked --mount form: {run_line}"
+            );
+            assert!(
+                !run_line.contains(" -v "),
+                "run line uses the -v string form: {run_line}"
+            );
+        }
+
+        #[test]
+        fn service_container_mount_symlinks_a_comma_and_colon_in_the_source_path() {
+            // The link carries neither character, so a path with
+            // both runs too — the service container's target is
+            // fixed, so the link is the whole answer.
+            let dir = TempDir::new();
+            let src = dir.path().join("so,:urce");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let record = vertical.service_run(&req).unwrap();
+            assert_eq!(record.ran.len(), 1);
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            let run_line = log.lines().find(|l| l.starts_with("run "));
+            let Some(run_line) = run_line else {
+                panic!("no run call in log: {log}");
+            };
+            let link = mount_source(&vertical.cache_dir, &src).unwrap();
+            assert!(
+                run_line.contains(&format!(
+                    "--mount type=bind,src={},target=/work",
+                    link.display()
+                )),
+                "run line carries no symlinked --mount form: {run_line}"
             );
         }
 
@@ -20380,6 +20881,41 @@ exit 0
         }
 
         #[test]
+        fn precommit_with_deadline_skips_services_after_a_run_mode_step() {
+            // The build leaf's gate: the run-mode step already ran
+            // the trylocal service, so the gate runs only
+            // pre_checkin.sh — the union runs once — and the
+            // record names the skipped service.
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/><service name=\"beta\" mode=\"trylocal\"/><service name=\"gamma\" mode=\"manual\"/></services>",
+            )
+            .unwrap();
+            write_script(
+                &src.join("pre_checkin.sh"),
+                "#!/bin/sh\necho ran > pre_checkin.marker\n",
+            );
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), podman);
+            let deadline = std::time::Instant::now() + Duration::from_secs(3600);
+            let record = vertical
+                .precommit_with_deadline(&src, None, 3600, deadline, false, true)
+                .unwrap();
+            assert!(record.services.ran.is_empty());
+            assert_eq!(record.services_skipped, vec!["beta".to_string()]);
+            assert!(record.pre_checkin.ran);
+            assert_eq!(record.pre_checkin.exit_code, Some(0));
+            assert!(src.join("pre_checkin.marker").exists());
+            // The skipped service did not re-run: no output file.
+            assert!(!src.join("beta.out").exists());
+        }
+
+        #[test]
         fn precommit_without_a_script_reports_it_did_not_run() {
             let dir = TempDir::new();
             let src = dir.path().join("source");
@@ -20395,9 +20931,9 @@ exit 0
         }
 
         #[test]
-        fn precheckin_refuses_a_comma_in_the_source_path() {
-            // The mount refusal fires before the image resolve:
-            // a comma path fails here, not in the container.
+        fn precheckin_symlinks_a_comma_in_the_source_path() {
+            // A comma path mounts through its stable symlink, so
+            // the script runs instead of refusing.
             let dir = TempDir::new();
             let src = dir.path().join("so,urce");
             fs::create_dir_all(&src).unwrap();
@@ -20407,16 +20943,21 @@ exit 0
             let client = client_with(&http);
             let vertical = vertical(&client, dir.path(), podman);
             let deadline = std::time::Instant::now() + Duration::from_secs(3600);
-            let err = vertical.run_precheckin(&src, deadline, false).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
-            assert!(
-                err.context.contains(&src.display().to_string()),
-                "refusal names no path: {err}"
-            );
+            let outcome = vertical.run_precheckin(&src, deadline, false).unwrap();
+            assert!(outcome.ran);
+            assert_eq!(outcome.exit_code, Some(0));
             let log = fs::read_to_string(&call_log).unwrap_or_default();
+            let run_line = log.lines().find(|l| l.starts_with("run "));
+            let Some(run_line) = run_line else {
+                panic!("no run call in log: {log}");
+            };
+            let link = mount_source(&vertical.cache_dir, &src).unwrap();
             assert!(
-                !log.lines().any(|l| l.starts_with("image ")),
-                "podman ran before the refusal: {log}"
+                run_line.contains(&format!(
+                    "--mount type=bind,src={},target=/work",
+                    link.display()
+                )),
+                "run line carries no symlinked --mount form: {run_line}"
             );
         }
 
@@ -20431,7 +20972,7 @@ exit 0
             let client = client_with(&http);
             let vertical = vertical(&client, dir.path(), podman);
             let err = vertical.precommit(&src, None, 3600, false).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::ServiceFailed);
+            assert_eq!(err.kind(), ErrorKind::PrecheckinFailed);
             assert!(
                 err.context.contains("pre_checkin.sh"),
                 "got: {}",
@@ -20440,9 +20981,9 @@ exit 0
         }
 
         #[test]
-        fn spec_cleaner_refuses_a_comma_in_the_source_path() {
-            // The mount refusal fires before the image resolve:
-            // a comma path fails here, not in the container.
+        fn spec_cleaner_symlinks_a_comma_in_the_source_path() {
+            // A comma path mounts through its stable symlink, so
+            // the cleaner runs instead of refusing.
             let dir = TempDir::new();
             let src = dir.path().join("so,urce");
             fs::create_dir_all(&src).unwrap();
@@ -20451,18 +20992,22 @@ exit 0
             let http = FakeHttp::new();
             let client = client_with(&http);
             let vertical = vertical(&client, dir.path(), podman);
-            let err = vertical
+            let result = vertical
                 .spec_cleaner(&src, Path::new("foo.spec"), &[], 3600, false)
-                .unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
-            assert!(
-                err.context.contains(&src.display().to_string()),
-                "refusal names no path: {err}"
-            );
+                .unwrap();
+            assert_eq!(result.exit_code, 0);
             let log = fs::read_to_string(&call_log).unwrap_or_default();
+            let run_line = log.lines().find(|l| l.starts_with("run "));
+            let Some(run_line) = run_line else {
+                panic!("no run call in log: {log}");
+            };
+            let link = mount_source(&vertical.cache_dir, &src).unwrap();
             assert!(
-                !log.lines().any(|l| l.starts_with("image ")),
-                "podman ran before the refusal: {log}"
+                run_line.contains(&format!(
+                    "--mount type=bind,src={},target=/work",
+                    link.display()
+                )),
+                "run line carries no symlinked --mount form: {run_line}"
             );
         }
 
@@ -20512,6 +21057,50 @@ exit 0
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(
                 err.context.contains("outside source directory"),
+                "got: {}",
+                err.context
+            );
+        }
+
+        #[test]
+        fn spec_cleaner_install_failure_maps_to_spec_cleaner_failed() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(src.join("foo.spec"), "Name: foo\n").unwrap();
+            fs::write(dir.path().join("fail-spec-cleaner-install"), "").unwrap();
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), podman);
+            let err = vertical
+                .spec_cleaner(&src, Path::new("foo.spec"), &[], 3600, false)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::SpecCleanerFailed);
+            assert!(
+                err.context.contains("cannot install spec-cleaner"),
+                "got: {}",
+                err.context
+            );
+        }
+
+        #[test]
+        fn spec_cleaner_binary_failure_maps_to_spec_cleaner_failed() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(src.join("foo.spec"), "Name: foo\n").unwrap();
+            fs::write(dir.path().join("fail-spec-cleaner-binary"), "").unwrap();
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), podman);
+            let err = vertical
+                .spec_cleaner(&src, Path::new("foo.spec"), &[], 3600, false)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::SpecCleanerFailed);
+            assert!(
+                err.context.contains("spec-cleaner failed with exit 3"),
                 "got: {}",
                 err.context
             );

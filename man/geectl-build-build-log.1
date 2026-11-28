@@ -4,7 +4,7 @@
 .SH NAME
 geectl\-build\-build\-log \- Read the build log for a package
 .SH SYNOPSIS
-\fBgeectl build build\-log\fR [\fB\-\-start\fR] [\fB\-\-last\fR] [\fB\-\-lastsucceeded\fR] [\fB\-\-multibuild\fR] [\fB\-\-strip\-time\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> [\fIPACKAGE\fR] [\fIREPOSITORY\fR] [\fIARCH\fR] 
+\fBgeectl build build\-log\fR [\fB\-\-start\fR] [\fB\-\-last\fR] [\fB\-\-lastsucceeded\fR] [\fB\-\-tail\fR] [\fB\-\-full\fR] [\fB\-\-multibuild\fR] [\fB\-\-strip\-time\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> [\fIPACKAGE\fR] [\fIREPOSITORY\fR] [\fIARCH\fR] 
 .SH DESCRIPTION
 Read the build log for a package
 .SH OPTIONS
@@ -17,6 +17,12 @@ The last build\*(Aqs log instead of the current one. Cannot combine with `\-\-la
 .TP
 \fB\-\-lastsucceeded\fR
 The last succeeded build\*(Aqs log. Cannot combine with `\-\-last`
+.TP
+\fB\-\-tail\fR \fI<TAIL>\fR
+Print only the last N lines of the log
+.TP
+\fB\-\-full\fR
+Read the whole log without the 4 MiB cap. Cannot combine with `\-\-start`
 .TP
 \fB\-\-multibuild\fR \fI<FLAVOR>\fR
 Only this multibuild flavor\*(Aqs log: appends `:FLAVOR` to the package. Refused when the package already carries a flavor

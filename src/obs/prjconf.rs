@@ -236,6 +236,19 @@ impl PrjconfFindingKind {
 pub struct PrjconfFinding {
     pub kind: PrjconfFindingKind,
     pub severity: PrjconfSeverity,
+    /// True when default `clean` removes what this finding names:
+    /// the finding's line is a restricted dead line, or its token
+    /// a restricted same-line duplicate. The path-dependent
+    /// opt-in (`clean --include-path-dependent`) removes more;
+    /// this flag is the default only, so a consumer can tell
+    /// which findings a default clean leaves behind.
+    #[serde(default)]
+    pub removed_by_default_clean: bool,
+    /// The token a `DuplicateToken` finding names, when the kind
+    /// carries one. The flag above reads this field, never the
+    /// human message, so a prose rework cannot under-flag it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     /// The repository the finding was evaluated for, when it is
     /// repository-scoped.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1480,6 +1493,8 @@ fn evaluate_buildconfig(
     for frame in &frames {
         findings.push(PrjconfFinding {
             kind: PrjconfFindingKind::UnclosedIf,
+            removed_by_default_clean: false,
+            token: None,
             severity: PrjconfSeverity::Error,
             repository: Some(repository.to_string()),
             project: frame.if_project.clone(),
@@ -1549,6 +1564,8 @@ fn finish_groups(
             }
             findings.push(PrjconfFinding {
                 kind: PrjconfFindingKind::DeadBranch,
+                removed_by_default_clean: false,
+                token: None,
                 severity: PrjconfSeverity::Warning,
                 repository: Some(repository.to_string()),
                 project: group.project.clone(),
@@ -1709,6 +1726,8 @@ fn handle_conditional(
             let Some(frame) = frames.last_mut() else {
                 findings.push(PrjconfFinding {
                     kind: PrjconfFindingKind::ParseError,
+                    removed_by_default_clean: false,
+                    token: None,
                     severity: PrjconfSeverity::Error,
                     repository: Some(repository.to_string()),
                     project: section_project.to_string(),
@@ -1764,6 +1783,8 @@ fn handle_conditional(
             let Some(frame) = frames.last_mut() else {
                 findings.push(PrjconfFinding {
                     kind: PrjconfFindingKind::ParseError,
+                    removed_by_default_clean: false,
+                    token: None,
                     severity: PrjconfSeverity::Error,
                     repository: Some(repository.to_string()),
                     project: section_project.to_string(),
@@ -1794,6 +1815,8 @@ fn handle_conditional(
             let Some(frame) = frames.pop() else {
                 findings.push(PrjconfFinding {
                     kind: PrjconfFindingKind::ParseError,
+                    removed_by_default_clean: false,
+                    token: None,
                     severity: PrjconfSeverity::Error,
                     repository: Some(repository.to_string()),
                     project: section_project.to_string(),
@@ -1952,6 +1975,8 @@ fn process_line(
     let Some(keyword_raw) = first.strip_suffix(':') else {
         findings.push(PrjconfFinding {
             kind: PrjconfFindingKind::UnknownKeyword,
+            removed_by_default_clean: false,
+            token: None,
             severity: PrjconfSeverity::Warning,
             repository: Some(repository.to_string()),
             project: section_project.to_string(),
@@ -2010,6 +2035,8 @@ fn process_line(
             if seen_content {
                 findings.push(PrjconfFinding {
                     kind: PrjconfFindingKind::ParseError,
+                    removed_by_default_clean: false,
+                    token: None,
                     severity: PrjconfSeverity::Error,
                     repository: Some(repository.to_string()),
                     project: section_project.to_string(),
@@ -2070,6 +2097,8 @@ fn process_line(
         _ => {
             findings.push(PrjconfFinding {
                 kind: PrjconfFindingKind::UnknownKeyword,
+                removed_by_default_clean: false,
+                token: None,
                 severity: PrjconfSeverity::Warning,
                 repository: Some(repository.to_string()),
                 project: section_project.to_string(),
@@ -2137,6 +2166,8 @@ fn process_list_directive(
             if known && state.list_is_empty(keyword) {
                 findings.push(PrjconfFinding {
                     kind: PrjconfFindingKind::DeadClear,
+                    removed_by_default_clean: false,
+                    token: None,
                     severity: PrjconfSeverity::Warning,
                     repository: Some(repository.to_string()),
                     project: section_project.to_string(),
@@ -2155,6 +2186,8 @@ fn process_list_directive(
             if known && !state.list_contains(keyword, removed) {
                 findings.push(PrjconfFinding {
                     kind: PrjconfFindingKind::DeadRemoval,
+                    removed_by_default_clean: false,
+                    token: None,
                     severity: PrjconfSeverity::Warning,
                     repository: Some(repository.to_string()),
                     project: section_project.to_string(),
@@ -2172,6 +2205,8 @@ fn process_list_directive(
         } else if known && state.list_contains(keyword, token) {
             findings.push(PrjconfFinding {
                 kind: PrjconfFindingKind::DuplicateToken,
+                removed_by_default_clean: false,
+                token: Some(token.clone()),
                 severity: PrjconfSeverity::Warning,
                 repository: Some(repository.to_string()),
                 project: section_project.to_string(),
@@ -2256,6 +2291,8 @@ fn process_substitute(
         if state.substitute_known && state.substitute.is_empty() {
             findings.push(PrjconfFinding {
                 kind: PrjconfFindingKind::DeadClear,
+                removed_by_default_clean: false,
+                token: None,
                 severity: PrjconfSeverity::Warning,
                 repository: Some(repository.to_string()),
                 project: section_project.to_string(),
@@ -2276,6 +2313,8 @@ fn process_substitute(
         if state.substitute_known && !state.substitute.contains_key(removed) {
             findings.push(PrjconfFinding {
                 kind: PrjconfFindingKind::DeadRemoval,
+                removed_by_default_clean: false,
+                token: None,
                 severity: PrjconfSeverity::Warning,
                 repository: Some(repository.to_string()),
                 project: section_project.to_string(),
@@ -2297,6 +2336,8 @@ fn process_substitute(
         if state.substitute_known {
             findings.push(PrjconfFinding {
                 kind: PrjconfFindingKind::OverriddenSubstitute,
+                removed_by_default_clean: false,
+                token: None,
                 severity: PrjconfSeverity::Warning,
                 repository: Some(repository.to_string()),
                 project: earlier.project.clone(),
@@ -2895,6 +2936,8 @@ impl ObsClient<'_> {
             for marker_own in group.dead_segments.keys() {
                 findings.push(PrjconfFinding {
                     kind: PrjconfFindingKind::DeadBranch,
+                    removed_by_default_clean: false,
+                    token: None,
                     severity: PrjconfSeverity::Warning,
                     repository: None,
                     project: project.to_string(),
@@ -2911,6 +2954,8 @@ impl ObsClient<'_> {
             }
             findings.push(PrjconfFinding {
                 kind: PrjconfFindingKind::DeadBranch,
+                removed_by_default_clean: false,
+                token: None,
                 severity: PrjconfSeverity::Warning,
                 repository: None,
                 project: branch_project.clone(),
@@ -2922,6 +2967,19 @@ impl ObsClient<'_> {
         }
         dedup_findings(&mut findings);
         dedup_skipped(&mut skipped);
+        // The flag is the default clean's answer, computed from
+        // the same restricted plan default clean applies: the
+        // intersected plan restricted to path-independent proofs.
+        // A finding is removed by it exactly when its line is a
+        // restricted dead line, or — for a duplicate token — its
+        // token is a restricted same-line duplicate. Dead
+        // removals, dead clears and dead branches need the
+        // path-dependent opt-in; anything else is not a removal
+        // at all.
+        let default_plan = intersected.restricted();
+        for finding in findings.iter_mut() {
+            finding.removed_by_default_clean = removed_by_default_clean(finding, &default_plan);
+        }
         Ok(FullValidation {
             validation: PrjconfValidation {
                 project: project.to_string(),
@@ -3082,6 +3140,8 @@ impl ObsClient<'_> {
                         Some(false) => {
                             outcome.findings.push(PrjconfFinding {
                                 kind: PrjconfFindingKind::UnresolvableTarget,
+                                removed_by_default_clean: false,
+                                token: None,
                                 severity: PrjconfSeverity::Warning,
                                 repository: Some(repository.to_string()),
                                 project: token.project.clone(),
@@ -3105,6 +3165,8 @@ impl ObsClient<'_> {
                 if let Some(false) = resolves(name, &ctx) {
                     outcome.findings.push(PrjconfFinding {
                         kind: PrjconfFindingKind::UnresolvableTarget,
+                        removed_by_default_clean: false,
+                        token: None,
                         severity: PrjconfSeverity::Warning,
                         repository: Some(repository.to_string()),
                         project: entry.project.clone(),
@@ -3132,6 +3194,8 @@ impl ObsClient<'_> {
                     if carried.contains(avoided) {
                         outcome.findings.push(PrjconfFinding {
                             kind: PrjconfFindingKind::ShadowedAvoid,
+                            removed_by_default_clean: false,
+                            token: None,
                             severity: PrjconfSeverity::Warning,
                             repository: Some(repository.to_string()),
                             project: token.project.clone(),
@@ -3154,10 +3218,15 @@ impl ObsClient<'_> {
 /// terminal escapes into the output, and overlong tokens are cut.
 pub fn prjconf_finding_line(finding: &PrjconfFinding) -> String {
     sanitize_text_output(&format!(
-        "{}: {}: {}",
+        "{}: {}: {}{}",
         finding_location(&finding.repository, &finding.project, finding.line),
         finding.kind.as_str(),
-        finding.message
+        finding.message,
+        if finding.removed_by_default_clean {
+            " [removed by default clean]"
+        } else {
+            ""
+        }
     ))
 }
 
@@ -3255,6 +3324,29 @@ fn dedup_findings(findings: &mut Vec<PrjconfFinding>) {
             f.message.clone(),
         )
     });
+}
+
+/// Whether default `clean` removes what this finding names.
+/// The restricted plan is what default clean applies, so the test
+/// is membership in it: a dead line, or a same-line duplicate
+/// token. `EvalPlan::restricted` already intersects the
+/// independent sets, so the plan passed here is the intersected
+/// one restricted — the same plan `clean` applies by default.
+fn removed_by_default_clean(finding: &PrjconfFinding, default_plan: &EvalPlan) -> bool {
+    let Some(line) = finding.line else {
+        return false;
+    };
+    if default_plan.dead_lines.contains(&line) {
+        return true;
+    }
+    if finding.kind == PrjconfFindingKind::DuplicateToken {
+        if let Some(token) = finding.token.as_deref() {
+            return default_plan
+                .duplicate_tokens
+                .contains_key(&(line, token.to_string()));
+        }
+    }
+    false
 }
 
 /// Remove duplicate skipped entries and sort for stable output.
@@ -3941,6 +4033,25 @@ mod tests {
     }
 
     #[test]
+    fn removed_by_default_clean_reads_the_token_field_not_the_message() {
+        // A reworded message must not under-flag the finding: the
+        // token rides on the struct, not in the prose.
+        let finding = PrjconfFinding {
+            kind: PrjconfFindingKind::DuplicateToken,
+            removed_by_default_clean: false,
+            severity: PrjconfSeverity::Warning,
+            repository: None,
+            project: "home:test".to_string(),
+            line: Some(3),
+            token: Some("foo".to_string()),
+            message: "already in the list (reworded prose)".to_string(),
+        };
+        let mut plan = EvalPlan::default();
+        plan.duplicate_tokens.insert((3, "foo".to_string()), 1);
+        assert!(removed_by_default_clean(&finding, &plan));
+    }
+
+    #[test]
     fn overridden_substitute_marks_the_earlier_line_dead() {
         let outcome = eval_own("Substitute: foo bar\nSubstitute: foo baz\n", "x86_64");
         assert!(has_finding(
@@ -4337,6 +4448,82 @@ mod tests {
             &outcome,
             PrjconfFindingKind::UnresolvableTarget
         ));
+    }
+
+    #[test]
+    fn validate_flags_what_default_clean_removes() {
+        // The default clean removes only the path-independent
+        // dead set: the unconditionally overridden Substitute
+        // line and the same-line duplicate token. The cross-line
+        // duplicate and the dead removal need the opt-in, so
+        // their findings read false — the flag is the default
+        // clean's answer, not the finding's kind.
+        let own = "Substitute: foo bar\nSubstitute: foo baz\nPrefer: foo foo\nPrefer: foo\nPrefer: !bar\n";
+        let buildconfig = format!(
+            "### from home:test\n%define _repository standard\n%define _project home:test\n%define _is_this_project 1\n{own}"
+        );
+        let meta = "<project name=\"home:test\"><repository name=\"standard\"><arch>x86_64</arch><path project=\"home:test\" repository=\"standard\"/></repository></project>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:test/_meta",
+                meta,
+            )
+            .with_get("https://api.opensuse.org/source/home:test/_config", own)
+            .with_get(
+                "https://api.opensuse.org/build/home:test/standard/_buildconfig",
+                &buildconfig,
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:test",
+                "<directory><entry name=\"foo\"/></directory>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let validation = client.validate_project_config("home:test").unwrap();
+        let flag = |kind: PrjconfFindingKind, line: usize| {
+            validation
+                .findings
+                .iter()
+                .find(|f| f.kind == kind && f.line == Some(line))
+                .map(|f| f.removed_by_default_clean)
+        };
+        assert_eq!(
+            flag(PrjconfFindingKind::OverriddenSubstitute, 1),
+            Some(true)
+        );
+        assert_eq!(flag(PrjconfFindingKind::DuplicateToken, 3), Some(true));
+        assert_eq!(flag(PrjconfFindingKind::DuplicateToken, 4), Some(false));
+        // The duplicate finding carries its token on the struct,
+        // not in the message prose.
+        let duplicate = validation
+            .findings
+            .iter()
+            .find(|f| f.kind == PrjconfFindingKind::DuplicateToken && f.line == Some(3))
+            .unwrap();
+        assert_eq!(duplicate.token.as_deref(), Some("foo"));
+        assert_eq!(flag(PrjconfFindingKind::DeadRemoval, 5), Some(false));
+        // The text line names the removal too.
+        let overridden = validation
+            .findings
+            .iter()
+            .find(|f| f.kind == PrjconfFindingKind::OverriddenSubstitute)
+            .unwrap();
+        assert!(
+            prjconf_finding_line(overridden).contains("[removed by default clean]"),
+            "{}",
+            prjconf_finding_line(overridden)
+        );
+        // And the default clean does exactly what the flags say:
+        // line 1 goes, the same-line duplicate token goes, the
+        // rest stays.
+        let dry = DryRun::new(true);
+        let result = client
+            .clean_project_config("home:test", &dry, false)
+            .unwrap();
+        assert_eq!(result.removed_lines, vec![1]);
+        assert_eq!(
+            result.cleaned,
+            "Substitute: foo baz\nPrefer: foo\nPrefer: foo\nPrefer: !bar\n"
+        );
     }
 
     #[test]
@@ -5367,6 +5554,8 @@ mod tests {
     fn text_rendering_escapes_control_characters() {
         let finding = PrjconfFinding {
             kind: PrjconfFindingKind::UnknownKeyword,
+            removed_by_default_clean: false,
+            token: None,
             severity: PrjconfSeverity::Warning,
             repository: None,
             project: "home:test".to_string(),

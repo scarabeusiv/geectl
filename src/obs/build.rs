@@ -309,7 +309,8 @@ pub(crate) fn parse_build_results(body: &str) -> Result<BuildResults, GeectlErro
 }
 
 /// Options for [`ObsClient::build_log`]: which slice of the log to
-/// read. The default reads the current log from the start.
+/// read. The default reads the tail of the current log — the last
+/// 4 MiB, like the local log leaf — never the whole log.
 #[derive(Debug, Default, Clone)]
 pub struct BuildLogQuery {
     /// Start reading at this byte offset; a negative offset reads
@@ -327,7 +328,38 @@ pub struct BuildLogQuery {
     /// returning the text. Client-side only: the server sends the
     /// same log either way.
     pub strip_time: bool,
+    /// Print only the last N lines of the fetched log, like the
+    /// local log leaf's `--tail`. Combines with the default tail
+    /// read, `--full`, and an explicit `--start`.
+    pub tail: Option<usize>,
+    /// Read the whole log without the 4 MiB cap, like the local
+    /// log leaf's `--full`. Still subject to the transport's body
+    /// limit: a log longer than that fails the read, as before.
+    /// Cannot combine with `--start`: an explicit offset already
+    /// names the window.
+    pub full: bool,
 }
+
+/// The result of [`ObsClient::build_log`]: the log text plus
+/// whether it is only the tail. The local log leaf carries the
+/// same pair (`BuildLog.truncated`); the server read had neither,
+/// so a log longer than the transport cap failed the read outright
+/// instead of returning its tail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildLogResult {
+    /// The log text: whole lines, timestamps stripped when asked,
+    /// the last `tail` lines when asked.
+    pub text: String,
+    /// True when the log is larger than the read cap, so the text
+    /// is only its last 4 MiB of whole lines. Never set on a full
+    /// read or an explicit `--start` read.
+    pub truncated: bool,
+}
+
+/// The server log read cap, in bytes: the tail window the default
+/// read fetches. Kept in step with `LOG_TAIL_CAP_BYTES` in
+/// `local_build`, so the two leaves return the same tail shape.
+const BUILD_LOG_TAIL_CAP_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Build-log coordinates from a pasted URL: project, package,
 /// repository, arch. The package may carry a multibuild flavor
@@ -3110,16 +3142,23 @@ impl<'a> ObsClient<'a> {
         Ok(())
     }
 
-    /// The build log for `package` in `repository`/`arch`: the raw
-    /// log text. `nostream=1` reads the whole log at once (no
-    /// streaming); the query selects the slice. None when there is no
-    /// log (404): the package was never built, or the package/project
-    /// does not exist — the server answers 404 for both, so the caller
-    /// checks the package exists when the distinction matters.
-    /// With `query.strip_time` the leading `[timestamp] ` is stripped
-    /// from each line client-side before the text is returned.
-    /// Requires OBS credentials. The log is capped by the
-    /// transport's body limit, like every read.
+    /// The build log for `package` in `repository`/`arch`: the log
+    /// text plus whether it is only the tail. `nostream=1` reads the
+    /// whole log at once (no streaming); the query selects the slice.
+    /// None when there is no log (404): the package was never built,
+    /// or the package/project does not exist — the server answers 404
+    /// for both, so the caller checks the package exists when the
+    /// distinction matters. With `query.strip_time` the leading
+    /// `[timestamp] ` is stripped from each line client-side before
+    /// the text is returned. Requires OBS credentials.
+    ///
+    /// The default read fetches the tail, like the local log leaf:
+    /// `start` is one byte past the 4 MiB cap, so a log longer than
+    /// the cap returns its last 4 MiB of whole lines with
+    /// `truncated` set, instead of failing on the transport's body
+    /// limit. An explicit `--start` keeps the caller's window, and
+    /// `--full` reads the whole log — both with `truncated` unset,
+    /// and the full read still subject to the transport cap.
     pub fn build_log(
         &self,
         project: &str,
@@ -3127,7 +3166,7 @@ impl<'a> ObsClient<'a> {
         repository: &str,
         arch: &str,
         query: &BuildLogQuery,
-    ) -> Result<Option<String>, GeectlError> {
+    ) -> Result<Option<BuildLogResult>, GeectlError> {
         Self::validate_build_coordinates(project, Some(package), repository, arch)?;
         if query.last && query.lastsucceeded {
             return Err(GeectlError::new(
@@ -3136,7 +3175,17 @@ impl<'a> ObsClient<'a> {
             ));
         }
         self.require_build_credentials()?;
-        let start = query.start.map(|offset| offset.to_string());
+        // The tail fetch asks for one byte past the cap: the first
+        // byte of the body is then the byte before the cap window,
+        // which says whether the window starts on a line boundary —
+        // the same shape `read_log_tail` reads locally.
+        let tail_fetch = query.start.is_none() && !query.full;
+        let start = if tail_fetch {
+            Some(-(BUILD_LOG_TAIL_CAP_BYTES as i64 + 1))
+        } else {
+            query.start
+        };
+        let start = start.map(|offset| offset.to_string());
         let mut pairs: Vec<(&str, &str)> = vec![("nostream", "1")];
         if let Some(start) = &start {
             pairs.push(("start", start));
@@ -3153,11 +3202,44 @@ impl<'a> ObsClient<'a> {
             &pairs,
         );
         match self.http.get_with(&url, &self.credentials) {
-            Ok(body) => Ok(Some(if query.strip_time {
-                strip_log_timestamps(&body)
-            } else {
-                body
-            })),
+            Ok(body) => {
+                let mut text = body;
+                let mut truncated = false;
+                if tail_fetch && text.len() as u64 > BUILD_LOG_TAIL_CAP_BYTES {
+                    // A body longer than the cap means the log is
+                    // longer than the cap: keep the last cap bytes,
+                    // starting at a whole line. A newline as the
+                    // first byte means the window starts on a line
+                    // boundary and its first line is complete —
+                    // otherwise the partial first line is dropped,
+                    // and a window with no newline at all reads as
+                    // empty. The cut is on bytes, like
+                    // `read_log_tail`: the window can start inside
+                    // a multi-byte char, and a lossy decode turns
+                    // that split char into U+FFFD instead of
+                    // panicking on a string slice.
+                    truncated = true;
+                    let bytes = text.as_bytes();
+                    let window = &bytes[1..];
+                    text = if bytes[0] == b'\n' {
+                        String::from_utf8_lossy(window).into_owned()
+                    } else {
+                        match window.iter().position(|&b| b == b'\n') {
+                            Some(pos) => String::from_utf8_lossy(&window[pos + 1..]).into_owned(),
+                            None => String::new(),
+                        }
+                    };
+                }
+                if query.strip_time {
+                    text = strip_log_timestamps(&text);
+                }
+                if let Some(n) = query.tail {
+                    let lines: Vec<&str> = text.lines().collect();
+                    let skip = lines.len().saturating_sub(n);
+                    text = lines[skip..].join("\n");
+                }
+                Ok(Some(BuildLogResult { text, truncated }))
+            }
             // A 404 means no log: never built, or the package/project
             // does not exist. Any other failure stays an error.
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
@@ -5296,7 +5378,10 @@ mod tests {
             client
                 .build_log("testproject", "foo", "standard", "x86_64", &query)
                 .unwrap(),
-            Some("build log text".to_string())
+            Some(BuildLogResult {
+                text: "build log text".to_string(),
+                truncated: false,
+            })
         );
         assert_eq!(
             http.get_calls(),
@@ -5311,7 +5396,7 @@ mod tests {
     #[test]
     fn build_log_keeps_the_multibuild_flavor_in_the_path() {
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/build/testproject/standard/x86_64/foo:flavor1/_log?nostream=1&lastsucceeded=1",
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo:flavor1/_log?nostream=1&start=-4194305&lastsucceeded=1",
             "flavor log",
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
@@ -5323,7 +5408,10 @@ mod tests {
             client
                 .build_log("testproject", "foo:flavor1", "standard", "x86_64", &query)
                 .unwrap(),
-            Some("flavor log".to_string())
+            Some(BuildLogResult {
+                text: "flavor log".to_string(),
+                truncated: false,
+            })
         );
     }
 
@@ -5349,7 +5437,7 @@ mod tests {
     #[test]
     fn build_log_404_is_none_not_an_error() {
         let http = FakeHttp::new().with_get_error(
-            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1",
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1&start=-4194305",
             ErrorKind::NotFound,
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
@@ -5387,7 +5475,7 @@ mod tests {
     #[test]
     fn build_log_strip_time_strips_the_timestamp_prefix() {
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1",
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1&start=-4194305",
             "[12:00:01] first line\nplain line\n[12:00:02] second line\n",
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
@@ -5399,14 +5487,17 @@ mod tests {
             client
                 .build_log("testproject", "foo", "standard", "x86_64", &query)
                 .unwrap(),
-            Some("first line\nplain line\nsecond line\n".to_string())
+            Some(BuildLogResult {
+                text: "first line\nplain line\nsecond line\n".to_string(),
+                truncated: false,
+            })
         );
     }
 
     #[test]
     fn build_log_without_strip_time_keeps_the_timestamps() {
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1",
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1&start=-4194305",
             "[12:00:01] first line\n",
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
@@ -5420,7 +5511,182 @@ mod tests {
                     &BuildLogQuery::default()
                 )
                 .unwrap(),
-            Some("[12:00:01] first line\n".to_string())
+            Some(BuildLogResult {
+                text: "[12:00:01] first line\n".to_string(),
+                truncated: false,
+            })
+        );
+    }
+
+    #[test]
+    fn build_log_default_read_fetches_the_tail_window() {
+        // The default read asks for one byte past the cap; a short
+        // log comes back whole, untruncated.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1&start=-4194305",
+            "short log\n",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .build_log(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    "x86_64",
+                    &BuildLogQuery::default()
+                )
+                .unwrap(),
+            Some(BuildLogResult {
+                text: "short log\n".to_string(),
+                truncated: false,
+            })
+        );
+    }
+
+    #[test]
+    fn build_log_tail_window_starts_at_a_whole_line() {
+        // A log longer than the cap returns its last cap bytes
+        // with the partial first line dropped — the body starts
+        // mid-line, so the text starts at the next whole line.
+        let body = "line\n".repeat(838_861);
+        assert_eq!(body.len() as u64, BUILD_LOG_TAIL_CAP_BYTES + 1);
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1&start=-4194305",
+            &body,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let result = client
+            .build_log(
+                "testproject",
+                "foo",
+                "standard",
+                "x86_64",
+                &BuildLogQuery::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(result.truncated);
+        assert!(result.text.starts_with("line\n"));
+        assert!(result.text.len() as u64 <= BUILD_LOG_TAIL_CAP_BYTES);
+        assert!(result.text.ends_with("line\n"));
+    }
+
+    #[test]
+    fn build_log_tail_window_on_a_line_boundary_keeps_the_first_line() {
+        // A newline as the first byte means the window starts on a
+        // line boundary: the window's first line is complete.
+        let body = format!("\n{}", "y".repeat(BUILD_LOG_TAIL_CAP_BYTES as usize));
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1&start=-4194305",
+            &body,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let result = client
+            .build_log(
+                "testproject",
+                "foo",
+                "standard",
+                "x86_64",
+                &BuildLogQuery::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.text, "y".repeat(BUILD_LOG_TAIL_CAP_BYTES as usize));
+    }
+
+    #[test]
+    fn build_log_tail_window_starting_inside_a_multibyte_char_does_not_panic() {
+        // The window starts inside `é`: the byte cut plus lossy
+        // decode reads as whole lines instead of panicking on a
+        // string slice at a non-boundary.
+        let body = format!("é\n{}", "line\n".repeat(838_860)) + "xy";
+        assert_eq!(body.len() as u64, BUILD_LOG_TAIL_CAP_BYTES + 1);
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1&start=-4194305",
+            &body,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let result = client
+            .build_log(
+                "testproject",
+                "foo",
+                "standard",
+                "x86_64",
+                &BuildLogQuery::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(result.truncated);
+        assert!(result.text.starts_with("line\n"));
+        assert!(result.text.len() as u64 <= BUILD_LOG_TAIL_CAP_BYTES);
+    }
+
+    #[test]
+    fn build_log_tail_window_without_a_newline_reads_as_empty() {
+        // A window with no newline at all has no whole line in it.
+        let body = "x".repeat(BUILD_LOG_TAIL_CAP_BYTES as usize + 1);
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1&start=-4194305",
+            &body,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let result = client
+            .build_log(
+                "testproject",
+                "foo",
+                "standard",
+                "x86_64",
+                &BuildLogQuery::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.text, "");
+    }
+
+    #[test]
+    fn build_log_full_reads_the_whole_log_without_a_start() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1",
+            "whole log\n",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let query = BuildLogQuery {
+            full: true,
+            ..BuildLogQuery::default()
+        };
+        assert_eq!(
+            client
+                .build_log("testproject", "foo", "standard", "x86_64", &query)
+                .unwrap(),
+            Some(BuildLogResult {
+                text: "whole log\n".to_string(),
+                truncated: false,
+            })
+        );
+    }
+
+    #[test]
+    fn build_log_tail_keeps_only_the_last_lines() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1&start=-4194305",
+            "one\ntwo\nthree\n",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let query = BuildLogQuery {
+            tail: Some(2),
+            ..BuildLogQuery::default()
+        };
+        assert_eq!(
+            client
+                .build_log("testproject", "foo", "standard", "x86_64", &query)
+                .unwrap(),
+            Some(BuildLogResult {
+                text: "two\nthree".to_string(),
+                truncated: false,
+            })
         );
     }
 

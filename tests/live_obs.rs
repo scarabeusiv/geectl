@@ -8257,7 +8257,7 @@ fn live_working_copy_checkout_edit_commit_update() {
         &client,
         &Config::default(),
         "Update to version 2",
-        false,
+        working_copy::ServiceSkips::none(),
         None,
         &DryRun::new(false),
     )
@@ -8334,7 +8334,7 @@ fn live_working_copy_submit_files_a_request() {
         &client,
         &Config::default(),
         "Update to version 2",
-        false,
+        working_copy::ServiceSkips::none(),
         None,
         &DryRun::new(false),
     )
@@ -8407,7 +8407,7 @@ fn live_pull_request_submit_cli_files_a_request() {
         &client,
         &Config::default(),
         "Update to version 2",
-        false,
+        working_copy::ServiceSkips::none(),
         None,
         &DryRun::new(false),
     )

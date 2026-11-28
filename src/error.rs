@@ -71,9 +71,17 @@ pub enum ErrorKind {
     /// The directory is not a geectl build root (no marker file).
     NotAGeectlBuildRoot,
     /// A source service run failed (a service binary exited
-    /// non-zero, a package install failed, or pre_checkin.sh
-    /// failed).
+    /// non-zero, or its package install failed).
     ServiceFailed,
+    /// A `spec-cleaner` run failed (its package install failed, or
+    /// the binary exited non-zero). Distinct from
+    /// [`ErrorKind::ServiceFailed`]: the fix is in the spec or the
+    /// spec-cleaner inputs, not in a source service.
+    SpecCleanerFailed,
+    /// `pre_checkin.sh` failed in the precommit gate. Distinct
+    /// from [`ErrorKind::ServiceFailed`]: the fix is in the script,
+    /// not in a source service.
+    PrecheckinFailed,
     /// A `.changes` validation failed (one or more V-rules), or a
     /// generation was refused (an incomplete draft must not be
     /// written). The context names the findings.
@@ -136,6 +144,8 @@ impl ErrorKind {
             ErrorKind::BuildRootInUse => "build_root_in_use",
             ErrorKind::NotAGeectlBuildRoot => "not_a_geectl_build_root",
             ErrorKind::ServiceFailed => "service_failed",
+            ErrorKind::SpecCleanerFailed => "spec_cleaner_failed",
+            ErrorKind::PrecheckinFailed => "precheckin_failed",
             ErrorKind::ValidationFailed => "validation_failed",
             ErrorKind::WorkingCopyNotFound => "working_copy_not_found",
             ErrorKind::WorkingCopyOutdated => "working_copy_outdated",
@@ -179,6 +189,8 @@ impl ErrorKind {
             ErrorKind::BuildRootInUse => "the build root is in use",
             ErrorKind::NotAGeectlBuildRoot => "the directory is not a geectl build root",
             ErrorKind::ServiceFailed => "a source service failed",
+            ErrorKind::SpecCleanerFailed => "spec-cleaner failed",
+            ErrorKind::PrecheckinFailed => "pre_checkin.sh failed",
             ErrorKind::ValidationFailed => "the validation failed",
             ErrorKind::WorkingCopyNotFound => "the directory is not a geectl working copy",
             ErrorKind::WorkingCopyOutdated => "the checkout's base revision is behind the server",
@@ -254,6 +266,12 @@ impl ErrorKind {
             ErrorKind::ServiceFailed => {
                 "read the failing service's output in the run record; fix the service or its inputs and retry"
             }
+            ErrorKind::SpecCleanerFailed => {
+                "read spec-cleaner's output in the result; fix the spec or the spec-cleaner inputs and retry"
+            }
+            ErrorKind::PrecheckinFailed => {
+                "read the script's output in the run record; fix pre_checkin.sh and retry"
+            }
             ErrorKind::ValidationFailed => "fix the findings and retry",
             ErrorKind::WorkingCopyNotFound => {
                 "run checkout PROJECT PACKAGE first; it creates the checkout under the current directory"
@@ -309,6 +327,8 @@ impl ErrorKind {
             ErrorKind::BuildRootInUse => 20,
             ErrorKind::NotAGeectlBuildRoot => 21,
             ErrorKind::ServiceFailed => 22,
+            ErrorKind::SpecCleanerFailed => 36,
+            ErrorKind::PrecheckinFailed => 37,
             ErrorKind::ValidationFailed => 24,
             ErrorKind::WorkingCopyNotFound => 25,
             ErrorKind::WorkingCopyOutdated => 26,
@@ -350,6 +370,8 @@ impl ErrorKind {
             ErrorKind::BuildRootInUse,
             ErrorKind::NotAGeectlBuildRoot,
             ErrorKind::ServiceFailed,
+            ErrorKind::SpecCleanerFailed,
+            ErrorKind::PrecheckinFailed,
             ErrorKind::ValidationFailed,
             ErrorKind::WorkingCopyNotFound,
             ErrorKind::WorkingCopyOutdated,

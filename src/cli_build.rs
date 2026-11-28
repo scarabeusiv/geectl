@@ -122,6 +122,13 @@ pub enum BuildCommand {
         /// The last succeeded build's log. Cannot combine with `--last`.
         #[arg(long)]
         lastsucceeded: bool,
+        /// Print only the last N lines of the log.
+        #[arg(long)]
+        tail: Option<usize>,
+        /// Read the whole log without the 4 MiB cap. Cannot combine
+        /// with `--start`.
+        #[arg(long, conflicts_with = "start")]
+        full: bool,
         /// Only this multibuild flavor's log: appends `:FLAVOR` to
         /// the package. Refused when the package already carries a
         /// flavor.
@@ -641,6 +648,8 @@ pub fn run_build(
             last,
             lastsucceeded,
             strip_time,
+            tail,
+            full,
             ..
         } => {
             let (project, package, repository, arch) =
@@ -650,15 +659,18 @@ pub fn run_build(
                 last,
                 lastsucceeded,
                 strip_time,
+                tail,
+                full,
             };
             let log = client.build_log(&project, &package, &repository, &arch, &query)?;
             // No coordinate header on the log itself: the text *is*
             // the log content, verbatim (design rule 4) — prepending
             // a header would corrupt piping the log to a file. The
             // synthetic `no log` line is not content, so it carries
-            // the header; the coordinates live in the JSON payload.
+            // the header; the coordinates and the truncation flag
+            // live in the JSON payload.
             let text = match &log {
-                Some(log) => log.clone(),
+                Some(log) => log.text.clone(),
                 None => with_header(&header, "no log".to_string()),
             };
             let payload = json!({
@@ -666,7 +678,10 @@ pub fn run_build(
                 "package": package,
                 "repository": repository,
                 "arch": arch,
-                "log": log,
+                "tail": tail,
+                "full": full,
+                "log": log.as_ref().map(|log| log.text.clone()),
+                "truncated": log.as_ref().map(|log| log.truncated),
             });
             Ok((payload, text))
         }
@@ -4604,6 +4619,32 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_build_log_tail_and_full() {
+        match parse_build(&["build-log", "p", "k", "r", "a", "--tail", "10", "--full"]) {
+            BuildCommand::BuildLog { tail, full, .. } => {
+                assert_eq!(tail, Some(10));
+                assert!(full);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // --full names the whole log; --start already names the
+        // window, so the two refuse each other.
+        assert!(build_command()
+            .try_get_matches_from(vec![
+                "build",
+                "build-log",
+                "p",
+                "k",
+                "r",
+                "a",
+                "--start",
+                "100",
+                "--full",
+            ])
+            .is_err());
     }
 
     #[test]

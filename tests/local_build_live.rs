@@ -820,6 +820,6 @@ fn live_precommit_runs_script_in_the_container() {
         let err = vertical
             .precommit(fixture.src(), None, 3600, false)
             .expect_err("a failing pre_checkin.sh must block precommit");
-        assert_eq!(err.kind(), ErrorKind::ServiceFailed);
+        assert_eq!(err.kind(), ErrorKind::PrecheckinFailed);
     });
 }
