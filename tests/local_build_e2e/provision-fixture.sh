@@ -79,6 +79,14 @@ fi
 
 auth=(-u "$ADMIN_USER:$ADMIN_PASS")
 
+# The recheck marker is set before the fixture exists: the daemon
+# checks the repository within seconds of the scheduler registering
+# it, which can be before this wait starts. The cookie can only be
+# written by a check of this repository, and the repository only
+# exists once the fixture creates it, so a pre-creation marker still
+# proves a post-creation recheck.
+created_at="$(date +%s)"
+
 echo "Creating fixture project $PROJECT on $BASE_URL ..."
 curl --fail-with-body -sS "${auth[@]}" -X PUT -H 'Content-Type: application/xml' \
     --data-binary @- "$BASE_URL/source/$PROJECT/_meta" <<XML
@@ -130,7 +138,6 @@ curl --fail-with-body -sS "${auth[@]}" -X PUT -H 'Content-Type: application/octe
 DOD_RECHECK_TIMEOUT_SECONDS="${FIXTURE_DOD_RECHECK_TIMEOUT_SECONDS:-1200}"
 dod_cookie="/srv/obs/build/$PROJECT/$REPO/$ARCH/:full/doddata.cookie"
 compose_file="$REPO_ROOT/tests/live/docker-compose.yml"
-created_at="$(date +%s)"
 echo "Waiting for the download-on-demand daemon to recheck $PROJECT/$REPO ..."
 deadline=$((SECONDS + DOD_RECHECK_TIMEOUT_SECONDS))
 while true; do
