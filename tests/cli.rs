@@ -2701,9 +2701,9 @@ fn person_search_text_mode_renders_both_sections() {
 
 #[test]
 fn person_search_with_no_credentials_fails_with_config_error() {
-    // No arm has credentials: both clients build before the
-    // search runs, so the missing Gitea token fails first — the
-    // same construction order as `pull-request search`.
+    // No arm has credentials: both arms are skipped, so the
+    // library fails closed naming the first arm in scope — the
+    // OBS credentials.
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["person", "search", "alice"])
@@ -2713,10 +2713,7 @@ fn person_search_with_no_credentials_fails_with_config_error() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
     assert_eq!(value["error"]["code"], "config_error");
-    assert!(
-        stderr.contains("no Gitea token configured"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains("OBS credentials"), "stderr: {stderr}");
 }
 
 #[test]
@@ -2738,33 +2735,79 @@ fn person_search_gitea_scoped_with_no_token_fails_with_config_error() {
 }
 
 #[test]
-fn person_search_both_arms_with_only_a_gitea_token_fails_on_obs_credentials() {
-    // Only the Gitea token is configured: both clients construct
-    // (OBS construction accepts Credentials::None by design), and
-    // the failure surfaces at the OBS arm, before any HTTP — the
-    // Gitea arm never runs, and no OBS request is attempted. The
-    // recording stub proves the last point: a request would land
-    // in its channel before the process exits.
+fn person_search_with_only_a_gitea_token_runs_the_gitea_arm() {
+    // Only the Gitea token is configured: the OBS arm is
+    // skipped and the search returns the Gitea users, with a
+    // note naming the skipped arm — and no OBS section. No OBS
+    // request is attempted: the recording stub proves it — a
+    // request would land in its channel before the process exits.
     let (obs_addr, obs_requests) = serve_once_recording(
+        "<collection matches=\"1\"><project name=\"devel:languages:python\"><title>Python</title><description>Python packages</description></project></collection>",
+    );
+    let gitea_addr = serve_once(
+        r#"{"ok": true, "data": [{"login": "alice", "full_name": "Alice", "email": "alice@example.com"}]}"#,
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "person", "search", "alice"])
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Gitea users:"), "stdout: {stdout}");
+    assert!(stdout.contains("alice@example.com"), "stdout: {stdout}");
+    assert!(!stdout.contains("OBS projects:"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("note: skipped the obs arm"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        obs_requests
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_err(),
+        "the skipped OBS arm must not attempt any OBS request"
+    );
+}
+
+#[test]
+fn person_search_with_only_obs_credentials_runs_the_obs_arm() {
+    // Only the OBS credentials are configured: the Gitea arm is
+    // skipped and the search returns the OBS projects, with the
+    // skipped arm named in the payload.
+    let obs_addr = serve_once(
         "<collection matches=\"1\"><project name=\"devel:languages:python\"><title>Python</title><description>Python packages</description></project></collection>",
     );
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["person", "search", "alice"])
         .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
-        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(9));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
-    assert_eq!(value["error"]["code"], "config_error");
-    assert!(stderr.contains("OBS credentials"), "stderr: {stderr}");
     assert!(
-        obs_requests
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .is_err(),
-        "the OBS arm must fail before any OBS request is attempted"
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["projects"][0]["name"], "devel:languages:python");
+    assert!(value["users"].as_array().unwrap().is_empty());
+    assert_eq!(value["skipped"][0]["backend"], "gitea");
+    assert!(
+        value["skipped"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Gitea token"),
+        "payload: {value}"
     );
 }
 
@@ -6259,7 +6302,7 @@ fn top_help_lists_the_service_group() {
 }
 
 #[test]
-fn gitea_help_lists_all_twelve_subcommands() {
+fn gitea_help_lists_all_subcommands() {
     let out = geectl().args(["gitea", "--help"]).output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
@@ -6276,6 +6319,7 @@ fn gitea_help_lists_all_twelve_subcommands() {
         "raw-file",
         "commit-statuses",
         "maintainers",
+        "build-comment",
     ] {
         assert!(text.contains(name), "gitea --help misses {name}");
     }
@@ -6301,7 +6345,6 @@ fn pull_request_help_lists_the_subcommands() {
         "approve",
         "request-changes",
         "comment",
-        "build-comment",
         "comments",
         "cancel-review-request",
         "merge",
@@ -6352,6 +6395,34 @@ fn meta_set_help_names_the_target_and_field_flags() {
 }
 
 #[test]
+fn meta_set_obs_dry_run_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "meta",
+            "set",
+            "--project",
+            "home:alice",
+            "--description",
+            "A project",
+        ])
+        .output()
+        .unwrap();
+    // ConfigError exits 9; a dry-run write needs its arm's
+    // credentials, like a live write does — dry-run only skips
+    // the mutation.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_OBS_USERNAME"));
+}
+
+#[test]
 fn top_help_lists_the_working_copy_leaves() {
     let out = geectl().arg("--help").output().unwrap();
     assert!(out.status.success());
@@ -6373,40 +6444,46 @@ fn top_help_lists_the_working_copy_leaves() {
 }
 
 #[test]
-fn pull_request_merge_obs_dry_run_without_credentials_prints_plan() {
+fn pull_request_merge_obs_dry_run_without_credentials_fails_with_config_error() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["pull-request", "merge", "obs:123"])
         .output()
         .unwrap();
-    // A dry-run level act on OBS prints without credentials: the
-    // plan names no acting user.
-    assert!(out.status.success());
+    // ConfigError exits 9; a dry-run act needs its arm's
+    // credentials, like a live act does — dry-run only skips the
+    // mutation.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     let value: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
-    assert_eq!(value["reference"], "obs:123");
-    assert_eq!(value["status"], serde_json::Value::Null);
-    assert_eq!(value["dry_run"], true);
-    assert_eq!(
-        value["plan"][0],
-        "[dry-run] would: change state of submit request 123 to accepted"
-    );
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_OBS_USERNAME"));
 }
 
 #[test]
-fn pull_request_merge_obs_text_dry_run_without_credentials_prints_plan() {
+fn pull_request_merge_obs_text_dry_run_without_credentials_fails_with_config_error() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["--format", "text", "pull-request", "merge", "obs:123"])
         .output()
         .unwrap();
-    assert!(out.status.success());
-    // The accept-time branch cleanup cannot read the request without
-    // credentials, so it reports instead of planning the deletes.
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        "dry-run: would merge obs:123; branch cleanup not run; would forward after merge"
+    // ConfigError exits 9; a dry-run act needs its arm's
+    // credentials, like a live act does. In text mode the error
+    // renders as plain text on stderr, not JSON, so the
+    // assertions are substrings.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error:"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("no OBS credentials configured"),
+        "stderr: {stderr}"
     );
+    assert!(stderr.contains("GEECTL_OBS_USERNAME"), "stderr: {stderr}");
 }
 
 #[test]
@@ -6414,6 +6491,8 @@ fn pull_request_merge_obs_dry_run_forward_message_names_the_changes_entry() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["pull-request", "merge", "obs:123", "-m", "- custom entry"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
         .output()
         .unwrap();
     assert!(
@@ -6474,6 +6553,65 @@ fn pull_request_merge_gitea_without_credentials_fails_with_config_error() {
 }
 
 #[test]
+fn pull_request_cleanup_obs_dry_run_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let checkout = obs_submit_checkout(&dir, "https://api.opensuse.org");
+    git_in(
+        &checkout,
+        &["config", "--local", "geectl.submitted-request", "1398492"],
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args(["pull-request", "cleanup"])
+        .output()
+        .unwrap();
+    // ConfigError exits 9; the cleanup dry-run reads no server
+    // at all, yet still needs the recorded arm's credentials to
+    // build its client — dry-run only skips the mutation.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_OBS_USERNAME"));
+}
+
+#[test]
+fn pull_request_cleanup_gitea_dry_run_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    git_in(
+        &checkout,
+        &[
+            "config",
+            "--local",
+            "geectl.submitted-pull-request",
+            "gitea:openSUSE/geectl#122",
+        ],
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args(["pull-request", "cleanup"])
+        .output()
+        .unwrap();
+    // ConfigError exits 9; the cleanup dry-run reads no server
+    // at all, yet still needs the recorded arm's token to build
+    // its client — dry-run only skips the mutation.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_GITEA_TOKEN"));
+}
+
+#[test]
 fn pull_request_merge_obs_with_a_method_is_invalid_input() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
@@ -6481,9 +6619,8 @@ fn pull_request_merge_obs_with_a_method_is_invalid_input() {
         .output()
         .unwrap();
     // InvalidInput exits 2; --method does not apply to OBS.
-    // The refusal precedes credential resolution, so the dry-run
-    // credential warning never appears; the assertions are
-    // substrings, not a JSON parse.
+    // The refusal precedes credential resolution; the assertions
+    // are substrings, not a JSON parse.
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -6572,6 +6709,179 @@ fn pull_request_approve_gitea_with_malformed_commit_is_invalid_input() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
     assert!(stderr.contains("not a full commit SHA"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_approve_obs_with_commit_is_invalid_input() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "pull-request",
+            "approve",
+            "obs:42",
+            "--commit",
+            "e490820bfabf010f5f267335067a52757aca72af2",
+        ])
+        .output()
+        .unwrap();
+    // InvalidInput exits 2; a --commit pin is Gitea-only, and
+    // the refusal precedes credential resolution, so it fires
+    // without OBS credentials where a plain approve would fail
+    // with ConfigError.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("--commit"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_search_with_closed_state_is_invalid_input() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "search", "--state", "closed"])
+        .output()
+        .unwrap();
+    // InvalidInput exits 2; a closed filter with the OBS arm in
+    // scope is refused before credential resolution, so it fires
+    // without credentials where a plain search would fail with
+    // ConfigError.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("--state closed"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_search_with_declined_state_is_invalid_input() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "search", "--state", "declined"])
+        .output()
+        .unwrap();
+    // InvalidInput exits 2; a declined filter with the Gitea arm
+    // in scope is refused before credential resolution, so it fires
+    // without credentials where a plain search would fail with
+    // ConfigError.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("--state declined"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_search_with_reviewer_on_obs_reaches_credentials() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "pull-request",
+            "search",
+            "--reviewer",
+            "plusky",
+            "--backend",
+            "obs",
+        ])
+        .output()
+        .unwrap();
+    // The reviewer filter is no longer Gitea-only: validation
+    // passes and the call reaches OBS credential resolution, which
+    // fails without credentials — where it used to fail as
+    // InvalidInput before any credential was read.
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn pull_request_search_with_no_credentials_fails_with_config_error() {
+    // No arm has credentials: both arms are skipped, so the
+    // library fails closed naming the first arm in scope — the
+    // OBS credentials.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "search"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(stderr.contains("OBS credentials"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_search_with_only_a_gitea_token_runs_the_gitea_arm() {
+    // Only the Gitea token is configured: the OBS arm is
+    // skipped and the search returns the Gitea pull requests,
+    // with the skipped arm named in the payload.
+    let gitea_addr = serve_once(
+        r#"[{"number": 122, "user": {"login": "scarabeusiv"}, "title": "change_review_state", "body": "A test PR body.", "labels": [], "state": "open", "pull_request": {"merged": false, "draft": false}, "repository": {"full_name": "openSUSE/geectl"}}]"#,
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "search"])
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["count"], 1);
+    assert_eq!(
+        value["pull_requests"][0]["reference"],
+        "gitea:openSUSE/geectl#122"
+    );
+    assert_eq!(value["skipped"][0]["backend"], "obs");
+    assert!(
+        value["skipped"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("OBS credentials"),
+        "payload: {value}"
+    );
+}
+
+#[test]
+fn pull_request_search_with_only_obs_credentials_runs_the_obs_arm() {
+    // Only the OBS credentials are configured: the Gitea arm is
+    // skipped and the search returns the OBS requests, with the
+    // skipped arm named in the payload.
+    let obs_addr = serve_once(
+        "<collection matches=\"1\"><request creator=\"creator\" id=\"123\"><action type=\"submit\"><source package=\"abc\" project=\"xyz\" /><options><sourceupdate>cleanup</sourceupdate><updatelink>1</updatelink></options><acceptinfo rev=\"5\" srcmd5=\"deadbeefdeadbeefdeadbeefdeadbeef\" /></action><action type=\"add_role\"><target project=\"home:foo\" /><person name=\"bar\" role=\"maintainer\" /><group name=\"groupxyz\" role=\"reader\" /></action><state approver=\"someone\" name=\"review\" when=\"2010-12-27T01:36:29\" who=\"abc\" /><review by_group=\"group1\" state=\"new\" when=\"2010-12-28T00:11:22\" who=\"abc\"><comment>review start</comment></review><history when=\"2010-12-11T00:00:00\" who=\"creator\"><description>Created request</description></history></request></collection>",
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "search"])
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["count"], 1);
+    assert_eq!(value["pull_requests"][0]["reference"], "obs:123");
+    assert_eq!(value["skipped"][0]["backend"], "gitea");
+    assert!(
+        value["skipped"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Gitea token"),
+        "payload: {value}"
+    );
 }
 
 #[test]
@@ -7911,11 +8221,13 @@ fn pull_request_submit_obs_dry_run_prints_plan() {
             "- Update to 1.1.",
         ])
         .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
         .output()
         .unwrap();
-    // A dry-run submit on OBS prints without credentials: the
-    // plan names no acting user, and the only network read is the
-    // base revision for the freshness check.
+    // A dry-run submit on OBS prints the plan with credentials
+    // configured: the plan names no acting user, and the only
+    // network read is the base revision for the freshness check.
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -7930,6 +8242,39 @@ fn pull_request_submit_obs_dry_run_prints_plan() {
         value["plan"][0],
         "[dry-run] would: file submit request for foo to home:devel"
     );
+}
+
+#[test]
+fn pull_request_submit_obs_dry_run_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let checkout = obs_submit_checkout(&dir, "https://api.opensuse.org");
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "pull-request",
+            "submit",
+            "--target-project",
+            "home:devel",
+            "--description",
+            "Update foo",
+            "--changes-entry",
+            "- Update to 1.1.",
+        ])
+        .output()
+        .unwrap();
+    // ConfigError exits 9; a dry-run act needs its arm's
+    // credentials, like a live act does. The flag validation
+    // still precedes credential resolution, so an invalid flag
+    // fails as InvalidInput instead.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_OBS_USERNAME"));
 }
 
 #[test]
@@ -7956,6 +8301,8 @@ fn pull_request_submit_obs_text_dry_run_prints_plan() {
             "- Update to 1.1.",
         ])
         .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
         .output()
         .unwrap();
     assert!(
@@ -8950,7 +9297,7 @@ fn build_comment_env(
 }
 
 #[test]
-fn pull_request_build_comment_dry_run_plans_and_posts_nothing() {
+fn gitea_build_comment_dry_run_plans_and_posts_nothing() {
     let (gitea, recorded, dir) = build_comment_setup();
     let link = "https://build.opensuse.org/package/show/testproject/foo";
     let run = |format: &str| {
@@ -8958,7 +9305,7 @@ fn pull_request_build_comment_dry_run_plans_and_posts_nothing() {
         cmd.args([
             "--format",
             format,
-            "pull-request",
+            "gitea",
             "build-comment",
             "gitea:owner/repo#122",
             "--project",
@@ -9023,7 +9370,7 @@ fn pull_request_build_comment_dry_run_plans_and_posts_nothing() {
 }
 
 #[test]
-fn pull_request_build_comment_live_posts_once() {
+fn gitea_build_comment_live_posts_once() {
     let (gitea, recorded, dir) = build_comment_setup();
     let link = "https://build.opensuse.org/package/show/testproject/foo";
     let mut cmd = geectl_isolated(&dir);
@@ -9031,7 +9378,7 @@ fn pull_request_build_comment_live_posts_once() {
         "--live",
         "--format",
         "text",
-        "pull-request",
+        "gitea",
         "build-comment",
         "gitea:owner/repo#122",
         "--project",
@@ -9073,13 +9420,13 @@ fn pull_request_build_comment_live_posts_once() {
 }
 
 #[test]
-fn pull_request_build_comment_refuses_an_obs_reference() {
+fn gitea_build_comment_refuses_an_obs_reference() {
     // The refusal happens before any credential resolution, so no
     // servers and no credentials are needed.
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args([
-            "pull-request",
+            "gitea",
             "build-comment",
             "obs:123",
             "--project",
@@ -9105,7 +9452,7 @@ fn pull_request_build_comment_refuses_an_obs_reference() {
 }
 
 #[test]
-fn pull_request_build_comment_refuses_a_non_production_host() {
+fn gitea_build_comment_refuses_a_non_production_host() {
     // The stub stands in for a non-production OBS: the link forms
     // before the results read, so the stub answers nothing and the
     // Gitea stub sees no post.
@@ -9114,7 +9461,7 @@ fn pull_request_build_comment_refuses_a_non_production_host() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args([
-            "pull-request",
+            "gitea",
             "build-comment",
             "gitea:owner/repo#122",
             "--project",
@@ -9140,14 +9487,14 @@ fn pull_request_build_comment_refuses_a_non_production_host() {
 }
 
 #[test]
-fn pull_request_build_comment_without_credentials_fails_with_config_error() {
-    // One configured instance only, no credentials: the merged read
-    // reports that instance's own failure unchanged — no comment is
-    // posted, and the Gitea client is never built.
+fn gitea_build_comment_without_credentials_fails_with_config_error() {
+    // No credentials: the Gitea client is built first, so the
+    // missing token fails before the OBS results read — no comment
+    // is posted.
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args([
-            "pull-request",
+            "gitea",
             "build-comment",
             "gitea:owner/repo#122",
             "--project",
@@ -9167,7 +9514,7 @@ fn pull_request_build_comment_without_credentials_fails_with_config_error() {
         value["error"]["context"]
             .as_str()
             .unwrap()
-            .contains("GEECTL_OBS_USERNAME"),
+            .contains("GEECTL_GITEA_TOKEN"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );

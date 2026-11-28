@@ -2449,8 +2449,9 @@ fn gitea_pull_request_merge_round_trip() {
 }
 
 /// Decline a live pull request through the unified pull-request
-/// surface: the reason stays visible as an issue comment, and the
-/// pull request reads back closed, not merged.
+/// surface: the reason stays visible as an issue comment, prefixed
+/// with the outcome so the close can be told apart from a withdraw
+/// afterwards, and the pull request reads back closed, not merged.
 #[test]
 fn gitea_pull_request_decline_round_trip() {
     let Some(base) = gitea_url() else {
@@ -2479,7 +2480,7 @@ fn gitea_pull_request_decline_round_trip() {
         .expect("typed comments lists the comments");
     assert_eq!(comments.len(), 1);
     assert_eq!(comments[0].author, closer);
-    assert_eq!(comments[0].body, "Not now.");
+    assert_eq!(comments[0].body, "Declined: Not now.");
     let pr = client
         .pr_get(&user, &repo, number)
         .expect("typed pr_get reads the declined PR");
@@ -2512,6 +2513,11 @@ fn gitea_pull_request_withdraw_round_trip() {
         .expect("typed withdraw withdraws the pull request")
         .expect("a live withdraw returns the status");
     assert_eq!(status, PullRequestStatus::Closed);
+    let comments = PullRequestClient::new(None, Some(&client))
+        .comments(&reference)
+        .expect("typed comments lists the comments");
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0].body, "Withdrawn.");
     let pr = client
         .pr_get(&user, &repo, number)
         .expect("typed pr_get reads the withdrawn PR");

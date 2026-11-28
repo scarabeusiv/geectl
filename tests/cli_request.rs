@@ -2219,6 +2219,8 @@ fn pull_request_merge_obs_dry_run_plans_the_forward() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["pull-request", "merge", "obs:42"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
         .output()
         .unwrap();
     assert!(
@@ -2242,6 +2244,8 @@ fn pull_request_merge_obs_dry_run_plans_the_forward() {
     );
     let out = geectl_isolated(&dir)
         .args(["--format", "text", "pull-request", "merge", "obs:42"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
         .output()
         .unwrap();
     assert!(out.status.success());

@@ -61,6 +61,7 @@
 pub mod auth;
 pub mod changelog;
 pub mod cli;
+pub mod cli_arms;
 pub mod cli_branch;
 pub mod cli_build;
 pub mod cli_changelog;

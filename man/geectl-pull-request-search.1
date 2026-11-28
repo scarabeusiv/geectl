@@ -23,7 +23,7 @@ gitea
 .RE
 .TP
 \fB\-\-state\fR \fI<STATE>\fR
-Only pull requests in these unified states. With none given each arm applies its own default (new/review/declined on OBS, open on Gitea). OBS has no closed state: `\-\-state closed` reads OBS declined requests, which report as `declined`
+Only pull requests in these unified states. With none given each arm applies its own default (new/review/declined on OBS, open on Gitea). A state an arm in scope cannot produce is refused: `closed` is never produced by OBS, and no Gitea pull request can ever be `declined`, `withdrawn`, `superseded`, or `deleted` — scope the search with `\-\-backend` to use those
 .br
 
 .br
@@ -49,7 +49,7 @@ deleted
 Only pull requests by this author
 .TP
 \fB\-\-reviewer\fR \fI<REVIEWER>\fR
-Only pull requests with review requested of this login. Requires `\-\-backend gitea`. Only the token owner\*(Aqs login: the server filters review requests for the authenticated user only
+Only pull requests with review requested of this login. On Gitea, only the token owner\*(Aqs login: the server filters review requests for the authenticated user only. On OBS, an open review addressed to the login
 .TP
 \fB\-\-repo\fR \fI<REPO>\fR
 Only pull requests in this Gitea repo (`owner/repo`). Requires `\-\-backend gitea`

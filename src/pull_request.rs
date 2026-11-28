@@ -6,18 +6,24 @@
 //! backends, with a unified status ([`PullRequestStatus`]). This module
 //! carries the handle, the shapes, and the status mappings.
 
+use crate::auth::Credentials;
 use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{
-    validate_gitea_name, GiteaClient, GiteaComment, GiteaIssue, GiteaMergeMethod, GiteaPullRequest,
-    GiteaPullRequestRef, GiteaPullRequestState, GiteaReview, GiteaReviewEvent, PrCreateOptions,
+    parse_gitea_repo, parse_scmsync_url, validate_gitea_base, validate_gitea_name, GiteaClient,
+    GiteaComment, GiteaIssue, GiteaMergeMethod, GiteaPullRequest, GiteaPullRequestRef,
+    GiteaPullRequestState, GiteaReview, GiteaReviewEvent, PrCreateOptions, ScmsyncUrl,
 };
 use crate::http::HttpClient;
 use crate::obs::request::{
-    validate_request_id, Request, RequestAction, RequestSearch, RequestState, ReviewState,
-    ReviewTarget,
+    validate_request_id, AcceptCleanup, AcceptCleanupOutcome, ForwardActionResult, ForwardResult,
+    Request, RequestAction, RequestSearch, RequestState, ReviewState, ReviewTarget,
 };
-use crate::obs::{DryRun, InstanceBuildResults, ObsClient, SrFiling, SrPayload};
+use crate::obs::{CveId, DryRun, InstanceBuildResults, ObsClient, SrFiling, SrPayload};
+use crate::working_copy::{
+    current_branch, origin_repo, refuse_not_submittable_git, refuse_not_submittable_obs, Backend,
+    GitTargetVerification, GiteaAuth, WorkingCopy,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -415,14 +421,15 @@ pub struct PullRequest {
     /// Where the change goes to.
     #[serde(default)]
     pub target: PullRequestEndpoint,
+    /// How many actions the request carries: 1 on Gitea, the OBS
+    /// action count on OBS. `source`/`target` are the first
+    /// action's endpoints — a count above 1 says the request
+    /// carries more than the endpoints shown.
+    #[serde(default)]
+    pub action_count: usize,
     /// One entry per review asked or given, in order.
     #[serde(default)]
     pub reviews: Vec<ReviewOpinion>,
-    /// The reviews-fetch error on the Gitea arm, when the PR read
-    /// but its reviews did not; `None` otherwise, and always
-    /// `None` on OBS, whose reviews arrive with the request.
-    #[serde(default)]
-    pub reviews_error: Option<String>,
     /// Gitea label names; empty on OBS.
     #[serde(default)]
     pub labels: Vec<String>,
@@ -432,7 +439,8 @@ impl PullRequest {
     /// Read an OBS submit request as the unified shape. The title
     /// is empty when the request carries none; the endpoints are
     /// the first action's — a request with several actions reads
-    /// its first. A review reads its asked-of target as the
+    /// its first, and `action_count` names how many actions it
+    /// carries. A review reads its asked-of target as the
     /// reviewer.
     pub fn from_obs(request: &Request) -> Result<Self, GeectlError> {
         let (source, target) = request
@@ -467,8 +475,8 @@ impl PullRequest {
             merge_base: None,
             source,
             target,
+            action_count: request.actions.len(),
             reviews,
-            reviews_error: None,
             labels: Vec::new(),
         })
     }
@@ -507,8 +515,8 @@ impl PullRequest {
             merge_base: pr.merge_base.clone().filter(|s| !s.is_empty()),
             source: gitea_endpoint(&pr.head),
             target: gitea_endpoint(&pr.base),
+            action_count: 1,
             reviews: opinions,
-            reviews_error: None,
             labels: pr
                 .labels
                 .iter()
@@ -652,6 +660,10 @@ pub struct PullRequestSummary {
     /// Where the change goes to.
     #[serde(default)]
     pub target: PullRequestEndpoint,
+    /// How many actions the request carries: 1 on Gitea, the OBS
+    /// action count on OBS. See `PullRequest::action_count`.
+    #[serde(default)]
+    pub action_count: usize,
 }
 
 impl PullRequestSummary {
@@ -665,6 +677,7 @@ impl PullRequestSummary {
             status: pull_request.status,
             source: pull_request.source,
             target: pull_request.target,
+            action_count: pull_request.action_count,
         })
     }
 
@@ -678,6 +691,7 @@ impl PullRequestSummary {
             status: pull_request.status,
             source: pull_request.source,
             target: pull_request.target,
+            action_count: pull_request.action_count,
         })
     }
 
@@ -706,6 +720,7 @@ impl PullRequestSummary {
             status: PullRequestStatus::from_gitea(&issue.state, merged)?,
             source: PullRequestEndpoint::default(),
             target: PullRequestEndpoint::default(),
+            action_count: 1,
         })
     }
 }
@@ -716,11 +731,11 @@ impl PullRequestSummary {
 /// the unified states; with none given each arm applies its own
 /// default (new/review/declined on OBS, open on Gitea). The
 /// creator filters by author. The reviewer filters by review
-/// requested of that login; it needs the Gitea backend — the
-/// OBS arm has no reviewer filter. Only the token owner's login
-/// is accepted: the server filters review requests for the
-/// authenticated user only, and the search answer carries no
-/// requested-reviewer info, so the filter is server-side only.
+/// requested of that login: on Gitea only the token owner's
+/// login (the server filters review requests for the
+/// authenticated user only), on OBS an open review addressed to
+/// the login. The search answer carries no requested-reviewer
+/// info, so the filter is server-side only.
 /// The repo scopes the Gitea arm to one repo
 /// (`owner`/`repo`); a repo-scoped search needs the Gitea
 /// backend — the OBS arm has no repo to scope to.
@@ -752,11 +767,40 @@ impl PullRequestSearch {
                 "a repo-scoped search needs backend gitea: the OBS arm has no repo to scope to",
             ));
         }
-        if self.reviewer.is_some() && self.backend != Some(PullRequestBackend::Gitea) {
+        // A state filter only reads as the states it names when
+        // every arm in scope can produce them: a state an in-scope
+        // arm cannot produce would return arm-skewed results
+        // instead of the filter — OBS has no closed state (its
+        // declined requests read as declined), and no Gitea pull
+        // request can ever be declined, withdrawn, superseded, or
+        // deleted. Reject the filter and name the backend to scope
+        // to, instead of running it.
+        if self.states.contains(&PullRequestStatus::Closed)
+            && (self.backend.is_none() || self.backend == Some(PullRequestBackend::Obs))
+        {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
-                "a reviewer-scoped search needs backend gitea: the OBS arm has no reviewer filter",
+                "--state closed is never produced by OBS: OBS has no closed state; its declined requests read as declined — scope the search with --backend gitea",
             ));
+        }
+        for state in [
+            PullRequestStatus::Declined,
+            PullRequestStatus::Withdrawn,
+            PullRequestStatus::Superseded,
+            PullRequestStatus::Deleted,
+        ] {
+            if self.states.contains(&state)
+                && (self.backend.is_none() || self.backend == Some(PullRequestBackend::Gitea))
+            {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "--state {} is never produced by Gitea: no Gitea pull request can ever be {} — scope the search with --backend obs",
+                        state.as_str(),
+                        state.as_str(),
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -792,6 +836,55 @@ pub struct Submitted {
     pub reference: PullRequestRef,
     /// The handles superseded with it, in supersede order.
     pub superseded: Vec<PullRequestRef>,
+}
+
+/// What to file, in backend-neutral form: every field a filing
+/// can carry, each arm taking what it needs and refusing the
+/// other's. The OBS arm needs the target project, the
+/// description, and the changes entry; the Gitea arm needs the
+/// title. The checkout supplies the rest — the source for OBS,
+/// the origin and branches for Gitea.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubmitFiling {
+    /// The project the request targets. OBS only.
+    pub target_project: Option<String>,
+    /// The package in the target project. OBS only; the checkout
+    /// package when unset.
+    pub target_package: Option<String>,
+    /// The request description. OBS only.
+    pub description: Option<String>,
+    /// The one `.changes` entry for this submission. OBS only.
+    pub changes_entry: Option<String>,
+    /// A CVE this submission claims to fix. OBS only.
+    pub cve: Vec<String>,
+    /// Keep the source branch on accept instead of deleting it.
+    /// OBS only.
+    pub without_cleanup: bool,
+    /// The repo to open the pull request in (`owner/repo`).
+    /// Gitea only.
+    pub repo: Option<String>,
+    /// The branch the change comes from. Gitea only.
+    pub head: Option<String>,
+    /// The branch the pull request targets. Gitea only.
+    pub base: Option<String>,
+    /// The pull request title. Gitea only.
+    pub title: Option<String>,
+    /// The pull request body. Gitea only.
+    pub body: Option<String>,
+    /// Open the pull request as a draft. Gitea only.
+    pub draft: bool,
+}
+
+/// What `submit_from_checkout` filed — or would file in
+/// dry-run: the submission (`None` in dry-run) and the target
+/// it resolved from the checkout, for the caller to render the
+/// plan from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitOutcome {
+    /// The filed submission, `None` in dry-run.
+    pub submitted: Option<Submitted>,
+    /// The target the checkout resolved to.
+    pub target: SubmitTarget,
 }
 
 /// The uniform pull-request client: one interface over the OBS and
@@ -849,9 +942,9 @@ impl<'a> PullRequestClient<'a> {
 
     /// Read one pull request as the unified shape: the OBS arm
     /// reads the request with its reviews, the Gitea arm reads the
-    /// PR and its reviews. A Gitea reviews fetch that fails leaves
-    /// the PR with no reviews and the error recorded, instead of
-    /// failing the read.
+    /// PR and its reviews. A Gitea reviews fetch that fails fails
+    /// the read: a returned PR always carries its reviews, so
+    /// `reviews: []` means "no reviews" on both arms.
     pub fn show(&self, reference: &PullRequestRef) -> Result<PullRequest, GeectlError> {
         match reference {
             PullRequestRef::Obs(id) => {
@@ -866,13 +959,8 @@ impl<'a> PullRequestClient<'a> {
             } => {
                 let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
                 let pr = gitea.pr_get(owner, repo, *number)?;
-                let (reviews, reviews_error) = match gitea.pr_reviews(owner, repo, *number) {
-                    Ok(reviews) => (reviews, None),
-                    Err(err) => (Vec::new(), Some(err.to_string())),
-                };
-                let mut pull_request = PullRequest::from_gitea(owner, repo, &pr, &reviews)?;
-                pull_request.reviews_error = reviews_error;
-                Ok(pull_request)
+                let reviews = gitea.pr_reviews(owner, repo, *number)?;
+                PullRequest::from_gitea(owner, repo, &pr, &reviews)
             }
         }
     }
@@ -910,10 +998,13 @@ impl<'a> PullRequestClient<'a> {
 
     /// Search pull requests as the list shape. With no backend
     /// both arms run, OBS first then Gitea; a backend scopes the
-    /// search to that arm. Both arms filter server-side (the
-    /// state mapping and the creator); the reviewer filters
-    /// server-side on the Gitea arm only (`review_requested`,
-    /// token owner only) and needs the Gitea backend. A
+    /// search to that arm. An arm without credentials is skipped:
+    /// the search runs on the configured arm(s), and only a
+    /// search with no arm at all fails closed naming the missing
+    /// credentials. Both arms filter server-side (the
+    /// state mapping, the creator, and the reviewer:
+    /// `review_requested` on Gitea, token owner only; an open
+    /// review addressed to the login on OBS). A
     /// reviewer-scoped search runs the global search even with
     /// a repo given, since the repo-scoped list has no reviewer
     /// filter. The Gitea arm filters client-side to the exact
@@ -930,41 +1021,73 @@ impl<'a> PullRequestClient<'a> {
     ) -> Result<Vec<PullRequestSummary>, GeectlError> {
         query.validate()?;
         let mut summaries = Vec::new();
+        let mut ran = false;
         if query.backend.is_none() || query.backend == Some(PullRequestBackend::Obs) {
-            let obs = self.obs.ok_or_else(missing_obs_arm)?;
-            let mut search = RequestSearch::new();
-            if let Some(states) = obs_states_for(&query.states) {
-                search = search.states(states);
-            }
-            if let Some(creator) = &query.creator {
-                search = search.creators(vec![creator.clone()]);
-            }
-            for request in &obs.search_requests(&search)? {
-                summaries.push(PullRequestSummary::from_obs(request)?);
+            if let Some(obs) = self.obs {
+                ran = true;
+                let mut search = RequestSearch::new();
+                if let Some(states) = obs_states_for(&query.states) {
+                    search = search.states(states);
+                }
+                if let Some(creator) = &query.creator {
+                    search = search.creators(vec![creator.clone()]);
+                }
+                if let Some(reviewer) = &query.reviewer {
+                    search = search.reviewers(vec![reviewer.clone()]);
+                }
+                for request in &obs.search_requests(&search)? {
+                    summaries.push(PullRequestSummary::from_obs(request)?);
+                }
             }
         }
         if query.backend.is_none() || query.backend == Some(PullRequestBackend::Gitea) {
-            let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
-            let wire = gitea_state_for(&query.states);
-            // The repo-scoped list has no reviewer filter, so a
-            // reviewer-scoped search runs the global search even
-            // with a repo given; the retain below scopes it.
-            let mut items = match (&query.repo, &query.reviewer) {
-                (Some((owner, repo)), None) => gitea
-                    .pr_list(owner, repo, wire)?
-                    .iter()
-                    .map(|pr| PullRequestSummary::from_gitea(owner, repo, pr))
-                    .collect::<Result<Vec<_>, _>>()?,
-                _ => gitea
-                    .pr_search_scoped(wire, query.creator.as_deref(), query.reviewer.as_deref())?
-                    .iter()
-                    .map(PullRequestSummary::from_gitea_issue)
-                    .collect::<Result<Vec<_>, _>>()?,
-            };
-            items.retain(|summary| matches_query(summary, query));
-            summaries.extend(items);
+            if let Some(gitea) = self.gitea {
+                ran = true;
+                let wire = gitea_state_for(&query.states);
+                // The repo-scoped list has no reviewer filter, so a
+                // reviewer-scoped search runs the global search even
+                // with a repo given; the retain below scopes it.
+                let mut items = match (&query.repo, &query.reviewer) {
+                    (Some((owner, repo)), None) => gitea
+                        .pr_list(owner, repo, wire)?
+                        .iter()
+                        .map(|pr| PullRequestSummary::from_gitea(owner, repo, pr))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    _ => gitea
+                        .pr_search_scoped(
+                            wire,
+                            query.creator.as_deref(),
+                            query.reviewer.as_deref(),
+                        )?
+                        .iter()
+                        .map(PullRequestSummary::from_gitea_issue)
+                        .collect::<Result<Vec<_>, _>>()?,
+                };
+                items.retain(|summary| matches_query(summary, query));
+                summaries.extend(items);
+            }
+        }
+        if !ran {
+            // No arm ran: the search had nothing to read from.
+            // The first arm in scope names the missing
+            // credentials, as a scoped search without its arm
+            // does.
+            return Err(match query.backend {
+                Some(PullRequestBackend::Gitea) => missing_gitea_arm(),
+                _ => missing_obs_arm(),
+            });
         }
         Ok(summaries)
+    }
+
+    /// Whether a `--commit` pin is supported for this handle: the
+    /// recorded limitation a queue can ask about before approving
+    /// with one, instead of hitting the runtime refusal. Gitea
+    /// only: a Gitea review is recorded against the head commit
+    /// server-side. OBS reviews carry no revision, so a pin on an
+    /// OBS ref is refused.
+    pub fn commit_pin_supported(reference: &PullRequestRef) -> bool {
+        matches!(reference, PullRequestRef::Gitea { .. })
     }
 
     /// Approve a pull request as the review asked of `target`:
@@ -977,6 +1100,8 @@ impl<'a> PullRequestClient<'a> {
     /// moved. The pin is best-effort: the head is read just before
     /// the review posts, so a push landing between the read and
     /// the post is not caught; on an OBS ref a commit is refused.
+    /// Whether a pin is supported for a handle is
+    /// [`commit_pin_supported`](Self::commit_pin_supported).
     /// Returns the recorded opinion, or `None` in dry-run.
     pub fn approve(
         &self,
@@ -1035,17 +1160,36 @@ impl<'a> PullRequestClient<'a> {
         match reference {
             PullRequestRef::Obs(id) => {
                 let obs = self.obs.ok_or_else(missing_obs_arm)?;
-                obs.add_comment(&id.to_string(), body, parent, dry_run)?;
                 if dry_run.enabled() {
+                    obs.add_comment(&id.to_string(), body, parent, dry_run)?;
                     return Ok(None);
                 }
-                // The POST answers only a status, no id: re-read
-                // the comments and take the newest one by the
-                // acting user with this text — the server appends
-                // in order, so the newest match is the one just
-                // posted. add_comment required credentials; with
-                // a username the acting user is known here, with
-                // an API token the match is by body alone.
+                // The POST answers only a status, no id: the posted
+                // comment is identified by re-reading the list. The
+                // list is read once before the post, and the match
+                // takes the newest comment with this text whose id
+                // is above every id in that baseline — OBS assigns
+                // comment ids in creation order, so the match is the
+                // comment this post created, not an identical body
+                // posted earlier. The baseline read fails closed
+                // before the post: without it the re-read cannot
+                // tell the new comment from an old duplicate.
+                // add_comment required credentials; with a username
+                // the acting user is known here, with an API token
+                // the match is by body alone. The one case this
+                // cannot tell apart is a same-body comment by the
+                // same author landing between the two reads; that
+                // window is the post itself.
+                let baseline = obs.list_comments(&id.to_string()).map_err(|err| {
+                    GeectlError::new(
+                        ErrorKind::ServerError,
+                        format!(
+                            "read of the comments on submit request {id} before commenting failed: {err}"
+                        ),
+                    )
+                })?;
+                let baseline = baseline.iter().map(|comment| comment.id).max();
+                obs.add_comment(&id.to_string(), body, parent, dry_run)?;
                 let author = obs.credentials().username();
                 let comments = obs.list_comments(&id.to_string()).map_err(|err| {
                     GeectlError::new(
@@ -1061,6 +1205,7 @@ impl<'a> PullRequestClient<'a> {
                     .find(|comment| {
                         comment.body == body
                             && author.is_none_or(|author| comment.who == author)
+                            && baseline.is_none_or(|baseline| comment.id > baseline)
                     })
                     .map(|comment| ReviewComment {
                         id: comment.id,
@@ -1080,10 +1225,10 @@ impl<'a> PullRequestClient<'a> {
                             ErrorKind::ServerError,
                             match author {
                                 Some(author) => format!(
-                                    "re-read of the comments on submit request {id} after commenting found no comment by {author} with the posted text"
+                                    "re-read of the comments on submit request {id} after commenting found no new comment by {author} with the posted text"
                                 ),
                                 None => format!(
-                                    "re-read of the comments on submit request {id} after commenting found no comment with the posted text"
+                                    "re-read of the comments on submit request {id} after commenting found no new comment with the posted text"
                                 ),
                             },
                         )
@@ -1278,6 +1423,11 @@ impl<'a> PullRequestClient<'a> {
     /// `force` accepts past open reviews on OBS and is refused on
     /// a Gitea ref: the merge API takes no force flag. Returns the
     /// unified status after the merge, or `None` in dry-run.
+    ///
+    /// This is the bare accept/merge: it forwards nothing and
+    /// cleans up nothing. [`merge_with_forward`](Self::merge_with_forward)
+    /// is the full verb — the forward and the branch-home cleanup
+    /// with it.
     pub fn merge(
         &self,
         reference: &PullRequestRef,
@@ -1319,12 +1469,454 @@ impl<'a> PullRequestClient<'a> {
         }
     }
 
+    /// Merge a pull request with the forward and the branch-home
+    /// cleanup: the full verb the CLI performs, for library
+    /// consumers that must not silently drop either. On OBS the
+    /// merge accepts, then cleans up the branch homes it merged
+    /// and forwards the accepted request to its link parent; on
+    /// Gitea the forward is resolved and validated before the
+    /// merge lands (a missing OBS credential, an ambiguous or
+    /// unforwardable package, or a refused hop fails with the pull
+    /// request still open), then the merge lands, the branch home
+    /// is cleaned up, and the merged pull request is forwarded to
+    /// its link parent. `options.forward` is the `--no-forward`
+    /// switch (Gitea only; the OBS arm refuses it off and always
+    /// forwards): with it off there is no preflight and no
+    /// forward. A forward that
+    /// fails after the merge landed is an error naming the landed
+    /// merge: the merge stands, nothing is declined, and the
+    /// forward stays retryable by a direct submit from the devel
+    /// project. A cleanup that cannot run is never an error: it is
+    /// reported in the outcome. In dry-run nothing merges, so
+    /// nothing is forwarded either — the outcome records the
+    /// forward as planned.
+    pub fn merge_with_forward(
+        &self,
+        reference: &PullRequestRef,
+        options: &MergeOptions<'_>,
+        dry_run: &DryRun,
+    ) -> Result<MergeOutcome, GeectlError> {
+        match reference {
+            PullRequestRef::Obs(id) => {
+                if let Some(method) = options.method {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "--method {} does not apply to an OBS submit request: OBS has no merge style",
+                            method.as_str()
+                        ),
+                    ));
+                }
+                if !options.forward {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        "--no-forward does not apply to an OBS submit request: the merge always forwards after accepting",
+                    ));
+                }
+                let obs = self.obs.ok_or_else(missing_obs_arm)?;
+                let status =
+                    self.merge(reference, options.comment, None, options.force, dry_run)?;
+                // The cleanup runs with its own dry-run mode so its
+                // plan lines stay with the cleanup outcome, like
+                // the accept-time cleanup's — never in the merge's
+                // own plan.
+                let cleanup_dry_run = DryRun::new(dry_run.enabled()).with_debug(self.debug.clone());
+                let cleanup = match obs.cleanup_accepted_request(&id.to_string(), &cleanup_dry_run)
+                {
+                    Ok(cleanup) => MergeCleanupOutcome::Obs(cleanup),
+                    Err(err) => MergeCleanupOutcome::NotRun {
+                        error: err.to_string(),
+                    },
+                };
+                let cleanup_plan = cleanup_dry_run.plan();
+                // The forward is unconditional on this arm:
+                // `forward=false` is refused above, so the only
+                // question left is dry-run or live.
+                let forward = if dry_run.enabled() {
+                    MergeForwardOutcome::Planned {
+                        preflight_skipped: false,
+                    }
+                } else {
+                    obs.forward_request(&id.to_string(), options.forward_message, dry_run)
+                        .map(MergeForwardOutcome::Obs)
+                        .map_err(|err| {
+                            GeectlError::new(
+                                err.kind(),
+                                format!("merged request {id}, but the forward failed: {err}"),
+                            )
+                        })?
+                };
+                Ok(MergeOutcome {
+                    status,
+                    forward,
+                    cleanup,
+                    cleanup_plan,
+                })
+            }
+            PullRequestRef::Gitea {
+                owner,
+                repo,
+                number,
+            } => {
+                // The force refusal runs before the preflight, like
+                // the CLI's: a refused merge does no forward reads.
+                if options.force {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        "--force does not apply to a Gitea pull request: the merge API takes no force flag",
+                    ));
+                }
+                // OBS credentials first: without them there is
+                // nothing to verify the forward against, and the
+                // Gitea reads must not run either — a
+                // credential-less dry-run plans the forward
+                // unverified. Live, the resolution fails fast on
+                // missing credentials, so a live merge never
+                // reaches the skip below.
+                let mut preflight_skipped = false;
+                if options.forward {
+                    match self.obs {
+                        Some(obs) if obs_ready(obs) => {
+                            self.preflight_gitea_forward(
+                                owner,
+                                repo,
+                                *number,
+                                options.forward_message,
+                            )?;
+                        }
+                        _ => {
+                            if dry_run.enabled() {
+                                self.debug.emit("decision: skipping the forward preflight: no OBS credentials in dry-run, so the forward is planned unverified");
+                                preflight_skipped = true;
+                            } else {
+                                return Err(GeectlError::new(
+                                    ErrorKind::ConfigError,
+                                    "cannot merge a Gitea pull request without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE]): the forward cannot be validated before the merge",
+                                ));
+                            }
+                        }
+                    }
+                }
+                let status =
+                    self.merge(reference, options.comment, options.method, false, dry_run)?;
+                let cleanup_dry_run = DryRun::new(dry_run.enabled()).with_debug(self.debug.clone());
+                let cleanup = self.merge_gitea_cleanup(reference, &cleanup_dry_run);
+                let cleanup_plan = cleanup_dry_run.plan();
+                let forward = if !options.forward {
+                    MergeForwardOutcome::NotRequested
+                } else if dry_run.enabled() {
+                    MergeForwardOutcome::Planned { preflight_skipped }
+                } else {
+                    self.forward_gitea(owner, repo, *number, options.forward_message)
+                        .map(MergeForwardOutcome::Gitea)
+                        .map_err(|err| {
+                            GeectlError::new(
+                                err.kind(),
+                                format!("merged {reference}, but the forward failed: {err}"),
+                            )
+                        })?
+                };
+                Ok(MergeOutcome {
+                    status,
+                    forward,
+                    cleanup,
+                    cleanup_plan,
+                })
+            }
+        }
+    }
+
+    /// Resolve and validate both arms of the Gitea forward before
+    /// the merge lands: the pull request and its repo on Gitea,
+    /// then the OBS package synced from the base repo and branch
+    /// and its hop to the link parent. The hop is verified by
+    /// running the forward itself in dry-run: it resolves and
+    /// validates everything the live forward would, and files
+    /// nothing. A failure here — a missing credential, an
+    /// ambiguous package, a refused hop — aborts before the merge,
+    /// with the pull request still open.
+    fn preflight_gitea_forward(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        forward_message: Option<&str>,
+    ) -> Result<(), GeectlError> {
+        let obs = self.obs.ok_or_else(missing_obs_arm)?;
+        let inputs = self.gitea_forward_inputs(owner, repo, number, forward_message)?;
+        let dry_run = DryRun::new(true).with_debug(self.debug.clone());
+        let package = resolve_forward_package(
+            obs,
+            &inputs.repo_url,
+            &inputs.base_owner,
+            &inputs.base_repo,
+            &inputs.base_branch,
+            &inputs.default_branch,
+        )?;
+        if let Some((project, package)) = package {
+            obs.forward_package(
+                &project,
+                &package,
+                &inputs.description,
+                &inputs.changes_entry,
+                &dry_run,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Forward a merged Gitea pull request: resolve the OBS package
+    /// synced from the base repo and branch, and forward that
+    /// package to its link parent. The pull request and repo come
+    /// from [`gitea_forward_inputs`](Self::gitea_forward_inputs),
+    /// shared with the preflight, so the forward cannot disagree
+    /// with what was validated before the merge.
+    fn forward_gitea(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        forward_message: Option<&str>,
+    ) -> Result<ForwardActionResult, GeectlError> {
+        let obs = self.obs.ok_or_else(missing_obs_arm)?;
+        let inputs = self.gitea_forward_inputs(owner, repo, number, forward_message)?;
+        let dry_run = DryRun::new(false).with_debug(self.debug.clone());
+        let package = resolve_forward_package(
+            obs,
+            &inputs.repo_url,
+            &inputs.base_owner,
+            &inputs.base_repo,
+            &inputs.base_branch,
+            &inputs.default_branch,
+        )?;
+        match package {
+            Some((project, package)) => obs.forward_package(
+                &project,
+                &package,
+                &inputs.description,
+                &inputs.changes_entry,
+                &dry_run,
+            ),
+            None => Ok(ForwardActionResult::Skipped {
+                source: format!(
+                    "{}/{}#{}",
+                    inputs.base_owner, inputs.base_repo, inputs.base_branch
+                ),
+                reason: format!(
+                    "no OBS package is synced from {}#{}",
+                    inputs.repo_url, inputs.base_branch
+                ),
+            }),
+        }
+    }
+
+    /// Run the merge-time branch cleanup for the Gitea arm: resolve
+    /// the OBS package synced from the merged pull request's head
+    /// (the fork), then clean up that branch home through the
+    /// shared per-source helper. The merge stands regardless: a
+    /// cleanup that cannot run at all (no OBS credentials, the
+    /// fork deleted, the head repo unreadable, an ambiguous sync)
+    /// is reported as not run, never an error from this call —
+    /// like the OBS arm's cleanup. A pull request whose head syncs
+    /// no OBS package (not a geectl branch) has nothing to clean
+    /// up: empty outcomes, the payload records the empty result.
+    fn merge_gitea_cleanup(
+        &self,
+        reference: &PullRequestRef,
+        dry_run: &DryRun,
+    ) -> MergeCleanupOutcome {
+        let not_run = |err: GeectlError| MergeCleanupOutcome::NotRun {
+            error: err.to_string(),
+        };
+        // OBS credentials first: without them there is nothing to
+        // resolve against, and the Gitea reads must not run either
+        // — a credential-less dry-run plans without a server.
+        // Live, the merge already landed, so missing credentials
+        // report instead of failing: the merge stands either way.
+        let obs = match self.obs {
+            Some(obs) => obs,
+            None => return not_run(missing_obs_arm()),
+        };
+        if !obs_ready(obs) {
+            self.debug.emit("decision: skipping the merge-time branch cleanup: no OBS credentials in dry-run, so the home package cannot be resolved");
+            return not_run(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot clean up the branch home without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        let (owner, repo, number) = match reference {
+            PullRequestRef::Gitea {
+                owner,
+                repo,
+                number,
+            } => (owner, repo, *number),
+            PullRequestRef::Obs(_) => {
+                return not_run(GeectlError::new(
+                    ErrorKind::InternalError,
+                    "merge_gitea_cleanup called on an OBS reference",
+                ));
+            }
+        };
+        let head = match self.gitea_merge_head_inputs(owner, repo, number) {
+            Ok(Some(head)) => head,
+            Ok(None) => {
+                self.debug.emit("decision: skipping the merge-time branch cleanup: the merged pull request's head repo is gone, so no branch home can be resolved");
+                return MergeCleanupOutcome::Gitea {
+                    reference: reference.to_string(),
+                    outcomes: Vec::new(),
+                };
+            }
+            Err(err) => return not_run(err),
+        };
+        let outcome = match resolve_forward_package(
+            obs,
+            &head.repo_url,
+            &head.owner,
+            &head.repo,
+            &head.branch,
+            &head.default_branch,
+        ) {
+            Ok(Some((project, package))) => {
+                Some(obs.cleanup_branch_source(&project, &package, dry_run))
+            }
+            Ok(None) => {
+                self.debug.emit(&format!(
+                    "decision: skipping the merge-time branch cleanup: no OBS package is synced from {}#{}",
+                    head.repo_url, head.branch
+                ));
+                None
+            }
+            Err(err) => return not_run(err),
+        };
+        MergeCleanupOutcome::Gitea {
+            reference: reference.to_string(),
+            outcomes: outcome.into_iter().collect(),
+        }
+    }
+
+    /// The Gitea side of the forward, resolved once and shared by
+    /// the preflight and the forward itself, so the two cannot
+    /// disagree on what the merge targeted: the merged pull
+    /// request's base repo and branch, the repo's clone URL and
+    /// default branch, and the forward description and `.changes`
+    /// entry carried from the pull request's text — or the `-m` /
+    /// `--forward-message` override for the `.changes` entry.
+    fn gitea_forward_inputs(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        forward_message: Option<&str>,
+    ) -> Result<GiteaForwardInputs, GeectlError> {
+        let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
+        let reference = PullRequestRef::Gitea {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+        };
+        let pr = gitea.pr_get(owner, repo, number)?;
+        let repo = gitea.repo_get(owner, repo)?;
+        let base_repo = pr.base.repo.as_ref().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("the merged pull request {reference} names no base repository"),
+            )
+        })?;
+        let (base_owner, base_repo_name) =
+            parse_gitea_full_name(&base_repo.full_name, &reference.to_string())?;
+        let base_branch = pr.base.branch.clone();
+        let repo_url = repo
+            .clone_url
+            .strip_suffix(".git")
+            .unwrap_or(&repo.clone_url);
+        // The forward description and `.changes` entry carry the
+        // pull request's text: the body when it has one, else the
+        // title, else the forward line alone. An explicit `-m`
+        // override replaces the `.changes` entry only: the
+        // description still carries the pull request's text.
+        let forward_line = format!(
+            "Forwarded Gitea pull request {base_owner}/{base_repo_name}#{number} from {}",
+            pr.user.login
+        );
+        let body = pr.body.as_deref().unwrap_or("").trim();
+        let title = pr.title.trim();
+        let description = if !body.is_empty() {
+            format!("{forward_line}\n\n{body}")
+        } else if !title.is_empty() {
+            format!("{forward_line}\n\n{title}")
+        } else {
+            forward_line.clone()
+        };
+        let changes_entry = match forward_message {
+            Some(entry) => entry.to_string(),
+            None if !body.is_empty() => body.to_string(),
+            None if !title.is_empty() => title.to_string(),
+            None => forward_line,
+        };
+        Ok(GiteaForwardInputs {
+            base_owner,
+            base_repo: base_repo_name,
+            base_branch,
+            default_branch: repo.default_branch,
+            repo_url: repo_url.to_string(),
+            description,
+            changes_entry,
+        })
+    }
+
+    /// The head side of a merged Gitea pull request: the fork repo
+    /// and branch, and the repo's clone URL and default branch —
+    /// the coordinates the merge-time cleanup resolves the branch
+    /// home from, through the same scmsync lookup the forward uses
+    /// for the base side. `None` when the fork the branch lived in
+    /// is deleted — the pull request keeps its head label, but
+    /// there is no repo to resolve a branch home from, so the
+    /// cleanup has nothing to clean up.
+    fn gitea_merge_head_inputs(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Option<GiteaMergeHeadInputs>, GeectlError> {
+        let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
+        let reference = PullRequestRef::Gitea {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+        };
+        let pr = gitea.pr_get(owner, repo, number)?;
+        let head = match pr.head.repo.as_ref() {
+            Some(head) => {
+                let (head_owner, head_name) =
+                    parse_gitea_full_name(&head.full_name, &reference.to_string())?;
+                let repo = gitea.repo_get(&head_owner, &head_name)?;
+                Some((head_owner, head_name, repo))
+            }
+            None => None,
+        };
+        let Some((head_owner, head_name, head_repo)) = head else {
+            return Ok(None);
+        };
+        let repo_url = head_repo
+            .clone_url
+            .strip_suffix(".git")
+            .unwrap_or(&head_repo.clone_url);
+        Ok(Some(GiteaMergeHeadInputs {
+            owner: head_owner,
+            repo: head_name,
+            branch: pr.head.branch.clone(),
+            default_branch: head_repo.default_branch,
+            repo_url: repo_url.to_string(),
+        }))
+    }
+
     /// Decline a pull request. On OBS this changes the request
     /// state to declined; on Gitea it closes the pull request —
-    /// Gitea has no declined state, so the close is the whole act
-    /// and the reason is posted as an issue comment first, when
-    /// one was given, so it stays visible. Returns the unified
-    /// status after the decline, or `None` in dry-run.
+    /// Gitea has no declined state, so the close is the whole act,
+    /// and the outcome is recorded in the posted comment
+    /// (`Declined: <reason>`, or `Declined.` when no reason was
+    /// given), so it stays recoverable after the fact. Returns the
+    /// unified status after the decline, or `None` in dry-run.
     pub fn decline(
         &self,
         reference: &PullRequestRef,
@@ -1342,7 +1934,7 @@ impl<'a> PullRequestClient<'a> {
                 repo,
                 number,
             } => {
-                self.close_gitea(owner, repo, *number, comment, dry_run)?;
+                self.close_gitea(owner, repo, *number, "Declined", comment, dry_run)?;
                 self.status_after_act(reference, dry_run)
             }
         }
@@ -1351,9 +1943,11 @@ impl<'a> PullRequestClient<'a> {
     /// Withdraw a pull request. On OBS this revokes the request —
     /// the creator's withdrawal; on Gitea it closes the pull
     /// request, like `decline`: Gitea has no withdrawn state, so
-    /// the close is the whole act and the reason is posted as an
-    /// issue comment first, when one was given. Returns the
-    /// unified status after the withdrawal, or `None` in dry-run.
+    /// the close is the whole act, and the outcome is recorded in
+    /// the posted comment (`Withdrawn: <reason>`, or `Withdrawn.`
+    /// when no reason was given), so it stays recoverable after
+    /// the fact. Returns the unified status after the withdrawal,
+    /// or `None` in dry-run.
     pub fn withdraw(
         &self,
         reference: &PullRequestRef,
@@ -1371,7 +1965,7 @@ impl<'a> PullRequestClient<'a> {
                 repo,
                 number,
             } => {
-                self.close_gitea(owner, repo, *number, comment, dry_run)?;
+                self.close_gitea(owner, repo, *number, "Withdrawn", comment, dry_run)?;
                 self.status_after_act(reference, dry_run)
             }
         }
@@ -1460,6 +2054,69 @@ impl<'a> PullRequestClient<'a> {
         }
     }
 
+    /// File a submission from the checkout, resolving the arm
+    /// from the checkout backend: the OBS arm files a submit
+    /// request, the Gitea arm opens a pull request. The caller
+    /// passes the filing in backend-neutral form and the token
+    /// for the Gitea pre-filing fetch (`None` when the caller
+    /// resolved none; a live git-backed filing without one fails
+    /// closed). The OBS arm's freshness refusal and the Gitea
+    /// arm's target verification run before anything files, as
+    /// they do from the CLI. Returns what was filed — or would
+    /// be filed in dry-run — and the target it resolved, for the
+    /// caller to render the plan from.
+    pub fn submit_from_checkout(
+        &self,
+        wc: &WorkingCopy,
+        filing: &SubmitFiling,
+        gitea_token: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<SubmitOutcome, GeectlError> {
+        match wc.backend {
+            Backend::Obs => {
+                let target = obs_submit_target(wc, filing)?;
+                let obs = self.obs.ok_or_else(missing_obs_arm)?;
+                refuse_not_submittable_obs(wc, obs)?;
+                let submitted = self.submit(&target, dry_run)?;
+                Ok(SubmitOutcome { submitted, target })
+            }
+            Backend::Git => {
+                let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
+                let base_url = gitea.base_url();
+                validate_gitea_base(base_url)?;
+                let parts = git_submit_parts(wc, filing, base_url)?;
+                let repo_explicit = parts.repo.is_some();
+                let target = resolve_git_submit_target(parts, gitea)?;
+                let SubmitTarget::Gitea {
+                    owner,
+                    repo,
+                    options,
+                } = &target
+                else {
+                    return Err(GeectlError::new(
+                        ErrorKind::InternalError,
+                        "the resolved git submit target is not a Gitea target",
+                    ));
+                };
+                let verification = GitTargetVerification {
+                    client: gitea,
+                    instance_url: base_url,
+                    owner: owner.as_str(),
+                    repo: repo.as_str(),
+                    base: options.base.as_str(),
+                    repo_explicit,
+                };
+                let auth = gitea_token.map(|token| GiteaAuth {
+                    token,
+                    url: base_url,
+                });
+                refuse_not_submittable_git(wc, auth.as_ref(), Some(&verification), dry_run)?;
+                let submitted = self.submit(&target, dry_run)?;
+                Ok(SubmitOutcome { submitted, target })
+            }
+        }
+    }
+
     /// The unified status after an act: the act answers only a
     /// status (OBS) or an empty body (Gitea merge), so the record
     /// is re-read, like `comment` re-reads the posted comment.
@@ -1476,21 +2133,28 @@ impl<'a> PullRequestClient<'a> {
         Ok(Some(self.show(reference)?.status))
     }
 
-    /// Close a Gitea pull request, posting `comment` as an issue
-    /// comment first when one was given: the close carries no
-    /// reason of its own.
+    /// Close a Gitea pull request, recording which close it is
+    /// in the posted comment: the close carries no reason of its
+    /// own, and Gitea has no declined/withdrawn state, so the
+    /// outcome is written in parseable form — `{outcome}:
+    /// <reason>`, the outcome alone when no reason was given —
+    /// and stays recoverable from the issue comments after the
+    /// fact.
     fn close_gitea(
         &self,
         owner: &str,
         repo: &str,
         number: u64,
+        outcome: &str,
         comment: Option<&str>,
         dry_run: &DryRun,
     ) -> Result<Option<GiteaIssue>, GeectlError> {
         let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
-        if let Some(comment) = comment.filter(|comment| !comment.is_empty()) {
-            gitea.pr_comment_add(owner, repo, number, comment, dry_run)?;
-        }
+        let body = match comment.filter(|comment| !comment.is_empty()) {
+            Some(reason) => format!("{outcome}: {reason}"),
+            None => format!("{outcome}."),
+        };
+        gitea.pr_comment_add(owner, repo, number, &body, dry_run)?;
         gitea.pr_close(owner, repo, number, dry_run)
     }
 
@@ -1508,6 +2172,8 @@ impl<'a> PullRequestClient<'a> {
     ) -> Result<Option<ReviewOpinion>, GeectlError> {
         match reference {
             PullRequestRef::Obs(id) => {
+                // The pin is Gitea-only (see `commit_pin_supported`):
+                // OBS reviews carry no revision.
                 if let Some(commit) = commit {
                     return Err(GeectlError::new(
                         ErrorKind::InvalidInput,
@@ -1599,6 +2265,220 @@ impl<'a> PullRequestClient<'a> {
                 "cannot approve or request changes on a submit request without a review target or an OBS username — an API token carries no username (pass a target, or unset the OBS API key first and set GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
             )),
         }
+    }
+}
+
+/// The options for the full merge ([`PullRequestClient::merge_with_forward`]):
+/// the bare accept/merge plus the forward and the branch-home cleanup.
+#[derive(Debug, Clone, Copy)]
+pub struct MergeOptions<'a> {
+    /// The message left with the accept on OBS and the merge commit
+    /// message on Gitea.
+    pub comment: Option<&'a str>,
+    /// The Gitea merge style; refused on an OBS ref.
+    pub method: Option<GiteaMergeMethod>,
+    /// Accept past open reviews on OBS; refused on a Gitea ref.
+    pub force: bool,
+    /// Forward after the merge lands. The OBS arm always forwards;
+    /// on Gitea this is the `--no-forward` switch, off when the
+    /// caller passes it.
+    pub forward: bool,
+    /// The `.changes` entry for the forwarded request, overriding
+    /// the default; `-m` / `--forward-message` on the CLI.
+    pub forward_message: Option<&'a str>,
+}
+
+/// The outcome of the full merge: the status after the merge, what
+/// the forward did, and what the branch-home cleanup did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutcome {
+    /// The unified status after the merge, or `None` in dry-run.
+    pub status: Option<PullRequestStatus>,
+    /// What the forward did.
+    pub forward: MergeForwardOutcome,
+    /// What the branch-home cleanup did.
+    pub cleanup: MergeCleanupOutcome,
+    /// The dry-run plan lines the cleanup recorded, in order. The
+    /// cleanup runs with its own dry-run mode so its lines stay
+    /// with the cleanup payload, like the accept-time cleanup's;
+    /// empty live, and empty in dry-run when nothing was planned.
+    pub cleanup_plan: Vec<String>,
+}
+
+/// What the merge-time forward did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeForwardOutcome {
+    /// No forward was requested (`--no-forward` on Gitea).
+    NotRequested,
+    /// The forward was planned but not run (dry-run): nothing was
+    /// filed. `preflight_skipped` is set on the Gitea arm when no
+    /// OBS credentials were available to verify the forward
+    /// against — the forward is planned unverified.
+    Planned { preflight_skipped: bool },
+    /// The OBS forward result: one outcome per submit action.
+    Obs(ForwardResult),
+    /// The Gitea forward result: the single forward action.
+    Gitea(ForwardActionResult),
+}
+
+/// What the merge-time branch-home cleanup did. A cleanup that
+/// cannot run at all is reported, never an error: the merge stands
+/// regardless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeCleanupOutcome {
+    /// The cleanup did not run; the error says why.
+    NotRun { error: String },
+    /// The OBS cleanup: one outcome per distinct submit source.
+    Obs(AcceptCleanup),
+    /// The Gitea cleanup: the outcomes for the package synced from
+    /// the merged pull request's head — empty when the head syncs
+    /// no OBS package.
+    Gitea {
+        /// The merged pull request, by its handle.
+        reference: String,
+        /// One outcome for the resolved branch home, when one was.
+        outcomes: Vec<AcceptCleanupOutcome>,
+    },
+}
+
+/// The Gitea side of the forward: the merged pull request's base
+/// repo and branch, the repo's clone URL and default branch, and
+/// the forward description and `.changes` entry.
+struct GiteaForwardInputs {
+    base_owner: String,
+    base_repo: String,
+    base_branch: String,
+    default_branch: String,
+    repo_url: String,
+    description: String,
+    changes_entry: String,
+}
+
+/// The head side of a merged Gitea pull request: the fork repo and
+/// branch, and the repo's clone URL and default branch.
+struct GiteaMergeHeadInputs {
+    owner: String,
+    repo: String,
+    branch: String,
+    default_branch: String,
+    repo_url: String,
+}
+
+/// Whether the OBS arm carries credentials that can act: a Basic
+/// pair or a Bearer token. `Credentials::None` reads public data
+/// only and cannot file, forward, or clean up.
+fn obs_ready(obs: &ObsClient) -> bool {
+    matches!(
+        obs.credentials(),
+        Credentials::Basic { .. } | Credentials::Bearer { .. }
+    )
+}
+
+/// Resolve the OBS package synced from a Gitea repo and branch:
+/// search OBS packages by the scmsync repo URL, then verify each
+/// hit against its own `_meta` scmsync — the search is a prefix
+/// match, so a repo name that prefixes another matches both, and
+/// only a hit whose parsed scmsync names this repo and branch is
+/// the package. A hit with no branch named tracks the repo's
+/// default branch; a hit whose fragment pins a commit still
+/// tracks the branch its `trackingbranch` names. No hit is `None`
+/// (nothing to forward); more than one distinct package is an
+/// error — the forward must not guess which one the merge
+/// targeted. A hit whose scmsync does not parse is skipped, not
+/// an error: it cannot be verified as this repo, and the search
+/// prefix alone does not prove it is.
+fn resolve_forward_package(
+    obs: &ObsClient,
+    repo_url: &str,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    default_branch: &str,
+) -> Result<Option<(String, String)>, GeectlError> {
+    let candidates = obs.search_packages_by_scmsync(repo_url)?;
+    let mut matched: Vec<(String, String)> = Vec::new();
+    for candidate in &candidates {
+        let meta = obs.package_meta_authenticated(&candidate.project, &candidate.name)?;
+        let Some(scmsync) = &meta.scmsync else {
+            continue;
+        };
+        let Ok(parsed) = parse_scmsync_url(scmsync) else {
+            continue;
+        };
+        if parsed.owner != owner || parsed.repo != repo {
+            continue;
+        }
+        if !scmsync_branch_matches(&parsed, branch, default_branch) {
+            continue;
+        }
+        let found = (candidate.project.clone(), candidate.name.clone());
+        if !matched.contains(&found) {
+            matched.push(found);
+        }
+    }
+    match matched.len() {
+        0 => Ok(None),
+        1 => Ok(matched.into_iter().next()),
+        _ => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "more than one OBS package is synced from {repo_url}#{branch}: {}; refusing to guess which one the merge targeted",
+                matched
+                    .iter()
+                    .map(|(project, package)| format!("{project}/{package}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
+    }
+}
+
+/// Whether `value` pins a commit rather than naming a branch: a
+/// full SHA-1 (40 hex) or SHA-256 (64 hex) — the shapes the server
+/// writes into a scmsync fragment when it pins a revision. A branch
+/// literally named 40 or 64 hex digits would read as a pin; no
+/// such branch exists in practice, and the server's own fixtures
+/// pin full SHAs.
+fn is_commit_pin(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Whether a parsed scmsync URL tracks `branch`: the fragment
+/// wins — when it names a branch, only that branch matches, and
+/// the tracking branch does not. When the fragment pins a commit
+/// instead, it names no branch at all: only the tracking branch
+/// matches. With neither a fragment nor a tracking branch, the
+/// package tracks the repo's default branch.
+fn scmsync_branch_matches(parsed: &ScmsyncUrl, branch: &str, default_branch: &str) -> bool {
+    match &parsed.branch {
+        Some(fragment) if is_commit_pin(fragment) => {
+            parsed.tracking_branch.as_deref() == Some(branch)
+        }
+        Some(fragment) => fragment.as_str() == branch,
+        None => branch == default_branch,
+    }
+}
+
+/// Split a Gitea `full_name` into its owner and repo: exactly one
+/// non-empty owner/repo pair. Anything else is malformed server
+/// data — a merged pull request always names its base repo this
+/// way — so it maps to `ServerError`, never `InvalidInput`: the
+/// caller did not supply the name.
+fn parse_gitea_full_name(
+    full_name: &str,
+    reference: &str,
+) -> Result<(String, String), GeectlError> {
+    let mut parts = full_name.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(repo), None) if !owner.is_empty() && !repo.is_empty() => {
+            Ok((owner.to_string(), repo.to_string()))
+        }
+        _ => Err(GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "the merged pull request {reference} names a malformed base repository {full_name:?}: expected one owner/repo pair"
+            ),
+        )),
     }
 }
 
@@ -1801,7 +2681,10 @@ fn resolve_cancel(
 /// `declined` (a closed PR reads as declined on OBS, which has no
 /// `closed` state of its own), the rest read as themselves.
 /// `None` is the search default — new/review/declined — so an
-/// empty filter leaves the search unset.
+/// empty filter leaves the search unset. A closed filter never
+/// reaches this mapping through search: `PullRequestSearch::validate`
+/// rejects it when the OBS arm is in scope, so the search never
+/// returns declined items for a closed query.
 fn obs_states_for(states: &[PullRequestStatus]) -> Option<Vec<RequestState>> {
     if states.is_empty() {
         return None;
@@ -1920,6 +2803,348 @@ pub fn build_comment_body(
     lines.join("\n")
 }
 
+// ---------- Filing targets ----------
+// The filing-target builders behind `submit_from_checkout`:
+// the OBS target and the Gitea target in two phases, from the
+// backend-neutral filing and the checkout.
+
+/// The OBS filing target from the filing: the foreign
+/// (Gitea) flags are refused, the required flags are named, the
+/// CVEs are parsed. The source is the checkout itself.
+pub(crate) fn obs_submit_target(
+    wc: &WorkingCopy,
+    filing: &SubmitFiling,
+) -> Result<SubmitTarget, GeectlError> {
+    refuse_gitea_flags(filing)?;
+    let target_project = filing.target_project.as_deref().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--target-project is required to file an OBS submit request",
+        )
+    })?;
+    let description = filing.description.as_deref().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--description is required to file an OBS submit request",
+        )
+    })?;
+    let changes_entry = filing.changes_entry.as_deref().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--changes-entry is required to file an OBS submit request",
+        )
+    })?;
+    let mut cves = Vec::new();
+    for value in &filing.cve {
+        cves.push(CveId::parse(value)?);
+    }
+    let mut payload = SrPayload::new(
+        &wc.project,
+        &wc.package,
+        target_project,
+        filing.target_package.as_deref().unwrap_or(&wc.package),
+        description,
+        changes_entry,
+        &cves,
+    )?;
+    if filing.without_cleanup {
+        payload = payload.without_cleanup();
+    }
+    Ok(SubmitTarget::Obs(payload))
+}
+
+/// Refuse the Gitea arm's flags on an OBS-native checkout: each
+/// names what applies instead, so the agent sees the OBS spelling.
+fn refuse_gitea_flags(filing: &SubmitFiling) -> Result<(), GeectlError> {
+    if filing.repo.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--repo does not apply to an OBS-native checkout: an OBS submit request targets a project, not a Gitea repo",
+        ));
+    }
+    if filing.head.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--head does not apply to an OBS-native checkout: the request files the checkout as it stands",
+        ));
+    }
+    if filing.base.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--base does not apply to an OBS-native checkout: the target is --target-project",
+        ));
+    }
+    if filing.title.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--title does not apply to an OBS-native checkout: the request takes --description",
+        ));
+    }
+    if filing.body.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--body does not apply to an OBS-native checkout: the request takes --description",
+        ));
+    }
+    if filing.draft {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--draft does not apply to an OBS-native checkout: OBS has no draft requests",
+        ));
+    }
+    Ok(())
+}
+
+/// The parts of a Gitea filing target the checkout already
+/// knows, before any API read: the target repo when the flags name
+/// it (else the origin, for the parent resolution), the head, and
+/// the base when the flags or the checkout name it (else the
+/// target's default branch). Built before any credential
+/// resolution, so an invalid flag fails as InvalidInput whether or
+/// not credentials are configured.
+#[derive(Debug)]
+pub(crate) struct GitSubmitParts {
+    /// The target repo when `--repo` names it; None when it must
+    /// default to the origin's parent.
+    pub(crate) repo: Option<(String, String)>,
+    /// The origin repo, when it was read: always, for the head
+    /// qualification in phase two — a bare head names a branch on
+    /// the fork, and only the origin says which fork that is. None
+    /// when `--repo` was explicit and the checkout carries no
+    /// readable origin; the target verification re-reads the origin
+    /// before anything files, so an unreadable origin is refused
+    /// there, not silently filed bare.
+    pub(crate) origin: Option<(String, String)>,
+    /// The branch the change comes from.
+    pub(crate) head: String,
+    /// The target branch when the flags or the checkout's scmsync
+    /// branch name it; None when it must default to the target
+    /// repo's default branch.
+    pub(crate) base: Option<String>,
+    /// The pull request title.
+    pub(crate) title: String,
+    /// The pull request body.
+    pub(crate) body: Option<String>,
+    /// Open the pull request as a draft.
+    pub(crate) draft: bool,
+}
+
+/// The Gitea filing target from the filing, phase one: the
+/// foreign (OBS) flags are refused, the required flags are named,
+/// and what the checkout already knows is resolved — the repo from
+/// `--repo` or the origin remote, the head from `--head` or the
+/// current branch, the base from `--base` or the checkout's
+/// scmsync branch. The origin is read whether or not `--repo`
+/// names the target: the default path resolves the parent from
+/// it, and the explicit path qualifies the head with it (phase
+/// two). The `factory` base is refused here when it is already
+/// known; a defaulted base is refused in phase two.
+pub(crate) fn git_submit_parts(
+    wc: &WorkingCopy,
+    filing: &SubmitFiling,
+    instance_url: &str,
+) -> Result<GitSubmitParts, GeectlError> {
+    refuse_obs_flags(filing)?;
+    // The origin is read in both paths: the default path needs it
+    // to resolve the parent, and the explicit path needs it to
+    // qualify the head (phase two) — a bare head lives on the
+    // fork, and only the origin names the fork. With an explicit
+    // `--repo` the origin is best-effort: a checkout without a
+    // readable origin still reaches the named target, and the
+    // target verification re-reads the origin before anything
+    // files, so an unreadable origin is refused there.
+    let (repo, origin) = match &filing.repo {
+        Some(repo) => (
+            Some(parse_gitea_repo(repo)?),
+            origin_repo(wc, instance_url).ok(),
+        ),
+        None => {
+            let origin = origin_repo(wc, instance_url)?;
+            (None, Some(origin))
+        }
+    };
+    let head = match &filing.head {
+        Some(head) => head.clone(),
+        None => current_branch(wc)?,
+    };
+    let base = match &filing.base {
+        Some(base) => Some(base.clone()),
+        None => wc.scmsync_branch.clone(),
+    };
+    if let Some(base) = &base {
+        refuse_factory_base(base)?;
+    }
+    let title = filing.title.as_deref().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--title is required to open a Gitea pull request",
+        )
+    })?;
+    Ok(GitSubmitParts {
+        repo,
+        origin,
+        head,
+        base,
+        title: title.to_string(),
+        body: filing.body.clone(),
+        draft: filing.draft,
+    })
+}
+
+/// Refuse a pull request onto the `factory` branch: it does not
+/// take pull requests. The Factory leg is an OBS submit request,
+/// never a Gitea PR — the devel branch takes the PR instead. The
+/// match is case-insensitive: the rule names the Factory leg, not
+/// a case-sensitive branch spelling, so `Factory` is refused like
+/// `factory`.
+fn refuse_factory_base(base: &str) -> Result<(), GeectlError> {
+    if base.eq_ignore_ascii_case("factory") {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "the factory branch does not take pull requests: target the devel branch with --base instead, and file the Factory leg as an OBS submit request (`osc sr`)",
+        ));
+    }
+    Ok(())
+}
+
+/// Qualify a bare head with the fork owner: Gitea resolves a bare
+/// head against the base repo, so a bare branch that also exists
+/// on the target would file from the target's branch, and one
+/// that does not fails head-not-found. A head the caller already
+/// qualified (`owner:branch`) passes through untouched.
+fn qualify_head(head: &str, owner: &str) -> String {
+    if head.contains(':') {
+        head.to_string()
+    } else {
+        format!("{owner}:{head}")
+    }
+}
+
+/// The Gitea filing target from the filing, phase two: the
+/// repo defaults to the origin's parent (resolved via `repo_get`
+/// on the origin) and the base to the target repo's default branch
+/// (via `repo_get`, only when the checkout carries no scmsync
+/// branch). The head is qualified with the origin owner
+/// (`owner:branch`) whenever the target is not the origin repo:
+/// Gitea resolves a bare head against the base repo, so a bare
+/// branch that also exists on the target would file from the
+/// target's branch — or fail head-not-found when it does not. A
+/// parentless origin is not a fork and names no target; a default
+/// branch of `factory` is refused like an explicit one.
+pub(crate) fn resolve_git_submit_target(
+    parts: GitSubmitParts,
+    gitea: &GiteaClient,
+) -> Result<SubmitTarget, GeectlError> {
+    // Destructured up front: the target resolution moves `repo`,
+    // `origin` and `base` out of the parts in turn, and the head
+    // qualification below still needs the origin and the head.
+    let GitSubmitParts {
+        repo,
+        origin,
+        head,
+        base,
+        title,
+        body,
+        draft,
+    } = parts;
+    let (owner, repo) = match repo {
+        Some(repo) => repo,
+        None => {
+            // Unreachable by construction — `git_submit_parts`
+            // sets exactly one of `repo`/`origin` — but kept as a
+            // defensive error rather than an unwrap: a parts value
+            // built any other way must not panic here.
+            let (origin_owner, origin_repo) = origin.as_ref().ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    "the submit target has no repo and no origin to resolve it from",
+                )
+            })?;
+            let origin = gitea.repo_get(origin_owner, origin_repo)?;
+            let parent = origin.parent.as_ref().ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "the checkout's origin {origin_owner}/{origin_repo} is not a fork on this instance: pass --repo to name the repo the pull request goes to"
+                    ),
+                )
+            })?;
+            (parent.owner.login.clone(), parent.name.clone())
+        }
+    };
+    let base = match base {
+        Some(base) => base,
+        None => {
+            let target = gitea.repo_get(&owner, &repo)?;
+            refuse_factory_base(&target.default_branch)?;
+            target.default_branch
+        }
+    };
+    // The head lives on the fork: qualify it with the origin
+    // owner whenever the target is not the origin repo itself. A
+    // head into the origin repo stays bare — it already names a
+    // branch on the target. Without a readable origin there is no
+    // fork owner to qualify with and the head stays bare; the
+    // target verification re-reads the origin before anything
+    // files, so that case never files unqualified.
+    let head = match &origin {
+        Some((origin_owner, origin_repo)) if origin_owner != &owner || origin_repo != &repo => {
+            qualify_head(&head, origin_owner)
+        }
+        _ => head,
+    };
+    let mut options = PrCreateOptions::new(&head, &base, &title)?;
+    options.body = body;
+    options.draft = draft;
+    Ok(SubmitTarget::Gitea {
+        owner,
+        repo,
+        options,
+    })
+}
+
+/// Refuse the OBS arm's flags on a git-backed checkout: each names
+/// what applies instead, so the agent sees the Gitea spelling.
+fn refuse_obs_flags(filing: &SubmitFiling) -> Result<(), GeectlError> {
+    if filing.target_project.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--target-project does not apply to a git-backed checkout: the pull request goes to --repo",
+        ));
+    }
+    if filing.target_package.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--target-package does not apply to a git-backed checkout: the pull request files the whole branch",
+        ));
+    }
+    if filing.description.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--description does not apply to a git-backed checkout: the pull request takes --title and --body",
+        ));
+    }
+    if filing.changes_entry.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--changes-entry does not apply to a git-backed checkout: OBS-only",
+        ));
+    }
+    if !filing.cve.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--cve does not apply to a git-backed checkout: OBS-only",
+        ));
+    }
+    if filing.without_cleanup {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--without-cleanup does not apply to a git-backed checkout: OBS-only",
+        ));
+    }
+    Ok(())
+}
+
 /// The missing-OBS-arm error: the read needs OBS credentials.
 fn missing_obs_arm() -> GeectlError {
     GeectlError::new(
@@ -1941,6 +3166,7 @@ mod tests {
     use super::*;
     use crate::auth::Credentials;
     use crate::http::{HttpClient, Timeout, UreqClient};
+    use crate::obs::request::CleanupStep;
     use crate::obs::test_support::{basic_credentials, FakeHttp};
     use crate::obs::{BuildResult, BuildResults, PackageBuildStatus};
 
@@ -2166,13 +3392,13 @@ mod tests {
             merge_base: None,
             source: endpoint("home:scarabeus_iv:patterns/patterns-base"),
             target: endpoint("openSUSE:Factory/patterns-base"),
+            action_count: 1,
             reviews: vec![ReviewOpinion {
                 reviewer: "dimstar".to_string(),
                 state: OpinionState::Approved,
                 comment: String::new(),
                 when: None,
             }],
-            reviews_error: None,
             labels: vec![],
         };
         let json = serde_json::to_value(&pull_request).unwrap();
@@ -2185,11 +3411,7 @@ mod tests {
         assert_eq!(json["mergeable"], serde_json::Value::Null);
         assert_eq!(json["merge_base"], serde_json::Value::Null);
         assert_eq!(json["reviews"][0]["state"], "approved");
-        assert!(
-            json.as_object().unwrap().contains_key("reviews_error"),
-            "reviews_error must be emitted on every read"
-        );
-        assert_eq!(json["reviews_error"], serde_json::Value::Null);
+        assert_eq!(json["action_count"], 1);
         assert_eq!(json["labels"], serde_json::json!([]));
         let round_tripped: PullRequest = serde_json::from_value(json).unwrap();
         assert_eq!(round_tripped, pull_request);
@@ -2208,6 +3430,7 @@ mod tests {
             status: PullRequestStatus::Open,
             source: endpoint("scarabeusiv/geectl"),
             target: endpoint("openSUSE/geectl"),
+            action_count: 1,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"gitea:openSUSE/geectl#122\""));
@@ -2437,10 +3660,10 @@ mod tests {
     }
 
     #[test]
-    fn show_gitea_reads_the_pr_when_reviews_fail() {
-        // The reviews are enrichment: when their fetch fails the
-        // read still returns the PR, with no reviews and the error
-        // recorded, instead of failing the whole read.
+    fn show_gitea_fails_when_reviews_fail() {
+        // The reviews are part of the read, not enrichment: when
+        // their fetch fails the whole read fails, so a returned PR
+        // never silently carries no reviews.
         let http = FakeHttp::new()
             .with_get(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
@@ -2457,14 +3680,15 @@ mod tests {
             repo: "geectl".to_string(),
             number: 122,
         };
-        let pr = client.show(&reference).unwrap();
-        assert_eq!(pr.reference, reference);
-        assert_eq!(pr.status, PullRequestStatus::Open);
-        assert!(pr.reviews.is_empty());
-        assert_eq!(
-            pr.reviews_error.as_deref(),
-            Some("network_error: a network error occurred (canned GET error for https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50)")
-        );
+        let err = client
+            .show(&reference)
+            .expect_err("a failed reviews fetch must fail the read");
+        assert_eq!(err.kind(), ErrorKind::NetworkError);
+        // The PR read ran first: the failure is on the reviews
+        // fetch, not on the PR itself.
+        assert!(http.get_calls().iter().any(
+            |(url, _)| url == "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122"
+        ));
     }
 
     #[test]
@@ -2549,25 +3773,37 @@ mod tests {
     }
 
     #[test]
-    fn search_closed_reads_obs_declined() {
-        // OBS has no closed state: `--state closed` reads OBS
-        // declined requests, which report as `declined` — an OBS
-        // search never returns a summary with status `closed`.
-        let collection = format!("<collection matches=\"1\">\n{DELETE_REQUEST_XML}\n</collection>");
-        let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27declined%27%5D",
-            &collection,
-        );
+    fn search_closed_is_refused_when_obs_in_scope() {
+        // OBS has no closed state: a closed filter with the OBS arm
+        // in scope used to read OBS declined requests, which report
+        // as `declined` — the filter never round-tripped. The search
+        // fails as invalid input instead, and names the backend to
+        // scope to. No HTTP call runs: the fake has no canned
+        // responses, so any arm running would fail with a network
+        // error, not the invalid-input error asserted here.
+        let http = FakeHttp::new();
         let obs = obs_client(&http);
-        let client = PullRequestClient::new(Some(&obs), None);
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(Some(&obs), Some(&gitea));
+        for backend in [None, Some(PullRequestBackend::Obs)] {
+            let query = PullRequestSearch {
+                backend,
+                states: vec![PullRequestStatus::Closed],
+                ..Default::default()
+            };
+            let err = client
+                .search(&query)
+                .expect_err("a closed search with the OBS arm in scope must fail");
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("--state closed"));
+        }
+        // Scoped to Gitea, the same filter is fine.
         let query = PullRequestSearch {
-            backend: Some(PullRequestBackend::Obs),
+            backend: Some(PullRequestBackend::Gitea),
             states: vec![PullRequestStatus::Closed],
             ..Default::default()
         };
-        let summaries = client.search(&query).unwrap();
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].status, PullRequestStatus::Declined);
+        assert!(query.validate().is_ok());
     }
 
     #[test]
@@ -2775,20 +4011,54 @@ mod tests {
     }
 
     #[test]
-    fn search_without_backend_fails_when_an_arm_is_missing() {
-        // No backend means both arms run, so a missing arm fails
-        // the search closed instead of silently returning one
-        // backend's results: the caller scopes with --backend.
+    fn search_without_backend_runs_the_configured_arm() {
+        // No backend means both arms run — but an arm without
+        // credentials is skipped, so the search returns the
+        // configured arm's results instead of failing on the
+        // missing one. Only a search with no arm at all fails
+        // closed.
         let collection = format!("<collection matches=\"1\">\n{REQUEST_XML}\n</collection>");
-        let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%20or%20%40name%3D%27declined%27%5D",
-            &collection,
-        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%20or%20%40name%3D%27declined%27%5D",
+                &collection,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&page=1&limit=50",
+                &format!("[{}]", issue_json(122, "open", false, "scarabeusiv")),
+            );
         let obs = obs_client(&http);
-        let err = PullRequestClient::new(Some(&obs), None)
-            .search(&PullRequestSearch::default())
-            .expect_err("a both-arms search without a Gitea arm must fail");
+        let gitea = gitea_client(&http);
+        let query = PullRequestSearch::default();
+        // OBS only: the unscoped search runs the OBS arm.
+        let summaries = PullRequestClient::new(Some(&obs), None)
+            .search(&query)
+            .unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].reference, PullRequestRef::Obs(123));
+        // Gitea only: the mirror case.
+        let summaries = PullRequestClient::new(None, Some(&gitea))
+            .search(&query)
+            .unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].reference,
+            PullRequestRef::Gitea {
+                owner: "openSUSE".to_string(),
+                repo: "geectl".to_string(),
+                number: 122,
+            }
+        );
+        // No arms at all: the search fails closed naming the
+        // OBS credentials, the first arm in scope.
+        let err = PullRequestClient::new(None, None)
+            .search(&query)
+            .expect_err("a search without arms must fail");
         assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.to_string().contains("OBS credentials"),
+            "the missing-arm error must name the credentials; got {err}"
+        );
     }
 
     #[test]
@@ -2895,32 +4165,6 @@ mod tests {
             .search(&query)
             .expect_err("a reviewer other than the token owner must fail");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn search_reviewer_scoped_search_needs_the_gitea_backend() {
-        // A reviewer scopes the Gitea arm only: with no backend,
-        // or with the OBS backend, the reviewer filter would be
-        // silently ignored on the OBS arm, so the search fails as
-        // invalid input instead. No HTTP call runs: the fake has
-        // no canned responses, so any arm running would fail with
-        // a network error, not the invalid-input error asserted
-        // here.
-        let http = FakeHttp::new();
-        let obs = obs_client(&http);
-        let gitea = gitea_client(&http);
-        let client = PullRequestClient::new(Some(&obs), Some(&gitea));
-        for backend in [None, Some(PullRequestBackend::Obs)] {
-            let query = PullRequestSearch {
-                backend,
-                reviewer: Some("scarabeus_iv".to_string()),
-                ..Default::default()
-            };
-            let err = client
-                .search(&query)
-                .expect_err("a reviewer-scoped search without the Gitea backend must fail");
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        }
     }
 
     #[test]
@@ -3434,9 +4678,9 @@ mod tests {
                 "https://api.opensuse.org/comments/request/1398977",
                 "<status code=\"ok\" />",
             )
-            .with_get(
+            .with_get_sequence(
                 "https://api.opensuse.org/comments/request/1398977",
-                &comments_xml(),
+                &["<comments></comments>", &comments_xml()],
             );
         let obs = obs_client(&http);
         let comment = act_client(Some(&obs), None)
@@ -3456,9 +4700,12 @@ mod tests {
                 "https://api.opensuse.org/comments/request/1398977",
                 "<status code=\"ok\" />",
             )
-            .with_get(
+            .with_get_sequence(
                 "https://api.opensuse.org/comments/request/1398977",
-                r#"<comments><comment id="7" who="scarabeus_iv" when="2026-11-22T19:52:58Z">Something else.</comment></comments>"#,
+                &[
+                    "<comments></comments>",
+                    r#"<comments><comment id="7" who="scarabeus_iv" when="2026-11-22T19:52:58Z">Something else.</comment></comments>"#,
+                ],
             );
         let obs = obs_client(&http);
         let err = act_client(Some(&obs), None)
@@ -3467,19 +4714,25 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::ServerError);
         assert!(err
             .to_string()
-            .contains("found no comment by scarabeus_iv with the posted text"));
+            .contains("found no new comment by scarabeus_iv with the posted text"));
     }
 
     #[test]
-    fn comment_obs_re_read_with_a_duplicate_takes_the_newest() {
+    fn comment_obs_re_read_ignores_a_duplicate_older_than_the_baseline() {
+        // The baseline read already carries the older duplicate
+        // (id 7); the re-read adds the new comment (id 9). The
+        // match takes the new one, not the older duplicate.
         let http = FakeHttp::new()
             .with_post(
                 "https://api.opensuse.org/comments/request/1398977",
                 "<status code=\"ok\" />",
             )
-            .with_get(
+            .with_get_sequence(
                 "https://api.opensuse.org/comments/request/1398977",
-                r#"<comments><comment id="7" who="scarabeus_iv" when="2026-11-22T19:52:58Z">Looks good.</comment><comment id="9" who="scarabeus_iv" when="2026-11-22T19:53:58Z">Looks good.</comment></comments>"#,
+                &[
+                    r#"<comments><comment id="7" who="scarabeus_iv" when="2026-11-22T19:52:58Z">Looks good.</comment></comments>"#,
+                    r#"<comments><comment id="7" who="scarabeus_iv" when="2026-11-22T19:52:58Z">Looks good.</comment><comment id="9" who="scarabeus_iv" when="2026-11-22T19:53:58Z">Looks good.</comment></comments>"#,
+                ],
             );
         let obs = obs_client(&http);
         let comment = act_client(Some(&obs), None)
@@ -3501,9 +4754,12 @@ mod tests {
                 "https://api.opensuse.org/comments/request/1398977",
                 "<status code=\"ok\" />",
             )
-            .with_get(
+            .with_get_sequence(
                 "https://api.opensuse.org/comments/request/1398977",
-                r#"<comments><comment id="7" who="someone_else" when="2026-11-22T19:52:58Z">Looks good.</comment></comments>"#,
+                &[
+                    "<comments></comments>",
+                    r#"<comments><comment id="7" who="someone_else" when="2026-11-22T19:52:58Z">Looks good.</comment></comments>"#,
+                ],
             );
         let obs = ObsClient::with_credentials(
             &http,
@@ -3528,9 +4784,12 @@ mod tests {
                 "https://api.opensuse.org/comments/request/1398977",
                 "<status code=\"ok\" />",
             )
-            .with_get(
+            .with_get_sequence(
                 "https://api.opensuse.org/comments/request/1398977",
-                r#"<comments><comment id="7" who="someone_else" when="2026-11-22T19:52:58Z">Something else.</comment></comments>"#,
+                &[
+                    "<comments></comments>",
+                    r#"<comments><comment id="7" who="someone_else" when="2026-11-22T19:52:58Z">Something else.</comment></comments>"#,
+                ],
             );
         let obs = ObsClient::with_credentials(
             &http,
@@ -3545,7 +4804,58 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::ServerError);
         assert!(err
             .to_string()
-            .contains("found no comment with the posted text"));
+            .contains("found no new comment with the posted text"));
+    }
+
+    #[test]
+    fn comment_obs_re_read_with_only_an_older_match_is_a_server_error() {
+        // The only matching comment predates the post: the baseline
+        // already carries it (id 9) and the re-read adds nothing new.
+        // The old newest-match read would have returned it; the
+        // baseline match refuses it.
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/comments/request/1398977",
+                "<status code=\"ok\" />",
+            )
+            .with_get_sequence(
+                "https://api.opensuse.org/comments/request/1398977",
+                &[
+                    r#"<comments><comment id="9" who="scarabeus_iv" when="2026-11-22T19:53:58Z">Looks good.</comment></comments>"#,
+                    r#"<comments><comment id="9" who="scarabeus_iv" when="2026-11-22T19:53:58Z">Looks good.</comment></comments>"#,
+                ],
+            );
+        let obs = obs_client(&http);
+        let err = act_client(Some(&obs), None)
+            .comment(&obs_ref(), "Looks good.", None, &DryRun::new(false))
+            .expect_err("a re-read with only an older match must fail");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err
+            .to_string()
+            .contains("found no new comment by scarabeus_iv with the posted text"));
+    }
+
+    #[test]
+    fn comment_obs_baseline_read_failure_fails_before_posting() {
+        // The baseline read cannot be parsed, so the post never runs:
+        // without the baseline the re-read could not tell the new
+        // comment from an old duplicate.
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/comments/request/1398977",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/comments/request/1398977",
+                "not xml",
+            );
+        let obs = obs_client(&http);
+        let err = act_client(Some(&obs), None)
+            .comment(&obs_ref(), "Looks good.", None, &DryRun::new(false))
+            .expect_err("a failed baseline read must fail");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.to_string().contains("before commenting failed"));
+        assert!(http.post_calls().is_empty());
     }
 
     #[test]
@@ -4291,7 +5601,7 @@ please fix this</comment></comments>"#,
         let http = FakeHttp::new()
             .with_post(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
-                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Declined: Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
             )
             .with_patch(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
@@ -4313,7 +5623,7 @@ please fix this</comment></comments>"#,
         assert_eq!(status, PullRequestStatus::Closed);
         let posts = http.post_calls();
         assert_eq!(posts.len(), 1);
-        assert_eq!(posts[0].1, r#"{"body":"Not now."}"#);
+        assert_eq!(posts[0].1, r#"{"body":"Declined: Not now."}"#);
         let patches = http.patch_calls();
         assert_eq!(patches.len(), 1);
         assert_eq!(patches[0].1, r#"{"state":"closed"}"#);
@@ -4345,8 +5655,12 @@ please fix this</comment></comments>"#,
     }
 
     #[test]
-    fn decline_gitea_without_a_comment_only_closes() {
+    fn decline_gitea_without_a_comment_posts_the_outcome() {
         let http = FakeHttp::new()
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Declined.", "created_at": "2026-11-22T19:52:58Z"}"#,
+            )
             .with_patch(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
                 &issue_json(122, "closed", false, "scarabeusiv"),
@@ -4365,7 +5679,9 @@ please fix this</comment></comments>"#,
             .unwrap()
             .unwrap();
         assert_eq!(status, PullRequestStatus::Closed);
-        assert!(http.post_calls().is_empty());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, r#"{"body":"Declined."}"#);
         assert_eq!(http.patch_calls().len(), 1);
     }
 
@@ -4374,7 +5690,7 @@ please fix this</comment></comments>"#,
         let http = FakeHttp::new()
             .with_post(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
-                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Declined: Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
             )
             .with_patch(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
@@ -4421,8 +5737,12 @@ please fix this</comment></comments>"#,
     }
 
     #[test]
-    fn withdraw_gitea_closes_and_re_reads_closed() {
+    fn withdraw_gitea_posts_the_outcome_then_closes_and_re_reads_closed() {
         let http = FakeHttp::new()
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Withdrawn.", "created_at": "2026-11-22T19:52:58Z"}"#,
+            )
             .with_patch(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
                 &issue_json(122, "closed", false, "scarabeusiv"),
@@ -4441,7 +5761,9 @@ please fix this</comment></comments>"#,
             .unwrap()
             .unwrap();
         assert_eq!(status, PullRequestStatus::Closed);
-        assert!(http.post_calls().is_empty());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, r#"{"body":"Withdrawn."}"#);
         assert_eq!(http.patch_calls().len(), 1);
         assert_eq!(
             http.get_calls()
@@ -4542,7 +5864,7 @@ please fix this</comment></comments>"#,
         let http = FakeHttp::new()
             .with_post(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
-                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Declined: Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
             )
             .with_patch_error(
                 "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
@@ -4700,5 +6022,787 @@ please fix this</comment></comments>"#,
             .submit(&SubmitTarget::Obs(sr_payload()), &DryRun::new(false))
             .expect_err("an OBS submit without an OBS arm must fail");
         assert_eq!(err.kind(), ErrorKind::ConfigError);
+    }
+
+    #[test]
+    fn scmsync_branch_matches_fragment_pin_and_tracking_branch() {
+        // A fragment that pins a commit still tracks the branch the
+        // `trackingbranch` names; a fragment naming a branch
+        // matches it — and only it; no branch at all tracks the
+        // default branch only.
+        let pinned = parse_scmsync_url(
+            "http://127.0.0.1:9/pool/systemd?trackingbranch=factory#deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        )
+        .expect("fixture scmsync parses");
+        assert!(scmsync_branch_matches(&pinned, "factory", "factory"));
+        assert!(!scmsync_branch_matches(&pinned, "main", "factory"));
+        let fragment_names_a_branch =
+            parse_scmsync_url("http://127.0.0.1:9/pool/systemd?trackingbranch=factory#main")
+                .expect("fixture scmsync parses");
+        assert!(scmsync_branch_matches(
+            &fragment_names_a_branch,
+            "main",
+            "factory"
+        ));
+        // The fragment wins: the tracking branch does not match
+        // when the fragment names another branch.
+        assert!(!scmsync_branch_matches(
+            &fragment_names_a_branch,
+            "factory",
+            "factory"
+        ));
+        let branched = parse_scmsync_url("http://127.0.0.1:9/pool/systemd#factory")
+            .expect("fixture scmsync parses");
+        assert!(scmsync_branch_matches(&branched, "factory", "factory"));
+        assert!(!scmsync_branch_matches(&branched, "main", "factory"));
+        let bare =
+            parse_scmsync_url("http://127.0.0.1:9/pool/systemd").expect("fixture scmsync parses");
+        assert!(scmsync_branch_matches(&bare, "factory", "factory"));
+        assert!(!scmsync_branch_matches(&bare, "main", "factory"));
+    }
+
+    #[test]
+    fn parse_gitea_full_name_requires_one_non_empty_pair() {
+        assert_eq!(
+            parse_gitea_full_name("pool/systemd", "gitea:pool/systemd#7").unwrap(),
+            ("pool".to_string(), "systemd".to_string())
+        );
+        for malformed in [
+            "pool",
+            "pool/systemd/extra",
+            "pool/",
+            "/systemd",
+            "",
+            "pool//systemd",
+        ] {
+            let err = parse_gitea_full_name(malformed, "gitea:pool/systemd#7").unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError, "{malformed}: {err}");
+        }
+    }
+
+    /// The request XML with the state and the id replaced: the
+    /// re-read after a level act answers the state the act moved
+    /// the request to, and the id matches the handle.
+    fn request_xml_accepted() -> String {
+        REQUEST_XML
+            .replace("name=\"review\"", "name=\"accepted\"")
+            .replace("id=\"123\"", "id=\"1398977\"")
+    }
+
+    /// A project meta with no branch marker: the cleanup skips the
+    /// source, planning nothing.
+    const PROJECT_META_XML: &str =
+        r#"<project name="xyz"><title>t</title><description>plain</description></project>"#;
+
+    /// A repo JSON, shaped like Gitea 1.24.7 answers.
+    const REPO_JSON: &str = r#"{"owner": {"login": "openSUSE"}, "name": "geectl", "full_name": "openSUSE/geectl", "parent": null, "default_branch": "main", "private": false, "clone_url": "https://src.opensuse.org/openSUSE/geectl.git", "ssh_url": "gitea@src.opensuse.org:openSUSE/geectl.git", "permissions": {"admin": true, "push": true, "pull": true}}"#;
+
+    fn merge_options() -> MergeOptions<'static> {
+        MergeOptions {
+            comment: Some("Merging."),
+            method: None,
+            force: false,
+            forward: true,
+            forward_message: None,
+        }
+    }
+
+    #[test]
+    fn merge_with_forward_obs_dry_run_plans_forward_and_cleanup() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/request/1398977?withhistory=1",
+                REQUEST_XML,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/xyz/_meta",
+                PROJECT_META_XML,
+            );
+        let obs = obs_client(&http);
+        let dry = DryRun::new(true);
+        let outcome = act_client(Some(&obs), None)
+            .merge_with_forward(&obs_ref(), &merge_options(), &dry)
+            .unwrap();
+        assert!(outcome.status.is_none());
+        assert_eq!(
+            outcome.forward,
+            MergeForwardOutcome::Planned {
+                preflight_skipped: false
+            }
+        );
+        assert!(outcome.cleanup_plan.is_empty());
+        match &outcome.cleanup {
+            MergeCleanupOutcome::Obs(cleanup) => {
+                assert_eq!(cleanup.id, 123);
+                assert_eq!(cleanup.outcomes.len(), 1);
+                assert_eq!(cleanup.outcomes[0].source_project, "xyz");
+                assert_eq!(cleanup.outcomes[0].source_package, "abc");
+                assert!(matches!(
+                    &cleanup.outcomes[0].package,
+                    CleanupStep::Skipped { reason }
+                        if reason == crate::obs::request::NO_BRANCH_MARKER_REASON
+                ));
+            }
+            other => panic!("expected the OBS cleanup, got {other:?}"),
+        }
+        assert!(http.post_calls().is_empty());
+        assert_eq!(dry.plan().len(), 1);
+        assert!(dry.plan()[0].contains("to accepted"));
+    }
+
+    #[test]
+    fn merge_with_forward_obs_live_forwards_nothing_and_cleans_up() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/request/1398977?cmd=changestate&newstate=accepted",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/request/1398977?withhistory=1",
+                &request_xml_accepted(),
+            )
+            .with_get(
+                "https://api.opensuse.org/source/xyz/_meta",
+                PROJECT_META_XML,
+            );
+        let obs = obs_client(&http);
+        let outcome = act_client(Some(&obs), None)
+            .merge_with_forward(&obs_ref(), &merge_options(), &DryRun::new(false))
+            .unwrap();
+        assert_eq!(outcome.status, Some(PullRequestStatus::Merged));
+        assert!(outcome.cleanup_plan.is_empty());
+        match &outcome.forward {
+            MergeForwardOutcome::Obs(forward) => {
+                assert_eq!(forward.id, 1398977);
+                assert_eq!(forward.actions.len(), 1);
+                assert!(matches!(
+                    &forward.actions[0],
+                    ForwardActionResult::Skipped { source, reason }
+                        if source == "xyz/abc" && reason == "the action names no target project"
+                ));
+            }
+            other => panic!("expected the OBS forward, got {other:?}"),
+        }
+        match &outcome.cleanup {
+            MergeCleanupOutcome::Obs(cleanup) => {
+                assert_eq!(cleanup.id, 1398977);
+                assert_eq!(cleanup.outcomes.len(), 1);
+                assert!(matches!(
+                    &cleanup.outcomes[0].package,
+                    CleanupStep::Skipped { reason }
+                        if reason == crate::obs::request::NO_BRANCH_MARKER_REASON
+                ));
+            }
+            other => panic!("expected the OBS cleanup, got {other:?}"),
+        }
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn merge_with_forward_obs_method_is_refused_before_any_call() {
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let options = MergeOptions {
+            method: Some(GiteaMergeMethod::Squash),
+            ..merge_options()
+        };
+        let err = act_client(Some(&obs), None)
+            .merge_with_forward(&obs_ref(), &options, &DryRun::new(false))
+            .expect_err("a merge method on an OBS ref must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--method squash"));
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn merge_with_forward_obs_no_forward_is_refused_before_any_call() {
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let options = MergeOptions {
+            forward: false,
+            ..merge_options()
+        };
+        let err = act_client(Some(&obs), None)
+            .merge_with_forward(&obs_ref(), &options, &DryRun::new(false))
+            .expect_err("a --no-forward on an OBS ref must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--no-forward"));
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn merge_with_forward_gitea_no_forward_skips_obs() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/merge",
+                "",
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &pr_json_with_state("closed", true),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = gitea_client(&http);
+        let options = MergeOptions {
+            comment: None,
+            forward: false,
+            ..merge_options()
+        };
+        let outcome = act_client(None, Some(&gitea))
+            .merge_with_forward(&gitea_ref(), &options, &DryRun::new(false))
+            .unwrap();
+        assert_eq!(outcome.status, Some(PullRequestStatus::Merged));
+        assert_eq!(outcome.forward, MergeForwardOutcome::NotRequested);
+        assert!(matches!(
+            &outcome.cleanup,
+            MergeCleanupOutcome::NotRun { error } if error.contains("OBS credentials")
+        ));
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn merge_with_forward_gitea_forward_without_obs_fails_before_merge() {
+        let http = FakeHttp::new();
+        let gitea = gitea_client(&http);
+        let err = act_client(None, Some(&gitea))
+            .merge_with_forward(&gitea_ref(), &merge_options(), &DryRun::new(false))
+            .expect_err("a Gitea merge with a forward and no OBS arm must fail");
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err
+            .to_string()
+            .contains("cannot merge a Gitea pull request without OBS credentials"));
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn merge_with_forward_gitea_dry_run_without_obs_credentials_plans_unverified() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, Credentials::None).unwrap();
+        let gitea = gitea_client(&http);
+        let dry = DryRun::new(true);
+        let outcome = act_client(Some(&obs), Some(&gitea))
+            .merge_with_forward(&gitea_ref(), &merge_options(), &dry)
+            .unwrap();
+        assert!(outcome.status.is_none());
+        assert_eq!(
+            outcome.forward,
+            MergeForwardOutcome::Planned {
+                preflight_skipped: true
+            }
+        );
+        assert!(matches!(
+            &outcome.cleanup,
+            MergeCleanupOutcome::NotRun { error } if error.contains("without OBS credentials")
+        ));
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+        assert_eq!(dry.plan().len(), 1);
+        assert!(dry.plan()[0].contains("merge pull request openSUSE/geectl#122"));
+    }
+
+    #[test]
+    fn merge_with_forward_gitea_preflight_refuses_ambiguous_package() {
+        // Two OBS packages sync the base repo and branch: the
+        // preflight refuses before the merge lands, so the pull
+        // request stays open and nothing is posted.
+        use crate::obs::common::build_url;
+        let match_expr = "starts-with(scmsync,'https://src.opensuse.org/openSUSE/geectl')";
+        let search_url = build_url(
+            "https://api.opensuse.org",
+            &["search", "package"],
+            &[("match", match_expr)],
+        );
+        let search_xml = "<collection matches=\"2\"><package name=\"geectl\" project=\"home:foo\"><title>t</title><description>d</description></package><package name=\"geectl\" project=\"home:bar\"><title>t</title><description>d</description></package></collection>";
+        let meta_xml = "<package name=\"geectl\" project=\"home:foo\"><title>t</title><description>d</description><scmsync>https://src.opensuse.org/openSUSE/geectl#main</scmsync></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                PR_JSON,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl",
+                REPO_JSON,
+            )
+            .with_get(&search_url, search_xml)
+            .with_get(
+                "https://api.opensuse.org/source/home:foo/geectl/_meta",
+                meta_xml,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/home:bar/geectl/_meta",
+                meta_xml,
+            );
+        let obs = obs_client(&http);
+        let gitea = gitea_client(&http);
+        let err = act_client(Some(&obs), Some(&gitea))
+            .merge_with_forward(&gitea_ref(), &merge_options(), &DryRun::new(false))
+            .expect_err("an ambiguous forward package must fail the preflight");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains(
+            "more than one OBS package is synced from https://src.opensuse.org/openSUSE/geectl#main"
+        ));
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn commit_pin_supported_is_gitea_only() {
+        assert!(!PullRequestClient::commit_pin_supported(&obs_ref()));
+        assert!(PullRequestClient::commit_pin_supported(&gitea_ref()));
+    }
+
+    #[test]
+    fn search_states_a_gitea_arm_cannot_produce_are_refused() {
+        // No Gitea pull request can ever be declined, withdrawn,
+        // superseded, or deleted: a filter naming one with the
+        // Gitea arm in scope fails as invalid input instead of
+        // silently returning nothing from that arm.
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(Some(&obs), Some(&gitea));
+        for state in [
+            PullRequestStatus::Declined,
+            PullRequestStatus::Withdrawn,
+            PullRequestStatus::Superseded,
+            PullRequestStatus::Deleted,
+        ] {
+            for backend in [None, Some(PullRequestBackend::Gitea)] {
+                let query = PullRequestSearch {
+                    backend,
+                    states: vec![state],
+                    ..Default::default()
+                };
+                let err = client
+                    .search(&query)
+                    .expect_err("a state the Gitea arm cannot produce must fail with it in scope");
+                assert_eq!(err.kind(), ErrorKind::InvalidInput);
+                assert!(err.to_string().contains(state.as_str()));
+            }
+            // Scoped to OBS, the same state is fine.
+            let query = PullRequestSearch {
+                backend: Some(PullRequestBackend::Obs),
+                states: vec![state],
+                ..Default::default()
+            };
+            assert!(query.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn search_states_both_arms_can_produce_are_accepted() {
+        for states in [
+            vec![],
+            vec![PullRequestStatus::Open],
+            vec![PullRequestStatus::Merged],
+            vec![PullRequestStatus::Open, PullRequestStatus::Merged],
+        ] {
+            for backend in [
+                None,
+                Some(PullRequestBackend::Obs),
+                Some(PullRequestBackend::Gitea),
+            ] {
+                let query = PullRequestSearch {
+                    backend,
+                    states: states.clone(),
+                    ..Default::default()
+                };
+                assert!(query.validate().is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn search_obs_scopes_reviewer_server_side() {
+        // The reviewer reaches the OBS search as an open review
+        // addressed to the login; with no explicit states the
+        // default narrows to the states a request can still be
+        // reviewed in.
+        let collection = format!("<collection matches=\"1\">\n{REQUEST_XML}\n</collection>");
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/request?match=review%5B%40by_user%3D%27plusky%27%20and%20%40state%3D%27new%27%5D%20and%20state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%5D",
+            &collection,
+        );
+        let obs = obs_client(&http);
+        let client = PullRequestClient::new(Some(&obs), None);
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Obs),
+            reviewer: Some("plusky".to_string()),
+            ..Default::default()
+        };
+        let summaries = client.search(&query).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].reference, PullRequestRef::Obs(123));
+    }
+
+    #[test]
+    fn search_reviewer_is_accepted_on_both_arms() {
+        // The reviewer filter is no longer Gitea-only: OBS
+        // supports it server-side (an open review addressed to the
+        // login), so it validates unscoped and on either arm.
+        for backend in [
+            None,
+            Some(PullRequestBackend::Obs),
+            Some(PullRequestBackend::Gitea),
+        ] {
+            let query = PullRequestSearch {
+                backend,
+                reviewer: Some("plusky".to_string()),
+                ..Default::default()
+            };
+            assert!(query.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn multi_action_obs_request_carries_its_action_count() {
+        // The unified endpoints are the first action's only: the
+        // count says how many actions the request carries, so a
+        // multi-action request no longer reads as a single-action
+        // one. REQUEST_XML carries a submit and an add_role.
+        let collection = format!("<collection matches=\"1\">\n{REQUEST_XML}\n</collection>");
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/request/123?withhistory=1",
+                REQUEST_XML,
+            )
+            .with_get(
+                "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%20or%20%40name%3D%27declined%27%5D",
+                &collection,
+            );
+        let obs = obs_client(&http);
+        let client = PullRequestClient::new(Some(&obs), None);
+        let pr = client.show(&PullRequestRef::Obs(123)).unwrap();
+        assert_eq!(pr.action_count, 2);
+        assert_eq!(pr.source.repository, "xyz/abc");
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Obs),
+            ..Default::default()
+        };
+        let summaries = client.search(&query).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].action_count, 2);
+    }
+
+    #[test]
+    fn gitea_pull_request_carries_one_action() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                PR_JSON,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let pr = client.show(&gitea_ref()).unwrap();
+        assert_eq!(pr.action_count, 1);
+    }
+
+    #[test]
+    fn withdraw_gitea_with_a_comment_posts_the_outcome() {
+        // The outcome is recorded in the posted comment in
+        // parseable form, so a closed pull request still says
+        // whether it was withdrawn.
+        let http = FakeHttp::new()
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Withdrawn: Going another way.", "created_at": "2026-11-22T19:52:58Z"}"#,
+            )
+            .with_patch(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
+                &issue_json(122, "closed", false, "scarabeusiv"),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &pr_json_with_state("closed", false),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = gitea_client(&http);
+        let status = act_client(None, Some(&gitea))
+            .withdraw(
+                &gitea_ref(),
+                Some("Going another way."),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, PullRequestStatus::Closed);
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, r#"{"body":"Withdrawn: Going another way."}"#);
+        assert_eq!(http.patch_calls().len(), 1);
+    }
+
+    /// An OBS-native checkout for the `submit_from_checkout`
+    /// tests: `home:alice/foo` at rev 1, mirroring the CLI
+    /// submit fixture. `git` shells out to the `git` binary.
+    fn obs_submit_checkout() -> (tempfile::TempDir, WorkingCopy) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "--quiet"]).status.success());
+        assert!(git(&["config", "--local", "user.name", "geectl"])
+            .status
+            .success());
+        assert!(
+            git(&["config", "--local", "user.email", "geectl@localhost"])
+                .status
+                .success()
+        );
+        std::fs::write(root.join("foo.spec"), "Name: foo\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&[
+            "commit",
+            "--quiet",
+            "-m",
+            "geectl base 1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .status
+        .success());
+        for (key, value) in [
+            ("geectl.apiurl", "https://api.opensuse.org"),
+            ("geectl.project", "home:alice"),
+            ("geectl.package", "foo"),
+            ("geectl.backend", "obs"),
+            ("geectl.base-rev", "1"),
+            ("geectl.base-srcmd5", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        ] {
+            assert!(git(&["config", "--local", key, value]).status.success());
+        }
+        let wc = crate::working_copy::open(root).unwrap();
+        (dir, wc)
+    }
+
+    /// A git-backed checkout for the `submit_from_checkout`
+    /// tests: `home:alice/foo` tracking the fork
+    /// `scarabeus_iv/foo`, on `main`, mirroring the CLI submit
+    /// fixture.
+    fn git_submit_checkout() -> (tempfile::TempDir, WorkingCopy) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "--quiet", "-b", "main"]).status.success());
+        assert!(git(&["config", "--local", "user.name", "geectl"])
+            .status
+            .success());
+        assert!(
+            git(&["config", "--local", "user.email", "geectl@localhost"])
+                .status
+                .success()
+        );
+        std::fs::write(root.join("foo.spec"), "Name: foo\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "--quiet", "-m", "initial"])
+            .status
+            .success());
+        let head = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap();
+        let head = head.trim().to_string();
+        assert!(git(&[
+            "config",
+            "--local",
+            "remote.origin.url",
+            "https://src.opensuse.org/scarabeus_iv/foo",
+        ])
+        .status
+        .success());
+        for (key, value) in [
+            ("geectl.apiurl", "https://api.opensuse.org"),
+            ("geectl.project", "home:alice"),
+            ("geectl.package", "foo"),
+            ("geectl.backend", "git"),
+            ("geectl.base-rev", head.as_str()),
+            ("geectl.base-srcmd5", ""),
+        ] {
+            assert!(git(&["config", "--local", key, value]).status.success());
+        }
+        let wc = crate::working_copy::open(root).unwrap();
+        (dir, wc)
+    }
+
+    fn obs_submit_filing() -> SubmitFiling {
+        SubmitFiling {
+            target_project: Some("home:devel".to_string()),
+            description: Some("Update foo".to_string()),
+            changes_entry: Some("- Update to 1.1.".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn gitea_submit_filing() -> SubmitFiling {
+        SubmitFiling {
+            repo: Some("openSUSE/geectl".to_string()),
+            base: Some("main".to_string()),
+            title: Some("Update foo".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The OBS directory listing at the checkout's base: rev 1,
+    /// the base srcmd5.
+    const OBS_LISTING_REV1: &str = "<directory name=\"foo\" rev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" vrev=\"1\"><entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" /></directory>";
+
+    /// The fork the git checkout syncs from, with its parent: the
+    /// target the filing resolves and verifies against.
+    fn fork_repo_json() -> String {
+        r#"{"id": 7, "owner": {"login": "scarabeus_iv"}, "name": "foo", "full_name": "scarabeus_iv/foo", "description": "", "empty": true, "private": false, "fork": true, "parent": {"owner": {"login": "openSUSE"}, "name": "geectl", "full_name": "openSUSE/geectl"}, "html_url": "https://src.opensuse.org/scarabeus_iv/foo", "ssh_url": "gitea@src.opensuse.org:scarabeus_iv/foo.git", "clone_url": "https://src.opensuse.org/scarabeus_iv/foo.git", "default_branch": "main", "created_at": "2026-11-21T00:00:00Z"}"#.to_string()
+    }
+
+    /// A branch JSON body, shaped like Gitea 1.24.7 answers.
+    fn branch_json(name: &str, sha: &str) -> String {
+        format!(
+            r#"{{"name": "{name}", "commit": {{"id": "{sha}", "message": "OBS bridge sync"}}, "protected": false}}"#
+        )
+    }
+
+    #[test]
+    fn submit_from_checkout_obs_dry_run_plans_without_filing() {
+        let (_dir, wc) = obs_submit_checkout();
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo",
+            OBS_LISTING_REV1,
+        );
+        let obs = obs_client(&http);
+        let outcome = act_client(Some(&obs), None)
+            .submit_from_checkout(&wc, &obs_submit_filing(), None, &DryRun::new(true))
+            .unwrap();
+        assert_eq!(outcome.submitted, None);
+        let SubmitTarget::Obs(payload) = &outcome.target else {
+            panic!("an OBS checkout must resolve an OBS target");
+        };
+        assert_eq!(payload.source_project(), "home:alice");
+        assert_eq!(payload.source_package(), "foo");
+        assert_eq!(payload.target_project(), "home:devel");
+        assert_eq!(payload.target_package(), "foo");
+        assert!(http.post_calls().is_empty());
+        assert_eq!(http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn submit_from_checkout_obs_live_files() {
+        let (_dir, wc) = obs_submit_checkout();
+        // The open-request search URL comes from the client, like
+        // the payload filing tests compute it — never hardcoded.
+        let search_url = {
+            let probe = FakeHttp::new();
+            obs_client(&probe).search_url("foo").unwrap()
+        };
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo",
+                OBS_LISTING_REV1,
+            )
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = obs_client(&http);
+        let outcome = act_client(Some(&obs), None)
+            .submit_from_checkout(&wc, &obs_submit_filing(), None, &DryRun::new(false))
+            .unwrap();
+        assert_eq!(
+            outcome.submitted,
+            Some(Submitted {
+                reference: PullRequestRef::Obs(1400001),
+                superseded: vec![],
+            })
+        );
+        let SubmitTarget::Obs(payload) = &outcome.target else {
+            panic!("an OBS checkout must resolve an OBS target");
+        };
+        assert_eq!(payload.target_project(), "home:devel");
+        assert_eq!(http.get_calls().len(), 2);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn submit_from_checkout_gitea_dry_run_plans_without_filing() {
+        let (_dir, wc) = git_submit_checkout();
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/scarabeus_iv/foo",
+                &fork_repo_json(),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/branches/main",
+                &branch_json(
+                    "main",
+                    "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa",
+                ),
+            );
+        let gitea = gitea_client(&http);
+        let outcome = act_client(None, Some(&gitea))
+            .submit_from_checkout(
+                &wc,
+                &gitea_submit_filing(),
+                Some("test-token"),
+                &DryRun::new(true),
+            )
+            .unwrap();
+        assert_eq!(outcome.submitted, None);
+        let SubmitTarget::Gitea {
+            owner,
+            repo,
+            options,
+        } = &outcome.target
+        else {
+            panic!("a git checkout must resolve a Gitea target");
+        };
+        assert_eq!(owner, "openSUSE");
+        assert_eq!(repo, "geectl");
+        assert_eq!(options.head, "scarabeus_iv:main");
+        assert_eq!(options.base, "main");
+        assert_eq!(options.title, "Update foo");
+        assert!(http.post_calls().is_empty());
+        assert_eq!(http.get_calls().len(), 2);
+    }
+
+    #[test]
+    fn submit_from_checkout_gitea_live_without_a_token_fails_closed() {
+        let (_dir, wc) = git_submit_checkout();
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/scarabeus_iv/foo",
+                &fork_repo_json(),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/branches/main",
+                &branch_json(
+                    "main",
+                    "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa",
+                ),
+            );
+        let gitea = gitea_client(&http);
+        let err = act_client(None, Some(&gitea))
+            .submit_from_checkout(&wc, &gitea_submit_filing(), None, &DryRun::new(false))
+            .expect_err("a live git-backed filing without a token must fail closed");
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err
+            .to_string()
+            .contains("a git-backed submit needs a Gitea token"));
+        assert!(http.post_calls().is_empty());
     }
 }

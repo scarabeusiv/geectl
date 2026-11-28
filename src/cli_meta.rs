@@ -21,11 +21,9 @@
 //! global `--live`. A write on an arm needs that arm's credentials
 //! — OBS credentials for `--project`, the Gitea Bearer <redacted>
 //! for `--repo` — and fails closed naming them when they are
-//! missing. In dry-run the OBS client builds without credentials
-//! (the plan prints without them); the
-//! Gitea client still needs its credential to be built, so a
-//! dry-run Gitea write without one fails closed naming it, like
-//! the gitea group. The Gitea token resolves per URL — the
+//! missing. A dry-run write needs its arm's credentials to build
+//! its client, on both arms: dry-run only skips the mutation,
+//! never the credential requirement. The Gitea token resolves per URL — the
 //! matching alias's variables from the config file's `[instances]`
 //! table, else the plain variables — so the leaf works with the
 //! credential resolution on main; it assumes no login scheme
@@ -163,10 +161,11 @@ fn set_meta_target(args: &SetMetaArgs) -> Result<MetaTarget, GeectlError> {
 /// `auth::resolve_obs_for_url`), wiring the debug sink
 /// through. The client borrows the transport, so both live in this
 /// scope and the caller runs inside it. Reads pass `live` as true
-/// and fail fast on a credential resolution error; an act in
-/// dry-run takes the request group's leniency instead — the plan
-/// prints without credentials, with the failure on the debug
-/// channel and as a stderr warning.
+/// and fail fast on a credential resolution error; a write in
+/// dry-run needs its credentials like a live write does — dry-run
+/// only skips the mutation, never the credential requirement —
+/// so a dry-run write without OBS credentials fails closed naming
+/// them, like the Gitea arm.
 fn with_obs<T>(
     debug: &Debug,
     live: bool,
@@ -184,21 +183,19 @@ fn with_obs<T>(
         Some(alias) => EnvObsAuth::credentials_for_instance(alias, &file_config.instances),
         None => EnvObsAuth::credentials_for_url(&base, &base, &file_config.instances),
     };
-    let credentials = match resolve {
-        Ok(credentials) => credentials,
-        Err(err) if !live && instance.is_none() => {
-            // The dry run prints the plan without credentials, but
-            // the failure must not be silent: the same credentials
-            // would fail a `--live` run, so the error goes on the
-            // debug channel and as a stderr warning.
-            debug.emit(&format!(
-                "ignoring credential resolution error in dry-run mode: {err}"
-            ));
-            eprintln!("warning: ignoring credential resolution error in dry-run mode: {err}");
-            Credentials::None
-        }
-        Err(err) => return Err(err),
-    };
+    let credentials = resolve?;
+    if !live && matches!(credentials, Credentials::None) {
+        // A dry-run write needs the arm's credentials, like the
+        // Gitea arm: dry-run only skips the mutation, never the
+        // credential requirement. Without credentials there is no
+        // client to plan with, so the write fails closed naming
+        // them instead of printing a plan against an account it
+        // cannot use.
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            "no OBS credentials configured (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+        ));
+    }
     let client =
         ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
     f(&client)

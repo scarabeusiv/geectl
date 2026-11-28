@@ -96,9 +96,11 @@ pub struct PersonSearchResult {
 
 /// The uniform person-search client: one interface over the OBS
 /// and Gitea clients. An arm is `None` when its credentials are
-/// not configured: a search on that arm fails closed naming the
-/// missing credentials, and a search on the other arm never needs
-/// them.
+/// not configured: a search scoped to that arm fails closed
+/// naming the missing credentials, and a search on the other arm
+/// never needs them. An unscoped search runs the configured
+/// arm(s) and skips the missing one; only a search with no arm
+/// at all fails closed.
 pub struct PersonClient<'a> {
     obs: Option<&'a ObsClient<'a>>,
     gitea: Option<&'a GiteaClient<'a>>,
@@ -116,18 +118,36 @@ impl<'a> PersonClient<'a> {
     /// Search for a person as the two lists. With no backend
     /// both arms run, OBS first then Gitea; a backend scopes the
     /// search to that arm, and the other arm's list stays empty.
-    /// The OBS arm matches the login exactly; the Gitea arm
-    /// matches the keyword.
+    /// An arm without credentials is skipped: the search runs on
+    /// the configured arm(s), and only a search with no arm at
+    /// all fails closed naming the missing credentials. The OBS
+    /// arm matches the login exactly; the Gitea arm matches the
+    /// keyword.
     pub fn search(&self, query: &PersonSearch) -> Result<PersonSearchResult, GeectlError> {
         query.validate()?;
         let mut result = PersonSearchResult::default();
+        let mut ran = false;
         if query.backend.is_none() || query.backend == Some(PersonBackend::Obs) {
-            let obs = self.obs.ok_or_else(missing_obs_arm)?;
-            result.projects = obs.search_projects_by_person(&query.query)?;
+            if let Some(obs) = self.obs {
+                ran = true;
+                result.projects = obs.search_projects_by_person(&query.query)?;
+            }
         }
         if query.backend.is_none() || query.backend == Some(PersonBackend::Gitea) {
-            let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
-            result.users = gitea.user_search(&query.query)?;
+            if let Some(gitea) = self.gitea {
+                ran = true;
+                result.users = gitea.user_search(&query.query)?;
+            }
+        }
+        if !ran {
+            // No arm ran: the search had nothing to read from.
+            // The first arm in scope names the missing
+            // credentials, as a scoped search without its arm
+            // does.
+            return Err(match query.backend {
+                Some(PersonBackend::Gitea) => missing_gitea_arm(),
+                _ => missing_obs_arm(),
+            });
         }
         Ok(result)
     }
@@ -293,29 +313,36 @@ mod tests {
             err.to_string().contains("OBS credentials"),
             "the missing-arm error must name the credentials; got {err}"
         );
-        // OBS arm present, Gitea missing: the both-arms search
-        // fails on the Gitea arm, the OBS-scoped one runs.
-        let err = PersonClient::new(Some(&obs), None)
+        // OBS arm present, Gitea missing: the unscoped search
+        // runs the OBS arm and leaves the users empty.
+        let result = PersonClient::new(Some(&obs), None)
             .search(&search("alice", None))
-            .expect_err("a both-arms search without a Gitea arm must fail");
+            .unwrap();
+        assert_eq!(result.projects.len(), 1);
+        assert!(result.users.is_empty());
+        // A search scoped to the missing arm still fails closed.
+        let err = PersonClient::new(Some(&obs), None)
+            .search(&search("alice", Some(PersonBackend::Gitea)))
+            .expect_err("a Gitea-scoped search without a Gitea arm must fail");
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(
             err.to_string().contains("Gitea token"),
             "the missing-arm error must name the token; got {err}"
         );
-        let result = PersonClient::new(Some(&obs), None)
-            .search(&search("alice", Some(PersonBackend::Obs)))
-            .unwrap();
-        assert_eq!(result.projects.len(), 1);
         // Gitea arm present, OBS missing: the mirror case.
-        let err = PersonClient::new(None, Some(&gitea))
-            .search(&search("alice", None))
-            .expect_err("a both-arms search without an OBS arm must fail");
-        assert_eq!(err.kind(), ErrorKind::ConfigError);
         let result = PersonClient::new(None, Some(&gitea))
-            .search(&search("alice", Some(PersonBackend::Gitea)))
+            .search(&search("alice", None))
             .unwrap();
+        assert!(result.projects.is_empty());
         assert_eq!(result.users.len(), 1);
+        let err = PersonClient::new(None, Some(&gitea))
+            .search(&search("alice", Some(PersonBackend::Obs)))
+            .expect_err("an OBS-scoped search without an OBS arm must fail");
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.to_string().contains("OBS credentials"),
+            "the missing-arm error must name the credentials; got {err}"
+        );
     }
 
     #[test]

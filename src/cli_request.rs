@@ -1456,11 +1456,24 @@ fn file_maintenance_incident_text(
 /// library records plan lines only when dry-run is enabled), so the
 /// field is omitted there.
 pub(crate) fn add_plan(payload: &mut Value, dry_run: &DryRun) {
+    add_plan_lines(payload, dry_run, &dry_run.plan());
+}
+
+/// Add the dry-run `plan` to a mutation payload from explicit
+/// lines, like [`add_plan`] but for a plan recorded on another
+/// dry-run mode — the library's merge-time cleanup records its
+/// lines on its own mode, and the CLI renders them into the
+/// cleanup payload from the outcome.
+pub(crate) fn add_plan_lines(payload: &mut Value, dry_run: &DryRun, plan: &[String]) {
     if dry_run.enabled() {
         if let Value::Object(map) = payload {
             map.insert(
                 "plan".to_string(),
-                Value::Array(dry_run.plan().into_iter().map(Value::String).collect()),
+                Value::Array(
+                    plan.iter()
+                        .map(|line| Value::String(line.clone()))
+                        .collect(),
+                ),
             );
         }
     }
@@ -1608,7 +1621,7 @@ pub(crate) fn accept_cleanup(
         client.cleanup_accepted_request(id, &dry_run)
     }) {
         Ok(cleanup) => (
-            accept_cleanup_json(&cleanup, &dry_run),
+            accept_cleanup_json(&cleanup, &dry_run, &dry_run.plan()),
             accept_cleanup_text(&cleanup, &dry_run),
         ),
         Err(err) => (
@@ -1625,7 +1638,11 @@ pub(crate) fn accept_cleanup(
 
 /// The accept-time cleanup as JSON: the request id, one outcome per
 /// submit source, and the dry-run plan when dry-running.
-fn accept_cleanup_json(cleanup: &AcceptCleanup, dry_run: &DryRun) -> Value {
+pub(crate) fn accept_cleanup_json(
+    cleanup: &AcceptCleanup,
+    dry_run: &DryRun,
+    plan: &[String],
+) -> Value {
     let mut payload = json!({
         "id": cleanup.id,
         "dry_run": dry_run.enabled(),
@@ -1639,7 +1656,7 @@ fn accept_cleanup_json(cleanup: &AcceptCleanup, dry_run: &DryRun) -> Value {
             }))
             .collect::<Vec<_>>(),
     });
-    add_plan(&mut payload, dry_run);
+    add_plan_lines(&mut payload, dry_run, plan);
     payload
 }
 
@@ -1659,7 +1676,7 @@ pub(crate) fn cleanup_step_json(step: &CleanupStep) -> Value {
 /// source was a plain no-marker skip — most accepts are not branch
 /// accepts — and when the request had no submit actions at all. The
 /// payload records every outcome either way.
-fn accept_cleanup_text(cleanup: &AcceptCleanup, dry_run: &DryRun) -> String {
+pub(crate) fn accept_cleanup_text(cleanup: &AcceptCleanup, dry_run: &DryRun) -> String {
     let reportable: Vec<_> = cleanup
         .outcomes
         .iter()
@@ -1771,7 +1788,7 @@ pub(crate) fn forward(
 
 /// The forward result as JSON: the original id, one outcome per
 /// submit action, and the dry-run plan when dry-running.
-fn forward_json(result: &ForwardResult, dry_run: &DryRun) -> Value {
+pub(crate) fn forward_json(result: &ForwardResult, dry_run: &DryRun) -> Value {
     let mut payload = json!({
         "id": result.id,
         "actions": result.actions.iter().map(forward_action_json).collect::<Vec<_>>(),
@@ -1825,7 +1842,7 @@ pub(crate) fn forward_action_json(action: &ForwardActionResult) -> Value {
 /// The forward result as text: one header line naming the
 /// request and whether anything was forwarded, then one line per
 /// action. The full result is the JSON payload.
-fn forward_text(result: &ForwardResult, dry_run: &DryRun) -> String {
+pub(crate) fn forward_text(result: &ForwardResult, dry_run: &DryRun) -> String {
     let filed = result.actions.iter().any(|action| {
         matches!(
             action,
@@ -1976,7 +1993,7 @@ pub(crate) fn with_client<T>(
 /// Falls back to the string if the id is not numeric — unreachable
 /// for a server-validated id, but the payload stays total without
 /// an unwrap.
-fn request_id_json(id: &str) -> Value {
+pub(crate) fn request_id_json(id: &str) -> Value {
     match id.parse::<u64>() {
         Ok(number) => json!(number),
         Err(_) => json!(id),

@@ -95,7 +95,7 @@ the dropped error goes to the debug channel) — except
 credentials like the reads, and `request accept`'s cleanup leg,
 which reads the request first and reports an error in its cleanup
 section without them. With `--instance` the flagged instance's
-credentials are strict, so the error propagates even in dry-run. `meta` takes the same leniency on its OBS arm: a dry-run `meta set --project` prints the plan while any credential-resolution error (a half-configured pair or a conflicting set) is reported on the debug channel and as a stderr warning. The Gitea arm resolves its token up front: a dry-run `meta set --repo` reports a missing token as a configuration error. `remote` and `build`
+credentials are strict, so the error propagates even in dry-run. `meta` fails fast on it on both arms: a dry-run `meta set` needs its arm's credentials to build its client, like a live write does — dry-run only skips the mutation. The Gitea arm resolves its token up front: a dry-run `meta set --repo` reports a missing token as a configuration error, and a dry-run `meta set --project` without OBS credentials reports them the same way. `remote` and `build`
 resolve credentials per command instead: the public reads (see
 Credentials in `docs/architecture.md`) skip credentials, so a half-set
 env leaves them working; a dry-run `remote` mutation
@@ -330,22 +330,22 @@ without evaluating trust.
 
 - `geectl pull-request show <REFERENCE>` — Show one pull request: `obs:<id>` or `gitea:<owner>/<repo>#<number>`.
 - `geectl pull-request diff <REFERENCE>` — Show the diff of a pull request: the unified diff, like `request diff`; key flags: --xml
-- `geectl pull-request search` — Search pull requests: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea; key flags: --backend <BACKEND>, --state <STATE>, --creator <CREATOR>, --reviewer <REVIEWER>, --repo <REPO>
+- `geectl pull-request search` — Search pull requests: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea; an arm without credentials is skipped and the search runs on the other arm, naming the skipped arm in the result; key flags: --backend <BACKEND>, --state <STATE>, --creator <CREATOR>, --reviewer <REVIEWER>, --repo <REPO>
 - `geectl pull-request approve <REFERENCE>` — Approve a pull request as the review asked of the target: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea); key flags: --message <MESSAGE>, --commit <COMMIT>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
 - `geectl pull-request request-changes <REFERENCE>` — Ask for changes on a pull request, as `approve` but with the review declined instead of accepted; key flags: --message <MESSAGE>, --commit <COMMIT>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
 - `geectl pull-request comment --body <BODY> <REFERENCE>` — Comment on a pull request; key flags: --parent <PARENT>
-- `geectl pull-request build-comment --project <PROJECT> --package <PACKAGE> <REFERENCE>` — Post the build-link comment on a Gitea pull request: the OBS build results for the test project and package as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; key flags: --project <PROJECT>, --package <PACKAGE>
+- `geectl gitea build-comment --project <PROJECT> --package <PACKAGE> <REFERENCE>` — Post the build-link comment on a Gitea pull request: the OBS build results for the test project and package as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; key flags: --project <PROJECT>, --package <PACKAGE>
 - `geectl pull-request comments <REFERENCE>` — List the comments on a pull request, oldest first; a comment on a diff carries its target, file, and line.
 - `geectl pull-request cancel-review-request <REFERENCE>` — Cancel pending review requests on a pull request; key flags: --reviewer <REVIEWER>, --all, --exclude <EXCLUDE>
 - `geectl pull-request merge <REFERENCE>` — Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent, or to openSUSE:Factory when the target has no link and the Factory package records it as its devel; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless `--no-forward` is given. After the merge lands, the branch home the pull request came from is cleaned up like the OBS arm's, and merges done outside geectl are left for `gitea cleanup-forks`. The OBS arm checks the hop after accepting while the Gitea arm preflights it, because the Gitea merge is irreversible while the accept flow's forward is retryable; key flags: --message <MESSAGE>, --method <METHOD>, --force, --forward-message <FORWARD_MESSAGE>, --no-forward- `geectl pull-request decline <REFERENCE>` — Decline a pull request; key flags: --message <MESSAGE>
 - `geectl pull-request withdraw <REFERENCE>` — Withdraw a pull request; key flags: --message <MESSAGE>
 - `geectl pull-request reopen <REFERENCE>` — Reopen a pull request.
 - `geectl pull-request submit` — File a submission from the working copy in the current directory: an OBS submit request from an OBS-native checkout, a Gitea pull request from a git-backed one; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --description <DESCRIPTION>, --changes-entry <CHANGES_ENTRY>, --title <TITLE>, --body <BODY>, --draft
-- `geectl pull-request cleanup` — Clean the local build roots for the submit request filed from the working copy in the current directory, when that request is accepted.
+- `geectl pull-request cleanup` — Clean the local build roots for the submit request or pull request filed from the working copy in the current directory, when that request is accepted (OBS) or merged (Gitea); a dry run still needs the recorded arm's credentials to build its client.
 
 ## `person` — unified person search
 
-- `geectl person search <QUERY>` — Search for a person: the OBS projects naming the login, and the Gitea users matching the keyword; key flags: --backend <BACKEND>
+- `geectl person search <QUERY>` — Search for a person: the OBS projects naming the login, and the Gitea users matching the keyword; an arm without credentials is skipped and the search runs on the other arm, naming the skipped arm in the result; key flags: --backend <BACKEND>
 
 ## `meta` — unified meta write
 
