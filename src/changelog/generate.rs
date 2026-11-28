@@ -171,40 +171,80 @@ pub fn message_bullets(text: &str) -> Vec<String> {
     lines
 }
 
-/// The version an `Update to` bullet names, if the bullet is one:
-/// `- Update to 2.0` / `- Updated to 2.0`, the marker matched
-/// case-insensitively, the version kept verbatim — the bullet is
-/// human text, so `2.0-RC1` stays `2.0-RC1` and compares equal to
-/// the spec's version. (Lowercasing the whole bullet first returned
-/// `2.0-rc1`, which read as a new version and demanded NEWS for a
-/// hotfix.) Mirrors the update-bullet shape V9 recognises.
+/// The version a bullet documents, if it documents one: `- Update to`, `- Version`, or `- <name> <version>:` — gated so prose cannot read as a baseline.
 fn update_bullet_version(text: &str) -> Option<String> {
-    let rest = ["- update to ", "- updated to "]
-        .iter()
-        .find_map(|marker| {
-            text.get(..marker.len())
-                .filter(|head| head.eq_ignore_ascii_case(marker))
-                .map(|_| &text[marker.len()..])
-        })?;
-    let mut words = rest.split_whitespace();
-    let mut version = words.next()?;
-    if version.eq_ignore_ascii_case("version") {
-        version = words.next()?;
+    let rest = ["- update to ", "- updated to "].iter().find_map(|marker| {
+        text.get(..marker.len())
+            .filter(|head| head.eq_ignore_ascii_case(marker))
+            .map(|_| &text[marker.len()..])
+    });
+    if let Some(rest) = rest {
+        let mut words = rest.split_whitespace();
+        let mut version = words.next()?;
+        if version.eq_ignore_ascii_case("version") {
+            version = words.next()?;
+        }
+        let version = version.trim_end_matches(['.', ',', ')', ';', ':']);
+        // A leading word is not a version: `- Update to release 2026` names none.
+        if !is_version_token(version) {
+            return None;
+        }
+        return Some(version.to_string());
     }
-    Some(
-        version
-            .trim_end_matches(['.', ',', ')', ';', ':'])
-            .to_string(),
-    )
+    let body = text.strip_prefix("- ")?;
+    // `- Version X` (trailing colon tolerated), nothing after it: `- Version 2.0 branch is EOL` is prose, not a record.
+    if body
+        .get(.."version".len())
+        .is_some_and(|head| head.eq_ignore_ascii_case("version"))
+    {
+        let rest = body["version".len()..]
+            .strip_prefix(':')
+            .unwrap_or(&body["version".len()..]);
+        let rest = rest.trim_start();
+        let token = rest.split_whitespace().next()?;
+        let version = token.trim_end_matches(['.', ',', ')', ';', ':']);
+        if !rest[token.len()..].trim().is_empty() {
+            return None;
+        }
+        if is_version_token(version) {
+            return Some(version.to_string());
+        }
+        return None;
+    }
+    // `- <name> X:` — the name is one token, or a run whose last word starts uppercase; lowercase runs and bare versions are prose.
+    // Prose shaped exactly like a header (`- Release Notes 2.0:`) still reads as a version: the shapes are identical.
+    let without_colon = text.strip_suffix(':')?.trim_end();
+    let token = without_colon.split_whitespace().last()?;
+    let version = token.trim_end_matches(['.', ',', ')', ';', ':']);
+    if !is_version_token(version) {
+        return None;
+    }
+    let name = without_colon
+        .strip_suffix(token)?
+        .trim_end()
+        .strip_prefix("- ")
+        .unwrap_or("");
+    let name_words: Vec<&str> = name.split_whitespace().collect();
+    if name_words.len() == 1
+        || name_words
+            .last()
+            .is_some_and(|word| word.chars().next().is_some_and(|c| c.is_uppercase()))
+    {
+        return Some(version.to_string());
+    }
+    None
 }
 
-/// Whether the local version is new relative to the baseline: the
-/// target spec when a target is given, else the version the local
-/// `.changes` file already documents — the most recent `Update to`
-/// bullet across its entries. A version with no baseline at all
-/// (no target, no `.changes` entry documenting any version) is
-/// new: the first entry for a new package. A spec with no version
-/// is never new.
+/// A token that reads as a version: a leading digit, then version characters only.
+fn is_version_token(token: &str) -> bool {
+    let mut chars = token.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '~' | '_'))
+}
+
+/// Whether the local version is new relative to the baseline: the target spec when given, else the version the local `.changes` already documents.
 pub fn version_is_new(local: &PackageSnapshot, target: Option<&PackageSnapshot>) -> bool {
     let spec_names = local.spec_names();
     let local_spec = spec_names
@@ -226,15 +266,7 @@ pub fn version_is_new(local: &PackageSnapshot, target: Option<&PackageSnapshot>)
             }
         }
         None => {
-            // No target: the baseline is what the local `.changes`
-            // file already documents. The most recent `Update to`
-            // bullet names the version the entries already cover —
-            // a hotfix on that version, or a later entry for it,
-            // still names it through an older bullet. Prefer the
-            // changes file whose stem matches the chosen spec: in
-            // a multibuild tree the first file in name order can
-            // belong to another subpackage. Fall back to name
-            // order when no file matches the chosen spec.
+            // No target: the baseline is the version the local `.changes` already documents, preferring the file matching the spec.
             let mut names = local.changes_names();
             if let Some(stem) = spec_names
                 .first()
@@ -506,7 +538,7 @@ pub struct PrependedEntry {
 /// legacy encodings transcoded to UTF-8 — so the suffix check runs
 /// on the normalized text, not the raw bytes, and bytes no known
 /// encoding decodes refuse the write instead of being kept as
-/// U+FFFD.
+/// U+FFFD. The composed file ends with exactly one newline.
 pub fn prepend_entry(old_bytes: &[u8], entry: &str) -> Result<PrependedEntry, String> {
     let report = normalize_changes_content_checked(old_bytes);
     if report.had_undecodable_bytes {
@@ -516,6 +548,15 @@ pub fn prepend_entry(old_bytes: &[u8], entry: &str) -> Result<PrependedEntry, St
         );
     }
     let old_content = report.text;
+    // The composed file ends with exactly one newline; a blank-only old file reads as empty.
+    let old_content = {
+        let trimmed = old_content.trim_end_matches('\n');
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}\n")
+        }
+    };
     let source_encoding = report.source_encoding;
     let guessed_single_byte = report.guessed_single_byte;
     // A fresh file ends with exactly one newline: the entry's
@@ -576,6 +617,27 @@ mod tests {
 
     const SPEC_V2: &str = "Name:           foo\nVersion:        2.0\nLicense:        GPL-3.0-only\nSource0:        foo-2.0.tar.gz\nPatch0:         new.patch\nBuildRequires:  pkgconfig\n%changelog\n";
     const SPEC_V1: &str = "Name:           foo\nVersion:        1.0\nLicense:        MIT\nSource0:        foo-1.0.tar.gz\nPatch0:         old.patch\n%changelog\n";
+
+    /// The written file ends with the given last line plus exactly one newline.
+    fn assert_single_trailing_newline(content: &str, last_line: &str) {
+        assert!(content.ends_with(&format!("{last_line}\n")));
+        assert!(!content.ends_with("\n\n"));
+    }
+
+    /// The file just written passes validate's end-of-file check.
+    fn assert_passes_v11_end_of_file(content: &str) {
+        use crate::changelog::validate::Rule;
+        let local = snapshot(&[("foo.spec", SPEC_V2), ("foo.changes", content)]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == Rule::V11 && f.message.contains("trailing blank line")),
+            "findings: {:?}",
+            report.findings
+        );
+    }
 
     #[test]
     fn generate_skeleton_from_the_diff() {
@@ -683,8 +745,33 @@ mod tests {
             format!("{sep}\nThu May 28 10:00:00 UTC 2026 - Jane <jane@example.com>\n\n- New\n\n");
         let new = prepend_entry(old.as_bytes(), &entry).expect("prepend succeeds");
         assert!(new.content.starts_with(&entry));
-        assert!(new.content.ends_with(&old));
+        assert_single_trailing_newline(&new.content, "- Old");
         assert_eq!(new.source_encoding, None);
+    }
+
+    #[test]
+    fn prepend_entry_drops_trailing_blank_lines_from_the_old_file() {
+        let sep = "-".repeat(67);
+        let old =
+            format!("{sep}\nWed May 27 16:31:48 UTC 2026 - Jane <jane@example.com>\n\n- Old\n\n");
+        let entry =
+            format!("{sep}\nThu May 28 10:00:00 UTC 2026 - Jane <jane@example.com>\n\n- New\n\n");
+        let new = prepend_entry(old.as_bytes(), &entry).expect("prepend succeeds");
+        assert!(new.content.starts_with(&entry));
+        assert_single_trailing_newline(&new.content, "- Old");
+        assert_passes_v11_end_of_file(&new.content);
+    }
+
+    #[test]
+    fn prepend_entry_adds_a_missing_final_newline() {
+        let sep = "-".repeat(67);
+        let old = format!("{sep}\nWed May 27 16:31:48 UTC 2026 - Jane <jane@example.com>\n\n- Old");
+        let entry =
+            format!("{sep}\nThu May 28 10:00:00 UTC 2026 - Jane <jane@example.com>\n\n- New\n\n");
+        let new = prepend_entry(old.as_bytes(), &entry).expect("prepend succeeds");
+        assert!(new.content.starts_with(&entry));
+        assert_single_trailing_newline(&new.content, "- Old");
+        assert_passes_v11_end_of_file(&new.content);
     }
 
     #[test]
@@ -701,7 +788,7 @@ mod tests {
             format!("{sep}\nThu May 28 10:00:00 UTC 2026 - Jane <jane@example.com>\n\n- New\n\n");
         let new = prepend_entry(old.as_bytes(), &entry).expect("prepend succeeds");
         assert!(new.content.starts_with(&entry));
-        assert!(new.content.ends_with(&old));
+        assert_single_trailing_newline(&new.content, "- Old Meego change");
         assert_eq!(new.source_encoding, None);
     }
 
@@ -717,7 +804,7 @@ mod tests {
             format!("{sep}\nThu May 28 10:00:00 UTC 2026 - Jane <jane@example.com>\n\n- New\n\n");
         let new = prepend_entry(old.as_bytes(), &entry).expect("prepend succeeds");
         assert!(new.content.starts_with(&entry));
-        assert!(new.content.ends_with(old));
+        assert_single_trailing_newline(&new.content, "- Older change");
         assert_eq!(new.source_encoding, None);
     }
 
@@ -1032,6 +1119,58 @@ mod tests {
     }
 
     #[test]
+    fn version_is_new_recognises_a_version_documented_without_update_to() {
+        for bullet in ["- Testpkg 2.0:", "- Version 2.0", "- GNU Hello 2.0:"] {
+            let changes = format!(
+                "{}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n{bullet}\n\n",
+                "-".repeat(67)
+            );
+            let local = snapshot(&[("foo.spec", SPEC_V2), ("foo.changes", &changes)]);
+            assert!(!version_is_new(&local, None), "bullet {bullet}");
+        }
+        // With a message the entry carries only the message.
+        let changes = format!(
+            "{}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Testpkg 2.0:\n\n",
+            "-".repeat(67)
+        );
+        let local = snapshot(&[("foo.spec", SPEC_V2), ("foo.changes", &changes)]);
+        let gen = generate(
+            &local,
+            None,
+            "Jane Packager <jane@example.com>",
+            None,
+            &messages(&["fix bug124"]),
+        )
+        .expect("generation runs");
+        assert!(gen.entry.contains("- fix bug124"));
+        assert!(!gen.entry.contains("Update to"));
+        // Without a message there is nothing to generate.
+        let err = generate(&local, None, "Jane Packager <jane@example.com>", None, &[])
+            .expect_err("nothing to generate");
+        assert!(err.context.contains("nothing to generate"));
+    }
+
+    #[test]
+    fn version_is_new_ignores_prose_about_a_version() {
+        // Prose about a version is not a record of it.
+        let changes = format!(
+            "{}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Version 2.0 branch is EOL\n\n",
+            "-".repeat(67)
+        );
+        let local = snapshot(&[("foo.spec", SPEC_V2), ("foo.changes", &changes)]);
+        assert!(version_is_new(&local, None));
+        let gen = generate(
+            &local,
+            None,
+            "Jane Packager <jane@example.com>",
+            None,
+            &messages(&["fix bug125"]),
+        )
+        .expect("generation runs");
+        assert!(gen.entry.contains("- Update to 2.0"));
+    }
+
+    #[test]
     fn update_bullet_version_keeps_the_version_verbatim() {
         assert_eq!(
             update_bullet_version("- Update to 2.0-RC1").as_deref(),
@@ -1047,6 +1186,45 @@ mod tests {
             update_bullet_version("- Updated to version 2.0").as_deref(),
             Some("2.0")
         );
+        // A digit-led token still counts, even a bare year.
+        assert_eq!(
+            update_bullet_version("- Update to 2026").as_deref(),
+            Some("2026")
+        );
+        // The first token after the marker must read as a version.
+        assert_eq!(update_bullet_version("- Update to release 2026"), None);
+        assert_eq!(update_bullet_version("- Fix a crash"), None);
+    }
+
+    #[test]
+    fn update_bullet_version_recognises_named_and_version_forms() {
+        assert_eq!(
+            update_bullet_version("- Testpkg 1.0:").as_deref(),
+            Some("1.0")
+        );
+        assert_eq!(
+            update_bullet_version("- GNU Hello 2.12.3:").as_deref(),
+            Some("2.12.3")
+        );
+        assert_eq!(
+            update_bullet_version("- Version 1.0").as_deref(),
+            Some("1.0")
+        );
+        assert_eq!(
+            update_bullet_version("- Version 2.0-RC1").as_deref(),
+            Some("2.0-RC1")
+        );
+        // A one-token name reads as a name even lowercase.
+        assert_eq!(update_bullet_version("- foo 2.0:").as_deref(), Some("2.0"));
+        // Prose about a version is not a record of it.
+        assert_eq!(update_bullet_version("- Version 2.0 branch is EOL"), None);
+        assert_eq!(update_bullet_version("- See section 2.0:"), None);
+        assert_eq!(update_bullet_version("- Changes in 2.0:"), None);
+        assert_eq!(update_bullet_version("- Fix bug 1234:"), None);
+        assert_eq!(update_bullet_version("- 2.0:"), None);
+        assert_eq!(update_bullet_version("- 2026:"), None);
+        // No trailing colon and no `Version` form: not a documented version.
+        assert_eq!(update_bullet_version("- Fix the crash in 2.0"), None);
         assert_eq!(update_bullet_version("- Fix a crash"), None);
     }
 

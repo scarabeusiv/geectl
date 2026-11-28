@@ -715,8 +715,15 @@ fn check_entry_format(
                 ),
             });
         }
-        // Blank line after the header.
-        if let Some((_, first)) = entry.body.first() {
+        // Blank line after the header; a body of blank lines only is no body at all.
+        if entry.body_nonblank().is_empty() {
+            report.findings.push(Finding {
+                rule: Rule::V11,
+                file: changes_name.to_string(),
+                line: entry.header_line,
+                message: "entry has no body — describe the change".to_string(),
+            });
+        } else if let Some((_, first)) = entry.body.first() {
             if !first.trim().is_empty() {
                 report.findings.push(Finding {
                     rule: Rule::V11,
@@ -725,13 +732,6 @@ fn check_entry_format(
                     message: "missing blank line after the entry header".to_string(),
                 });
             }
-        } else {
-            report.findings.push(Finding {
-                rule: Rule::V11,
-                file: changes_name.to_string(),
-                line: entry.header_line,
-                message: "entry has no body — describe the change".to_string(),
-            });
         }
         // Blank line before the next separator (the boundary after
         // the newest entry is in scope even when the next entry is
@@ -1272,7 +1272,8 @@ fn check_file_ending(
 /// new version. NEWS only changes the message — when a section was
 /// found, the finding names it as the material to distill.
 /// A draft marker left by `generate` (`TODO` slots) is also a
-/// needs-detail finding: the human step has not run yet.
+/// needs-detail finding, update line or not: the human step has not
+/// run yet.
 fn check_bare_update(
     changes_name: &str,
     entry: &Entry,
@@ -1281,6 +1282,21 @@ fn check_bare_update(
     options: &ValidateOptions<'_>,
     report: &mut ValidationReport,
 ) {
+    // A leftover generation slot is never a finished entry, update line or not.
+    let has_todo_slot = entry
+        .body_nonblank()
+        .iter()
+        .any(|(_, line)| is_unfilled_slot(line));
+    if has_todo_slot {
+        report.findings.push(Finding {
+            rule: Rule::V9,
+            file: changes_name.to_string(),
+            line: entry.bullets().first().map(|(n, _, _)| *n).unwrap_or(entry.header_line),
+            message: "entry still carries unfilled generation slots (TODO) — fill in the reasons and the upstream highlights before filing"
+                .to_string(),
+        });
+        return;
+    }
     let bullets = entry.bullets();
     let update = |text: &str| {
         let lower = text.to_lowercase();
@@ -1308,21 +1324,6 @@ fn check_bare_update(
             || contains_ci(line, "no user visible change")
             || contains_ci(line, "no visible change")
     });
-    // A leftover generation slot is never a finished entry.
-    let has_todo_slot = entry
-        .body_nonblank()
-        .iter()
-        .any(|(_, line)| is_unfilled_slot(line));
-    if has_todo_slot {
-        report.findings.push(Finding {
-            rule: Rule::V9,
-            file: changes_name.to_string(),
-            line: entry.bullets().first().map(|(n, _, _)| *n).unwrap_or(entry.header_line),
-            message: "entry still carries unfilled generation slots (TODO) — fill in the reasons and the upstream highlights before filing"
-                .to_string(),
-        });
-        return;
-    }
     if other.is_empty() && !states_no_change {
         // NEWS only changes the message, never whether the rule
         // fires: with a section the author has material to distill,
@@ -1539,8 +1540,9 @@ fn check_bug_refs(changes_name: &str, entry: &Entry, report: &mut ValidationRepo
                 ),
             });
         }
-        // Incomplete CVE ids.
-        for partial in partial_cve_ids(&text) {
+        // Incomplete CVE ids: the bare-CVE arm below strips these first, so a partial id is not also a bare mention.
+        let partials = partial_cve_ids(&text);
+        for partial in &partials {
             report.findings.push(Finding {
                 rule: Rule::V12,
                 file: changes_name.to_string(),
@@ -1560,7 +1562,12 @@ fn check_bug_refs(changes_name: &str, entry: &Entry, report: &mut ValidationRepo
             || !bug_refs(&text, "bnc").is_empty()
             || text.to_uppercase().contains("GHSA-");
         let lower = text.to_lowercase();
-        let bare_cve = contains_word(&lower, "cve") || contains_word(&lower, "cves");
+        // A partial id reads as a bare `CVE` word to `contains_word`; strip the covered ids first.
+        let mut stripped = lower.clone();
+        for partial in &partials {
+            stripped = stripped.replace(&partial.to_lowercase(), " ");
+        }
+        let bare_cve = contains_word(&stripped, "cve") || contains_word(&stripped, "cves");
         let security_claim = [
             "security fix",
             "security fixes",
@@ -1756,8 +1763,10 @@ const NOT_FIXED: [&str; 17] = [
 ];
 
 /// Phrases that state an issue does not affect this package.
-const NOT_AFFECTED: [&str; 9] = [
+const NOT_AFFECTED: [&str; 11] = [
     "not affected",
+    "does not affect",
+    "doesn't affect",
     "is not affected by",
     "unaffected",
     "not vulnerable",
@@ -2232,6 +2241,25 @@ mod tests {
     }
 
     #[test]
+    fn v12_reports_one_incomplete_cve_id_once() {
+        let local = snapshot(&[
+            ("foo.spec", SPEC),
+            (
+                "foo.changes",
+                &changes_file("- Update to 2.0\n- Fix CVE-2026-12", "- Initial package"),
+            ),
+        ]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        let v12: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == Rule::V12)
+            .collect();
+        assert_eq!(v12.len(), 1, "findings: {:?}", report.findings);
+        assert!(v12[0].message.contains("incomplete CVE"));
+    }
+
+    #[test]
     fn v12_flags_a_cve_named_as_not_fixed() {
         let local = snapshot(&[
             ("foo.spec", SPEC),
@@ -2529,6 +2557,49 @@ mod tests {
     }
 
     #[test]
+    fn v9_todo_slot_is_a_finding_without_an_update_line() {
+        let local = snapshot(&[
+            ("foo.spec", SPEC),
+            (
+                "foo.changes",
+                &changes_file(
+                    "- Fix the crash on startup\n- Upstream highlights (TODO: distill to the user-facing items; drop CI, test-only and non-Linux noise):\n  * TODO: summarize the upstream changes, or state '* No user-visible changes' if the release truly has none",
+                    "- Initial package",
+                ),
+            ),
+        ]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == Rule::V9 && f.message.contains("unfilled generation slots")),
+            "findings: {:?}",
+            report.findings
+        );
+        // A `reason: TODO` sub-bullet in a non-update entry is likewise a leftover slot.
+        let local = snapshot(&[
+            ("foo.spec", SPEC),
+            (
+                "foo.changes",
+                &changes_file(
+                    "- Fix the crash on startup\n  * reason: TODO",
+                    "- Initial package",
+                ),
+            ),
+        ]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == Rule::V9 && f.message.contains("unfilled generation slots")),
+            "findings: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
     fn v10_direction_ignores_a_line_saying_no_change() {
         let target = snapshot(&[
             ("foo.spec", SPEC),
@@ -2629,6 +2700,24 @@ mod tests {
     }
 
     #[test]
+    fn v11_flags_a_newest_entry_whose_body_is_only_blank_lines() {
+        // The newest entry carries no content, only the blank line(s) before the next separator.
+        let local = snapshot(&[
+            ("foo.spec", SPEC),
+            ("foo.changes", &changes_file("", "- Initial package")),
+        ]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == Rule::V11 && f.message.contains("entry has no body")),
+            "findings: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
     fn v12_flags_a_top_level_cve_named_as_not_affected() {
         let local = snapshot(&[
             ("foo.spec", SPEC),
@@ -2645,6 +2734,31 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.rule == Rule::V12 && f.message.contains("not fixed / not affected")));
+    }
+
+    #[test]
+    fn v12_flags_a_cve_the_entry_says_does_not_affect_the_package() {
+        for bullet in [
+            "- CVE-2026-12345 does not affect this package",
+            "- CVE-2026-12345 doesn't affect this package",
+        ] {
+            let local = snapshot(&[
+                ("foo.spec", SPEC),
+                (
+                    "foo.changes",
+                    &changes_file(&format!("- Update to 2.0\n{bullet}"), "- Initial package"),
+                ),
+            ]);
+            let report = validate(&local, None, &ValidateOptions::default());
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|f| f.rule == Rule::V12 && f.message.contains("not fixed / not affected")),
+                "bullet {bullet:?} findings: {:?}",
+                report.findings
+            );
+        }
     }
 
     #[test]
