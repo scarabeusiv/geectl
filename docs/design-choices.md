@@ -162,6 +162,13 @@ Errors are structured values from the central store (kind, code,
 message, remediation, exit code). The server's error body is parsed with
 the same hardened XML parser as everything else; if parsing fails,
 the raw status plus a truncated body excerpt are reported as data.
+An error's context may also carry a bounded, redacted wire preview
+(see `debug::format_body_preview`: credential-redacted,
+control-stripped, capped): diagnostic data for a malformed server
+response, never a second identity — callers match on the kind,
+never on the context. The previews are retained deliberately:
+without them a malformed response is undiagnosable from the error
+alone.
 Every error kind renders cleanly — the error path has its own test.
 
 Rationale: structured errors give callers a stable identity to match

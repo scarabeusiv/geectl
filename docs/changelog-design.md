@@ -13,7 +13,7 @@ geectl changelog identity [<dir>]
 ```
 
 `dir` defaults to `.`. The target flags pass as a pair.
-`--author` wins over the identity chain for `generate`; without it the author resolves from the config `[identity]` section, then `VC_REALNAME`/`VC_MAILADDR`, then the OBS account, then git identity, refusing when none yields an identity. `identity` prints that resolved author. `changelog` accepts `--live` and runs locally regardless; `--write` is the explicit local-write flag.
+`--author` wins over the identity chain for `generate`; without it the author resolves from the config `[identity]` section, then `VC_REALNAME`/`VC_MAILADDR`, then the OBS account, then git identity, refusing when none yields an identity. `identity` prints that resolved author. `changelog` accepts `--live` and runs locally regardless; `--write` is the explicit local-write flag, and the global `--live` counts as `--write`: a live `generate` rewrites the package's `.changes` file.
 
 ## Rules (V1–V12)
 

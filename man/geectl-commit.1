@@ -4,7 +4,7 @@
 .SH NAME
 geectl\-commit \- Commit the staged changes
 .SH SYNOPSIS
-\fBgeectl commit\fR [\fB\-\-noservice\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-m\fR|\fB\-\-message\fR> 
+\fBgeectl commit\fR [\fB\-\-no\-service\fR] [\fB\-\-no\-local\-services\fR] [\fB\-\-no\-server\-services\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-m\fR|\fB\-\-message\fR> 
 .SH DESCRIPTION
 Commit the staged changes
 .SH OPTIONS
@@ -12,8 +12,14 @@ Commit the staged changes
 \fB\-m\fR, \fB\-\-message\fR \fI<MESSAGE>\fR
 The commit message
 .TP
-\fB\-\-noservice\fR
-Skip the service gate (source services and `pre_checkin.sh`)
+\fB\-\-no\-service\fR
+Skip the local service gate and the server\-side services: the combined shorthand for `\-\-no\-local\-services` and `\-\-no\-server\-services`
+.TP
+\fB\-\-no\-local\-services\fR
+Skip the local service gate (source services and `pre_checkin.sh`) only; the server still runs its services for the commit
+.TP
+\fB\-\-no\-server\-services\fR
+Skip the server\-side services for the commit only (`noservice=1` on the commit); the local service gate still runs. OBS\-native commits only: a git\-backed commit has no server\-side services switch, so the flag has no effect there
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help

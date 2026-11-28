@@ -319,7 +319,7 @@ pub struct BuildLogQuery {
     /// the live-worker handoff and reads the local logfile, so on a
     /// currently-building package with no prior local log it reads
     /// as no log (None) rather than the live log. Cannot combine
-    /// with `lastsucceeded`.
+    /// with `--last-succeeded`.
     pub last: bool,
     /// The last succeeded build's log. Cannot combine with `last`.
     pub lastsucceeded: bool,
@@ -3132,7 +3132,7 @@ impl<'a> ObsClient<'a> {
         if query.last && query.lastsucceeded {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
-                "--last and --lastsucceeded cannot be combined: pass at most one",
+                "--last and --last-succeeded cannot be combined: pass at most one",
             ));
         }
         self.require_build_credentials()?;
@@ -5343,6 +5343,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(err.context.contains("pass at most one"));
+        assert!(err.context.contains("--last-succeeded"));
         assert!(http.get_calls().is_empty());
     }
 

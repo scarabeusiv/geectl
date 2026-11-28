@@ -17,13 +17,13 @@ truth for the full text: run `geectl --help` or
 geectl [--format json|text] [--debug] [--debug-body] [--live] [--instance <ALIAS>] <group> <command> [args] [flags]
 ```
 
-Required coordinates are positionals where the leaf takes them; the build group orders them project, package, repository, arch. Branch and maintenance take coordinates as long flags. The exact order per leaf is in its `--help` output. Everything else is a named long flag. Group/leaf options take long flags only, apart from clap's built-in `-h`/`-V`, `commit -m`, and `local-build build -k`/`-p`. Each command has a single name.
+Required coordinates are positionals where the leaf takes them; the build group orders them project, package, repository, arch. Branch and maintenance take coordinates as long flags. The exact order per leaf is in its `--help` output. Everything else is a named long flag. Group/leaf options take long flags only, apart from clap's built-in `-h`/`-V`, the four `-m` flags (`commit -m`, `request accept -m`, `pull-request merge -m`, `changelog generate -m`), and `local-build build -k`/`-p`. Each command has a single name.
 
 `--format` selects the stdout payload: `json` (default — the format agents parse) or `text` (a human rendering of the same data). The same invocation produces the same bytes in every context. A persistent default comes from `GEECTL_FORMAT`, else the `format` key in the config file; `--format` wins over both. Agent invocations pass `--format json` explicitly.
 
 `--debug` prints human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions); `GEECTL_DEBUG=1` enables it without the flag. `--debug-body` additionally prints request and response bodies (capped, redacted, header-free). Debug leaves stdout alone.
 
-Mutations are dry-run by default: without `--live` only the plan is printed (on stderr as it is recorded, and in the payload as `dry_run: true` with a `plan`). Pass the global `--live` to perform the mutation. `request supersede` needs `--live`: it performs the supersede directly. The dry-runnable supersede flow is `request refile --supersede`.
+Mutations are dry-run by default: without `--live` only the plan is printed (on stderr as it is recorded, and in the payload as `dry_run: true` with a `plan`). Pass the global `--live` to perform the mutation.
 
 `remote set-project-meta` in dry-run validates no repositories: it performs no fetch and reads every carried repository as pre-existing; `--live` validates only the repositories it changes.
 
@@ -64,7 +64,7 @@ call to another instance with zero configured credentials
 fails naming what to set — the alias variables for a matching
 alias, the `[instances]` entry to add otherwise — and
 the configured instance's credentials stay with it.
-`branch copy-package --to-apiurl` resolves the target's
+`branch copy-package --to-api-url` resolves the target's
 credentials this way.
 
 `--instance <alias>` selects the OBS instance for one call: the
@@ -134,19 +134,19 @@ directory's `.env` only.
 
 ## Top level
 
-- `geectl remote` — Remote reads and mutations: inspect what the distribution holds, and change it.
-- `geectl request` — Read and act on OBS submit requests, and file new ones.
-- `geectl branch` — Branch, copy, and link packages.
-- `geectl build` — Build-status commands: results, logs, histories, binaries, buildconfig.
+- `geectl remote` — OBS only. Remote reads and mutations: inspect what the distribution holds, and change it.
+- `geectl request` — OBS only. Read and act on OBS submit requests, and file new ones.
+- `geectl branch` — OBS only. Branch, copy, and link packages.
+- `geectl build` — OBS only. Build-status commands: results, logs, histories, binaries, buildconfig.
 - `geectl local-build` — Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, wipe a build root, prune the cache, manage the daily periodic cleanup, enter the preserved build root, and read the log of the last local build.
-- `geectl maintenance` — Maintenance operations: maintained-instances listing and maintenance branching.
-- `geectl service` — Service reads and trigger: list a package's services, their run state, and trigger a server-side run.
+- `geectl maintenance` — OBS only. Maintenance operations: maintained-instances listing and maintenance branching.
+- `geectl service` — OBS only. Service reads and trigger: list a package's services, their run state, and trigger a server-side run.
 - `geectl gitea` — Gitea operations: repository and branch reads and mutations on the configured instance.
 - `geectl pull-request` — Read and act on pull requests: OBS submit requests and Gitea pull requests as one surface.
 - `geectl person` — Search for a person: the OBS projects naming the login and the Gitea users matching the keyword, as one operation.
 - `geectl meta` — Set the meta of an OBS project, an OBS package, or a Gitea repository as one operation: the target selects the backend.
 - `geectl changelog` — Validate and generate `.changes` entries in a package directory, pre-file, and print the resolved entry author.
-- `geectl prjconf` — Read, validate and clean a project's prjconf.
+- `geectl prjconf` — OBS only. Read, validate and clean a project's prjconf.
 - `geectl version` — Print version information as the result payload.
 - `geectl config` — Inspect or initialise the config file.
 - `geectl config show` — Show the effective config: endpoint URLs with their source, the changelog identity with its source (`config` or `none`), and credential status (never a secret value).
@@ -179,7 +179,7 @@ directory's `.env` only.
 - `geectl remote owners-for-binary <BINARY>` — Show the owners of a binary package; key flags: --verbose
 - `geectl remote owners-for-package <PACKAGE>` — Show the owners of a package by name alone, in the owner root projects; key flags: --verbose
 - `geectl remote maintainers <PROJECT> <PACKAGE>` — Show the maintainers of a package.
-- `geectl remote whois [LOGIN]` — Show a user's full name, email, and account state.
+- `geectl remote whois [LOGIN]` — Show a user's full name, email, and account state (also available as `remote whoami`): any login is accepted, or the authenticated user with no login.
 - `geectl remote link-target <PROJECT> <PACKAGE>` — Show the link target of a package, when it is a link.
 - `geectl remote project-diff <OLD> <NEW>` — Diff two projects, package by package; key flags: --include <INCLUDE>, --exclude <EXCLUDE>, --annotate-requests
 - `geectl remote diff-packages <OLD_PROJECT> <OLD_PACKAGE> <NEW_PROJECT> <NEW_PACKAGE>` — Diff two packages, file by file.
@@ -192,17 +192,17 @@ directory's `.env` only.
 - `geectl remote create-token --operation <OPERATION>` — Create an operation-scoped trigger token for the authenticated user; key flags: --project <PROJECT>, --package <PACKAGE>, --description <DESCRIPTION>, --scm-token <TOKEN>; without --scm-token the SCM token comes from GEECTL_SCM_TOKEN (or GEECTL_SCM_TOKEN_FILE), which keeps it out of ps and shell history
 - `geectl remote list-tokens` — List the authenticated user's operation-scoped tokens.
 - `geectl remote delete-token <ID>` — Delete one of the authenticated user's operation-scoped tokens, by id.
-- `geectl remote delete-package <PROJECT> <PACKAGE>` — Delete a package; key flags: --force, --message <MESSAGE>
+- `geectl remote delete-package <PROJECT> <PACKAGE>` — Delete a package; key flags: --force, --comment <COMMENT>
 - `geectl remote delete-link <PROJECT> <PACKAGE>` — Delete a `_link` file from a package.
-- `geectl remote delete-file <PROJECT> <PACKAGE> <FILE>` — Delete a file from a package. The delete is not idempotent: deleting a file that is already gone is refused by the server (NotFound). The server records the delete with the fixed comment `removed <file>`; there is no `--message` option, unlike `delete-package` — the asymmetry is intentional.
+- `geectl remote delete-file <PROJECT> <PACKAGE> <FILE>` — Delete a file from a package. The delete is not idempotent: deleting a file that is already gone is refused by the server (NotFound). The server records the delete with the fixed comment `removed <file>`; there is no `--comment` option, unlike `delete-package` — the asymmetry is intentional.
 - `geectl remote delete-project <PROJECT>` — Delete a project; key flags: --recursive, --force, --comment <COMMENT>
 - `geectl remote undelete-package <PROJECT> <PACKAGE>` — Restore a deleted package.
 - `geectl remote undelete-project <PROJECT>` — Restore a deleted project.
 - `geectl remote aggregate-package <SOURCE_PROJECT> <SOURCE_PACKAGE> <TARGET_PROJECT> <TARGET_PACKAGE>` — Aggregate a package's binaries into another package; key flags: --repository-map <REPOSITORY_MAP>, --no-sources, --disable-publish
 - `geectl remote release-package <PROJECT> <PACKAGE>` — Release a package's sources and binaries; key flags: --repository <REPOSITORY>, --arch <ARCH>, --target-project <TARGET_PROJECT>, --target-repository <TARGET_REPOSITORY>, --set-release <SET_RELEASE>, --no-delay
 - `geectl remote release-project <PROJECT>` — Release a whole project's sources and binaries; key flags: --repository <REPOSITORY>, --arch <ARCH>, --target-project <TARGET_PROJECT>, --target-repository <TARGET_REPOSITORY>, --set-release <SET_RELEASE>, --no-delay
-- `geectl remote lock <PROJECT> [PACKAGE]` — Lock a project or a package; key flags: --message <MESSAGE>
-- `geectl remote unlock <PROJECT> [PACKAGE] --message <MESSAGE>` — Unlock a project or a package
+- `geectl remote lock <PROJECT> [PACKAGE]` — Lock a project or a package; key flags: --comment <COMMENT>
+- `geectl remote unlock <PROJECT> [PACKAGE] --comment <COMMENT>` — Unlock a project or a package
 - `geectl remote add-channels <PROJECT> [PACKAGE]` — Add the channels defined for a project or a package; key flags: --enable-all, --skip-disabled
 - `geectl remote add-containers <PROJECT> <PACKAGE>` — Add the maintained containers for a package; key flags: --extend-package-names
 
@@ -211,8 +211,8 @@ directory's `.env` only.
 - `geectl request show <ID>` — Show one submit request: source/target/message, reviews, history.
 - `geectl request log <ID>` — Show one submit request's history: creation, then each state change.
 - `geectl request search` — List the submit requests matching the filters: a typed search; key flags: --creator <CREATOR>, --reviewer <REVIEWER>, --state <STATE>, --project <PROJECT>, --package <PACKAGE>, --type <TYPES>, --since <SINCE>, --limit <LIMIT>
-- `geectl request list` — List submit requests: the same search, with the states still awaiting action (new, review) as the default; key flags: --project <PROJECT>, --package <PACKAGE>, --state <STATE>, --since <SINCE>, --limit <LIMIT>
-- `geectl request diff <ID>` — Show the diff of a submit request: the unified diff, or the request XML with the diff injected with `--xml`; key flags: --xml
+- `geectl request list` — Deprecated: use `request search`. List submit requests: the same search, with the states still awaiting action (new, review) as the default; key flags: --project <PROJECT>, --package <PACKAGE>, --state <STATE>, --since <SINCE>, --limit <LIMIT>
+- `geectl request diff <ID>` — Show the diff of a submit request: the unified diff, or the request XML with the diff injected with `--xml` (the OBS-only escape hatch); key flags: --xml
 - `geectl request list-comments <ID>` — List the comments on a submit request, in id order; a comment on a diff carries its target, file, and line.
 - `geectl request accept <ID>` — Accept a submit request, with a comment as the message left with the accept. An accepted request is forwarded to its link parent unless `--no-forward` is given; a target without a link forwards to openSUSE:Factory when the Factory package records it as its devel; a refused forward is reported and the accepted request stands, with the work staying queued in the devel project; key flags: --comment <COMMENT>, --force, --forward-message <FORWARD_MESSAGE>, --no-forward
 - `geectl request decline <ID>` — Decline a submit request, with a comment as the reason; key flags: --comment <COMMENT>
@@ -221,10 +221,10 @@ directory's `.env` only.
 - `geectl request try-change-state <ID> <STATE>` — Best-effort state change: try it, and report whether it happened; a dry-run reads the request first, so it needs credentials; key flags: --comment <COMMENT>, --force
 - `geectl request add-review --comment <COMMENT> <ID>` — Ask a user, group, project, or package to review a submit request; key flags: --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
 - `geectl request change-review-state <ID> <STATE>` — Change the state of one review on a submit request: accept it, decline it, or reopen it to new; key flags: --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>, --comment <COMMENT>
-- `geectl request add-comment --body <BODY> <ID>` — Comment on a submit request, optionally as a reply to another comment; key flags: --parent <PARENT>
+- `geectl request add-comment --comment <COMMENT> <ID>` — Comment on a submit request, optionally as a reply to another comment; key flags: --parent <PARENT>
 - `geectl request file --source-project <SOURCE_PROJECT> --source-package <SOURCE_PACKAGE> --target-project <TARGET_PROJECT> --target-package <TARGET_PACKAGE> --description <DESCRIPTION> --changes-entry <CHANGES_ENTRY>` — File a submit request: source package to a devel project, superseding every open submit request for the package from the same user; live, a git-backed source is verified current before filing (refuses a stale or not-yet-synced source, or a scmsync URL on another Gitea host; no Gitea token means the check is off); key flags: --cve <CVE>, --without-cleanup
 - `geectl request refile --source-project <SOURCE_PROJECT> --source-package <SOURCE_PACKAGE> --target-project <TARGET_PROJECT> --target-package <TARGET_PACKAGE> --description <DESCRIPTION> --changes-entry <CHANGES_ENTRY> --supersede <SUPERSEDE>` — File a submit request and supersede an old one with it, plus every other open submit request for the package from the same user: the new request is filed first, and only then is each open one superseded pointing at it; live, a git-backed source is verified current before filing (refuses a stale or not-yet-synced source, or a scmsync URL on another Gitea host; no Gitea token means the check is off); key flags: --cve <CVE>, --without-cleanup
-- `geectl request supersede <OLD_ID> <NEW_ID>` — Supersede one request with another existing one. Needs `--live`.
+- `geectl request supersede <OLD_ID> <NEW_ID>` — Supersede one request with another existing one. A mutation: dry-run is the default (only the plan is printed); `--live` performs it.
 - `geectl request file-add-role --target-project <TARGET_PROJECT> --description <DESCRIPTION>` — File an add-role request: grant a person or a group a role on a project or a package; key flags: --target-package <TARGET_PACKAGE>, --person <PERSON>, --person-role <PERSON_ROLE>, --group <GROUP>, --group-role <GROUP_ROLE>
 - `geectl request file-change-devel --source-project <SOURCE_PROJECT> --source-package <SOURCE_PACKAGE> --target-project <TARGET_PROJECT> --target-package <TARGET_PACKAGE> --description <DESCRIPTION>` — File a change-devel request: change a package's devel project.
 - `geectl request file-delete --target-project <TARGET_PROJECT> --description <DESCRIPTION>` — File a delete request: delete a package, a repository, or a whole project; key flags: --package <PACKAGE>, --repository <REPOSITORY>, --whole-project, --accept-in-hours <ACCEPT_IN_HOURS>
@@ -235,8 +235,8 @@ directory's `.env` only.
 
 - `geectl branch create --project <PROJECT> --package <PACKAGE>` — Branch a git-backed package: Gitea fork + OBS fork into a test project with the source project's repositories; key flags: --new-repo-name <NEW_REPO_NAME>, --organization <ORGANIZATION>, --git-branch <GIT_BRANCH>, --no-devel-project, --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --first-build-deadline-secs <FIRST_BUILD_DEADLINE_SECS>
 - `geectl branch branch-package --project <PROJECT> --package <PACKAGE>` — Branch a package: create a linked copy under a branch project; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --add-repositories, --maintenance, --revision <REVISION>, --force, --new-package
-- `geectl branch copy-package --source-project <SOURCE_PROJECT> --source-package <SOURCE_PACKAGE> --target-project <TARGET_PROJECT> --target-package <TARGET_PACKAGE>` — Copy a package to another project (or another OBS instance with `--to-apiurl`); key flags: --revision <REVISION>, --keep-link, --expand, --comment <COMMENT>, --noservice, --to-apiurl <TO_APIURL>
-- `geectl branch copy-project --source-project <SOURCE_PROJECT> --target-project <TARGET_PROJECT>` — Copy a whole project; key flags: --with-binaries, --with-history, --noservice, --comment <COMMENT>
+- `geectl branch copy-package --source-project <SOURCE_PROJECT> --source-package <SOURCE_PACKAGE> --target-project <TARGET_PROJECT> --target-package <TARGET_PACKAGE>` — Copy a package to another project (or another OBS instance with `--to-api-url`); key flags: --revision <REVISION>, --keep-link, --expand, --comment <COMMENT>, --no-service, --to-api-url <TO_APIURL>
+- `geectl branch copy-project --source-project <SOURCE_PROJECT> --target-project <TARGET_PROJECT>` — Copy a whole project; key flags: --with-binaries, --with-history, --no-service, --comment <COMMENT>
 - `geectl branch set-devel-project --project <PROJECT> --package <PACKAGE>` — Set (or, without `--devel-project`, remove) the devel project of a package; key flags: --devel-project <DEVEL_PROJECT>, --devel-package <DEVEL_PACKAGE>
 - `geectl branch link-package --source-project <SOURCE_PROJECT> --source-package <SOURCE_PACKAGE> --target-project <TARGET_PROJECT> --target-package <TARGET_PACKAGE>` — Link a package to another package; key flags: --force, --revision <REVISION>, --vrev <VREV>, --missing-target, --disable-build, --disable-publish
 - `geectl branch repair-link --project <PROJECT> --package <PACKAGE>` — Repair a broken link: strip the failing patches from `_link` server-side and pin it at a revision where it expands.
@@ -247,9 +247,9 @@ directory's `.env` only.
 
 ## `build` — build status
 
-- `geectl build results <PROJECT>` — Read the build-results matrix for a project; key flags: --package <PACKAGE>, --repository <REPOSITORY>, --arch <ARCH>, --code <CODE>, --multibuild, --lastbuild, --oldstate <OLDSTATE>, --all-instances; a partially-failing `--all-instances` read exits 0 with per-instance errors in the view
-- `geectl build wait-for-results --deadline-secs <DEADLINE_SECS> <PROJECT>` — Poll the build results until they settle, or the deadline passes; key flags: --package <PACKAGE>, --repository <REPOSITORY>, --arch <ARCH>, --code <CODE>, --multibuild, --lastbuild
-- `geectl build build-log <PROJECT> [PACKAGE] [REPOSITORY] [ARCH]` — Read the build log for a package; key flags: --start <START>, --last, --lastsucceeded, --multibuild <FLAVOR>, --strip-time
+- `geectl build results <PROJECT>` — Read the build-results matrix for a project; key flags: --package <PACKAGE>, --repository <REPOSITORY>, --arch <ARCH>, --code <CODE>, --multibuild, --last-build, --oldstate <OLDSTATE>, --all-instances; a partially-failing `--all-instances` read exits 0 with per-instance errors in the view
+- `geectl build wait-for-results --deadline-secs <DEADLINE_SECS> <PROJECT>` — Poll the build results until they settle, or the deadline passes; key flags: --package <PACKAGE>, --repository <REPOSITORY>, --arch <ARCH>, --code <CODE>, --multibuild, --last-build
+- `geectl build build-log <PROJECT> [PACKAGE] [REPOSITORY] [ARCH]` — Read the build log for a package; key flags: --start <START>, --last, --last-succeeded, --multibuild <FLAVOR>, --strip-time
 - `geectl build build-status <PROJECT> <PACKAGE> <REPOSITORY> <ARCH>` — Read the build status code for a package.
 - `geectl build job-status <PROJECT> <PACKAGE> <REPOSITORY> <ARCH>` — Read the running build job for a package, if any.
 - `geectl build rebuild-package <PROJECT> <PACKAGE> <REPOSITORY> <ARCH>` — Rebuild a package: rerun a build without touching the sources.
@@ -279,13 +279,13 @@ or a not-installed flag). Text output renders each dependency as
 - `geectl local-build service-run <DIRECTORY>` — Run the `_service` file's services in the container, filtered by the run mode; key flags: --mode <MODE>, --service <SERVICE>, --project <PROJECT>, --timeout-secs <TIMEOUT_SECS>
 - `geectl local-build precommit <DIRECTORY>` — The precommit gate: the `precommit`-mode service run, then `pre_checkin.sh` when the source directory carries one; key flags: --project <PROJECT>, --timeout-secs <TIMEOUT_SECS>
 - `geectl local-build spec-cleaner <DIRECTORY> <SPEC> [-- <ARGS>...]` — Run `spec-cleaner` on a spec in the container; key flags: --timeout-secs <TIMEOUT_SECS>
-- `geectl local-build build --project <PROJECT> --repo <REPO> <DIRECTORY>` — Build the package in the container: the run-mode service run, the precommit gate, then the engine build; key flags: --arch <ARCH>, --flavor <FLAVOR>, --clean, --trust-all-projects, --alternative-project <ALTERNATIVE_PROJECT>, --root <ROOT>, --timeout-secs <TIMEOUT_SECS> A foreign arch builds on the server instead: `geectl build rebuild-package`, `wait-for-results`, `build-log`, `build-status`, `results`, `download-binary`, `list-binaries`, `build-history`; the submit proceeds without the build result — the result is visible on the submission and checked at the accepting step.
+- `geectl local-build build --project <PROJECT> --repository <REPOSITORY> <DIRECTORY>` — Build the package in the container: the run-mode service run, the precommit gate, then the engine build; key flags: --arch <ARCH>, --flavor <FLAVOR>, --clean, --trust-all-projects, --alternative-project <ALTERNATIVE_PROJECT>, --root <ROOT>, --timeout-secs <TIMEOUT_SECS> A foreign arch builds on the server instead: `geectl build rebuild-package`, `wait-for-results`, `build-log`, `build-status`, `results`, `download-binary`, `list-binaries`, `build-history`; the submit proceeds without the build result — the result is visible on the submission and checked at the accepting step.
 - `geectl local-build wipe [REPO] [ARCH] [SPEC]` — Wipe a build root: delete its contents (the lock file stays); key flags: --project <PROJECT>, --flavor <FLAVOR>, --root <ROOT>
-- `geectl local-build prune` — Print the eviction plan (what would be evicted, in order, with bytes); delete only with `--apply`; key flags: --apply
+- `geectl local-build prune` — Print the eviction plan (what would be evicted, in order, with bytes); delete only with `--apply` or `--live`; key flags: --apply
 - `geectl local-build periodic-install` — Install the daily periodic cleanup for this platform: write the scheduler entry and enable it.
 - `geectl local-build periodic-uninstall` — Remove the daily periodic cleanup for this platform: disable the scheduler entry, then remove its files.
 - `geectl local-build periodic-status` — Show whether the daily periodic cleanup is installed and enabled on this platform.
-- `geectl local-build chroot --project <PROJECT> --repo <REPO> <DIRECTORY>` — Enter the preserved build root of the last build for the package and run repro commands there, read from stdin, one per line, joined with `&&` into one shell command; key flags: --arch <ARCH>, --flavor <FLAVOR>, --timeout-secs <TIMEOUT_SECS>
+- `geectl local-build chroot --project <PROJECT> --repository <REPOSITORY> <DIRECTORY>` — Enter the preserved build root of the last build for the package and run repro commands there, read from stdin, one per line, joined with `&&` into one shell command; key flags: --arch <ARCH>, --flavor <FLAVOR>, --timeout-secs <TIMEOUT_SECS>
 - `geectl local-build log --project <PROJECT> <REPO> <ARCH> <SPEC>` — Read the log of the last local build: the `<root>/.build.log` the build's coordinates name; key flags: --flavor <FLAVOR>, --tail <TAIL>, --full
 
 `local-build build --trust-all-projects` allows build dependencies from
@@ -314,7 +314,7 @@ without evaluating trust.
 - `geectl gitea repo-get <OWNER> <REPO>` — Show a repository: owner, default branch, privacy, clone URLs, and the token owner's permissions.
 - `geectl gitea repo-list` — List repositories: the token owner's own repos, one user's repos with `--owner`, one organization's with `--org`, or both (the user's first, then the organization's); key flags: --owner <OWNER>, --org <ORG>
 - `geectl gitea repo-search <QUERY>` — Search repositories across the instance by keyword: the keyword matches the name and the description. The Gitea counterpart of `remote search-packages` / `remote search-projects`.
-- `geectl gitea whoami` — Show the token owner: the login, full name, and email the configured Gitea token belongs to.
+- `geectl gitea whoami` — Show the token owner: the login, full name, and email the configured Gitea token belongs to (also available as `gitea whois`): token-owner-only — no login is accepted, the token decides.
 - `geectl gitea repo-create <NAME>` — Create a repository under the token owner's account; key flags: --private, --description <DESCRIPTION>, --default-branch <DEFAULT_BRANCH>
 - `geectl gitea repo-delete <OWNER> <REPO>` — Delete a repository; key flags: --force
 - `geectl gitea repo-fork <OWNER> <REPO>` — Fork a repository into the token owner's account (or an organization with `--organization`); key flags: --new-name <NEW_NAME>, --organization <ORGANIZATION>
@@ -325,36 +325,36 @@ without evaluating trust.
 - `geectl gitea commit-statuses <OWNER> <REPO> <SHA>` — List a commit's statuses: the CI states reported for that commit.
 - `geectl gitea maintainers <OWNER> <REPO>` — Show the maintainers recorded in a git project's `_maintainership.json`: the project maintainers and the per-package maintainers.
 - `geectl gitea cleanup-forks` — List obsolete Gitea forks and their OBS home test projects, and delete them; key flags: --user <USER>
+- `geectl gitea build-comment --project <PROJECT> --package <PACKAGE> <REFERENCE>` — Post the build-link comment on a Gitea pull request: the OBS build results for the test project and package as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; key flags: --project <PROJECT>, --package <PACKAGE>
 
 ## `pull-request` — unified pull-request read and act
 
 - `geectl pull-request show <REFERENCE>` — Show one pull request: `obs:<id>` or `gitea:<owner>/<repo>#<number>`.
-- `geectl pull-request diff <REFERENCE>` — Show the diff of a pull request: the unified diff, like `request diff`; key flags: --xml
+- `geectl pull-request diff <REFERENCE>` — Show the diff of a pull request: the unified diff, like `request diff`; `--xml` is the OBS-only escape hatch; key flags: --xml
 - `geectl pull-request search` — Search pull requests: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea; key flags: --backend <BACKEND>, --state <STATE>, --creator <CREATOR>, --reviewer <REVIEWER>, --repo <REPO>
-- `geectl pull-request approve <REFERENCE>` — Approve a pull request as the review asked of the target: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea); key flags: --message <MESSAGE>, --commit <COMMIT>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
-- `geectl pull-request request-changes <REFERENCE>` — Ask for changes on a pull request, as `approve` but with the review declined instead of accepted; key flags: --message <MESSAGE>, --commit <COMMIT>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
-- `geectl pull-request comment --body <BODY> <REFERENCE>` — Comment on a pull request; key flags: --parent <PARENT>
-- `geectl pull-request build-comment --project <PROJECT> --package <PACKAGE> <REFERENCE>` — Post the build-link comment on a Gitea pull request: the OBS build results for the test project and package as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; key flags: --project <PROJECT>, --package <PACKAGE>
+- `geectl pull-request approve <REFERENCE>` — Approve a pull request as the review asked of the target: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea); key flags: --comment <COMMENT>, --commit <COMMIT>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
+- `geectl pull-request request-changes <REFERENCE>` — Ask for changes on a pull request, as `approve` but with the review declined instead of accepted; key flags: --comment <COMMENT>, --commit <COMMIT>, --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
+- `geectl pull-request comment --comment <COMMENT> <REFERENCE>` — Comment on a pull request; key flags: --parent <PARENT>
 - `geectl pull-request comments <REFERENCE>` — List the comments on a pull request, oldest first; a comment on a diff carries its target, file, and line.
 - `geectl pull-request cancel-review-request <REFERENCE>` — Cancel pending review requests on a pull request; key flags: --reviewer <REVIEWER>, --all, --exclude <EXCLUDE>
-- `geectl pull-request merge <REFERENCE>` — Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent, or to openSUSE:Factory when the target has no link and the Factory package records it as its devel; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless `--no-forward` is given. After the merge lands, the branch home the pull request came from is cleaned up like the OBS arm's, and merges done outside geectl are left for `gitea cleanup-forks`. The OBS arm checks the hop after accepting while the Gitea arm preflights it, because the Gitea merge is irreversible while the accept flow's forward is retryable; key flags: --message <MESSAGE>, --method <METHOD>, --force, --forward-message <FORWARD_MESSAGE>, --no-forward- `geectl pull-request decline <REFERENCE>` — Decline a pull request; key flags: --message <MESSAGE>
-- `geectl pull-request withdraw <REFERENCE>` — Withdraw a pull request; key flags: --message <MESSAGE>
+- `geectl pull-request merge <REFERENCE>` — Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent, or to openSUSE:Factory when the target has no link and the Factory package records it as its devel; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless `--no-forward` is given. After the merge lands, the branch home the pull request came from is cleaned up like the OBS arm's, and merges done outside geectl are left for `gitea cleanup-forks`. The OBS arm checks the hop after accepting while the Gitea arm preflights it, because the Gitea merge is irreversible while the accept flow's forward is retryable; key flags: --comment <COMMENT>, --method <METHOD>, --force, --forward-message <FORWARD_MESSAGE>, --no-forward- `geectl pull-request decline <REFERENCE>` — Decline a pull request; key flags: --comment <COMMENT>
+- `geectl pull-request withdraw <REFERENCE>` — Withdraw a pull request; key flags: --comment <COMMENT>
 - `geectl pull-request reopen <REFERENCE>` — Reopen a pull request.
 - `geectl pull-request submit` — File a submission from the working copy in the current directory: an OBS submit request from an OBS-native checkout, a Gitea pull request from a git-backed one; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --description <DESCRIPTION>, --changes-entry <CHANGES_ENTRY>, --title <TITLE>, --body <BODY>, --draft
 - `geectl pull-request cleanup` — Clean the local build roots for the submit request filed from the working copy in the current directory, when that request is accepted.
 
 ## `person` — unified person search
 
-- `geectl person search <QUERY>` — Search for a person: the OBS projects naming the login, and the Gitea users matching the keyword; key flags: --backend <BACKEND>
+- `geectl person search <QUERY>` — Search for a person: the OBS projects naming the login, and the Gitea users matching the keyword; one list of results, each naming its `source` (`obs` or `gitea`) and `kind` (`project` or `user`); key flags: --backend <BACKEND>
 
 ## `meta` — unified meta write
 
-- `geectl meta set` — Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL. The target selects the backend: `--project` (with `--package` for a package) writes OBS meta, `--repo` writes Gitea repo settings. A mutation: dry-run is the default (only the plan is printed); `--live` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field; key flags: --project <PROJECT>, --package <PACKAGE>, --repo <REPO>, --description <DESCRIPTION>, --url <URL>
+- `geectl meta set` — Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL. The target selects the backend: `--project` (with `--package` for a package) writes OBS meta, `--repo` writes Gitea repo settings. A mutation: dry-run is the default (only the plan is printed); `--live` performs the write. Only the given fields change; the rest of the meta is kept as it is. Clear a field with `--clear description` / `--clear url` instead of setting it; key flags: --project <PROJECT>, --package <PACKAGE>, --repo <REPO>, --description <DESCRIPTION>, --url <URL>, --clear <CLEAR>
 
 ## `changelog` — `.changes` validation and generation
 
 - `geectl changelog validate [DIR]` — Validate the `.changes` entries in a package directory against the V1–V12 rules; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --entries <ENTRIES>
-- `geectl changelog generate [DIR]` — Generate a skeleton `.changes` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball; the author resolves from the config `[identity]` section, then `VC_REALNAME`/`VC_MAILADDR`, then the OBS account, then git, and the command refuses when none yields an identity; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --author <AUTHOR>, --message <MESSAGE>, --write
+- `geectl changelog generate [DIR]` — Generate a skeleton `.changes` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball; the author resolves from the config `[identity]` section, then `VC_REALNAME`/`VC_MAILADDR`, then the OBS account, then git, and the command refuses when none yields an identity; `--write` prepends the entry into the package's `.changes` file, and the global `--live` counts as `--write`; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --author <AUTHOR>, --message <MESSAGE>, --write
 - `geectl changelog identity [DIR]` — Print the resolved `.changes` entry author in `Name <email>` form, the same value a bare `changelog generate` would write; refuses when no level of the identity chain yields an identity
 
 ## Working copy — git working copy
@@ -366,7 +366,7 @@ the directory name); without a package it writes one working copy
 per package in the project, multibuild flavors collapsing onto the
 base package. The rest open the checkout found there. `commit`
 runs the source services and `pre_checkin.sh` before sending, with
-`--noservice` skipping that gate. The base record lives in the checkout's git
+`--no-service` skipping that gate. The base record lives in the checkout's git
 config (`geectl.apiurl`, `geectl.project`, `geectl.package`,
 `geectl.backend`, `geectl.base-rev`, `geectl.base-srcmd5`).
 
@@ -377,7 +377,7 @@ config (`geectl.apiurl`, `geectl.project`, `geectl.package`,
 - `geectl add <FILES>...` — Stage files for commit.
 - `geectl rm <FILES>...` — Remove files from the working copy.
 - `geectl addremove` — Stage new files and worktree deletions.
-- `geectl commit --message <MESSAGE>` — Commit the staged changes; key flags: --noservice
+- `geectl commit --message <MESSAGE>` — Commit the staged changes; key flags: --no-service
 - `geectl pull` — Pull a linked package to the link target's latest revision.
 - `geectl resolve` — Stage the resolved files and continue a stopped rebase.
 

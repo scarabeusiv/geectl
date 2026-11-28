@@ -116,7 +116,7 @@ pub enum RemoteCommand {
         /// The file to print.
         file: String,
         /// Print the file as of this revision (default: latest):
-        /// a revision number or a srcmd5.
+        /// a revision number or a srcmd5 (the source checksum of a revision, as `remote package-log` reports it in JSON).
         #[arg(long)]
         rev: Option<String>,
     },
@@ -133,8 +133,8 @@ pub enum RemoteCommand {
         package: String,
         /// The file to download.
         file: String,
-        /// Download the file as of this revision: a revision number
-        /// or a srcmd5 (default: latest).
+        /// Download the file as of this revision (default: latest):
+        /// a revision number or a srcmd5 (the source checksum of a revision, as `remote package-log` reports it in JSON).
         #[arg(long)]
         rev: Option<String>,
         /// Where to write the downloaded bytes.
@@ -148,7 +148,7 @@ pub enum RemoteCommand {
         /// The package to list.
         package: String,
         /// List the files as of this revision (default: latest):
-        /// a revision number or a srcmd5.
+        /// a revision number or a srcmd5 (the source checksum of a revision, as `remote package-log` reports it in JSON).
         #[arg(long)]
         rev: Option<String>,
         /// Include files from deleted revisions in the listing: the
@@ -198,7 +198,7 @@ pub enum RemoteCommand {
         /// The package to show the history of.
         package: String,
         /// Only entries in this revision range (`FROM:TO`, either side
-        /// may be empty; a side is a revision number or a srcmd5).
+        /// may be empty; a side is a revision number or a srcmd5 (the source checksum of a revision, as `remote package-log` reports it in JSON)).
         #[arg(long)]
         range: Option<String>,
         /// At most this many entries.
@@ -471,7 +471,10 @@ pub enum RemoteCommand {
         package: String,
     },
     /// Show a user's full name, email, and account state.
-    /// Without a login, the authenticated user.
+    /// Without a login, the authenticated user; any login is
+    /// accepted. `whoami` is an alias: with no login, the same
+    /// identity read as `gitea whoami`.
+    #[command(visible_alias = "whoami")]
     Whois {
         /// The login name to look up; without one, the
         /// authenticated user.
@@ -663,9 +666,8 @@ pub enum RemoteCommand {
         /// Delete even when open submit requests involve the package.
         #[arg(long)]
         force: bool,
-        /// A message recorded on the delete, sent as the server's
-        /// `comment` query parameter.
-        #[arg(long)]
+        /// A message recorded on the delete.
+        #[arg(long = "comment", alias = "message", value_name = "COMMENT")]
         message: Option<String>,
     },
     /// Delete a `_link` file from a package. A mutation: dry-run is
@@ -813,11 +815,10 @@ pub enum RemoteCommand {
         project: String,
         /// The package to lock. Omit to lock the whole project.
         package: Option<String>,
-        /// A message for the lock, sent as the server's `comment`
-        /// query parameter. A project lock records it; a package
-        /// lock sends it but the server does not record it — there
-        /// is no package-scope lock command.
-        #[arg(long)]
+        /// A message for the lock. A project lock records it; a
+        /// package lock's message is not recorded — there is no
+        /// package-scope lock command.
+        #[arg(long = "comment", alias = "message", value_name = "COMMENT")]
         message: Option<String>,
     },
     /// Unlock a project or a package. A mutation: dry-run is the
@@ -829,9 +830,8 @@ pub enum RemoteCommand {
         project: String,
         /// The package to unlock. Omit to unlock the whole project.
         package: Option<String>,
-        /// A message recorded on the unlock, sent as the server's
-        /// `comment` query parameter.
-        #[arg(long)]
+        /// A message recorded on the unlock.
+        #[arg(long = "comment", alias = "message", value_name = "COMMENT")]
         message: String,
     },
     /// Add the channels defined for a project or a package. A
@@ -4962,6 +4962,16 @@ mod tests {
             RemoteCommand::Whois { login } => assert_eq!(login, None),
             _ => panic!("wrong variant"),
         }
+        match parse(&["geectl", "remote", "whoami", "alice"]) {
+            RemoteCommand::Whois { login } => {
+                assert_eq!(login.as_deref(), Some("alice"));
+            }
+            _ => panic!("wrong variant"),
+        }
+        match parse(&["geectl", "remote", "whoami"]) {
+            RemoteCommand::Whois { login } => assert_eq!(login, None),
+            _ => panic!("wrong variant"),
+        }
         assert!(matches!(
             parse(&["geectl", "remote", "link-target", "P", "K"]),
             RemoteCommand::LinkTarget { .. }
@@ -5632,7 +5642,7 @@ mod tests {
             "delete-package",
             "P",
             "K",
-            "--message",
+            "--comment",
             "cleanup",
         ]);
         assert!(matches!(
@@ -7232,7 +7242,7 @@ mod tests {
             "lock",
             "P",
             "K",
-            "--message",
+            "--comment",
             "freeze for release",
         ]);
         assert!(matches!(
@@ -7291,7 +7301,7 @@ mod tests {
             "unlock",
             "P",
             "K",
-            "--message",
+            "--comment",
             "release done",
         ]);
         assert!(matches!(
@@ -8914,5 +8924,33 @@ mod tests {
             assert!(text.contains(field), "search text misses {field}:\n{text}");
         }
         assert!(!text.contains("A very long description"));
+    }
+
+    #[test]
+    fn old_message_spelling_still_parses() {
+        match parse(&[
+            "geectl",
+            "remote",
+            "delete-package",
+            "P",
+            "K",
+            "--message",
+            "gone",
+        ]) {
+            RemoteCommand::DeletePackage { message, .. } => {
+                assert_eq!(message.as_deref(), Some("gone"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&["geectl", "remote", "lock", "P", "--message", "freeze"]) {
+            RemoteCommand::Lock { message, .. } => {
+                assert_eq!(message.as_deref(), Some("freeze"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&["geectl", "remote", "unlock", "P", "--message", "done"]) {
+            RemoteCommand::Unlock { message, .. } => assert_eq!(message, "done"),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

@@ -4,12 +4,12 @@
 .SH NAME
 geectl\-pull\-request\-approve \- Approve a pull request as the review asked of the target: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea). Dry\-run by default; mutates only with `\-\-live`
 .SH SYNOPSIS
-\fBgeectl pull\-request approve\fR [\fB\-\-message\fR] [\fB\-\-commit\fR] [\fB\-\-user\fR] [\fB\-\-group\fR] [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
+\fBgeectl pull\-request approve\fR [\fB\-\-comment\fR] [\fB\-\-commit\fR] [\fB\-\-user\fR] [\fB\-\-group\fR] [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
 .SH DESCRIPTION
 Approve a pull request as the review asked of the target: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea). Dry\-run by default; mutates only with `\-\-live`
 .SH OPTIONS
 .TP
-\fB\-\-message\fR \fI<MESSAGE>\fR
+\fB\-\-comment\fR \fI<COMMENT>\fR
 The message left with the review. Values starting with `\-` are taken literally: a message may open with a `\- ` bullet
 .TP
 \fB\-\-commit\fR \fI<COMMIT>\fR

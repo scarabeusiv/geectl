@@ -108,7 +108,7 @@ the created name; the description is in the JSON payload.
 `branch branch-package` branches an OBS-native package: a linked copy
 under a branch project, with `--target-project`, `--target-package`,
 `--no-devel-project`, `--new-package`, `--force`, `--revision`, and
-`--linkrev`. The group also carries the link operations
+`--link-rev`. The group also carries the link operations
 `repair-link`, `set-link-rev`, `set-link-rev-project`,
 `link-to-branch`, and `detach-branch`. The git-backed fork composite is a
 library operation, exposed as `branch create`.

@@ -4,7 +4,7 @@
 .SH NAME
 geectl\-build\-results \- Read the build\-results matrix for a project
 .SH SYNOPSIS
-\fBgeectl build results\fR [\fB\-\-package\fR] [\fB\-\-repository\fR] [\fB\-\-arch\fR] [\fB\-\-code\fR] [\fB\-\-multibuild\fR] [\fB\-\-locallink\fR] [\fB\-\-lastbuild\fR] [\fB\-\-oldstate\fR] [\fB\-\-all\-instances\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> 
+\fBgeectl build results\fR [\fB\-\-package\fR] [\fB\-\-repository\fR] [\fB\-\-arch\fR] [\fB\-\-code\fR] [\fB\-\-multibuild\fR] [\fB\-\-local\-link\fR] [\fB\-\-last\-build\fR] [\fB\-\-oldstate\fR] [\fB\-\-all\-instances\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> 
 .SH DESCRIPTION
 Read the build\-results matrix for a project
 .SH OPTIONS
@@ -24,14 +24,14 @@ Only packages with this build code (e.g. `failed`)
 \fB\-\-multibuild\fR
 Expand multibuild flavors into their own statuses
 .TP
-\fB\-\-locallink\fR
+\fB\-\-local\-link\fR
 Follow local links when expanding multibuild flavors
 .TP
-\fB\-\-lastbuild\fR
+\fB\-\-last\-build\fR
 The last build\*(Aqs results instead of the current state
 .TP
 \fB\-\-oldstate\fR \fI<OLDSTATE>\fR
-Poll for changes since this state hash (from a previous run). Only `results` takes it: `wait\-for\-results` polls plainly
+Poll for changes since this state hash — a polling token from a previous `results` run\*(Aqs payload. Only `results` takes it: `wait\-for\-results` polls plainly
 .TP
 \fB\-\-all\-instances\fR
 Merge the results from every configured instance into one view, instead of only the instance currently pointed at. Cannot combine with `\-\-oldstate`: a state hash is per instance. A partially\-failing read still exits 0: per\-instance errors render in the view and payload, and only an every\-instance failure is an error

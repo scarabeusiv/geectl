@@ -7,7 +7,7 @@
 //! the same values in a human-readable form.
 //!
 //! Reads are always live; the act leaves (`approve`,
-//! `request-changes`, `comment`, `build-comment`, `cancel-review-request`,
+//! `request-changes`, `comment`, `cancel-review-request`,
 //! `merge`, `decline`, `withdraw`, `reopen`, `submit`, `cleanup`) are
 //! dry-run by default and mutate only with the global `--live`.
 //! `submit` files from the working copy in the current directory:
@@ -56,13 +56,13 @@ use crate::gitea::{
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::local_build::LocalBuild;
 use crate::obs::{
-    package_show_url, AcceptCleanupOutcome, CveId, DryRun, ForwardActionResult, ObsClient,
-    RequestAction, RequestState, ResultsQuery, ReviewTarget, SrPayload,
+    AcceptCleanupOutcome, CveId, DryRun, ForwardActionResult, ObsClient, RequestAction,
+    RequestState, ReviewTarget, SrPayload,
 };
 use crate::pull_request::{
-    build_comment_body, PullRequest, PullRequestBackend, PullRequestClient, PullRequestEndpoint,
-    PullRequestRef, PullRequestSearch, PullRequestStatus, PullRequestSummary, ReviewComment,
-    ReviewOpinion, SubmitTarget, Submitted,
+    PullRequest, PullRequestBackend, PullRequestClient, PullRequestEndpoint, PullRequestRef,
+    PullRequestSearch, PullRequestStatus, PullRequestSummary, ReviewComment, ReviewOpinion,
+    SubmitTarget, Submitted,
 };
 use crate::working_copy::{self, Backend};
 use clap::{Args, Subcommand};
@@ -81,16 +81,17 @@ pub enum PullRequestCommand {
         reference: String,
     },
     /// Show the diff of a pull request: the unified diff, like
-    /// `request diff`. With `--xml` the OBS arm renders the
-    /// request XML with the diff injected; `--xml` is refused on
-    /// a Gitea pull request, which has no request XML. A read,
-    /// always live.
+    /// `request diff`. `--xml` is the OBS-only escape hatch: the
+    /// OBS arm renders the request XML with the diff injected,
+    /// and `--xml` is refused on a Gitea pull request, which has
+    /// no request XML. A read, always live.
     Diff {
         /// The pull-request handle: `obs:<id>` or
         /// `gitea:<owner>/<repo>#<number>`.
         reference: String,
         /// Render the OBS request XML with the diff injected,
-        /// instead of the bare diff. Refused on a Gitea ref.
+        /// instead of the bare diff — the OBS-only escape hatch.
+        /// Refused on a Gitea ref.
         #[arg(long)]
         xml: bool,
     },
@@ -110,13 +111,6 @@ pub enum PullRequestCommand {
     /// Comment on a pull request. Dry-run by default; mutates
     /// only with `--live`.
     Comment(CommentArgs),
-    /// Post the build-link comment on a Gitea pull request: the
-    /// OBS build results for the test project and package, as a
-    /// link plus a one-line per-instance summary. The comment is
-    /// posted once, on PR opening; there is no polling, no live
-    /// update, and no edit. Dry-run by default; mutates only
-    /// with `--live`.
-    BuildComment(BuildCommentArgs),
     /// List the comments on a pull request, oldest first. A read,
     /// always live.
     Comments {
@@ -159,7 +153,10 @@ pub enum PullRequestCommand {
     /// directory: an OBS submit request from an OBS-native
     /// checkout, a Gitea pull request from a git-backed one. The
     /// checkout's backend decides; the other arm's flags are
-    /// refused. Dry-run by default; mutates only with `--live`.
+    /// refused, except the submission text: `--title`/`--body`
+    /// work on both arms, and on OBS they compose `--description`
+    /// (the title as the headline, the body after a blank line).
+    /// Dry-run by default; mutates only with `--live`.
     Submit(SubmitArgs),
     /// Clean the local build roots for the submit request filed
     /// from the working copy in the current directory, when that
@@ -173,10 +170,15 @@ pub enum PullRequestCommand {
 }
 
 /// Arguments for `pull-request submit`: the OBS arm's flags and
-/// the Gitea arm's flags in one set, each arm taking its own.
-/// The required flags are enforced per arm, after the checkout's
-/// backend is known: `--target-project`, `--description` and
-/// `--changes-entry` on OBS; `--base` and `--title` on Gitea.
+/// the Gitea arm's flags in one set, each arm taking its own —
+/// except the submission text, which is one pair on both arms:
+/// `--title`/`--body` is the pull request title and body on
+/// Gitea, and on OBS it composes `--description` (the title as
+/// the headline, the body after a blank line). The required flags
+/// are enforced per arm, after the checkout's backend is known:
+/// `--target-project` and `--changes-entry` on OBS, plus
+/// `--description` or `--title`/`--body`; `--base` and `--title`
+/// on Gitea.
 #[derive(Debug, Args)]
 pub struct SubmitArgs {
     /// The project the request targets: the devel project, or
@@ -189,9 +191,11 @@ pub struct SubmitArgs {
     #[arg(long)]
     target_package: Option<String>,
     /// The request description: one headline, then `- ` lines for
-    /// staging, needs, and rebuilds. OBS only; required there.
-    /// Values starting with `-` are taken literally: a description
-    /// may open with a `- ` bullet.
+    /// staging, needs, and rebuilds. OBS only; required there
+    /// unless `--title` is given (the two are spellings of the
+    /// same text — pass one, not both). Values starting with `-`
+    /// are taken literally: a description may open with a `- `
+    /// bullet.
     #[arg(long, allow_hyphen_values = true)]
     description: Option<String>,
     /// The one `.changes` entry for this submission. It must name
@@ -223,12 +227,17 @@ pub struct SubmitArgs {
     /// branch does not take pull requests.
     #[arg(long)]
     base: Option<String>,
-    /// The pull request title. Gitea only; required there. Values
-    /// starting with `-` are taken literally.
+    /// The submission title. On Gitea the pull request title,
+    /// required there; on OBS the headline of the request
+    /// description, in place of `--description`. Values starting
+    /// with `-` are taken literally.
     #[arg(long, allow_hyphen_values = true)]
     title: Option<String>,
-    /// The pull request body. Gitea only. Values starting with `-`
-    /// are taken literally: the body may open with a `- ` bullet.
+    /// The submission body. On Gitea the pull request body; on
+    /// OBS the text after the headline in the request
+    /// description, in place of `--description` together with
+    /// `--title`. Values starting with `-` are taken literally:
+    /// the body may open with a `- ` bullet.
     #[arg(long, allow_hyphen_values = true)]
     body: Option<String>,
     /// Open the pull request as a draft. Gitea only.
@@ -245,7 +254,12 @@ pub struct ReviewActArgs {
     reference: String,
     /// The message left with the review. Values starting with `-`
     /// are taken literally: a message may open with a `- ` bullet.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(
+        long = "comment",
+        alias = "message",
+        value_name = "COMMENT",
+        allow_hyphen_values = true
+    )]
     message: Option<String>,
     /// Pin the review to this head commit (Gitea only): the
     /// review is recorded against it server-side, and is refused
@@ -277,27 +291,17 @@ pub struct CommentArgs {
     reference: String,
     /// The comment text. Values starting with `-` are taken
     /// literally: the body may open with a `- ` bullet.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(
+        long = "comment",
+        alias = "body",
+        value_name = "COMMENT",
+        allow_hyphen_values = true
+    )]
     body: String,
     /// The comment being replied to, when this is a reply (OBS
     /// only; refused on a Gitea ref).
     #[arg(long)]
     parent: Option<String>,
-}
-
-/// Arguments for `pull-request build-comment`.
-#[derive(Debug, Args)]
-pub struct BuildCommentArgs {
-    /// The pull-request handle: `gitea:<owner>/<repo>#<number>`.
-    /// An OBS handle is refused: the build link belongs on the
-    /// Gitea pull request.
-    reference: String,
-    /// The test project the build results are read from.
-    #[arg(long)]
-    project: String,
-    /// The package in the test project.
-    #[arg(long)]
-    package: String,
 }
 
 /// Arguments for `pull-request cancel-review-request`.
@@ -326,7 +330,12 @@ pub struct MergeArgs {
     reference: String,
     /// The message left with the merge. Values starting with `-`
     /// are taken literally: a message may open with a `- ` bullet.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(
+        long = "comment",
+        alias = "message",
+        value_name = "COMMENT",
+        allow_hyphen_values = true
+    )]
     message: Option<String>,
     /// The changes entry for the forwarded request, overriding
     /// the original description on the OBS arm and the pull
@@ -358,7 +367,12 @@ pub struct LevelCommentArgs {
     /// The reason for the decline or withdrawal. Values starting
     /// with `-` are taken literally: a message may open with a
     /// `- ` bullet.
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(
+        long = "comment",
+        alias = "message",
+        value_name = "COMMENT",
+        allow_hyphen_values = true
+    )]
     message: Option<String>,
 }
 
@@ -382,9 +396,9 @@ pub struct SearchArgs {
     #[arg(long)]
     creator: Option<String>,
     /// Only pull requests with review requested of this login.
-    /// Requires `--backend gitea`. Only the token owner's login:
-    /// the server filters review requests for the authenticated
-    /// user only.
+    /// On Gitea only the token owner's login: the server filters
+    /// review requests for the authenticated user only; on OBS
+    /// an open review addressed to the login.
     #[arg(long)]
     reviewer: Option<String>,
     /// Only pull requests in this Gitea repo (`owner/repo`).
@@ -426,7 +440,7 @@ pub fn run_pull_request(
             if xml {
                 if let PullRequestRef::Gitea { .. } = &reference {
                     return Err(GeectlError::new(
-                        ErrorKind::InvalidInput,
+                        ErrorKind::UnsupportedFlagForBackend,
                         "--xml does not apply to a Gitea pull request: a Gitea pull request has no request XML",
                     ));
                 }
@@ -485,70 +499,6 @@ pub fn run_pull_request(
                     ))
                 }),
             }
-        }
-        PullRequestCommand::BuildComment(args) => {
-            // The OBS ref is refused before any credential
-            // resolution, so the refusal is reachable without
-            // credentials — the library refuses again, as
-            // enforcement.
-            let reference: PullRequestRef = args.reference.parse()?;
-            if let PullRequestRef::Obs(id) = &reference {
-                return Err(GeectlError::new(
-                    ErrorKind::InvalidInput,
-                    format!(
-                        "build-comment posts the build link on a Gitea pull request; {id} is an OBS submit request"
-                    ),
-                ));
-            }
-            let dry_run = DryRun::new(!live).with_debug(debug.clone());
-            let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-            let (base, instances) = crate::cli_build::obs_endpoint(instance)?;
-            // The link forms before the results read: a
-            // non-production host fails before any network.
-            let link = package_show_url(&args.project, &args.package, &base)?;
-            let query = ResultsQuery {
-                package: Some(args.package.clone()),
-                ..Default::default()
-            };
-            let outcomes = crate::cli_build::read_results_across_instances(
-                &http,
-                debug,
-                &base,
-                &instances,
-                &args.project,
-                &query,
-                instance,
-            )?;
-            let body = build_comment_body(&args.project, &args.package, &link, &outcomes);
-            with_gitea(debug, instance, |gitea| {
-                let client = PullRequestClient::new(None, Some(gitea));
-                let comment = client.build_comment(
-                    &reference,
-                    &args.project,
-                    &args.package,
-                    &link,
-                    &outcomes,
-                    &dry_run,
-                )?;
-                Ok((
-                    build_comment_payload(
-                        &reference,
-                        &args.project,
-                        &args.package,
-                        &link,
-                        &comment,
-                        &dry_run,
-                    )?,
-                    build_comment_text(
-                        &reference,
-                        &args.project,
-                        &args.package,
-                        &comment,
-                        &body,
-                        &dry_run,
-                    ),
-                ))
-            })
         }
         PullRequestCommand::Comments { reference } => {
             let reference: PullRequestRef = reference.parse()?;
@@ -621,7 +571,7 @@ pub fn run_pull_request(
                 PullRequestRef::Obs(_) => {
                     if let Some(method) = method {
                         return Err(GeectlError::new(
-                            ErrorKind::InvalidInput,
+                            ErrorKind::UnsupportedFlagForBackend,
                             format!(
                                 "--method {} does not apply to an OBS submit request: OBS has no merge style",
                                 method.as_str()
@@ -630,7 +580,7 @@ pub fn run_pull_request(
                     }
                     if args.no_forward {
                         return Err(GeectlError::new(
-                            ErrorKind::InvalidInput,
+                            ErrorKind::UnsupportedFlagForBackend,
                             "--no-forward does not apply to an OBS submit request: the merge always forwards after accepting",
                         ));
                     }
@@ -638,7 +588,7 @@ pub fn run_pull_request(
                 PullRequestRef::Gitea { .. } => {
                     if args.force {
                         return Err(GeectlError::new(
-                            ErrorKind::InvalidInput,
+                            ErrorKind::UnsupportedFlagForBackend,
                             "--force does not apply to a Gitea pull request: the merge API takes no force flag",
                         ));
                     }
@@ -1035,12 +985,32 @@ fn obs_submit_target(
             "--target-project is required to file an OBS submit request",
         )
     })?;
-    let description = args.description.as_deref().ok_or_else(|| {
-        GeectlError::new(
+    // The submission text has two spellings: the OBS
+    // `--description`, or the shared `--title`/`--body` pair,
+    // which composes it (the title as the headline, the body
+    // after a blank line). One spelling, not both; a body
+    // without a title is not a spelling at all.
+    if args.description.is_some() && (args.title.is_some() || args.body.is_some()) {
+        return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "--description is required to file an OBS submit request",
-        )
-    })?;
+            "pass --description or --title/--body, not both: they are two spellings of the submission text",
+        ));
+    }
+    let description = match args.description.as_deref() {
+        Some(description) => description.to_string(),
+        None => {
+            let title = args.title.as_deref().ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "--description or --title is required to file an OBS submit request",
+                )
+            })?;
+            match args.body.as_deref() {
+                Some(body) => format!("{title}\n\n{body}"),
+                None => title.to_string(),
+            }
+        }
+    };
     let changes_entry = args.changes_entry.as_deref().ok_or_else(|| {
         GeectlError::new(
             ErrorKind::InvalidInput,
@@ -1056,7 +1026,7 @@ fn obs_submit_target(
         &wc.package,
         target_project,
         args.target_package.as_deref().unwrap_or(&wc.package),
-        description,
+        &description,
         changes_entry,
         &cves,
     )?;
@@ -1071,37 +1041,25 @@ fn obs_submit_target(
 fn refuse_gitea_flags(args: &SubmitArgs) -> Result<(), GeectlError> {
     if args.repo.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--repo does not apply to an OBS-native checkout: an OBS submit request targets a project, not a Gitea repo",
         ));
     }
     if args.head.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--head does not apply to an OBS-native checkout: the request files the checkout as it stands",
         ));
     }
     if args.base.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--base does not apply to an OBS-native checkout: the target is --target-project",
-        ));
-    }
-    if args.title.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--title does not apply to an OBS-native checkout: the request takes --description",
-        ));
-    }
-    if args.body.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "--body does not apply to an OBS-native checkout: the request takes --description",
         ));
     }
     if args.draft {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--draft does not apply to an OBS-native checkout: OBS has no draft requests",
         ));
     }
@@ -1214,7 +1172,7 @@ fn refuse_factory_base(base: &str) -> Result<(), GeectlError> {
     if base.eq_ignore_ascii_case("factory") {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "the factory branch does not take pull requests: target the devel branch with --base instead, and file the Factory leg as an OBS submit request (`osc sr`)",
+            "the factory branch does not take pull requests: target the devel branch with --base instead, and file the Factory leg as an OBS submit request (`pull-request submit` or `request file`)",
         ));
     }
     Ok(())
@@ -1321,37 +1279,37 @@ fn resolve_git_submit_target(
 fn refuse_obs_flags(args: &SubmitArgs) -> Result<(), GeectlError> {
     if args.target_project.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--target-project does not apply to a git-backed checkout: the pull request goes to --repo",
         ));
     }
     if args.target_package.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--target-package does not apply to a git-backed checkout: the pull request files the whole branch",
         ));
     }
     if args.description.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--description does not apply to a git-backed checkout: the pull request takes --title and --body",
         ));
     }
     if args.changes_entry.is_some() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--changes-entry does not apply to a git-backed checkout: OBS-only",
         ));
     }
     if !args.cve.is_empty() {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--cve does not apply to a git-backed checkout: OBS-only",
         ));
     }
     if args.without_cleanup {
         return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
+            ErrorKind::UnsupportedFlagForBackend,
             "--without-cleanup does not apply to a git-backed checkout: OBS-only",
         ));
     }
@@ -1396,6 +1354,21 @@ fn review_act_with(
     ) -> Result<Option<ReviewOpinion>, GeectlError>,
 ) -> Result<(Value, String), GeectlError> {
     let reference: PullRequestRef = args.reference.parse()?;
+    // A `--commit` pin is Gitea-only (see
+    // `PullRequestClient::commit_pin_supported`): refuse it on an
+    // OBS ref before any credential resolution, like the merge
+    // leaf refuses its backend-only options — the library refuses
+    // again, as enforcement.
+    if let Some(commit) = args.commit.as_deref() {
+        if !PullRequestClient::commit_pin_supported(&reference) {
+            return Err(GeectlError::new(
+                ErrorKind::UnsupportedFlagForBackend,
+                format!(
+                    "--commit {commit} does not apply to a submit request: OBS reviews are not pinned to a commit"
+                ),
+            ));
+        }
+    }
     let target = review_target(
         args.user.as_deref(),
         args.group.as_deref(),
@@ -2353,60 +2326,6 @@ fn comment_text(
 }
 
 /// The payload for a build-link comment: the reference, the
-/// test project and package, the link, the created comment
-/// (`null` in dry-run), and `dry_run`, plus the plan in dry-run.
-fn build_comment_payload(
-    reference: &PullRequestRef,
-    project: &str,
-    package: &str,
-    link: &str,
-    comment: &Option<ReviewComment>,
-    dry_run: &DryRun,
-) -> Result<Value, GeectlError> {
-    let mut payload = json!({
-        "reference": reference.to_string(),
-        "project": project,
-        "package": package,
-        "link": link,
-        "comment": match comment {
-            Some(comment) => payload_json(comment)?,
-            None => Value::Null,
-        },
-        "dry_run": dry_run.enabled(),
-    });
-    add_plan(&mut payload, dry_run);
-    Ok(payload)
-}
-
-/// The text for a build-link comment: the header first — the
-/// reference and the test project/package — then the posted
-/// comment body in full, so a dry-run shows the comment that
-/// would be posted.
-fn build_comment_text(
-    reference: &PullRequestRef,
-    project: &str,
-    package: &str,
-    comment: &Option<ReviewComment>,
-    body: &str,
-    dry_run: &DryRun,
-) -> String {
-    if dry_run.enabled() {
-        format!(
-            "dry-run: would post the build-link comment on {reference} for {project}/{package}:\n{body}"
-        )
-    } else {
-        match comment {
-            Some(comment) => format!(
-                "posted the build-link comment on {reference} (comment {} by {}) for {project}/{package}:\n{body}",
-                comment.id, comment.author
-            ),
-            None => format!(
-                "posted the build-link comment on {reference} for {project}/{package}:\n{body}"
-            ),
-        }
-    }
-}
-
 /// Record a filed OBS submit request in the checkout at
 /// `root`, for `pull-request cleanup` to watch. Only the OBS arm
 /// files a submit request: a Gitea pull request, or a dry run that
@@ -2931,7 +2850,7 @@ fn search_with(
 }
 
 /// Serialize a pull-request shape to its JSON payload value.
-fn payload_json<T: Serialize>(value: &T) -> Result<Value, GeectlError> {
+pub(crate) fn payload_json<T: Serialize>(value: &T) -> Result<Value, GeectlError> {
     serde_json::to_value(value).map_err(|err| {
         GeectlError::new(
             ErrorKind::InternalError,
@@ -3586,59 +3505,6 @@ mod tests {
     }
 
     #[test]
-    fn build_comment_json_and_text_agree() {
-        let reference = gitea_reference();
-        let comment = Some(fixture_comment());
-        let link = "https://build.opensuse.org/package/show/home:test/foo";
-        let body = "Build results for home:test/foo: https://build.opensuse.org/package/show/home:test/foo";
-        let dry_run = DryRun::new(false);
-        let payload =
-            build_comment_payload(&reference, "home:test", "foo", link, &comment, &dry_run)
-                .unwrap();
-        assert_eq!(payload["reference"], "gitea:openSUSE/geectl#122");
-        assert_eq!(payload["project"], "home:test");
-        assert_eq!(payload["package"], "foo");
-        assert_eq!(payload["link"], link);
-        assert_eq!(payload["comment"]["id"], 7);
-        assert_eq!(payload["comment"]["author"], "plusky");
-        assert_eq!(payload["comment"]["body"], "One nit.");
-        assert_eq!(payload["dry_run"], false);
-
-        let text = build_comment_text(&reference, "home:test", "foo", &comment, body, &dry_run);
-        for expected in [
-            "gitea:openSUSE/geectl#122",
-            "comment 7",
-            "plusky",
-            "Build results for home:test/foo",
-        ] {
-            assert!(
-                text.contains(expected),
-                "text missing {expected:?}:\n{text}"
-            );
-        }
-
-        let dry_run = DryRun::new(true);
-        dry_run.allow("comment on pull request openSUSE/geectl#122");
-        let payload =
-            build_comment_payload(&reference, "home:test", "foo", link, &None, &dry_run).unwrap();
-        assert_eq!(payload["comment"], Value::Null);
-        assert_eq!(payload["dry_run"], true);
-        assert_eq!(
-            payload["plan"][0],
-            "[dry-run] would: comment on pull request openSUSE/geectl#122"
-        );
-
-        let text = build_comment_text(&reference, "home:test", "foo", &None, body, &dry_run);
-        assert!(
-            text.starts_with(
-                "dry-run: would post the build-link comment on gitea:openSUSE/geectl#122 for home:test/foo:"
-            ),
-            "text: {text}"
-        );
-        assert!(text.contains(body), "text: {text}");
-    }
-
-    #[test]
     fn comments_json_and_text_agree() {
         let reference = gitea_reference();
         let mut reply = fixture_comment();
@@ -4176,6 +4042,70 @@ mod tests {
         }
     }
 
+    fn obs_submit_args() -> SubmitArgs {
+        SubmitArgs {
+            target_project: Some("home:devel".to_string()),
+            target_package: None,
+            description: None,
+            changes_entry: Some("- Update to 1.1.".to_string()),
+            cve: Vec::new(),
+            without_cleanup: false,
+            repo: None,
+            head: None,
+            base: None,
+            title: None,
+            body: None,
+            draft: false,
+        }
+    }
+
+    fn obs_checkout() -> working_copy::WorkingCopy {
+        working_copy::WorkingCopy {
+            root: std::path::PathBuf::from("/tmp"),
+            project: "home:alice".to_string(),
+            package: "foo".to_string(),
+            apiurl: "https://api.opensuse.org".to_string(),
+            backend: working_copy::Backend::Obs,
+            base_rev: "1".to_string(),
+            base_srcmd5: String::new(),
+            mtimes: Vec::new(),
+            scmsync_url: None,
+            scmsync_branch: None,
+        }
+    }
+
+    #[test]
+    fn obs_submit_target_derives_the_description_from_title_and_body() {
+        let wc = obs_checkout();
+        let mut args = obs_submit_args();
+        args.title = Some("Update foo".to_string());
+        args.body = Some("The body.".to_string());
+        let SubmitTarget::Obs(payload) = obs_submit_target(&args, &wc).unwrap() else {
+            panic!("an OBS checkout files an OBS target");
+        };
+        assert_eq!(payload.description(), "Update foo\n\nThe body.");
+        // A title alone is the whole description.
+        let mut args = obs_submit_args();
+        args.title = Some("Update foo".to_string());
+        let SubmitTarget::Obs(payload) = obs_submit_target(&args, &wc).unwrap() else {
+            panic!("an OBS checkout files an OBS target");
+        };
+        assert_eq!(payload.description(), "Update foo");
+        // Two spellings at once are refused; a body without a
+        // title is not a spelling at all.
+        let mut args = obs_submit_args();
+        args.description = Some("Update foo".to_string());
+        args.title = Some("Update foo".to_string());
+        let err = obs_submit_target(&args, &wc).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not both"));
+        let mut args = obs_submit_args();
+        args.body = Some("The body.".to_string());
+        let err = obs_submit_target(&args, &wc).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--description or --title"));
+    }
+
     /// A git-backed checkout for the submit-parts tests: a repo
     /// with an origin on the default instance and the record
     /// written by hand, like the `origin_repo` tests in the
@@ -4277,7 +4207,10 @@ mod tests {
                 .contains("the factory branch does not take pull requests"),
             "err: {err}"
         );
-        assert!(err.to_string().contains("osc sr"), "err: {err}");
+        assert!(
+            err.to_string().contains("pull-request submit"),
+            "err: {err}"
+        );
     }
 
     #[test]
@@ -4684,5 +4617,57 @@ mod tests {
             let err = parse_gitea_full_name(malformed, "gitea:pool/systemd#7").unwrap_err();
             assert_eq!(err.kind(), ErrorKind::ServerError, "{malformed}: {err}");
         }
+    }
+
+    #[test]
+    fn old_comment_spellings_still_parse() {
+        use clap::FromArgMatches;
+        let command = PullRequestCommand::augment_subcommands(clap::Command::new("pull-request"));
+        let matches = command
+            .clone()
+            .try_get_matches_from(["pull-request", "merge", "obs:1", "--message", "done"])
+            .unwrap();
+        assert!(matches!(
+            PullRequestCommand::from_arg_matches(&matches).unwrap(),
+            PullRequestCommand::Merge(MergeArgs {
+                message: Some(_),
+                ..
+            })
+        ));
+        let matches = command
+            .clone()
+            .try_get_matches_from([
+                "pull-request",
+                "approve",
+                "obs:1",
+                "--message",
+                "looks good",
+            ])
+            .unwrap();
+        assert!(matches!(
+            PullRequestCommand::from_arg_matches(&matches).unwrap(),
+            PullRequestCommand::Approve(ReviewActArgs {
+                message: Some(_),
+                ..
+            })
+        ));
+        let matches = command
+            .clone()
+            .try_get_matches_from(["pull-request", "decline", "obs:1", "--message", "not yet"])
+            .unwrap();
+        assert!(matches!(
+            PullRequestCommand::from_arg_matches(&matches).unwrap(),
+            PullRequestCommand::Decline(LevelCommentArgs {
+                message: Some(_),
+                ..
+            })
+        ));
+        let matches = command
+            .try_get_matches_from(["pull-request", "comment", "obs:1", "--body", "noted"])
+            .unwrap();
+        assert!(matches!(
+            PullRequestCommand::from_arg_matches(&matches).unwrap(),
+            PullRequestCommand::Comment(CommentArgs { body, .. }) if body == "noted"
+        ));
     }
 }

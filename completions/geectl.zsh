@@ -157,7 +157,7 @@ _arguments "${_arguments_options[@]}" : \
         case $line[1] in
             (cat)
 _arguments "${_arguments_options[@]}" : \
-'--rev=[Print the file as of this revision (default\: latest)\: a revision number or a srcmd5]:REV:_default' \
+'--rev=[Print the file as of this revision (default\: latest)\: a revision number or a srcmd5 (the source checksum of a revision, as \`remote package-log\` reports it in JSON)]:REV:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
@@ -172,7 +172,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (download)
 _arguments "${_arguments_options[@]}" : \
-'--rev=[Download the file as of this revision\: a revision number or a srcmd5 (default\: latest)]:REV:_default' \
+'--rev=[Download the file as of this revision (default\: latest)\: a revision number or a srcmd5 (the source checksum of a revision, as \`remote package-log\` reports it in JSON)]:REV:_default' \
 '--output=[Where to write the downloaded bytes]:OUTPUT:_files' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
@@ -188,7 +188,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (list-files)
 _arguments "${_arguments_options[@]}" : \
-'--rev=[List the files as of this revision (default\: latest)\: a revision number or a srcmd5]:REV:_default' \
+'--rev=[List the files as of this revision (default\: latest)\: a revision number or a srcmd5 (the source checksum of a revision, as \`remote package-log\` reports it in JSON)]:REV:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--include-deleted[Include files from deleted revisions in the listing\: the files of a deleted package, for asking whether a project ever held it. Requires OBS credentials\: the deleted listing reads the authenticated source route]' \
@@ -255,7 +255,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (package-log)
 _arguments "${_arguments_options[@]}" : \
-'--range=[Only entries in this revision range (\`FROM\:TO\`, either side may be empty; a side is a revision number or a srcmd5)]:RANGE:_default' \
+'--range=[Only entries in this revision range (\`FROM\:TO\`, either side may be empty; a side is a revision number or a srcmd5 (the source checksum of a revision, as \`remote package-log\` reports it in JSON))]:RANGE:_default' \
 '--limit=[At most this many entries]:LIMIT:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
@@ -506,6 +506,18 @@ _arguments "${_arguments_options[@]}" : \
 '::login -- The login name to look up; without one, the authenticated user:_default' \
 && ret=0
 ;;
+(whoami)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'::login -- The login name to look up; without one, the authenticated user:_default' \
+&& ret=0
+;;
 (link-target)
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
@@ -683,7 +695,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (delete-package)
 _arguments "${_arguments_options[@]}" : \
-'--message=[A message recorded on the delete, sent as the server'\''s \`comment\` query parameter]:MESSAGE:_default' \
+'--comment=[A message recorded on the delete]:COMMENT:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--force[Delete even when open submit requests involve the package]' \
@@ -820,7 +832,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (lock)
 _arguments "${_arguments_options[@]}" : \
-'--message=[A message for the lock, sent as the server'\''s \`comment\` query parameter. A project lock records it; a package lock sends it but the server does not record it — there is no package-scope lock command]:MESSAGE:_default' \
+'--comment=[A message for the lock. A project lock records it; a package lock'\''s message is not recorded — there is no package-scope lock command]:COMMENT:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
@@ -834,7 +846,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (unlock)
 _arguments "${_arguments_options[@]}" : \
-'--message=[A message recorded on the unlock, sent as the server'\''s \`comment\` query parameter]:MESSAGE:_default' \
+'--comment=[A message recorded on the unlock]:COMMENT:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
@@ -1190,7 +1202,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
-'--xml[Render the request XML with the diff injected, instead of the unified diff]' \
+'--xml[Render the request XML with the diff injected, instead of the unified diff — the OBS-only escape hatch]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
 '--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
@@ -1321,7 +1333,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (add-comment)
 _arguments "${_arguments_options[@]}" : \
-'--body=[The comment text. Values starting with \`-\` are taken literally\: the body may open with a \`- \` bullet]:BODY:_default' \
+'--comment=[The comment text. Values starting with \`-\` are taken literally\: the body may open with a \`- \` bullet]:COMMENT:_default' \
 '--parent=[The comment being replied to, when this is a reply]:PARENT:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
@@ -1629,7 +1641,7 @@ _arguments "${_arguments_options[@]}" : \
 '--target-project=[The branch project. Without it, the server picks the default (usually \`home\:<user>\:branches\:<source project>\`)]:TARGET_PROJECT:_default' \
 '--target-package=[The branch package name. Without it, the source package name]:TARGET_PACKAGE:_default' \
 '--revision=[Branch from this source revision instead of the latest]:REVISION:_default' \
-'--linkrev=[The link revision the branch records]:LINKREV:_default' \
+'--link-rev=[The link revision the branch records]:LINKREV:_default' \
 '--comment=[A comment recorded on the branch]:COMMENT:_default' \
 '--add-repositories-block=[Block the added repositories. Only sent with \`--add-repositories\` (clap refuses it without that flag\: a block the live run would silently drop must fail at parse time, not vanish)]:ADD_REPOSITORIES_BLOCK:_default' \
 '--add-repositories-rebuild=[Rebuild the added repositories. Only sent with \`--add-repositories\` (clap refuses it without that flag, as above)]:ADD_REPOSITORIES_REBUILD:_default' \
@@ -1638,7 +1650,7 @@ _arguments "${_arguments_options[@]}" : \
 '--no-devel-project[Ignore the devel project when resolving the link source]' \
 '--new-package[Branch a package that does not exist yet]' \
 '--force[Overwrite an existing target package]' \
-'--noaccess[Withhold the branch'\''s read access to the source package'\''s project]' \
+'--no-access[Withhold the branch'\''s read access to the source package'\''s project]' \
 '--add-repositories[Add the source project'\''s repositories to the branch project]' \
 '--extend-package-names[Extend the branch package names with the source project name]' \
 '--maintenance[Branch as a maintenance incident]' \
@@ -1657,12 +1669,12 @@ _arguments "${_arguments_options[@]}" : \
 '--target-package=[The package to copy to]:TARGET_PACKAGE:_default' \
 '--revision=[Copy this source revision instead of the latest]:REVISION:_default' \
 '--comment=[A comment recorded on the copy]:COMMENT:_default' \
-'--to-apiurl=[Copy to another OBS instance at this API URL instead of the configured one. The target'\''s credentials come from the instance alias matching that URL in the config file'\''s \`\[instances\]\` table (\`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\` or \`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\`; see \`auth\:\:resolve_obs_for_url\`) and the copy fails clearly when none are configured — the source instance'\''s credentials are never forwarded to the target. The copy is client-side and always expanded; \`--keep-link\` and the server-side copy options are refused with it]:TO_APIURL:_default' \
+'--to-api-url=[Copy to another OBS instance at this API URL instead of the configured one. The target'\''s credentials come from the instance alias matching that URL in the config file'\''s \`\[instances\]\` table (\`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\` or \`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\`; see \`auth\:\:resolve_obs_for_url\`) and the copy fails clearly when none are configured — the source instance'\''s credentials are never forwarded to the target. The copy is client-side and always expanded; \`--keep-link\` and the server-side copy options are refused with it]:TO_APIURL:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--keep-link[Keep the source package'\''s link when copying a link package]' \
 '--expand[Copy the expanded source (the link resolved) instead of the link itself]' \
-'--noservice[Do not run source services on the copied files]' \
+'--no-service[Do not run source services on the copied files]' \
 '--dont-update-source[Do not update the source package when copying a link onto its target]' \
 '--with-vrev[Carry the source revision'\''s vrev over to the copy]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
@@ -1683,7 +1695,7 @@ _arguments "${_arguments_options[@]}" : \
 '--with-history[Copy the project history as well]' \
 '--make-older[Make the copied project older than the source]' \
 '--make-origin-older[Make the copied project older than the source'\''s origin]' \
-'--noservice[Do not run source services on the copied files]' \
+'--no-service[Do not run source services on the copied files]' \
 '--resign[Re-sign the copied project]' \
 '--no-delay[Run the copy synchronously instead of as a background job]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
@@ -1889,12 +1901,12 @@ _arguments "${_arguments_options[@]}" : \
 '*--repository=[Only these repositories (repeatable)]:REPOSITORY:_default' \
 '*--arch=[Only these architectures (repeatable)]:ARCH:_default' \
 '--code=[Only packages with this build code (e.g. \`failed\`)]:CODE:_default' \
-'--oldstate=[Poll for changes since this state hash (from a previous run). Only \`results\` takes it\: \`wait-for-results\` polls plainly]:OLDSTATE:_default' \
+'--oldstate=[Poll for changes since this state hash — a polling token from a previous \`results\` run'\''s payload. Only \`results\` takes it\: \`wait-for-results\` polls plainly]:OLDSTATE:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--multibuild[Expand multibuild flavors into their own statuses]' \
-'--locallink[Follow local links when expanding multibuild flavors]' \
-'--lastbuild[The last build'\''s results instead of the current state]' \
+'--local-link[Follow local links when expanding multibuild flavors]' \
+'--last-build[The last build'\''s results instead of the current state]' \
 '(--oldstate)--all-instances[Merge the results from every configured instance into one view, instead of only the instance currently pointed at. Cannot combine with \`--oldstate\`\: a state hash is per instance. A partially-failing read still exits 0\: per-instance errors render in the view and payload, and only an every-instance failure is an error]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
@@ -1914,8 +1926,8 @@ _arguments "${_arguments_options[@]}" : \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--multibuild[Expand multibuild flavors into their own statuses]' \
-'--locallink[Follow local links when expanding multibuild flavors]' \
-'--lastbuild[The last build'\''s results instead of the current state]' \
+'--local-link[Follow local links when expanding multibuild flavors]' \
+'--last-build[The last build'\''s results instead of the current state]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
 '--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
@@ -1930,15 +1942,15 @@ _arguments "${_arguments_options[@]}" : \
 '--multibuild=[Only this multibuild flavor'\''s log\: appends \`\:FLAVOR\` to the package. Refused when the package already carries a flavor]:FLAVOR:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
-'(--lastsucceeded)--last[The last build'\''s log instead of the current one. Cannot combine with \`--lastsucceeded\`]' \
-'--lastsucceeded[The last succeeded build'\''s log. Cannot combine with \`--last\`]' \
+'(--last-succeeded)--last[The last build'\''s log instead of the current one. Cannot combine with \`--last-succeeded\`]' \
+'--last-succeeded[The last succeeded build'\''s log. Cannot combine with \`--last\`]' \
 '--strip-time[Strip the leading \`\[timestamp\] \` from each log line]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
 '--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
 '-h[Print help]' \
 '--help[Print help]' \
-':project -- The project the package is in — or a build-log URL, in which case the other coordinates are omitted. The URL form takes an API log URL (`http(s)\://<api-host>/build/<project>/<repository>/<arch>/<package>/_log`) or a web-UI log URL (`http(s)\://build.opensuse.org/package/live_build_log/<project>/<package>/<repository>/<arch>`):_default' \
+':project -- The project the package is in — or a build-log URL, in which case the other coordinates are omitted. The URL form takes an API log URL (`http(s)\://<api-host>/build/<project>/<repository>/<arch>/<package>/_log`) or a web-UI live-build-log URL (`http(s)\://<web-host>/package/live_build_log/<project>/<package>/<repository>/<arch>`):_default' \
 '::package -- The package to read the log for. Omit with a URL:_default' \
 '::repository -- The repository the package builds in. Omit with a URL:_default' \
 '::arch -- The architecture the package builds for. Omit with a URL:_default' \
@@ -2381,7 +2393,7 @@ _arguments "${_arguments_options[@]}" : \
 (build)
 _arguments "${_arguments_options[@]}" : \
 '--project=[The OBS project the package belongs to]:PROJECT:_default' \
-'--repo=[The repository to build for (e.g. \`standard\`)]:REPO:_default' \
+'--repository=[The repository to build for (e.g. \`standard\`)]:REPOSITORY:_default' \
 '--arch=[The architecture to build for; must equal the host arch]:ARCH:_default' \
 '--flavor=[The multibuild flavor; required when the source carries a \`_multibuild\` file. One invocation builds one flavor]:FLAVOR:_default' \
 '--release=[The release number, passed through to the engine]:RELEASE:_default' \
@@ -2397,9 +2409,9 @@ _arguments "${_arguments_options[@]}" : \
 '--clean[Wipe the root before building]' \
 '--trust-all-projects[Allow build dependencies from other users'\'' \`home\:\` projects (their packages run code in the build root). Without this such builds are refused]' \
 '--refresh-image[Force an image pull even when the local image is fresh]' \
-'--noinit[Skip the root initialization\: start the build immediately in the existing root. Needs an initialized root (a previous build wrote the rpmlist and buildconfig there)]' \
-'--preinstall-image[Use the preinstall image when the buildinfo offers one. Off by default\: the engine extracts the image with bsdtar \`--chroot\` plus device nodes, which need root. The engine always runs as container root, so the image is always selectable]' \
-'--privileged[Run the build container privileged (the engine'\''s own privileged podman mode, like upstream'\''s \`VM_TYPE_PRIVILEGED\` opt-in)\: the default is rootless, with a cap list only and the build root inside the disposable container]' \
+'--no-init[Skip the root initialization\: start the build immediately in the existing root. Needs an initialized root (a previous build wrote the rpmlist and buildconfig there)]' \
+'--preinstall-image[Use the preinstall image when the buildinfo offers one. Off by default\: extracting the image needs root. The engine always runs as container root, so the image is always selectable]' \
+'--privileged[Run the build container privileged\: the default is rootless, with a cap list only and the build root inside the disposable container]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
 '--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
@@ -2473,7 +2485,7 @@ _arguments "${_arguments_options[@]}" : \
 (chroot)
 _arguments "${_arguments_options[@]}" : \
 '--project=[The OBS project the package belongs to]:PROJECT:_default' \
-'--repo=[The repository the root was built for (e.g. \`standard\`)]:REPO:_default' \
+'--repository=[The repository the root was built for (e.g. \`standard\`)]:REPOSITORY:_default' \
 '--arch=[The architecture the root was built for; defaults to the host arch]:ARCH:_default' \
 '--flavor=[The multibuild flavor; required when the source carries a \`_multibuild\` file]:FLAVOR:_default' \
 '--timeout-secs=[Timeout in seconds for the whole run]:TIMEOUT_SECS:_default' \
@@ -2816,6 +2828,17 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(whois)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (repo-create)
 _arguments "${_arguments_options[@]}" : \
 '--description=[A short description]:DESCRIPTION:_default' \
@@ -2955,6 +2978,20 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(build-comment)
+_arguments "${_arguments_options[@]}" : \
+'--project=[The test project the build results are read from]:PROJECT:_default' \
+'--package=[The package in the test project]:PACKAGE:_default' \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':reference -- The pull-request handle\: `gitea\:<owner>/<repo>#<number>`. An OBS handle is refused\: the build link belongs on the Gitea pull request:_default' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_geectl__subcmd__gitea__subcmd__help_commands" \
@@ -3023,6 +3060,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(build-comment)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -3070,7 +3111,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
-'--xml[Render the OBS request XML with the diff injected, instead of the bare diff. Refused on a Gitea ref]' \
+'--xml[Render the OBS request XML with the diff injected, instead of the bare diff — the OBS-only escape hatch. Refused on a Gitea ref]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
 '--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
@@ -3084,7 +3125,7 @@ _arguments "${_arguments_options[@]}" : \
 '--backend=[Only this backend (\`obs\` or \`gitea\`). With no backend both arms run, OBS first then Gitea]:BACKEND:(obs gitea)' \
 '*--state=[Only pull requests in these unified states. With none given each arm applies its own default (new/review/declined on OBS, open on Gitea). OBS has no closed state\: \`--state closed\` reads OBS declined requests, which report as \`declined\`]:STATE:(open merged declined withdrawn closed superseded deleted)' \
 '--creator=[Only pull requests by this author]:CREATOR:_default' \
-'--reviewer=[Only pull requests with review requested of this login. Requires \`--backend gitea\`. Only the token owner'\''s login\: the server filters review requests for the authenticated user only]:REVIEWER:_default' \
+'--reviewer=[Only pull requests with review requested of this login. On Gitea only the token owner'\''s login\: the server filters review requests for the authenticated user only; on OBS an open review addressed to the login]:REVIEWER:_default' \
 '--repo=[Only pull requests in this Gitea repo (\`owner/repo\`). Requires \`--backend gitea\`]:REPO:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
@@ -3097,7 +3138,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (approve)
 _arguments "${_arguments_options[@]}" : \
-'--message=[The message left with the review. Values starting with \`-\` are taken literally\: a message may open with a \`- \` bullet]:MESSAGE:_default' \
+'--comment=[The message left with the review. Values starting with \`-\` are taken literally\: a message may open with a \`- \` bullet]:COMMENT:_default' \
 '--commit=[Pin the review to this head commit (Gitea only)\: the review is recorded against it server-side, and is refused when the head has moved. Best-effort\: the head is read just before the review posts, so a push landing between the read and the post is not caught. Refused on an OBS ref]:COMMIT:_default' \
 '--user=[Act on the review asked of this user (OBS only)]:USER:_default' \
 '--group=[Act on the review asked of this group (OBS only)]:GROUP:_default' \
@@ -3115,7 +3156,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (request-changes)
 _arguments "${_arguments_options[@]}" : \
-'--message=[The message left with the review. Values starting with \`-\` are taken literally\: a message may open with a \`- \` bullet]:MESSAGE:_default' \
+'--comment=[The message left with the review. Values starting with \`-\` are taken literally\: a message may open with a \`- \` bullet]:COMMENT:_default' \
 '--commit=[Pin the review to this head commit (Gitea only)\: the review is recorded against it server-side, and is refused when the head has moved. Best-effort\: the head is read just before the review posts, so a push landing between the read and the post is not caught. Refused on an OBS ref]:COMMIT:_default' \
 '--user=[Act on the review asked of this user (OBS only)]:USER:_default' \
 '--group=[Act on the review asked of this group (OBS only)]:GROUP:_default' \
@@ -3133,7 +3174,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (comment)
 _arguments "${_arguments_options[@]}" : \
-'--body=[The comment text. Values starting with \`-\` are taken literally\: the body may open with a \`- \` bullet]:BODY:_default' \
+'--comment=[The comment text. Values starting with \`-\` are taken literally\: the body may open with a \`- \` bullet]:COMMENT:_default' \
 '--parent=[The comment being replied to, when this is a reply (OBS only; refused on a Gitea ref)]:PARENT:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
@@ -3143,20 +3184,6 @@ _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
 '--help[Print help]' \
 ':reference -- The pull-request handle\: `obs\:<id>` or `gitea\:<owner>/<repo>#<number>`:_default' \
-&& ret=0
-;;
-(build-comment)
-_arguments "${_arguments_options[@]}" : \
-'--project=[The test project the build results are read from]:PROJECT:_default' \
-'--package=[The package in the test project]:PACKAGE:_default' \
-'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
-'--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
-'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
-'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
-'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
-'-h[Print help]' \
-'--help[Print help]' \
-':reference -- The pull-request handle\: `gitea\:<owner>/<repo>#<number>`. An OBS handle is refused\: the build link belongs on the Gitea pull request:_default' \
 && ret=0
 ;;
 (comments)
@@ -3188,7 +3215,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (merge)
 _arguments "${_arguments_options[@]}" : \
-'--message=[The message left with the merge. Values starting with \`-\` are taken literally\: a message may open with a \`- \` bullet]:MESSAGE:_default' \
+'--comment=[The message left with the merge. Values starting with \`-\` are taken literally\: a message may open with a \`- \` bullet]:COMMENT:_default' \
 '-m+[The changes entry for the forwarded request, overriding the original description on the OBS arm and the pull request'\''s text on the Gitea arm. Values starting with \`-\` are taken literally\: an entry may open with a \`- \` bullet]:FORWARD_MESSAGE:_default' \
 '--forward-message=[The changes entry for the forwarded request, overriding the original description on the OBS arm and the pull request'\''s text on the Gitea arm. Values starting with \`-\` are taken literally\: an entry may open with a \`- \` bullet]:FORWARD_MESSAGE:_default' \
 '--method=[The Gitea merge style (Gitea only; refused on an OBS ref)]:METHOD:(merge rebase rebase-merge squash fast-forward-only)' \
@@ -3206,7 +3233,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (decline)
 _arguments "${_arguments_options[@]}" : \
-'--message=[The reason for the decline or withdrawal. Values starting with \`-\` are taken literally\: a message may open with a \`- \` bullet]:MESSAGE:_default' \
+'--comment=[The reason for the decline or withdrawal. Values starting with \`-\` are taken literally\: a message may open with a \`- \` bullet]:COMMENT:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
@@ -3219,7 +3246,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (withdraw)
 _arguments "${_arguments_options[@]}" : \
-'--message=[The reason for the decline or withdrawal. Values starting with \`-\` are taken literally\: a message may open with a \`- \` bullet]:MESSAGE:_default' \
+'--comment=[The reason for the decline or withdrawal. Values starting with \`-\` are taken literally\: a message may open with a \`- \` bullet]:COMMENT:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
@@ -3246,14 +3273,14 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--target-project=[The project the request targets\: the devel project, or openSUSE\:Factory when the source is the recorded devel project and package. OBS only; required there]:TARGET_PROJECT:_default' \
 '--target-package=[The package in the target project. OBS only; the checkout package when unset]:TARGET_PACKAGE:_default' \
-'--description=[The request description\: one headline, then \`- \` lines for staging, needs, and rebuilds. OBS only; required there. Values starting with \`-\` are taken literally\: a description may open with a \`- \` bullet]:DESCRIPTION:_default' \
+'--description=[The request description\: one headline, then \`- \` lines for staging, needs, and rebuilds. OBS only; required there unless \`--title\` is given (the two are spellings of the same text — pass one, not both). Values starting with \`-\` are taken literally\: a description may open with a \`- \` bullet]:DESCRIPTION:_default' \
 '--changes-entry=[The one \`.changes\` entry for this submission. It must name every CVE passed with \`--cve\`. OBS only; required there. Values starting with \`-\` are taken literally\: a \`.changes\` entry starts with \`- \`]:CHANGES_ENTRY:_default' \
 '*--cve=[A CVE this submission claims to fix. Repeatable; each one must be named in \`--changes-entry\`. OBS only]:CVE:_default' \
 '--repo=[The repo to open the pull request in (\`owner/repo\`). Gitea only; the parent of the checkout'\''s origin remote (the fork'\''s parent, never the fork) when unset]:REPO:_default' \
 '--head=[The branch the change comes from. Gitea only; the checkout'\''s current branch when unset]:HEAD:_default' \
 '--base=[The branch the pull request targets. Gitea only; the branch the checkout tracks (its scmsync branch) when unset, else the target repo'\''s default branch. The \`factory\` branch does not take pull requests]:BASE:_default' \
-'--title=[The pull request title. Gitea only; required there. Values starting with \`-\` are taken literally]:TITLE:_default' \
-'--body=[The pull request body. Gitea only. Values starting with \`-\` are taken literally\: the body may open with a \`- \` bullet]:BODY:_default' \
+'--title=[The submission title. On Gitea the pull request title, required there; on OBS the headline of the request description, in place of \`--description\`. Values starting with \`-\` are taken literally]:TITLE:_default' \
+'--body=[The submission body. On Gitea the pull request body; on OBS the text after the headline in the request description, in place of \`--description\` together with \`--title\`. Values starting with \`-\` are taken literally\: the body may open with a \`- \` bullet]:BODY:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--without-cleanup[Keep the source branch on accept instead of deleting it (cleanup is the default). OBS only]' \
@@ -3309,10 +3336,6 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (comment)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(build-comment)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -3446,6 +3469,7 @@ _arguments "${_arguments_options[@]}" : \
 '(--project)--repo=[The Gitea repository, as \`owner/repo\`, whose settings to set]:REPO:_default' \
 '--description=[A short description]:DESCRIPTION:_default' \
 '--url=[A URL with more information; the repository website on the Gitea arm]:URL:_default' \
+'*--clear=[Clear a field instead of setting it\: \`description\` or \`url\`. Repeatable; refused together with setting the same field]:CLEAR:(description url)' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
@@ -3526,7 +3550,7 @@ _arguments "${_arguments_options[@]}" : \
 '*--message=[Custom message bullets for the entry, one bullet per \`-m\`. Repeatable\: \`-m "Fix the crash" -m "Add the subcommand"\`. A message may span lines — embedded newlines become indented continuation lines of that bullet, and a blank line inside a message is a paragraph break within it. A leading \`- \`, \`* \` or \`+ \` marker is stripped, never double-bulleted. The message is the human detail\: it replaces the TODO summary slot, so \`--write\` no longer refuses the draft for the missing message; other TODO slots still refuse]:MESSAGE:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
-'--write[Prepend the draft into the package'\''s \`.changes\` file instead of printing it. The whole file is normalized on write\: trailing ASCII whitespace stripped, CRLF→LF, legacy encodings transcoded to UTF-8, a BOM stripped. The write is atomic and refuses a symlink destination, an unreadable file, or bytes no known encoding decodes. A file decoded from a guessed single-byte encoding is transcoded on the guess instead — a wrong guess cannot be detected — and the write warns about it, naming the encoding]' \
+'--write[Prepend the draft into the package'\''s \`.changes\` file instead of printing it. The global \`--live\` counts as \`--write\`, so a live \`generate\` rewrites the file too. The whole file is normalized on write\: trailing ASCII whitespace stripped, CRLF→LF, legacy encodings transcoded to UTF-8, a BOM stripped. The write is atomic and refuses a symlink destination, an unreadable file, or bytes no known encoding decodes. A file decoded from a guessed single-byte encoding is transcoded on the guess instead — a wrong guess cannot be detected — and the write warns about it, naming the encoding]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
 '--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
@@ -3585,7 +3609,7 @@ esac
 ;;
 (checkout)
 _arguments "${_arguments_options[@]}" : \
-'--rev=[The revision to check out (a number or a source md5). The latest when omitted. Needs a package]:REV:_default' \
+'--rev=[The revision to check out (a revision number or a srcmd5 (the source checksum of a revision, as \`remote package-log\` reports it in JSON)). The latest when omitted. Needs a package]:REV:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
@@ -3599,7 +3623,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (update)
 _arguments "${_arguments_options[@]}" : \
-'--rev=[The revision to update to (a number or a source md5). The latest when omitted]:REV:_default' \
+'--rev=[The revision to update to (a revision number or a srcmd5 (the source checksum of a revision, as \`remote package-log\` reports it in JSON)). The latest when omitted]:REV:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
@@ -3672,7 +3696,9 @@ _arguments "${_arguments_options[@]}" : \
 '--message=[The commit message]:MESSAGE:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--instance=[Select the instance for this call, by its alias in the config file'\''s \`\[instances\]\` table. The flag is authoritative\: it beats the \`GEECTL_OBS_URL\` environment variable, the configured URL, and any working-copy state. For OBS, the flagged alias'\''s URL replaces the configured URL and credentials resolve only from the flagged instance'\''s own variables (\`GEECTL_OBS_USERNAME_<ALIAS>\` / \`GEECTL_OBS_PASSWORD\[_FILE\]_<ALIAS>\` / \`GEECTL_OBS_APIKEY\[_FILE\]_<ALIAS>\`); another instance'\''s variables are never borrowed, and a missing credential for the flagged instance fails the call. For Gitea, the host is unaffected, but every Gitea call authenticates with the flagged alias'\''s \`GEECTL_GITEA_TOKEN\[_FILE\]_<ALIAS>\` only]:ALIAS:_default' \
-'--noservice[Skip the service gate (source services and \`pre_checkin.sh\`)]' \
+'--no-service[Skip the local service gate and the server-side services\: the combined shorthand for \`--no-local-services\` and \`--no-server-services\`]' \
+'--no-local-services[Skip the local service gate (source services and \`pre_checkin.sh\`) only; the server still runs its services for the commit]' \
+'--no-server-services[Skip the server-side services for the commit only (\`noservice=1\` on the commit); the local service gate still runs. OBS-native commits only\: a git-backed commit has no server-side services switch, so the flag has no effect there]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
 '--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
@@ -4494,6 +4520,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(build-comment)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -4531,10 +4561,6 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (comment)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(build-comment)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -4728,13 +4754,13 @@ _geectl_commands() {
     local commands; commands=(
 'version:Print version information as the result payload' \
 'config:Inspect or initialise the config file' \
-'remote:Remote reads and mutations\: inspect what the distribution holds, and change it' \
+'remote:OBS only. Remote reads and mutations\: inspect what the distribution holds, and change it' \
 'request:Read and act on OBS submit requests, and file new ones' \
-'branch:Branch, copy, and link packages' \
-'build:Build-status commands\: results, logs, histories, binaries, buildconfig' \
+'branch:OBS only. Branch, copy, and link packages' \
+'build:OBS only. Build-status commands\: results, logs, histories, binaries, buildconfig' \
 'local-build:Local builds in the podman build vertical\: build a package, run its \`_service\` services, the precommit gate, \`spec-cleaner\`, wipe a build root, prune the cache, manage the daily periodic cleanup, enter the preserved build root, and read the log of the last local build' \
-'maintenance:Maintenance operations\: maintained-instances listing and maintenance branching' \
-'service:Service reads and trigger\: list a package'\''s services, their run state, and trigger a server-side run' \
+'maintenance:OBS only. Maintenance operations\: maintained-instances listing and maintenance branching' \
+'service:OBS only. Service reads and trigger\: list a package'\''s services, their run state, and trigger a server-side run' \
 'gitea:Gitea operations\: repository and branch reads and mutations on the configured instance' \
 'pull-request:Read and act on pull requests\: OBS submit requests and Gitea pull requests as one surface' \
 'person:Search for a person\: the OBS projects naming the login and the Gitea users matching the keyword, as one operation' \
@@ -4750,7 +4776,7 @@ _geectl_commands() {
 'commit:Commit the staged changes' \
 'pull:Pull a linked package to the link target'\''s latest revision' \
 'resolve:Stage the resolved files and continue a stopped rebase' \
-'prjconf:Read, validate and clean a project'\''s prjconf' \
+'prjconf:OBS only. Read, validate and clean a project'\''s prjconf' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl commands' commands "$@"
@@ -4770,7 +4796,7 @@ _geectl__subcmd__branch_commands() {
     local commands; commands=(
 'create:Branch a git-backed package\: Gitea fork + OBS fork into a test project with the source project'\''s repositories. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the branch' \
 'branch-package:Branch a package\: create a linked copy under a branch project. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the branch' \
-'copy-package:Copy a package to another project (or another OBS instance with \`--to-apiurl\`). A mutation\: dry-run is the default' \
+'copy-package:Copy a package to another project (or another OBS instance with \`--to-api-url\`). A mutation\: dry-run is the default' \
 'copy-project:Copy a whole project. A mutation\: dry-run is the default' \
 'set-devel-project:Set (or, without \`--devel-project\`, remove) the devel project of a package. A mutation\: dry-run is the default' \
 'link-package:Link a package to another package. A mutation\: dry-run is the default' \
@@ -4813,7 +4839,7 @@ _geectl__subcmd__branch__subcmd__help_commands() {
     local commands; commands=(
 'create:Branch a git-backed package\: Gitea fork + OBS fork into a test project with the source project'\''s repositories. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the branch' \
 'branch-package:Branch a package\: create a linked copy under a branch project. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the branch' \
-'copy-package:Copy a package to another project (or another OBS instance with \`--to-apiurl\`). A mutation\: dry-run is the default' \
+'copy-package:Copy a package to another project (or another OBS instance with \`--to-api-url\`). A mutation\: dry-run is the default' \
 'copy-project:Copy a whole project. A mutation\: dry-run is the default' \
 'set-devel-project:Set (or, without \`--devel-project\`, remove) the devel project of a package. A mutation\: dry-run is the default' \
 'link-package:Link a package to another package. A mutation\: dry-run is the default' \
@@ -5306,7 +5332,8 @@ _geectl__subcmd__gitea_commands() {
 'repo-get:Show a repository\: owner, default branch, privacy, clone URLs, and the token owner'\''s permissions' \
 'repo-list:List repositories\: the token owner'\''s own repos, one user'\''s repos with \`--owner\`, one organization'\''s with \`--org\`, or both (the user'\''s first, then the organization'\''s)' \
 'repo-search:Search repositories across the instance by keyword\: the keyword matches the name and the description. The Gitea counterpart of \`remote search-packages\` / \`remote search-projects\`' \
-'whoami:Show the token owner\: the login, full name, and email the configured Gitea token belongs to' \
+'whoami:Show the token owner\: the login, full name, and email the configured Gitea token belongs to — token-owner-only, no login is accepted. \`whois\` is an alias\: the same identity read as \`remote whois\` with no login' \
+'whois:Show the token owner\: the login, full name, and email the configured Gitea token belongs to — token-owner-only, no login is accepted. \`whois\` is an alias\: the same identity read as \`remote whois\` with no login' \
 'repo-create:Create a repository under the token owner'\''s account. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation' \
 'repo-delete:Delete a repository. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. The library refuses without \`--force\`, even live' \
 'repo-fork:Fork a repository into the token owner'\''s account (or an organization with \`--organization\`). A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the fork' \
@@ -5317,6 +5344,7 @@ _geectl__subcmd__gitea_commands() {
 'commit-statuses:List a commit'\''s statuses\: the CI states reported for that commit' \
 'maintainers:Show the maintainers recorded in a git project'\''s \`_maintainership.json\`\: the project maintainers and the per-package maintainers. The git-side counterpart of \`remote maintainers\`, read from the repo'\''s default branch' \
 'cleanup-forks:List obsolete Gitea forks and their OBS home test projects, and delete them. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. A project is deleted only when its description marker names a fork that no longer exists on Gitea; every other project is listed and left in place' \
+'build-comment:Post the build-link comment on a Gitea pull request\: the OBS build results for the test project and package, as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; there is no polling, no live update, and no edit. Dry-run by default; mutates only with \`--live\`' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl gitea commands' commands "$@"
@@ -5336,6 +5364,11 @@ _geectl__subcmd__gitea__subcmd__branch-list_commands() {
     local commands; commands=()
     _describe -t commands 'geectl gitea branch-list commands' commands "$@"
 }
+(( $+functions[_geectl__subcmd__gitea__subcmd__build-comment_commands] )) ||
+_geectl__subcmd__gitea__subcmd__build-comment_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl gitea build-comment commands' commands "$@"
+}
 (( $+functions[_geectl__subcmd__gitea__subcmd__cleanup-forks_commands] )) ||
 _geectl__subcmd__gitea__subcmd__cleanup-forks_commands() {
     local commands; commands=()
@@ -5352,7 +5385,7 @@ _geectl__subcmd__gitea__subcmd__help_commands() {
 'repo-get:Show a repository\: owner, default branch, privacy, clone URLs, and the token owner'\''s permissions' \
 'repo-list:List repositories\: the token owner'\''s own repos, one user'\''s repos with \`--owner\`, one organization'\''s with \`--org\`, or both (the user'\''s first, then the organization'\''s)' \
 'repo-search:Search repositories across the instance by keyword\: the keyword matches the name and the description. The Gitea counterpart of \`remote search-packages\` / \`remote search-projects\`' \
-'whoami:Show the token owner\: the login, full name, and email the configured Gitea token belongs to' \
+'whoami:Show the token owner\: the login, full name, and email the configured Gitea token belongs to — token-owner-only, no login is accepted. \`whois\` is an alias\: the same identity read as \`remote whois\` with no login' \
 'repo-create:Create a repository under the token owner'\''s account. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation' \
 'repo-delete:Delete a repository. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. The library refuses without \`--force\`, even live' \
 'repo-fork:Fork a repository into the token owner'\''s account (or an organization with \`--organization\`). A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the fork' \
@@ -5363,6 +5396,7 @@ _geectl__subcmd__gitea__subcmd__help_commands() {
 'commit-statuses:List a commit'\''s statuses\: the CI states reported for that commit' \
 'maintainers:Show the maintainers recorded in a git project'\''s \`_maintainership.json\`\: the project maintainers and the per-package maintainers. The git-side counterpart of \`remote maintainers\`, read from the repo'\''s default branch' \
 'cleanup-forks:List obsolete Gitea forks and their OBS home test projects, and delete them. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. A project is deleted only when its description marker names a fork that no longer exists on Gitea; every other project is listed and left in place' \
+'build-comment:Post the build-link comment on a Gitea pull request\: the OBS build results for the test project and package, as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; there is no polling, no live update, and no edit. Dry-run by default; mutates only with \`--live\`' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl gitea help commands' commands "$@"
@@ -5381,6 +5415,11 @@ _geectl__subcmd__gitea__subcmd__help__subcmd__branch-head_commands() {
 _geectl__subcmd__gitea__subcmd__help__subcmd__branch-list_commands() {
     local commands; commands=()
     _describe -t commands 'geectl gitea help branch-list commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__gitea__subcmd__help__subcmd__build-comment_commands] )) ||
+_geectl__subcmd__gitea__subcmd__help__subcmd__build-comment_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl gitea help build-comment commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__gitea__subcmd__help__subcmd__cleanup-forks_commands] )) ||
 _geectl__subcmd__gitea__subcmd__help__subcmd__cleanup-forks_commands() {
@@ -5492,13 +5531,13 @@ _geectl__subcmd__help_commands() {
     local commands; commands=(
 'version:Print version information as the result payload' \
 'config:Inspect or initialise the config file' \
-'remote:Remote reads and mutations\: inspect what the distribution holds, and change it' \
+'remote:OBS only. Remote reads and mutations\: inspect what the distribution holds, and change it' \
 'request:Read and act on OBS submit requests, and file new ones' \
-'branch:Branch, copy, and link packages' \
-'build:Build-status commands\: results, logs, histories, binaries, buildconfig' \
+'branch:OBS only. Branch, copy, and link packages' \
+'build:OBS only. Build-status commands\: results, logs, histories, binaries, buildconfig' \
 'local-build:Local builds in the podman build vertical\: build a package, run its \`_service\` services, the precommit gate, \`spec-cleaner\`, wipe a build root, prune the cache, manage the daily periodic cleanup, enter the preserved build root, and read the log of the last local build' \
-'maintenance:Maintenance operations\: maintained-instances listing and maintenance branching' \
-'service:Service reads and trigger\: list a package'\''s services, their run state, and trigger a server-side run' \
+'maintenance:OBS only. Maintenance operations\: maintained-instances listing and maintenance branching' \
+'service:OBS only. Service reads and trigger\: list a package'\''s services, their run state, and trigger a server-side run' \
 'gitea:Gitea operations\: repository and branch reads and mutations on the configured instance' \
 'pull-request:Read and act on pull requests\: OBS submit requests and Gitea pull requests as one surface' \
 'person:Search for a person\: the OBS projects naming the login and the Gitea users matching the keyword, as one operation' \
@@ -5514,7 +5553,7 @@ _geectl__subcmd__help_commands() {
 'commit:Commit the staged changes' \
 'pull:Pull a linked package to the link target'\''s latest revision' \
 'resolve:Stage the resolved files and continue a stopped rebase' \
-'prjconf:Read, validate and clean a project'\''s prjconf' \
+'prjconf:OBS only. Read, validate and clean a project'\''s prjconf' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl help commands' commands "$@"
@@ -5534,7 +5573,7 @@ _geectl__subcmd__help__subcmd__branch_commands() {
     local commands; commands=(
 'create:Branch a git-backed package\: Gitea fork + OBS fork into a test project with the source project'\''s repositories. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the branch' \
 'branch-package:Branch a package\: create a linked copy under a branch project. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the branch' \
-'copy-package:Copy a package to another project (or another OBS instance with \`--to-apiurl\`). A mutation\: dry-run is the default' \
+'copy-package:Copy a package to another project (or another OBS instance with \`--to-api-url\`). A mutation\: dry-run is the default' \
 'copy-project:Copy a whole project. A mutation\: dry-run is the default' \
 'set-devel-project:Set (or, without \`--devel-project\`, remove) the devel project of a package. A mutation\: dry-run is the default' \
 'link-package:Link a package to another package. A mutation\: dry-run is the default' \
@@ -5796,7 +5835,7 @@ _geectl__subcmd__help__subcmd__gitea_commands() {
 'repo-get:Show a repository\: owner, default branch, privacy, clone URLs, and the token owner'\''s permissions' \
 'repo-list:List repositories\: the token owner'\''s own repos, one user'\''s repos with \`--owner\`, one organization'\''s with \`--org\`, or both (the user'\''s first, then the organization'\''s)' \
 'repo-search:Search repositories across the instance by keyword\: the keyword matches the name and the description. The Gitea counterpart of \`remote search-packages\` / \`remote search-projects\`' \
-'whoami:Show the token owner\: the login, full name, and email the configured Gitea token belongs to' \
+'whoami:Show the token owner\: the login, full name, and email the configured Gitea token belongs to — token-owner-only, no login is accepted. \`whois\` is an alias\: the same identity read as \`remote whois\` with no login' \
 'repo-create:Create a repository under the token owner'\''s account. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation' \
 'repo-delete:Delete a repository. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. The library refuses without \`--force\`, even live' \
 'repo-fork:Fork a repository into the token owner'\''s account (or an organization with \`--organization\`). A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the fork' \
@@ -5807,6 +5846,7 @@ _geectl__subcmd__help__subcmd__gitea_commands() {
 'commit-statuses:List a commit'\''s statuses\: the CI states reported for that commit' \
 'maintainers:Show the maintainers recorded in a git project'\''s \`_maintainership.json\`\: the project maintainers and the per-package maintainers. The git-side counterpart of \`remote maintainers\`, read from the repo'\''s default branch' \
 'cleanup-forks:List obsolete Gitea forks and their OBS home test projects, and delete them. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. A project is deleted only when its description marker names a fork that no longer exists on Gitea; every other project is listed and left in place' \
+'build-comment:Post the build-link comment on a Gitea pull request\: the OBS build results for the test project and package, as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; there is no polling, no live update, and no edit. Dry-run by default; mutates only with \`--live\`' \
     )
     _describe -t commands 'geectl help gitea commands' commands "$@"
 }
@@ -5824,6 +5864,11 @@ _geectl__subcmd__help__subcmd__gitea__subcmd__branch-head_commands() {
 _geectl__subcmd__help__subcmd__gitea__subcmd__branch-list_commands() {
     local commands; commands=()
     _describe -t commands 'geectl help gitea branch-list commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__help__subcmd__gitea__subcmd__build-comment_commands] )) ||
+_geectl__subcmd__help__subcmd__gitea__subcmd__build-comment_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help gitea build-comment commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help__subcmd__gitea__subcmd__cleanup-forks_commands] )) ||
 _geectl__subcmd__help__subcmd__gitea__subcmd__cleanup-forks_commands() {
@@ -5893,7 +5938,7 @@ _geectl__subcmd__help__subcmd__local-build_commands() {
 'spec-cleaner:Run \`spec-cleaner\` on a spec in the container' \
 'build:Build the package in the container\: the run-mode service run, the precommit gate, then the engine build' \
 'wipe:Wipe a build root\: delete its contents (the lock file stays). A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the wipe. The marker check and the in-use lock are safety invariants, never bypassed' \
-'prune:Print the eviction plan (what would be evicted, in order, with bytes); delete only with \`--apply\`. The plan is the default\: the leaf'\''s own \`--apply\` is the confirmation, so the scheduled task runs exactly \`prune --apply\`' \
+'prune:Print the eviction plan (what would be evicted, in order, with bytes); delete only with \`--apply\` or \`--live\`. The plan is the default\: the leaf'\''s own \`--apply\` is the confirmation, so the scheduled task runs exactly \`prune --apply\`' \
 'periodic-install:Install the daily periodic cleanup for this platform\: write the scheduler entry and enable it. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the install' \
 'periodic-uninstall:Remove the daily periodic cleanup for this platform\: disable the scheduler entry, then remove its files. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the uninstall' \
 'periodic-status:Show whether the daily periodic cleanup is installed and enabled on this platform. Read-only' \
@@ -5978,7 +6023,7 @@ _geectl__subcmd__help__subcmd__maintenance__subcmd__maintenance-branch_commands(
 (( $+functions[_geectl__subcmd__help__subcmd__meta_commands] )) ||
 _geectl__subcmd__help__subcmd__meta_commands() {
     local commands; commands=(
-'set:Set the meta of an OBS project, an OBS package, or a Gitea repository\: the description and/or URL. The target selects the backend\: \`--project\` (with \`--package\` for a package) writes OBS meta, \`--repo\` writes Gitea repo settings. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field' \
+'set:Set the meta of an OBS project, an OBS package, or a Gitea repository\: the description and/or URL. The target selects the backend\: \`--project\` (with \`--package\` for a package) writes OBS meta, \`--repo\` writes Gitea repo settings. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the write. Only the given fields change; the rest of the meta is kept as it is. \`--clear description\` / \`--clear url\` clears a field instead of setting it' \
     )
     _describe -t commands 'geectl help meta commands' commands "$@"
 }
@@ -5990,7 +6035,7 @@ _geectl__subcmd__help__subcmd__meta__subcmd__set_commands() {
 (( $+functions[_geectl__subcmd__help__subcmd__person_commands] )) ||
 _geectl__subcmd__help__subcmd__person_commands() {
     local commands; commands=(
-'search:Search for a person\: the OBS projects naming the login, and the Gitea users matching the keyword. With no \`--backend\` both arms run, OBS first then Gitea' \
+'search:Search for a person\: the OBS projects naming the login, and the Gitea users matching the keyword — one list of results, each naming its source. With no \`--backend\` both arms run, OBS first then Gitea' \
     )
     _describe -t commands 'geectl help person commands' commands "$@"
 }
@@ -6032,19 +6077,18 @@ _geectl__subcmd__help__subcmd__pull_commands() {
 _geectl__subcmd__help__subcmd__pull-request_commands() {
     local commands; commands=(
 'show:Show one pull request\: \`obs\:<id>\` or \`gitea\:<owner>/<repo>#<number>\`' \
-'diff:Show the diff of a pull request\: the unified diff, like \`request diff\`. With \`--xml\` the OBS arm renders the request XML with the diff injected; \`--xml\` is refused on a Gitea pull request, which has no request XML. A read, always live' \
+'diff:Show the diff of a pull request\: the unified diff, like \`request diff\`. \`--xml\` is the OBS-only escape hatch\: the OBS arm renders the request XML with the diff injected, and \`--xml\` is refused on a Gitea pull request, which has no request XML. A read, always live' \
 'search:Search pull requests\: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea. With no \`--backend\` both arms run; \`--backend\` scopes to one' \
 'approve:Approve a pull request as the review asked of the target\: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea). Dry-run by default; mutates only with \`--live\`' \
 'request-changes:Ask for changes on a pull request, as \`approve\` but with the review declined instead of accepted. Dry-run by default; mutates only with \`--live\`' \
 'comment:Comment on a pull request. Dry-run by default; mutates only with \`--live\`' \
-'build-comment:Post the build-link comment on a Gitea pull request\: the OBS build results for the test project and package, as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; there is no polling, no live update, and no edit. Dry-run by default; mutates only with \`--live\`' \
 'comments:List the comments on a pull request, oldest first. A read, always live' \
 'cancel-review-request:Cancel pending review requests on a pull request. Dry-run by default; mutates only with \`--live\`. On OBS the cancel fails closed' \
 'merge:Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless \`--no-forward\` is given. The forwarded request'\''s \`.changes\` entry is the original description on the OBS arm and the pull request'\''s text on the Gitea arm, overridable with \`-m\` / \`--forward-message\`. Dry-run by default; mutates only with \`--live\`' \
 'decline:Decline a pull request. On OBS this changes the request state to declined; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'withdraw:Withdraw a pull request. On OBS this revokes the request; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'reopen:Reopen a pull request. On OBS this changes a declined request back to \`new\`; on Gitea it reopens the closed pull request. Dry-run by default; mutates only with \`--live\`' \
-'submit:File a submission from the working copy in the current directory\: an OBS submit request from an OBS-native checkout, a Gitea pull request from a git-backed one. The checkout'\''s backend decides; the other arm'\''s flags are refused. Dry-run by default; mutates only with \`--live\`' \
+'submit:File a submission from the working copy in the current directory\: an OBS submit request from an OBS-native checkout, a Gitea pull request from a git-backed one. The checkout'\''s backend decides; the other arm'\''s flags are refused, except the submission text\: \`--title\`/\`--body\` work on both arms, and on OBS they compose \`--description\` (the title as the headline, the body after a blank line). Dry-run by default; mutates only with \`--live\`' \
 'cleanup:Clean the local build roots for the submit request filed from the working copy in the current directory, when that request is accepted. The request id was recorded by \`submit\` in the checkout; the leaf reads the request state once and wipes the roots only on \`accepted\`. A request in any other state, and a checkout with nothing recorded, delete nothing. Dry-run by default; mutates only with \`--live\`' \
     )
     _describe -t commands 'geectl help pull-request commands' commands "$@"
@@ -6053,11 +6097,6 @@ _geectl__subcmd__help__subcmd__pull-request_commands() {
 _geectl__subcmd__help__subcmd__pull-request__subcmd__approve_commands() {
     local commands; commands=()
     _describe -t commands 'geectl help pull-request approve commands' commands "$@"
-}
-(( $+functions[_geectl__subcmd__help__subcmd__pull-request__subcmd__build-comment_commands] )) ||
-_geectl__subcmd__help__subcmd__pull-request__subcmd__build-comment_commands() {
-    local commands; commands=()
-    _describe -t commands 'geectl help pull-request build-comment commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help__subcmd__pull-request__subcmd__cancel-review-request_commands] )) ||
 _geectl__subcmd__help__subcmd__pull-request__subcmd__cancel-review-request_commands() {
@@ -6151,7 +6190,7 @@ _geectl__subcmd__help__subcmd__remote_commands() {
 'owners-for-binary:Show the owners of a binary package' \
 'owners-for-package:Show the owners of a package by name alone, in the owner root projects' \
 'maintainers:Show the maintainers of a package' \
-'whois:Show a user'\''s full name, email, and account state. Without a login, the authenticated user' \
+'whois:Show a user'\''s full name, email, and account state. Without a login, the authenticated user; any login is accepted. \`whoami\` is an alias\: with no login, the same identity read as \`gitea whoami\`' \
 'link-target:Show the link target of a package, when it is a link' \
 'project-diff:Diff two projects, package by package. Computed client-side\: the library lists both projects and reads every file of every differing package, so a large diff issues many requests and a differing binary file fails the call' \
 'diff-packages:Diff two packages, file by file. Computed client-side\: the library diffs the two file lists and cats each changed file, so a differing binary file fails the call' \
@@ -6436,8 +6475,8 @@ _geectl__subcmd__help__subcmd__request_commands() {
 'show:Show one submit request\: source/target/message, reviews, history' \
 'log:Show one submit request'\''s history\: creation, then each state change' \
 'search:List the submit requests matching the filters\: a typed search' \
-'list:List submit requests\: the same search, with the states still awaiting action (new, review) as the default. A thin wrapper over the search operation\: the flags select the same server-side search' \
-'diff:Show the diff of a submit request\: the unified diff, or the request XML with the diff injected with \`--xml\`' \
+'list:Deprecated\: use \`request search\`. List submit requests\: the same search, with the states still awaiting action (new, review) as the default — \`search\` defaults to new/review/declined. A thin wrapper over the search operation\: the flags select the same server-side search' \
+'diff:Show the diff of a submit request\: the unified diff, or the request XML with the diff injected with \`--xml\` — the OBS-only escape hatch' \
 'list-comments:List the comments on a submit request, in id order' \
 'accept:Accept a submit request, with a comment as the message left with the accept. An accepted request is forwarded to its link parent unless \`--no-forward\` is given; a refused forward is reported and the accepted request stands, with the work staying queued in the devel project. The forwarded request'\''s \`.changes\` entry is the original description, overridable with \`-m\` / \`--forward-message\`. Dry-run by default; mutates only with \`--live\`' \
 'decline:Decline a submit request, with a comment as the reason' \
@@ -6449,7 +6488,7 @@ _geectl__subcmd__help__subcmd__request_commands() {
 'add-comment:Comment on a submit request, optionally as a reply to another comment' \
 'file:File a submit request\: source package to a devel project, superseding every open submit request for the package from the same user' \
 'refile:File a submit request and supersede an old one with it, plus every other open submit request for the package from the same user\: the new request is filed first, and only then is each open one superseded pointing at it' \
-'supersede:Supersede one request with another existing one. A mutation that needs \`--live\`; the dry-runnable supersede flow is \`request refile --supersede\`' \
+'supersede:Supersede one request with another existing one. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs it' \
 'file-add-role:File an add-role request\: grant a person or a group a role on a project or a package' \
 'file-change-devel:File a change-devel request\: change a package'\''s devel project' \
 'file-delete:File a delete request\: delete a package, a repository, or a whole project' \
@@ -6625,7 +6664,7 @@ _geectl__subcmd__local-build_commands() {
 'spec-cleaner:Run \`spec-cleaner\` on a spec in the container' \
 'build:Build the package in the container\: the run-mode service run, the precommit gate, then the engine build' \
 'wipe:Wipe a build root\: delete its contents (the lock file stays). A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the wipe. The marker check and the in-use lock are safety invariants, never bypassed' \
-'prune:Print the eviction plan (what would be evicted, in order, with bytes); delete only with \`--apply\`. The plan is the default\: the leaf'\''s own \`--apply\` is the confirmation, so the scheduled task runs exactly \`prune --apply\`' \
+'prune:Print the eviction plan (what would be evicted, in order, with bytes); delete only with \`--apply\` or \`--live\`. The plan is the default\: the leaf'\''s own \`--apply\` is the confirmation, so the scheduled task runs exactly \`prune --apply\`' \
 'periodic-install:Install the daily periodic cleanup for this platform\: write the scheduler entry and enable it. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the install' \
 'periodic-uninstall:Remove the daily periodic cleanup for this platform\: disable the scheduler entry, then remove its files. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the uninstall' \
 'periodic-status:Show whether the daily periodic cleanup is installed and enabled on this platform. Read-only' \
@@ -6653,7 +6692,7 @@ _geectl__subcmd__local-build__subcmd__help_commands() {
 'spec-cleaner:Run \`spec-cleaner\` on a spec in the container' \
 'build:Build the package in the container\: the run-mode service run, the precommit gate, then the engine build' \
 'wipe:Wipe a build root\: delete its contents (the lock file stays). A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the wipe. The marker check and the in-use lock are safety invariants, never bypassed' \
-'prune:Print the eviction plan (what would be evicted, in order, with bytes); delete only with \`--apply\`. The plan is the default\: the leaf'\''s own \`--apply\` is the confirmation, so the scheduled task runs exactly \`prune --apply\`' \
+'prune:Print the eviction plan (what would be evicted, in order, with bytes); delete only with \`--apply\` or \`--live\`. The plan is the default\: the leaf'\''s own \`--apply\` is the confirmation, so the scheduled task runs exactly \`prune --apply\`' \
 'periodic-install:Install the daily periodic cleanup for this platform\: write the scheduler entry and enable it. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the install' \
 'periodic-uninstall:Remove the daily periodic cleanup for this platform\: disable the scheduler entry, then remove its files. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the uninstall' \
 'periodic-status:Show whether the daily periodic cleanup is installed and enabled on this platform. Read-only' \
@@ -6814,7 +6853,7 @@ _geectl__subcmd__maintenance__subcmd__maintenance-branch_commands() {
 (( $+functions[_geectl__subcmd__meta_commands] )) ||
 _geectl__subcmd__meta_commands() {
     local commands; commands=(
-'set:Set the meta of an OBS project, an OBS package, or a Gitea repository\: the description and/or URL. The target selects the backend\: \`--project\` (with \`--package\` for a package) writes OBS meta, \`--repo\` writes Gitea repo settings. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field' \
+'set:Set the meta of an OBS project, an OBS package, or a Gitea repository\: the description and/or URL. The target selects the backend\: \`--project\` (with \`--package\` for a package) writes OBS meta, \`--repo\` writes Gitea repo settings. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the write. Only the given fields change; the rest of the meta is kept as it is. \`--clear description\` / \`--clear url\` clears a field instead of setting it' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl meta commands' commands "$@"
@@ -6822,7 +6861,7 @@ _geectl__subcmd__meta_commands() {
 (( $+functions[_geectl__subcmd__meta__subcmd__help_commands] )) ||
 _geectl__subcmd__meta__subcmd__help_commands() {
     local commands; commands=(
-'set:Set the meta of an OBS project, an OBS package, or a Gitea repository\: the description and/or URL. The target selects the backend\: \`--project\` (with \`--package\` for a package) writes OBS meta, \`--repo\` writes Gitea repo settings. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field' \
+'set:Set the meta of an OBS project, an OBS package, or a Gitea repository\: the description and/or URL. The target selects the backend\: \`--project\` (with \`--package\` for a package) writes OBS meta, \`--repo\` writes Gitea repo settings. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the write. Only the given fields change; the rest of the meta is kept as it is. \`--clear description\` / \`--clear url\` clears a field instead of setting it' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl meta help commands' commands "$@"
@@ -6845,7 +6884,7 @@ _geectl__subcmd__meta__subcmd__set_commands() {
 (( $+functions[_geectl__subcmd__person_commands] )) ||
 _geectl__subcmd__person_commands() {
     local commands; commands=(
-'search:Search for a person\: the OBS projects naming the login, and the Gitea users matching the keyword. With no \`--backend\` both arms run, OBS first then Gitea' \
+'search:Search for a person\: the OBS projects naming the login, and the Gitea users matching the keyword — one list of results, each naming its source. With no \`--backend\` both arms run, OBS first then Gitea' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl person commands' commands "$@"
@@ -6853,7 +6892,7 @@ _geectl__subcmd__person_commands() {
 (( $+functions[_geectl__subcmd__person__subcmd__help_commands] )) ||
 _geectl__subcmd__person__subcmd__help_commands() {
     local commands; commands=(
-'search:Search for a person\: the OBS projects naming the login, and the Gitea users matching the keyword. With no \`--backend\` both arms run, OBS first then Gitea' \
+'search:Search for a person\: the OBS projects naming the login, and the Gitea users matching the keyword — one list of results, each naming its source. With no \`--backend\` both arms run, OBS first then Gitea' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl person help commands' commands "$@"
@@ -6937,19 +6976,18 @@ _geectl__subcmd__pull_commands() {
 _geectl__subcmd__pull-request_commands() {
     local commands; commands=(
 'show:Show one pull request\: \`obs\:<id>\` or \`gitea\:<owner>/<repo>#<number>\`' \
-'diff:Show the diff of a pull request\: the unified diff, like \`request diff\`. With \`--xml\` the OBS arm renders the request XML with the diff injected; \`--xml\` is refused on a Gitea pull request, which has no request XML. A read, always live' \
+'diff:Show the diff of a pull request\: the unified diff, like \`request diff\`. \`--xml\` is the OBS-only escape hatch\: the OBS arm renders the request XML with the diff injected, and \`--xml\` is refused on a Gitea pull request, which has no request XML. A read, always live' \
 'search:Search pull requests\: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea. With no \`--backend\` both arms run; \`--backend\` scopes to one' \
 'approve:Approve a pull request as the review asked of the target\: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea). Dry-run by default; mutates only with \`--live\`' \
 'request-changes:Ask for changes on a pull request, as \`approve\` but with the review declined instead of accepted. Dry-run by default; mutates only with \`--live\`' \
 'comment:Comment on a pull request. Dry-run by default; mutates only with \`--live\`' \
-'build-comment:Post the build-link comment on a Gitea pull request\: the OBS build results for the test project and package, as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; there is no polling, no live update, and no edit. Dry-run by default; mutates only with \`--live\`' \
 'comments:List the comments on a pull request, oldest first. A read, always live' \
 'cancel-review-request:Cancel pending review requests on a pull request. Dry-run by default; mutates only with \`--live\`. On OBS the cancel fails closed' \
 'merge:Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless \`--no-forward\` is given. The forwarded request'\''s \`.changes\` entry is the original description on the OBS arm and the pull request'\''s text on the Gitea arm, overridable with \`-m\` / \`--forward-message\`. Dry-run by default; mutates only with \`--live\`' \
 'decline:Decline a pull request. On OBS this changes the request state to declined; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'withdraw:Withdraw a pull request. On OBS this revokes the request; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'reopen:Reopen a pull request. On OBS this changes a declined request back to \`new\`; on Gitea it reopens the closed pull request. Dry-run by default; mutates only with \`--live\`' \
-'submit:File a submission from the working copy in the current directory\: an OBS submit request from an OBS-native checkout, a Gitea pull request from a git-backed one. The checkout'\''s backend decides; the other arm'\''s flags are refused. Dry-run by default; mutates only with \`--live\`' \
+'submit:File a submission from the working copy in the current directory\: an OBS submit request from an OBS-native checkout, a Gitea pull request from a git-backed one. The checkout'\''s backend decides; the other arm'\''s flags are refused, except the submission text\: \`--title\`/\`--body\` work on both arms, and on OBS they compose \`--description\` (the title as the headline, the body after a blank line). Dry-run by default; mutates only with \`--live\`' \
 'cleanup:Clean the local build roots for the submit request filed from the working copy in the current directory, when that request is accepted. The request id was recorded by \`submit\` in the checkout; the leaf reads the request state once and wipes the roots only on \`accepted\`. A request in any other state, and a checkout with nothing recorded, delete nothing. Dry-run by default; mutates only with \`--live\`' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -6959,11 +6997,6 @@ _geectl__subcmd__pull-request_commands() {
 _geectl__subcmd__pull-request__subcmd__approve_commands() {
     local commands; commands=()
     _describe -t commands 'geectl pull-request approve commands' commands "$@"
-}
-(( $+functions[_geectl__subcmd__pull-request__subcmd__build-comment_commands] )) ||
-_geectl__subcmd__pull-request__subcmd__build-comment_commands() {
-    local commands; commands=()
-    _describe -t commands 'geectl pull-request build-comment commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__pull-request__subcmd__cancel-review-request_commands] )) ||
 _geectl__subcmd__pull-request__subcmd__cancel-review-request_commands() {
@@ -6999,19 +7032,18 @@ _geectl__subcmd__pull-request__subcmd__diff_commands() {
 _geectl__subcmd__pull-request__subcmd__help_commands() {
     local commands; commands=(
 'show:Show one pull request\: \`obs\:<id>\` or \`gitea\:<owner>/<repo>#<number>\`' \
-'diff:Show the diff of a pull request\: the unified diff, like \`request diff\`. With \`--xml\` the OBS arm renders the request XML with the diff injected; \`--xml\` is refused on a Gitea pull request, which has no request XML. A read, always live' \
+'diff:Show the diff of a pull request\: the unified diff, like \`request diff\`. \`--xml\` is the OBS-only escape hatch\: the OBS arm renders the request XML with the diff injected, and \`--xml\` is refused on a Gitea pull request, which has no request XML. A read, always live' \
 'search:Search pull requests\: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea. With no \`--backend\` both arms run; \`--backend\` scopes to one' \
 'approve:Approve a pull request as the review asked of the target\: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea). Dry-run by default; mutates only with \`--live\`' \
 'request-changes:Ask for changes on a pull request, as \`approve\` but with the review declined instead of accepted. Dry-run by default; mutates only with \`--live\`' \
 'comment:Comment on a pull request. Dry-run by default; mutates only with \`--live\`' \
-'build-comment:Post the build-link comment on a Gitea pull request\: the OBS build results for the test project and package, as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; there is no polling, no live update, and no edit. Dry-run by default; mutates only with \`--live\`' \
 'comments:List the comments on a pull request, oldest first. A read, always live' \
 'cancel-review-request:Cancel pending review requests on a pull request. Dry-run by default; mutates only with \`--live\`. On OBS the cancel fails closed' \
 'merge:Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless \`--no-forward\` is given. The forwarded request'\''s \`.changes\` entry is the original description on the OBS arm and the pull request'\''s text on the Gitea arm, overridable with \`-m\` / \`--forward-message\`. Dry-run by default; mutates only with \`--live\`' \
 'decline:Decline a pull request. On OBS this changes the request state to declined; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'withdraw:Withdraw a pull request. On OBS this revokes the request; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'reopen:Reopen a pull request. On OBS this changes a declined request back to \`new\`; on Gitea it reopens the closed pull request. Dry-run by default; mutates only with \`--live\`' \
-'submit:File a submission from the working copy in the current directory\: an OBS submit request from an OBS-native checkout, a Gitea pull request from a git-backed one. The checkout'\''s backend decides; the other arm'\''s flags are refused. Dry-run by default; mutates only with \`--live\`' \
+'submit:File a submission from the working copy in the current directory\: an OBS submit request from an OBS-native checkout, a Gitea pull request from a git-backed one. The checkout'\''s backend decides; the other arm'\''s flags are refused, except the submission text\: \`--title\`/\`--body\` work on both arms, and on OBS they compose \`--description\` (the title as the headline, the body after a blank line). Dry-run by default; mutates only with \`--live\`' \
 'cleanup:Clean the local build roots for the submit request filed from the working copy in the current directory, when that request is accepted. The request id was recorded by \`submit\` in the checkout; the leaf reads the request state once and wipes the roots only on \`accepted\`. A request in any other state, and a checkout with nothing recorded, delete nothing. Dry-run by default; mutates only with \`--live\`' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -7021,11 +7053,6 @@ _geectl__subcmd__pull-request__subcmd__help_commands() {
 _geectl__subcmd__pull-request__subcmd__help__subcmd__approve_commands() {
     local commands; commands=()
     _describe -t commands 'geectl pull-request help approve commands' commands "$@"
-}
-(( $+functions[_geectl__subcmd__pull-request__subcmd__help__subcmd__build-comment_commands] )) ||
-_geectl__subcmd__pull-request__subcmd__help__subcmd__build-comment_commands() {
-    local commands; commands=()
-    _describe -t commands 'geectl pull-request help build-comment commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__pull-request__subcmd__help__subcmd__cancel-review-request_commands] )) ||
 _geectl__subcmd__pull-request__subcmd__help__subcmd__cancel-review-request_commands() {
@@ -7159,7 +7186,8 @@ _geectl__subcmd__remote_commands() {
 'owners-for-binary:Show the owners of a binary package' \
 'owners-for-package:Show the owners of a package by name alone, in the owner root projects' \
 'maintainers:Show the maintainers of a package' \
-'whois:Show a user'\''s full name, email, and account state. Without a login, the authenticated user' \
+'whois:Show a user'\''s full name, email, and account state. Without a login, the authenticated user; any login is accepted. \`whoami\` is an alias\: with no login, the same identity read as \`gitea whoami\`' \
+'whoami:Show a user'\''s full name, email, and account state. Without a login, the authenticated user; any login is accepted. \`whoami\` is an alias\: with no login, the same identity read as \`gitea whoami\`' \
 'link-target:Show the link target of a package, when it is a link' \
 'project-diff:Diff two projects, package by package. Computed client-side\: the library lists both projects and reads every file of every differing package, so a large diff issues many requests and a differing binary file fails the call' \
 'diff-packages:Diff two packages, file by file. Computed client-side\: the library diffs the two file lists and cats each changed file, so a differing binary file fails the call' \
@@ -7296,7 +7324,7 @@ _geectl__subcmd__remote__subcmd__help_commands() {
 'owners-for-binary:Show the owners of a binary package' \
 'owners-for-package:Show the owners of a package by name alone, in the owner root projects' \
 'maintainers:Show the maintainers of a package' \
-'whois:Show a user'\''s full name, email, and account state. Without a login, the authenticated user' \
+'whois:Show a user'\''s full name, email, and account state. Without a login, the authenticated user; any login is accepted. \`whoami\` is an alias\: with no login, the same identity read as \`gitea whoami\`' \
 'link-target:Show the link target of a package, when it is a link' \
 'project-diff:Diff two projects, package by package. Computed client-side\: the library lists both projects and reads every file of every differing package, so a large diff issues many requests and a differing binary file fails the call' \
 'diff-packages:Diff two packages, file by file. Computed client-side\: the library diffs the two file lists and cats each changed file, so a differing binary file fails the call' \
@@ -7757,8 +7785,8 @@ _geectl__subcmd__request_commands() {
 'show:Show one submit request\: source/target/message, reviews, history' \
 'log:Show one submit request'\''s history\: creation, then each state change' \
 'search:List the submit requests matching the filters\: a typed search' \
-'list:List submit requests\: the same search, with the states still awaiting action (new, review) as the default. A thin wrapper over the search operation\: the flags select the same server-side search' \
-'diff:Show the diff of a submit request\: the unified diff, or the request XML with the diff injected with \`--xml\`' \
+'list:Deprecated\: use \`request search\`. List submit requests\: the same search, with the states still awaiting action (new, review) as the default — \`search\` defaults to new/review/declined. A thin wrapper over the search operation\: the flags select the same server-side search' \
+'diff:Show the diff of a submit request\: the unified diff, or the request XML with the diff injected with \`--xml\` — the OBS-only escape hatch' \
 'list-comments:List the comments on a submit request, in id order' \
 'accept:Accept a submit request, with a comment as the message left with the accept. An accepted request is forwarded to its link parent unless \`--no-forward\` is given; a refused forward is reported and the accepted request stands, with the work staying queued in the devel project. The forwarded request'\''s \`.changes\` entry is the original description, overridable with \`-m\` / \`--forward-message\`. Dry-run by default; mutates only with \`--live\`' \
 'decline:Decline a submit request, with a comment as the reason' \
@@ -7770,7 +7798,7 @@ _geectl__subcmd__request_commands() {
 'add-comment:Comment on a submit request, optionally as a reply to another comment' \
 'file:File a submit request\: source package to a devel project, superseding every open submit request for the package from the same user' \
 'refile:File a submit request and supersede an old one with it, plus every other open submit request for the package from the same user\: the new request is filed first, and only then is each open one superseded pointing at it' \
-'supersede:Supersede one request with another existing one. A mutation that needs \`--live\`; the dry-runnable supersede flow is \`request refile --supersede\`' \
+'supersede:Supersede one request with another existing one. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs it' \
 'file-add-role:File an add-role request\: grant a person or a group a role on a project or a package' \
 'file-change-devel:File a change-devel request\: change a package'\''s devel project' \
 'file-delete:File a delete request\: delete a package, a repository, or a whole project' \
@@ -7846,8 +7874,8 @@ _geectl__subcmd__request__subcmd__help_commands() {
 'show:Show one submit request\: source/target/message, reviews, history' \
 'log:Show one submit request'\''s history\: creation, then each state change' \
 'search:List the submit requests matching the filters\: a typed search' \
-'list:List submit requests\: the same search, with the states still awaiting action (new, review) as the default. A thin wrapper over the search operation\: the flags select the same server-side search' \
-'diff:Show the diff of a submit request\: the unified diff, or the request XML with the diff injected with \`--xml\`' \
+'list:Deprecated\: use \`request search\`. List submit requests\: the same search, with the states still awaiting action (new, review) as the default — \`search\` defaults to new/review/declined. A thin wrapper over the search operation\: the flags select the same server-side search' \
+'diff:Show the diff of a submit request\: the unified diff, or the request XML with the diff injected with \`--xml\` — the OBS-only escape hatch' \
 'list-comments:List the comments on a submit request, in id order' \
 'accept:Accept a submit request, with a comment as the message left with the accept. An accepted request is forwarded to its link parent unless \`--no-forward\` is given; a refused forward is reported and the accepted request stands, with the work staying queued in the devel project. The forwarded request'\''s \`.changes\` entry is the original description, overridable with \`-m\` / \`--forward-message\`. Dry-run by default; mutates only with \`--live\`' \
 'decline:Decline a submit request, with a comment as the reason' \
@@ -7859,7 +7887,7 @@ _geectl__subcmd__request__subcmd__help_commands() {
 'add-comment:Comment on a submit request, optionally as a reply to another comment' \
 'file:File a submit request\: source package to a devel project, superseding every open submit request for the package from the same user' \
 'refile:File a submit request and supersede an old one with it, plus every other open submit request for the package from the same user\: the new request is filed first, and only then is each open one superseded pointing at it' \
-'supersede:Supersede one request with another existing one. A mutation that needs \`--live\`; the dry-runnable supersede flow is \`request refile --supersede\`' \
+'supersede:Supersede one request with another existing one. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs it' \
 'file-add-role:File an add-role request\: grant a person or a group a role on a project or a package' \
 'file-change-devel:File a change-devel request\: change a package'\''s devel project' \
 'file-delete:File a delete request\: delete a package, a repository, or a whole project' \

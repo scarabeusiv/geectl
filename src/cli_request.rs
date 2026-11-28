@@ -19,10 +19,7 @@
 //! `try-change-state` reports `changed` as the would-change answer:
 //! true only when the request exists and is in another state — a
 //! request already in the target state reports `false`, and a
-//! request that does not exist is `not_found`. The one exception is
-//! `request supersede`: the library's raw supersede has no dry-run,
-//! so without `--live` that command refuses — `request refile
-//! --supersede` is the dry-runnable supersede flow.
+//! request that does not exist is `not_found`.
 //!
 //! Credentials in dry-run: this group swallows a half-configured
 //! credential pair in dry-run (the plan prints without credentials;
@@ -69,6 +66,7 @@ use crate::config;
 use crate::debug::{strip_terminal_controls_marked, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{HttpClient, Timeout, UreqClient};
+use crate::obs::request::validate_supersede_ids;
 use crate::obs::{
     AcceptCleanup, AcceptInfo, AddRolePayload, ChangeDevelPayload, CleanupStep, CveId,
     DeletePayload, DeleteTarget, DryRun, FiledRequest, ForwardActionResult, ForwardResult,
@@ -154,10 +152,11 @@ pub enum RequestCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// List submit requests: the same search, with the states still
-    /// awaiting action (new, review) as the default. A thin wrapper
-    /// over the search operation: the flags select the same
-    /// server-side search.
+    /// Deprecated: use `request search`. List submit requests: the
+    /// same search, with the states still awaiting action (new,
+    /// review) as the default — `search` defaults to
+    /// new/review/declined. A thin wrapper over the search
+    /// operation: the flags select the same server-side search.
     List {
         /// Requests touching this project.
         #[arg(long)]
@@ -178,12 +177,13 @@ pub enum RequestCommand {
         limit: Option<usize>,
     },
     /// Show the diff of a submit request: the unified diff, or the
-    /// request XML with the diff injected with `--xml`.
+    /// request XML with the diff injected with `--xml` — the
+    /// OBS-only escape hatch.
     Diff {
         /// The request id.
         id: String,
         /// Render the request XML with the diff injected, instead of
-        /// the unified diff.
+        /// the unified diff — the OBS-only escape hatch.
         #[arg(long)]
         xml: bool,
     },
@@ -314,7 +314,12 @@ pub enum RequestCommand {
         /// The request id.
         id: String,
         /// The comment text. Values starting with `-` are taken literally: the body may open with a `- ` bullet.
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(
+            long = "comment",
+            alias = "body",
+            value_name = "COMMENT",
+            allow_hyphen_values = true
+        )]
         body: String,
         /// The comment being replied to, when this is a reply.
         #[arg(long)]
@@ -336,9 +341,9 @@ pub enum RequestCommand {
         #[arg(long)]
         supersede: String,
     },
-    /// Supersede one request with another existing one. A mutation
-    /// that needs `--live`; the dry-runnable supersede flow is
-    /// `request refile --supersede`.
+    /// Supersede one request with another existing one. A mutation:
+    /// dry-run is the default (only the plan is printed); `--live`
+    /// performs it.
     Supersede {
         /// The open request being superseded.
         old_id: String,
@@ -645,14 +650,23 @@ pub fn run(
                 limit,
             )?;
             search.match_expr()?;
-            with_client(debug, true, instance, |client| {
+            let result = with_client(debug, true, instance, |client| {
                 let requests = client.search_requests(&search)?;
                 let payload = json!({
                     "requests": requests.iter().map(request_json).collect::<Vec<_>>(),
                     "count": requests.len(),
                 });
                 Ok((payload, render_list_text(&coordinates, &requests)))
-            })
+            })?;
+            // Deprecated: `request search` is the same search with
+            // the wider default (new/review/declined). The warning
+            // goes to stderr on a successful run only: a failing
+            // run's stderr is the JSON error alone, and a warning
+            // line ahead of it would break that.
+            eprintln!(
+                "warning: `request list` is deprecated; use `request search` instead (search defaults to the new/review/declined states; list defaults to new/review)"
+            );
+            Ok(result)
         }
         RequestCommand::Diff { id, xml } => with_client(debug, true, instance, |client| {
             let diff = client.request_diff(&id, xml)?;
@@ -900,10 +914,26 @@ pub fn run(
             supersede,
         } => file_maintenance_incident(debug, live, instance, &incident, Some(&supersede)),
         RequestCommand::Supersede { old_id, new_id } => {
-            if !live {
-                return Err(GeectlError::new(
-                    ErrorKind::InvalidInput,
-                    "request supersede has no dry-run: pass --live to perform it, or use `request refile --supersede` for the dry-runnable supersede flow",
+            // The ids are validated before the dry-run branch: a
+            // malformed, zero, or identical pair must fail here,
+            // not plan success and fail only live.
+            validate_supersede_ids(&old_id, &new_id)?;
+            // The library's raw supersede has no dry-run of its own,
+            // so the CLI records the plan here: without `--live` the
+            // plan prints and no client is built, so no credentials
+            // are needed and no network happens.
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            if dry_run.enabled() {
+                dry_run.note(&format!("would: supersede request {old_id} with {new_id}"));
+                let mut payload = json!({
+                    "old_id": request_id_json(&old_id),
+                    "new_id": request_id_json(&new_id),
+                    "dry_run": true,
+                });
+                add_plan(&mut payload, &dry_run);
+                return Ok((
+                    payload,
+                    format!("dry-run: would supersede request {old_id} with {new_id}"),
                 ));
             }
             with_client(debug, true, instance, |client| {
@@ -3396,6 +3426,16 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_add_comment_accepts_the_old_body_spelling() {
+        let cli =
+            TestCli::try_parse_from(["geectl", "add-comment", "42", "--body", "noted"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            RequestCommand::AddComment { body, .. } if body == "noted"
+        ));
     }
 
     #[test]

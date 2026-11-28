@@ -58,6 +58,25 @@ pub(crate) fn validate_request_id(id: &str) -> Result<u64, GeectlError> {
     Ok(number)
 }
 
+/// Validate a supersede pair: both ids well-formed and positive,
+/// and the two different. The CLI validates before its dry-run
+/// branch, so a malformed pair fails there instead of planning
+/// success and failing only live.
+pub(crate) fn validate_supersede_ids(
+    old_id: &str,
+    new_id: &str,
+) -> Result<(u64, u64), GeectlError> {
+    let old = validate_request_id(old_id)?;
+    let new = validate_request_id(new_id)?;
+    if old == new {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("cannot supersede submit request {old_id} with itself"),
+        ));
+    }
+    Ok((old, new))
+}
+
 /// The state name a changestate accepts for `state`: `new`, `review`,
 /// `accepted`, `declined`, or `revoked`. `superseded` is refused:
 /// superseding needs a replacement id, and
@@ -3200,14 +3219,7 @@ impl<'a> ObsClient<'a> {
     /// - Success is the `<status code="ok"/>` body: any other body
     ///   is a server error, never success.
     pub fn supersede_request(&self, old_id: &str, new_id: &str) -> Result<(), GeectlError> {
-        let old = validate_request_id(old_id)?;
-        let new = validate_request_id(new_id)?;
-        if old == new {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                format!("cannot supersede submit request {old_id} with itself"),
-            ));
-        }
+        let (old, new) = validate_supersede_ids(old_id, new_id)?;
         if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,

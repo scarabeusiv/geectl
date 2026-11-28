@@ -4,12 +4,12 @@
 .SH NAME
 geectl\-pull\-request\-decline \- Decline a pull request. On OBS this changes the request state to declined; on Gitea it closes the pull request. Dry\-run by default; mutates only with `\-\-live`
 .SH SYNOPSIS
-\fBgeectl pull\-request decline\fR [\fB\-\-message\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
+\fBgeectl pull\-request decline\fR [\fB\-\-comment\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
 .SH DESCRIPTION
 Decline a pull request. On OBS this changes the request state to declined; on Gitea it closes the pull request. Dry\-run by default; mutates only with `\-\-live`
 .SH OPTIONS
 .TP
-\fB\-\-message\fR \fI<MESSAGE>\fR
+\fB\-\-comment\fR \fI<COMMENT>\fR
 The reason for the decline or withdrawal. Values starting with `\-` are taken literally: a message may open with a `\- ` bullet
 .TP
 \fB\-h\fR, \fB\-\-help\fR

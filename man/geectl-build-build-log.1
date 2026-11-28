@@ -4,7 +4,7 @@
 .SH NAME
 geectl\-build\-build\-log \- Read the build log for a package
 .SH SYNOPSIS
-\fBgeectl build build\-log\fR [\fB\-\-start\fR] [\fB\-\-last\fR] [\fB\-\-lastsucceeded\fR] [\fB\-\-multibuild\fR] [\fB\-\-strip\-time\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> [\fIPACKAGE\fR] [\fIREPOSITORY\fR] [\fIARCH\fR] 
+\fBgeectl build build\-log\fR [\fB\-\-start\fR] [\fB\-\-last\fR] [\fB\-\-last\-succeeded\fR] [\fB\-\-multibuild\fR] [\fB\-\-strip\-time\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> [\fIPACKAGE\fR] [\fIREPOSITORY\fR] [\fIARCH\fR] 
 .SH DESCRIPTION
 Read the build log for a package
 .SH OPTIONS
@@ -13,9 +13,9 @@ Read the build log for a package
 Start reading at this byte offset; a negative offset reads from the end of the log
 .TP
 \fB\-\-last\fR
-The last build\*(Aqs log instead of the current one. Cannot combine with `\-\-lastsucceeded`
+The last build\*(Aqs log instead of the current one. Cannot combine with `\-\-last\-succeeded`
 .TP
-\fB\-\-lastsucceeded\fR
+\fB\-\-last\-succeeded\fR
 The last succeeded build\*(Aqs log. Cannot combine with `\-\-last`
 .TP
 \fB\-\-multibuild\fR \fI<FLAVOR>\fR
@@ -28,7 +28,7 @@ Strip the leading `[timestamp] ` from each log line
 Print help
 .TP
 <\fIPROJECT\fR>
-The project the package is in — or a build\-log URL, in which case the other coordinates are omitted. The URL form takes an API log URL (`http(s)://<api\-host>/build/<project>/<repository>/<arch>/<package>/_log`) or a web\-UI log URL (`http(s)://build.opensuse.org/package/live_build_log/<project>/<package>/<repository>/<arch>`)
+The project the package is in — or a build\-log URL, in which case the other coordinates are omitted. The URL form takes an API log URL (`http(s)://<api\-host>/build/<project>/<repository>/<arch>/<package>/_log`) or a web\-UI live\-build\-log URL (`http(s)://<web\-host>/package/live_build_log/<project>/<package>/<repository>/<arch>`)
 .TP
 [\fIPACKAGE\fR]
 The package to read the log for. Omit with a URL

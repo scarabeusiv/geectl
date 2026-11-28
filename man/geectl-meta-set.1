@@ -2,11 +2,11 @@
 .el .ds Aq '
 .TH geectl-meta-set 1  "geectl-meta-set 0.3.0" 
 .SH NAME
-geectl\-meta\-set \- Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL. The target selects the backend: `\-\-project` (with `\-\-package` for a package) writes OBS meta, `\-\-repo` writes Gitea repo settings. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field
+geectl\-meta\-set \- Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL. The target selects the backend: `\-\-project` (with `\-\-package` for a package) writes OBS meta, `\-\-repo` writes Gitea repo settings. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the write. Only the given fields change; the rest of the meta is kept as it is. `\-\-clear description` / `\-\-clear url` clears a field instead of setting it
 .SH SYNOPSIS
-\fBgeectl meta set\fR [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-\-repo\fR] [\fB\-\-description\fR] [\fB\-\-url\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBgeectl meta set\fR [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-\-repo\fR] [\fB\-\-description\fR] [\fB\-\-url\fR] [\fB\-\-clear\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL. The target selects the backend: `\-\-project` (with `\-\-package` for a package) writes OBS meta, `\-\-repo` writes Gitea repo settings. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field
+Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL. The target selects the backend: `\-\-project` (with `\-\-package` for a package) writes OBS meta, `\-\-repo` writes Gitea repo settings. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the write. Only the given fields change; the rest of the meta is kept as it is. `\-\-clear description` / `\-\-clear url` clears a field instead of setting it
 .SH OPTIONS
 .TP
 \fB\-\-project\fR \fI<PROJECT>\fR
@@ -23,6 +23,19 @@ A short description
 .TP
 \fB\-\-url\fR \fI<URL>\fR
 A URL with more information; the repository website on the Gitea arm
+.TP
+\fB\-\-clear\fR \fI<CLEAR>\fR
+Clear a field instead of setting it: `description` or `url`. Repeatable; refused together with setting the same field
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+description
+.IP \(bu 2
+url
+.RE
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help

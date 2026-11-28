@@ -2,11 +2,11 @@
 .el .ds Aq '
 .TH geectl-local-build-prune 1  "geectl-local-build-prune 0.3.0" 
 .SH NAME
-geectl\-local\-build\-prune \- Print the eviction plan (what would be evicted, in order, with bytes); delete only with `\-\-apply`. The plan is the default: the leaf\*(Aqs own `\-\-apply` is the confirmation, so the scheduled task runs exactly `prune \-\-apply`
+geectl\-local\-build\-prune \- Print the eviction plan (what would be evicted, in order, with bytes); delete only with `\-\-apply` or `\-\-live`. The plan is the default: the leaf\*(Aqs own `\-\-apply` is the confirmation, so the scheduled task runs exactly `prune \-\-apply`
 .SH SYNOPSIS
 \fBgeectl local\-build prune\fR [\fB\-\-apply\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Print the eviction plan (what would be evicted, in order, with bytes); delete only with `\-\-apply`. The plan is the default: the leaf\*(Aqs own `\-\-apply` is the confirmation, so the scheduled task runs exactly `prune \-\-apply`
+Print the eviction plan (what would be evicted, in order, with bytes); delete only with `\-\-apply` or `\-\-live`. The plan is the default: the leaf\*(Aqs own `\-\-apply` is the confirmation, so the scheduled task runs exactly `prune \-\-apply`
 .SH OPTIONS
 .TP
 \fB\-\-apply\fR

@@ -1083,18 +1083,27 @@ pub struct RepoEditOptions {
     /// A URL with more information about the repository; omitted
     /// when unset.
     pub website: Option<String>,
+    /// Clear the description; refused together with `description`.
+    /// A clear sends an empty string, which the server clears.
+    pub clear_description: bool,
+    /// Clear the website; refused together with `website`.
+    pub clear_website: bool,
 }
 
 impl RepoEditOptions {
-    /// True when at least one field is set: an edit with nothing
-    /// to edit is a no-op, refused before any call.
+    /// True when at least one field is set or cleared: an edit
+    /// with nothing to edit is a no-op, refused before any call.
     pub fn has_fields(&self) -> bool {
-        self.description.is_some() || self.website.is_some()
+        self.description.is_some()
+            || self.website.is_some()
+            || self.clear_description
+            || self.clear_website
     }
 
-    /// Validate the options: at least one field set, and no field
-    /// empty — there is no flag to clear a field, so an empty
-    /// value is an input error, not a clear.
+    /// Validate the options: at least one field set or cleared, no
+    /// field empty, and no field both set and cleared. An empty
+    /// value is an input error, not a clear — a clear is the flag,
+    /// never an empty string smuggled in as a value.
     pub fn validate(&self) -> Result<(), GeectlError> {
         if !self.has_fields() {
             return Err(GeectlError::new(
@@ -1102,16 +1111,28 @@ impl RepoEditOptions {
                 "repo edit needs at least one of --description, --url",
             ));
         }
+        if self.description.is_some() && self.clear_description {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "--description and --clear description conflict: pass one, not both",
+            ));
+        }
+        if self.website.is_some() && self.clear_website {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "--url and --clear url conflict: pass one, not both",
+            ));
+        }
         if self.description.as_deref() == Some("") {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
-                "--description must not be empty: there is no flag to clear a field",
+                "--description must not be empty: use --clear description to clear it",
             ));
         }
         if self.website.as_deref() == Some("") {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
-                "--url must not be empty: there is no flag to clear a field",
+                "--url must not be empty: use --clear url to clear it",
             ));
         }
         Ok(())
@@ -1871,9 +1892,19 @@ impl<'a> GiteaClient<'a> {
         if !dry_run.allow(&format!("edit repository {owner}/{repo}")) {
             return Ok(None);
         }
+        // A clear sends an empty string: the server clears the
+        // field, and the verify below checks the echoed empty value.
         let request = RepoEditRequest {
-            description: options.description.clone(),
-            website: options.website.clone(),
+            description: if options.clear_description {
+                Some(String::new())
+            } else {
+                options.description.clone()
+            },
+            website: if options.clear_website {
+                Some(String::new())
+            } else {
+                options.website.clone()
+            },
         };
         let body = serde_json::to_string(&request).map_err(|err| {
             GeectlError::new(
@@ -1909,6 +1940,28 @@ impl<'a> GiteaClient<'a> {
                     ),
                 ));
             }
+        }
+        // A clear is verified like a set: the echoed value must be
+        // empty (or absent) — a server that silently kept the old
+        // value must not report success.
+        if options.clear_description && edited.description.as_deref().is_some_and(|d| !d.is_empty())
+        {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea repository response for the edited repository {owner}/{repo}: the server answered with description {:?}, not an empty value — the clear was ignored",
+                    edited.description
+                ),
+            ));
+        }
+        if options.clear_website && edited.website.as_deref().is_some_and(|w| !w.is_empty()) {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea repository response for the edited repository {owner}/{repo}: the server answered with website {:?}, not an empty value — the clear was ignored",
+                    edited.website
+                ),
+            ));
         }
         Ok(Some(edited))
     }
@@ -6525,6 +6578,7 @@ mod tests {
         let options = RepoEditOptions {
             description: Some("sources for a package".to_string()),
             website: Some("https://example.com/package".to_string()),
+            ..Default::default()
         };
         let http = FakeHttp::new().with_patch(
             "https://src.opensuse.org/api/v1/repos/pool/systemd",
@@ -6563,6 +6617,7 @@ mod tests {
         let options = RepoEditOptions {
             description: Some("sources for a package".to_string()),
             website: None,
+            ..Default::default()
         };
         let http = FakeHttp::new().with_patch(
             "https://src.opensuse.org/api/v1/repos/pool/systemd",
@@ -6588,6 +6643,7 @@ mod tests {
         let options = RepoEditOptions {
             description: Some("sources for a package".to_string()),
             website: None,
+            ..Default::default()
         };
         let http = FakeHttp::new();
         let dry_run = DryRun::new(true);
@@ -6609,6 +6665,7 @@ mod tests {
         let options = RepoEditOptions {
             description: Some("sources for a package".to_string()),
             website: Some("https://example.com/package".to_string()),
+            ..Default::default()
         };
         let http = FakeHttp::new().with_patch(
             "https://src.opensuse.org/api/v1/repos/pool/systemd",
@@ -6644,6 +6701,7 @@ mod tests {
         let options = RepoEditOptions {
             description: Some("sources for a package".to_string()),
             website: None,
+            ..Default::default()
         };
         let http = FakeHttp::new().with_patch(
             "https://src.opensuse.org/api/v1/repos/pool/systemd",
@@ -6676,6 +6734,7 @@ mod tests {
         let options = RepoEditOptions {
             description: Some(String::new()),
             website: None,
+            ..Default::default()
         };
         let err = client(&http)
             .repo_edit("pool", "systemd", &options, &DryRun::new(false))
@@ -6684,6 +6743,7 @@ mod tests {
         let options = RepoEditOptions {
             description: None,
             website: Some(String::new()),
+            ..Default::default()
         };
         let err = client(&http)
             .repo_edit("pool", "systemd", &options, &DryRun::new(false))
@@ -6693,10 +6753,84 @@ mod tests {
     }
 
     #[test]
+    fn repo_edit_clears_a_field_with_an_empty_string() {
+        // A clear sends the field as an empty string — never as
+        // null, never omitted — and the echoed empty value verifies.
+        let options = RepoEditOptions {
+            description: None,
+            website: None,
+            clear_description: true,
+            ..Default::default()
+        };
+        let http = FakeHttp::new().with_patch(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json_with_meta("pool", "systemd", "", "https://example.com/systemd"),
+        );
+        let edited = client(&http)
+            .repo_edit("pool", "systemd", &options, &DryRun::new(false))
+            .unwrap()
+            .expect("a non-dry-run edit returns the repo");
+        assert_eq!(edited.description.as_deref(), Some(""));
+        assert_eq!(
+            edited.website.as_deref(),
+            Some("https://example.com/systemd")
+        );
+        assert_eq!(
+            http.patch_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd".to_string(),
+                r#"{"description":""}"#.to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn repo_edit_refuses_an_ignored_clear() {
+        // A server that silently kept the old description after a
+        // clear must not report success — same as a kept set field.
+        let options = RepoEditOptions {
+            description: None,
+            website: None,
+            clear_description: true,
+            ..Default::default()
+        };
+        let http = FakeHttp::new().with_patch(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json_with_meta(
+                "pool",
+                "systemd",
+                "old description",
+                "https://example.com/systemd",
+            ),
+        );
+        let err = client(&http)
+            .repo_edit("pool", "systemd", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        // And a kept website.
+        let options = RepoEditOptions {
+            description: None,
+            website: None,
+            clear_website: true,
+            ..Default::default()
+        };
+        let http = FakeHttp::new().with_patch(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json_with_meta("pool", "systemd", "", "https://example.com/old"),
+        );
+        let err = client(&http)
+            .repo_edit("pool", "systemd", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
     fn repo_edit_validates_names_before_any_call() {
         let options = RepoEditOptions {
             description: Some("sources for a package".to_string()),
             website: None,
+            ..Default::default()
         };
         let http = FakeHttp::new();
         let err = client(&http)
