@@ -22,7 +22,7 @@
 //! — OBS credentials for `--project`, the Gitea Bearer <redacted>
 //! for `--repo` — and fails closed naming them when they are
 //! missing. In dry-run the OBS client builds without credentials
-//! (the plan prints without them), like the request group; the
+//! (the plan prints without them); the
 //! Gitea client still needs its credential to be built, so a
 //! dry-run Gitea write without one fails closed naming it, like
 //! the gitea group. The Gitea token resolves per URL — the

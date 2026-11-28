@@ -4,8 +4,10 @@
 //! `CARGO_BIN_EXE_geectl`, set by Cargo for integration tests).
 //! Dry-run mutations need no network and no credentials — the
 //! library records the plan before any HTTP — so they run fully
-//! offline in an isolated environment. Reads refuse without
-//! credentials before any request, with a ConfigError (exit 9).
+//! offline in an isolated environment, except `try-change-state`,
+//! whose dry run reads the request back first and so needs
+//! credentials and a server. Reads refuse without credentials
+//! before any request, with a ConfigError (exit 9).
 
 use serde_json::json;
 use std::fs;
@@ -90,6 +92,27 @@ const REQUEST_STUB_XML: &str = r#"<request creator="creator" id="42">
     <target project="deleteme" />
   </action>
   <state name="accepted" when="2010-12-27T01:36:29" who="user1" />
+  <history when="2010-12-13T13:02:03" who="creator">
+    <description>Create Request</description>
+    <comment>foobar</comment>
+  </history>
+  <title>title of the request</title>
+  <description>this is a
+very long
+description</description>
+</request>"#;
+
+/// The same request in `review` state: the dry-run read finds it
+/// movable, so the change would happen.
+const REQUEST_STUB_XML_REVIEW: &str = r#"<request creator="creator" id="42">
+  <action type="submit">
+    <source package="bar" project="foo" rev="1" />
+    <target package="bar" project="foobar" />
+  </action>
+  <action type="delete">
+    <target project="deleteme" />
+  </action>
+  <state name="review" when="2010-12-27T01:36:29" who="user1" />
   <history when="2010-12-13T13:02:03" who="creator">
     <description>Create Request</description>
     <comment>foobar</comment>
@@ -2321,6 +2344,12 @@ fn request_accept_dry_run_text_echoes_the_comment() {
 
 #[test]
 fn request_try_change_state_dry_run_names_target_state() {
+    // The dry-run reads the request back first: the stub answers
+    // request 42 in review, so the change would happen.
+    let (obs_addr, obs_seen) = serve_routes(vec![(
+        "/request/42".to_string(),
+        REQUEST_STUB_XML_REVIEW.to_string(),
+    )]);
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args([
@@ -2331,6 +2360,9 @@ fn request_try_change_state_dry_run_names_target_state() {
             "--comment",
             "looks good",
         ])
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
         .output()
         .unwrap();
     assert!(
@@ -2345,10 +2377,17 @@ fn request_try_change_state_dry_run_names_target_state() {
     assert_eq!(value["dry_run"], true);
     assert_plan_non_empty(&value);
     assert_eq!(value["comment"], "looks good");
+    let seen = obs_seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0], "/request/42?withhistory=1");
 }
 
 #[test]
 fn request_try_change_state_dry_run_text_echoes_the_comment() {
+    let (obs_addr, obs_seen) = serve_routes(vec![(
+        "/request/42".to_string(),
+        REQUEST_STUB_XML_REVIEW.to_string(),
+    )]);
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args([
@@ -2361,6 +2400,9 @@ fn request_try_change_state_dry_run_text_echoes_the_comment() {
             "--comment",
             "looks good",
         ])
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -2368,6 +2410,130 @@ fn request_try_change_state_dry_run_text_echoes_the_comment() {
         String::from_utf8_lossy(&out.stdout).trim(),
         "dry-run: would try to change request 42 to accepted \u{2014} looks good"
     );
+    let seen = obs_seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0], "/request/42?withhistory=1");
+}
+
+#[test]
+fn request_try_change_state_dry_run_refuses_superseded_target() {
+    // The target is validated before the read: superseding needs a
+    // replacement id, so the dry-run refuses without credentials
+    // and without a server.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "try-change-state", "42", "superseded"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn request_try_change_state_dry_run_without_credentials_fails_with_config_error() {
+    // The dry-run reads the request back first, and the read needs
+    // credentials: without them the preview fails closed instead of
+    // claiming a change it cannot verify.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "request",
+            "try-change-state",
+            "42",
+            "accepted",
+            "--comment",
+            "looks good",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    assert_eq!(error_of(&out)["error"]["code"], "config_error");
+}
+
+#[test]
+fn request_try_change_state_dry_run_false_when_already_in_the_target_state() {
+    // The stub answers request 42 already accepted, so the dry-run
+    // reports false and the plan carries the skip, not the change.
+    let (obs_addr, obs_seen) = serve_routes(vec![(
+        "/request/42".to_string(),
+        REQUEST_STUB_XML.to_string(),
+    )]);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "try-change-state", "42", "accepted"])
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["changed"], false);
+    assert_eq!(value["dry_run"], true);
+    let plan = value["plan"].as_array().expect("payload carries a plan");
+    assert_eq!(plan.len(), 1);
+    assert_eq!(
+        plan[0],
+        "[dry-run] request 42 already accepted; nothing to change"
+    );
+    let seen = obs_seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0], "/request/42?withhistory=1");
+}
+
+#[test]
+fn request_try_change_state_dry_run_text_names_already_in_target_state() {
+    let (obs_addr, _) = serve_routes(vec![(
+        "/request/42".to_string(),
+        REQUEST_STUB_XML.to_string(),
+    )]);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "request",
+            "try-change-state",
+            "42",
+            "accepted",
+            "--comment",
+            "looks good",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "dry-run: request 42 already accepted; nothing to change \u{2014} looks good"
+    );
+}
+
+#[test]
+fn request_try_change_state_dry_run_not_found_when_request_missing() {
+    // No route matches the read, so the stub 404s and the dry-run
+    // reports not_found instead of planning a change.
+    let (obs_addr, _) = serve_routes(vec![]);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "try-change-state", "999999999", "declined"])
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    assert_eq!(error_of(&out)["error"]["code"], "not_found");
 }
 
 #[test]

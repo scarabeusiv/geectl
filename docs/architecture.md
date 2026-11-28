@@ -313,7 +313,7 @@ and `request_diff` returns the submit diff, plain or wrapped in the
 request XML. `change_state` moves a request (`accepted`, `declined`,
 `revoked`, `review`, `new`); `accept_request`, `decline_request`,
 and `revoke_request` are the named wrappers, and
-`try_change_state` is the lenient form: a refused move propagates the error so the decline reason reaches the payload, while a request already in the target state reports `false` (a no-op). `add_review` asks a user, group, project, or
+`try_change_state` is the lenient form: a refused move propagates the error so the decline reason reaches the payload, while a request already in the target state reports `false` (a no-op). The dry-run reads the request back first, so a `true` answer means the request exists and is in another state — whether the server accepts the move is still the server's call. `add_review` asks a user, group, project, or
 project/package to review (`ReviewTarget` validates the target up
 front: at least one of user, group, project, and a package needs its
 project); `list_comments` and `add_comment` read and write the

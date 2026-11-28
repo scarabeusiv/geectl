@@ -90,7 +90,12 @@ in dry-run too, since a dry run previews a live run
 (`service`'s trigger is the mutation there; its reads are public
 but resolve credentials up front).
 `request` swallows it in dry-run (a preview performs no write;
-the dropped error goes to the debug channel). `meta` takes the same leniency on its OBS arm: a dry-run `meta set --project` prints the plan while any credential-resolution error (a half-configured pair or a conflicting set) is reported on the debug channel and as a stderr warning. The Gitea arm resolves its token up front: a dry-run `meta set --repo` reports a missing token as a configuration error. `remote` and `build`
+the dropped error goes to the debug channel) — except
+`try-change-state`, which reads the request first and so needs
+credentials like the reads, and `request accept`'s cleanup leg,
+which reads the request first and reports an error in its cleanup
+section without them. With `--instance` the flagged instance's
+credentials are strict, so the error propagates even in dry-run. `meta` takes the same leniency on its OBS arm: a dry-run `meta set --project` prints the plan while any credential-resolution error (a half-configured pair or a conflicting set) is reported on the debug channel and as a stderr warning. The Gitea arm resolves its token up front: a dry-run `meta set --repo` reports a missing token as a configuration error. `remote` and `build`
 resolve credentials per command instead: the public reads (see
 Credentials in `docs/architecture.md`) skip credentials, so a half-set
 env leaves them working; a dry-run `remote` mutation
@@ -213,7 +218,7 @@ directory's `.env` only.
 - `geectl request decline <ID>` — Decline a submit request, with a comment as the reason; key flags: --comment <COMMENT>
 - `geectl request revoke <ID>` — Revoke (withdraw) a submit request, with a comment as the reason; key flags: --comment <COMMENT>
 - `geectl request change-state <ID> <STATE>` — Change a submit request's state to one of new/review/accepted/declined/revoked; key flags: --comment <COMMENT>, --force
-- `geectl request try-change-state <ID> <STATE>` — Best-effort state change: try it, and report whether it happened; key flags: --comment <COMMENT>, --force
+- `geectl request try-change-state <ID> <STATE>` — Best-effort state change: try it, and report whether it happened; a dry-run reads the request first, so it needs credentials; key flags: --comment <COMMENT>, --force
 - `geectl request add-review --comment <COMMENT> <ID>` — Ask a user, group, project, or package to review a submit request; key flags: --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>
 - `geectl request change-review-state <ID> <STATE>` — Change the state of one review on a submit request: accept it, decline it, or reopen it to new; key flags: --user <USER>, --group <GROUP>, --project <PROJECT>, --package <PACKAGE>, --comment <COMMENT>
 - `geectl request add-comment --body <BODY> <ID>` — Comment on a submit request, optionally as a reply to another comment; key flags: --parent <PARENT>
