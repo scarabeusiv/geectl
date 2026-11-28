@@ -3865,9 +3865,12 @@ impl<'a> GiteaClient<'a> {
         }
         // Read the meta of the thing being forked and resolve the
         // source: the package meta, or the project meta for a
-        // project fork ("_project").
+        // project fork ("_project"). The reads go through the
+        // authenticated twins: the public route omits the
+        // `<scmsync>` element, so a git-backed source would read
+        // as plain here.
         let (source_project, source_package, scmsync) = if package == "_project" {
-            let meta = obs.project_meta(project)?;
+            let meta = obs.project_meta_authenticated(project)?;
             let source_project = match (&meta.devel, options.no_devel_project) {
                 (Some(devel_project), false) => {
                     self.debug.emit(&format!(
@@ -3881,7 +3884,7 @@ impl<'a> GiteaClient<'a> {
                 meta.scmsync
             } else {
                 // The devel project's meta carries its own scmsync.
-                obs.project_meta(&source_project)?.scmsync
+                obs.project_meta_authenticated(&source_project)?.scmsync
             };
             let scmsync = scmsync.ok_or_else(|| {
                 GeectlError::new(
@@ -3893,7 +3896,7 @@ impl<'a> GiteaClient<'a> {
             })?;
             (source_project, "_project".to_string(), scmsync)
         } else {
-            let meta = obs.package_meta(project, package)?;
+            let meta = obs.package_meta_authenticated(project, package)?;
             let (source_project, source_package) = match (&meta.devel, options.no_devel_project) {
                 (Some((devel_project, devel_package)), false) => {
                     self.debug.emit(&format!(
@@ -3907,7 +3910,8 @@ impl<'a> GiteaClient<'a> {
                 meta.scmsync
             } else {
                 // The devel source's meta carries its own scmsync.
-                obs.package_meta(&source_project, &source_package)?.scmsync
+                obs.package_meta_authenticated(&source_project, &source_package)?
+                    .scmsync
             };
             let scmsync = match scmsync {
                 Some(url) => url,
@@ -3915,7 +3919,7 @@ impl<'a> GiteaClient<'a> {
                     // The package itself is not git-managed. When
                     // its project is, the actionable alternative
                     // is forking the project.
-                    let hint = match obs.project_meta(project) {
+                    let hint = match obs.project_meta_authenticated(project) {
                         Ok(project_meta) if project_meta.scmsync.is_some() => format!(
                             "; the project {project} is managed in Git — fork the project (package \"_project\") instead"
                         ),
@@ -9667,7 +9671,7 @@ mod tests {
         );
         let obs_http = branch_source_repos_fixture(obs_fork_fixture(
             branch_target_fixture(FakeHttp::new(), "games"),
-            "https://api.opensuse.org/public/source/games/descent3/_meta",
+            "https://api.opensuse.org/source/games/descent3/_meta",
             &meta,
             "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master",
             &fork_status(
@@ -9713,6 +9717,73 @@ mod tests {
     }
 
     #[test]
+    fn branch_reads_the_source_package_meta_from_the_authenticated_endpoint() {
+        // The public route omits `<scmsync>`, so the source read
+        // must hit the authenticated endpoint: the fixture registers
+        // the source meta only there, and a regression to the public
+        // read fails with no canned response.
+        let fork_body = repo_json_branch(
+            "fbui",
+            "descent3",
+            Some(("jengelh", "descent3")),
+            "master",
+            false,
+        );
+        let gitea_http = fork_fixture(
+            FakeHttp::new().with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            ),
+            "jengelh",
+            "descent3",
+            "https://src.opensuse.org/api/v1/repos/fbui/descent3",
+            &fork_body,
+        );
+        let meta = package_meta(
+            "games",
+            "descent3",
+            Some("https://src.opensuse.org/jengelh/descent3#master"),
+            None,
+        );
+        let obs_http = branch_source_repos_fixture(obs_fork_fixture(
+            branch_target_fixture(FakeHttp::new(), "games"),
+            "https://api.opensuse.org/source/games/descent3/_meta",
+            &meta,
+            "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master",
+            &fork_status(
+                "home:fbui:branches:games",
+                "descent3",
+                "games",
+                "descent3",
+            ),
+        ), "games", "");
+        let result = client(&gitea_http)
+            .branch(
+                &obs_client(&obs_http),
+                "games",
+                "descent3",
+                &ForkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.target_project, "home:fbui:branches:games");
+        // The source meta came from the authenticated endpoint,
+        // with credentials — never from the public route.
+        assert!(obs_http.get_calls().contains(&(
+            "https://api.opensuse.org/source/games/descent3/_meta".to_string(),
+            true
+        )));
+        assert!(
+            !obs_http.get_calls().iter().any(
+                |(url, _)| url == "https://api.opensuse.org/public/source/games/descent3/_meta"
+            ),
+            "the source read must not use the public route: {:?}",
+            obs_http.get_calls()
+        );
+    }
+
+    #[test]
     fn branch_generates_a_missing_target_project() {
         // Branching to a test project that does not exist yet
         // generates it as part of the branch: the explicit target
@@ -9748,7 +9819,7 @@ mod tests {
         );
         let obs_http = branch_source_repos_fixture(FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/games/descent3/_meta",
+                "https://api.opensuse.org/source/games/descent3/_meta",
                 &meta,
             )
             .with_get(
@@ -9867,7 +9938,7 @@ mod tests {
             branch_source_repos_fixture(
                 FakeHttp::new()
                     .with_get(
-                        "https://api.opensuse.org/public/source/games/descent3/_meta",
+                        "https://api.opensuse.org/source/games/descent3/_meta",
                         &meta,
                     )
                     .with_get(
@@ -9991,7 +10062,7 @@ mod tests {
         let obs_http = branch_source_repos_fixture(
             FakeHttp::new()
                 .with_get(
-                    "https://api.opensuse.org/public/source/games/descent3/_meta",
+                    "https://api.opensuse.org/source/games/descent3/_meta",
                     &meta,
                 )
                 .with_get(
@@ -10071,7 +10142,7 @@ mod tests {
             branch_source_repos_fixture(
                 FakeHttp::new()
                     .with_get(
-                        "https://api.opensuse.org/public/source/games/descent3/_meta",
+                        "https://api.opensuse.org/source/games/descent3/_meta",
                         &meta,
                     )
                     .with_get(
@@ -10269,7 +10340,7 @@ mod tests {
             branch_source_repos_fixture(
                 FakeHttp::new()
                     .with_get(
-                        "https://api.opensuse.org/public/source/games/descent3/_meta",
+                        "https://api.opensuse.org/source/games/descent3/_meta",
                         &meta,
                     )
                     .with_get(
@@ -10365,7 +10436,7 @@ mod tests {
         let obs_http = branch_source_repos_fixture(
             FakeHttp::new()
                 .with_get(
-                    "https://api.opensuse.org/public/source/games/descent3/_meta",
+                    "https://api.opensuse.org/source/games/descent3/_meta",
                     &meta,
                 )
                 .with_get(
@@ -10458,7 +10529,7 @@ mod tests {
         let obs_http = branch_source_repos_fixture(
             FakeHttp::new()
                 .with_get(
-                    "https://api.opensuse.org/public/source/games/descent3/_meta",
+                    "https://api.opensuse.org/source/games/descent3/_meta",
                     &meta,
                 )
                 .with_get(
@@ -10560,7 +10631,7 @@ mod tests {
             branch_source_repos_fixture(
                 FakeHttp::new()
                     .with_get(
-                        "https://api.opensuse.org/public/source/games/descent3/_meta",
+                        "https://api.opensuse.org/source/games/descent3/_meta",
                         &meta,
                     )
                     .with_get(
@@ -10671,7 +10742,7 @@ mod tests {
         let obs_http = branch_source_repos_fixture(
             FakeHttp::new()
                 .with_get(
-                    "https://api.opensuse.org/public/source/games/descent3/_meta",
+                    "https://api.opensuse.org/source/games/descent3/_meta",
                     &meta,
                 )
                 .with_get(
@@ -10757,7 +10828,7 @@ mod tests {
             branch_source_repos_fixture(
                 FakeHttp::new()
                     .with_get(
-                        "https://api.opensuse.org/public/source/games/descent3/_meta",
+                        "https://api.opensuse.org/source/games/descent3/_meta",
                         &meta,
                     )
                     .with_get(
@@ -10835,7 +10906,7 @@ mod tests {
         let obs_http = branch_source_repos_fixture(
             FakeHttp::new()
                 .with_get(
-                    "https://api.opensuse.org/public/source/games/descent3/_meta",
+                    "https://api.opensuse.org/source/games/descent3/_meta",
                     &meta,
                 )
                 .with_get(
@@ -10921,7 +10992,7 @@ mod tests {
             branch_source_repos_fixture(
                 FakeHttp::new()
                     .with_get(
-                        "https://api.opensuse.org/public/source/games/descent3/_meta",
+                        "https://api.opensuse.org/source/games/descent3/_meta",
                         &meta,
                     )
                     .with_get(
@@ -11015,7 +11086,7 @@ mod tests {
         let obs_http = branch_source_repos_fixture(
             FakeHttp::new()
                 .with_get(
-                    "https://api.opensuse.org/public/source/games/descent3/_meta",
+                    "https://api.opensuse.org/source/games/descent3/_meta",
                     &meta,
                 )
                 .with_get(
@@ -11085,7 +11156,7 @@ mod tests {
         );
         let obs_http = branch_source_repos_fixture(FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/games/descent3/_meta",
+                "https://api.opensuse.org/source/games/descent3/_meta",
                 &meta,
             )
             .with_get(
@@ -11149,7 +11220,7 @@ mod tests {
         );
         let obs_http = branch_source_repos_fixture(FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/games/descent3/_meta",
+                "https://api.opensuse.org/source/games/descent3/_meta",
                 &meta,
             )
             .with_get_error(
@@ -11190,8 +11261,8 @@ mod tests {
             obs_http.get_calls(),
             vec![
                 (
-                    "https://api.opensuse.org/public/source/games/descent3/_meta".to_string(),
-                    false
+                    "https://api.opensuse.org/source/games/descent3/_meta".to_string(),
+                    true
                 ),
                 (
                     "https://api.opensuse.org/public/source/home:fbui:test:descent3/_meta"
@@ -11242,7 +11313,7 @@ mod tests {
         );
         let obs_http = branch_source_repos_fixture(FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/games/descent3/_meta",
+                "https://api.opensuse.org/source/games/descent3/_meta",
                 &meta,
             )
             .with_get(
@@ -11328,7 +11399,7 @@ mod tests {
         );
         let obs_http = branch_source_repos_fixture(obs_fork_fixture(
             FakeHttp::new(),
-            "https://api.opensuse.org/public/source/games/descent3/_meta",
+            "https://api.opensuse.org/source/games/descent3/_meta",
             &meta,
             "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master",
             &fork_status("home:fbui:branches:games", "descent3", "games", "descent3"),
@@ -11361,7 +11432,7 @@ mod tests {
                 .map(|(url, _)| url.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "https://api.opensuse.org/public/source/games/descent3/_meta",
+                "https://api.opensuse.org/source/games/descent3/_meta",
                 "https://api.opensuse.org/public/source/games/_meta",
             ]
         );
@@ -11401,7 +11472,7 @@ mod tests {
         );
         let obs_http = branch_source_repos_fixture(obs_fork_fixture(
             FakeHttp::new(),
-            "https://api.opensuse.org/public/source/games/descent3/_meta",
+            "https://api.opensuse.org/source/games/descent3/_meta",
             &meta,
             "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master",
             &fork_status("home:fbui:branches:games", "descent3", "games", "descent3"),
@@ -11432,8 +11503,8 @@ mod tests {
             obs_http.get_calls(),
             vec![
                 (
-                    "https://api.opensuse.org/public/source/games/descent3/_meta".to_string(),
-                    false
+                    "https://api.opensuse.org/source/games/descent3/_meta".to_string(),
+                    true
                 ),
                 (
                     "https://api.opensuse.org/public/source/games/_meta".to_string(),
@@ -11475,7 +11546,7 @@ mod tests {
         );
         let obs_http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/games/descent3/_meta",
+                "https://api.opensuse.org/source/games/descent3/_meta",
                 &meta,
             )
             .with_get_error(
@@ -11530,7 +11601,7 @@ mod tests {
         );
         let obs_http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/games/descent3/_meta",
+                "https://api.opensuse.org/source/games/descent3/_meta",
                 &meta,
             )
             .with_get_error(
@@ -11593,6 +11664,10 @@ mod tests {
         );
         let fork_response = "<status code=\"ok\"><summary>Ok</summary><data name=\"targetproject\">home:fbui:test:xmpp</data><data name=\"sourceproject\">network:messaging:xmpp</data></status>";
         let obs_http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/network:messaging:xmpp/_meta",
+                &meta,
+            )
             .with_get(
                 "https://api.opensuse.org/public/source/network:messaging:xmpp/_meta",
                 &meta,
@@ -11681,7 +11756,7 @@ mod tests {
         );
         let obs_http = branch_source_repos_fixture(FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/games/descent3/_meta",
+                "https://api.opensuse.org/source/games/descent3/_meta",
                 &meta,
             )
             .with_get(
@@ -11883,7 +11958,7 @@ mod tests {
         );
         let obs_http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/games/descent3/_meta",
+                "https://api.opensuse.org/source/games/descent3/_meta",
                 &meta,
             )
             .with_get(
@@ -11975,7 +12050,7 @@ mod tests {
         );
         let obs_http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/games/descent3/_meta",
+                "https://api.opensuse.org/source/games/descent3/_meta",
                 &meta,
             )
             .with_get(
@@ -12053,7 +12128,7 @@ mod tests {
         );
         let obs_http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/games/descent3/_meta",
+                "https://api.opensuse.org/source/games/descent3/_meta",
                 &meta,
             )
             .with_get(
@@ -12096,7 +12171,7 @@ mod tests {
             None,
         );
         let obs_http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/games/descent3/_meta",
+            "https://api.opensuse.org/source/games/descent3/_meta",
             &meta,
         );
         let err = client(&gitea_http)
@@ -12140,11 +12215,11 @@ mod tests {
         );
         let obs_http = branch_source_repos_fixture(branch_target_fixture(FakeHttp::new(), "science")
             .with_get(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/gsl/_meta",
+                "https://api.opensuse.org/source/openSUSE:Factory/gsl/_meta",
                 &named_meta,
             )
             .with_get(
-                "https://api.opensuse.org/public/source/science/gsl/_meta",
+                "https://api.opensuse.org/source/science/gsl/_meta",
                 &devel_meta,
             )
             .with_post(
@@ -12204,7 +12279,7 @@ mod tests {
         );
         let obs_http = branch_source_repos_fixture(obs_fork_fixture(
             branch_target_fixture(FakeHttp::new(), "openSUSE:Factory"),
-            "https://api.opensuse.org/public/source/openSUSE:Factory/gsl/_meta",
+            "https://api.opensuse.org/source/openSUSE:Factory/gsl/_meta",
             &named_meta,
             "https://api.opensuse.org/source/openSUSE:Factory/gsl?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fgsl%23factory",
             &fork_status("home:fbui:branches:openSUSE:Factory", "gsl", "openSUSE:Factory", "gsl"),
@@ -12234,7 +12309,7 @@ mod tests {
                 .map(|(url, _)| url.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "https://api.opensuse.org/public/source/openSUSE:Factory/gsl/_meta",
+                "https://api.opensuse.org/source/openSUSE:Factory/gsl/_meta",
                 "https://api.opensuse.org/public/source/home:scarabeus_iv:branches:openSUSE:Factory/_meta",
                 "https://api.opensuse.org/public/source/openSUSE:Factory/_meta",
             ]
@@ -12252,15 +12327,15 @@ mod tests {
         let gitea_http = FakeHttp::new();
         let obs_http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/systemd/_meta",
+                "https://api.opensuse.org/source/openSUSE:Factory/systemd/_meta",
                 &package_meta("openSUSE:Factory", "systemd", None, Some("Base:System")),
             )
             .with_get(
-                "https://api.opensuse.org/public/source/Base:System/systemd/_meta",
+                "https://api.opensuse.org/source/Base:System/systemd/_meta",
                 &package_meta("Base:System", "systemd", None, None),
             )
             .with_get(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/_meta",
+                "https://api.opensuse.org/source/openSUSE:Factory/_meta",
                 &project_meta("openSUSE:Factory", None, None),
             );
         let err = client(&gitea_http)
@@ -12284,9 +12359,9 @@ mod tests {
                 .map(|(url, _)| url.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "https://api.opensuse.org/public/source/openSUSE:Factory/systemd/_meta",
-                "https://api.opensuse.org/public/source/Base:System/systemd/_meta",
-                "https://api.opensuse.org/public/source/openSUSE:Factory/_meta",
+                "https://api.opensuse.org/source/openSUSE:Factory/systemd/_meta",
+                "https://api.opensuse.org/source/Base:System/systemd/_meta",
+                "https://api.opensuse.org/source/openSUSE:Factory/_meta",
             ]
         );
     }
@@ -12325,7 +12400,7 @@ mod tests {
         );
         let obs_http = branch_source_repos_fixture(obs_fork_fixture(
             branch_target_fixture(FakeHttp::new(), "games"),
-            "https://api.opensuse.org/public/source/games/descent3/_meta",
+            "https://api.opensuse.org/source/games/descent3/_meta",
             &meta,
             "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%3A443%2Ffbui%2Fdescent3%23master",
             &fork_status("home:fbui:branches:games", "descent3", "games", "descent3"),
@@ -12363,11 +12438,11 @@ mod tests {
         let gitea_http = FakeHttp::new();
         let obs_http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/systemd/_meta",
+                "https://api.opensuse.org/source/openSUSE:Factory/systemd/_meta",
                 &package_meta("openSUSE:Factory", "systemd", None, None),
             )
             .with_get(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/_meta",
+                "https://api.opensuse.org/source/openSUSE:Factory/_meta",
                 &project_meta(
                     "openSUSE:Factory",
                     Some("https://src.opensuse.org/xmpp/_ObsPrj.git#master"),
@@ -12391,7 +12466,7 @@ mod tests {
     fn branch_refuses_a_repo_on_another_host() {
         let gitea_http = FakeHttp::new();
         let obs_http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/systemd/_meta",
+            "https://api.opensuse.org/source/openSUSE:Factory/systemd/_meta",
             &package_meta(
                 "openSUSE:Factory",
                 "systemd",
@@ -12448,7 +12523,7 @@ mod tests {
         );
         let obs_http = branch_source_repos_fixture(obs_fork_fixture(
             branch_target_fixture(FakeHttp::new(), "home:adamm"),
-            "https://api.opensuse.org/public/source/home:adamm/git-quick-stats/_meta",
+            "https://api.opensuse.org/source/home:adamm/git-quick-stats/_meta",
             &meta,
             "https://api.opensuse.org/source/home:adamm/git-quick-stats?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fgit-quick-stats%23main",
             &fork_status("home:fbui:branches:home:adamm", "git-quick-stats", "home:adamm", "git-quick-stats"),
@@ -12498,7 +12573,7 @@ mod tests {
         );
         let obs_http = branch_source_repos_fixture(obs_fork_fixture(
             branch_target_fixture(FakeHttp::new(), "science"),
-            "https://api.opensuse.org/public/source/science/gsl/_meta",
+            "https://api.opensuse.org/source/science/gsl/_meta",
             &meta,
             "https://api.opensuse.org/source/science/gsl?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fgsl%23slfo-main",
             &fork_status("home:fbui:branches:science", "gsl", "science", "gsl"),
@@ -12554,12 +12629,16 @@ mod tests {
         // A project fork answers only targetproject /
         // sourceproject — no package names.
         let fork_response = "<status code=\"ok\"><summary>Ok</summary><data name=\"targetproject\">home:fbui:branches:network:messaging:xmpp</data><data name=\"sourceproject\">network:messaging:xmpp</data></status>";
-        let obs_http = obs_fork_fixture(
-            branch_target_fixture(FakeHttp::new(), "network:messaging:xmpp"),
-            "https://api.opensuse.org/public/source/network:messaging:xmpp/_meta",
-            &meta,
-            "https://api.opensuse.org/source/network:messaging:xmpp/_project?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2F_ObsPrj%23master",
-            fork_response,
+        let obs_http = branch_source_repos_fixture(
+            obs_fork_fixture(
+                branch_target_fixture(FakeHttp::new(), "network:messaging:xmpp"),
+                "https://api.opensuse.org/source/network:messaging:xmpp/_meta",
+                &meta,
+                "https://api.opensuse.org/source/network:messaging:xmpp/_project?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2F_ObsPrj%23master",
+                fork_response,
+            ),
+            "network:messaging:xmpp",
+            "",
         );
         let result = client(&gitea_http)
             .branch(

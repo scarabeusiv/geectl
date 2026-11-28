@@ -3627,10 +3627,12 @@ impl<'a> ObsClient<'a> {
     /// Read the meta of project `project` (`GET
     /// /public/source/<project>/_meta`). A public read: no
     /// credentials. The meta carries the title, description, url,
-    /// scmsync, devel project, persons, groups, and repositories —
-    /// the same operation regardless of whether the project is a
-    /// plain project or a git-backed one: a scmsync project returns
-    /// its typed `scmsync` element through this call.
+    /// devel project, persons, groups, and repositories — the same
+    /// operation regardless of whether the project is a plain
+    /// project or a git-backed one. The public route omits the
+    /// `<scmsync>` element, so a git-backed project reads as plain
+    /// here; callers that need the scmsync URL use
+    /// [`ObsClient::project_meta_authenticated`].
     pub fn project_meta(&self, project: &str) -> Result<ProjectMeta, GeectlError> {
         if !valid_obs_name(project) {
             return Err(GeectlError::new(
@@ -3651,7 +3653,9 @@ impl<'a> ObsClient<'a> {
     /// the public read alone would PUT bare meta over it and wipe
     /// its repositories, persons, and lock/access flags. A 404 here
     /// means the project really is missing for this caller; any
-    /// other failure fails loudly, like the public read.
+    /// other failure fails loudly, like the public read. The
+    /// response is the full meta, including the `<scmsync>`
+    /// element when the project is git-backed.
     pub fn project_meta_authenticated(&self, project: &str) -> Result<ProjectMeta, GeectlError> {
         if !valid_obs_name(project) {
             return Err(GeectlError::new(
@@ -3667,10 +3671,12 @@ impl<'a> ObsClient<'a> {
     /// Read the meta of package `package` in project `project` (`GET
     /// /public/source/<project>/<package>/_meta`). A public read: no
     /// credentials. The meta carries the title, description, url,
-    /// scmsync, releasename, devel project and package, persons, and
-    /// groups — the same operation regardless of whether the package
-    /// is a plain package or a git-backed one: a scmsync package
-    /// returns its typed `scmsync` element through this call.
+    /// releasename, devel project and package, persons, and groups —
+    /// the same operation regardless of whether the package is a
+    /// plain package or a git-backed one. The public route omits the
+    /// `<scmsync>` element, so a git-backed package reads as plain
+    /// here; callers that need the scmsync URL use
+    /// [`ObsClient::package_meta_authenticated`].
     pub fn package_meta(&self, project: &str, package: &str) -> Result<PackageMeta, GeectlError> {
         for (label, value) in [("project", project), ("package", package)] {
             if !valid_obs_name(value) {
@@ -3700,7 +3706,9 @@ impl<'a> ObsClient<'a> {
     /// The filing path would likewise skip the recorded-devel
     /// verification, and the forward would file unchecked. A 404
     /// here means the package really is missing for this caller; any
-    /// other failure fails loudly, like the public read.
+    /// other failure fails loudly, like the public read. The
+    /// response is the full meta, including the `<scmsync>`
+    /// element when the package is git-backed.
     pub fn package_meta_authenticated(
         &self,
         project: &str,
