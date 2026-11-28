@@ -9,6 +9,7 @@ use super::parse_status_ok;
 use super::parse_submit_request_ids;
 use super::parse_submit_request_ids_for_creator;
 use super::parse_submit_request_ids_for_forward_hop;
+use super::payload::NoRecordedDevel;
 use super::remote::is_md5;
 use super::remote::parse_linkinfo;
 use super::valid_obs_name;
@@ -719,6 +720,9 @@ pub enum ForwardActionResult {
         source: String,
         /// Why the action was not forwarded.
         reason: String,
+        /// The change-devel coordinates, when the skip is for a
+        /// Factory target that records no devel project.
+        no_recorded_devel: Option<NoRecordedDevel>,
     },
 }
 
@@ -822,6 +826,9 @@ enum ForwardHop {
     Skipped {
         source: String,
         reason: String,
+        /// The change-devel coordinates, when the skip is for a
+        /// Factory target that records no devel project.
+        no_recorded_devel: Option<NoRecordedDevel>,
     },
 }
 
@@ -841,7 +848,7 @@ impl ForwardHop {
             } => {
                 format!("{source_project}/{source_package} -> {target_project}/{target_package}")
             }
-            ForwardHop::Skipped { source, reason } => {
+            ForwardHop::Skipped { source, reason, .. } => {
                 format!("{source} (skipped: {reason})")
             }
         }
@@ -3412,10 +3419,18 @@ impl<'a> ObsClient<'a> {
         let mut hops = hops.into_iter();
         while let Some(hop) = hops.next() {
             match hop {
-                ForwardHop::Skipped { source, reason } => {
+                ForwardHop::Skipped {
+                    source,
+                    reason,
+                    no_recorded_devel,
+                } => {
                     self.debug
                         .emit(&format!("decision: skipping forward of {source}: {reason}"));
-                    actions.push(ForwardActionResult::Skipped { source, reason });
+                    actions.push(ForwardActionResult::Skipped {
+                        source,
+                        reason,
+                        no_recorded_devel,
+                    });
                 }
                 ForwardHop::Forward {
                     source_project,
@@ -3755,10 +3770,18 @@ impl<'a> ObsClient<'a> {
         }
         let hop = self.resolve_forward_hop_for_package(project, package)?;
         match hop {
-            ForwardHop::Skipped { source, reason } => {
+            ForwardHop::Skipped {
+                source,
+                reason,
+                no_recorded_devel,
+            } => {
                 self.debug
                     .emit(&format!("decision: skipping forward of {source}: {reason}"));
-                Ok(ForwardActionResult::Skipped { source, reason })
+                Ok(ForwardActionResult::Skipped {
+                    source,
+                    reason,
+                    no_recorded_devel,
+                })
             }
             ForwardHop::Forward {
                 source_project,
@@ -3916,12 +3939,14 @@ impl<'a> ObsClient<'a> {
             return Ok(ForwardHop::Skipped {
                 source: format!("{source_project}/{source_package}"),
                 reason: "the action names no target project".to_string(),
+                no_recorded_devel: None,
             });
         };
         let Some(target_package) = target_package else {
             return Ok(ForwardHop::Skipped {
                 source: format!("{source_project}/{source_package}"),
                 reason: "the action names no target package".to_string(),
+                no_recorded_devel: None,
             });
         };
         self.resolve_forward_hop_for_package(target_project, target_package)
@@ -4042,9 +4067,11 @@ impl<'a> ObsClient<'a> {
     /// it names this package, Factory is the forward target. Any
     /// other record, or no Factory package yet, skips and
     /// reports — the forward files nothing for a package
-    /// Factory does not record as developed here. The
-    /// maintenance decision runs the same as on the link path:
-    /// Factory is unmaintained, so it reads None.
+    /// Factory does not record as developed here. A skip for no
+    /// recorded devel names the change-devel command that records
+    /// the source as the devel. The maintenance decision
+    /// runs the same as on the link path: Factory is unmaintained,
+    /// so it reads None.
     fn resolve_forward_hop_from_devel(
         &self,
         target_project: &str,
@@ -4071,12 +4098,19 @@ impl<'a> ObsClient<'a> {
                 reason: format!(
                     "openSUSE:Factory/{target_package} records devel {recorded_project}/{recorded_package}, not {target_project}/{target_package}"
                 ),
+                no_recorded_devel: None,
             }),
             None => Ok(ForwardHop::Skipped {
                 source,
                 reason: format!(
                     "openSUSE:Factory/{target_package} records no devel for {target_project}/{target_package}"
                 ),
+                no_recorded_devel: Some(NoRecordedDevel::new(
+                    target_project,
+                    target_package,
+                    FACTORY_PROJECT,
+                    target_package,
+                )),
             }),
         }
     }
@@ -4975,6 +5009,8 @@ mod tests {
     const FORWARD_CREATE_URL: &str = "https://api.opensuse.org/request?cmd=create";
     const FORWARD_DIR_FACTORY: &str =
         "<directory><linkinfo project=\"openSUSE:Factory\" package=\"foo\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" /></directory>";
+    const FORWARD_DIR_HOME_URL: &str =
+        "https://api.opensuse.org/source/home:alice:branches:openSUSE:Factory/foo?rev=latest";
     const FORWARD_FACTORY_META_URL: &str =
         "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta";
     const FORWARD_FACTORY_META: &str =
@@ -5157,6 +5193,12 @@ mod tests {
                 source: "devel:languages:python/foo".to_string(),
                 reason: "openSUSE:Factory/foo records no devel for devel:languages:python/foo"
                     .to_string(),
+                no_recorded_devel: Some(NoRecordedDevel::new(
+                    "devel:languages:python",
+                    "foo",
+                    "openSUSE:Factory",
+                    "foo",
+                )),
             }]
         );
     }
@@ -5269,6 +5311,7 @@ mod tests {
                 source: "devel:languages:python/foo".to_string(),
                 reason: "openSUSE:Factory/foo records devel devel:languages:python/other, not devel:languages:python/foo"
                     .to_string(),
+                no_recorded_devel: None,
             }]
         );
     }
@@ -5292,6 +5335,12 @@ mod tests {
                 source: "devel:languages:python/foo".to_string(),
                 reason: "openSUSE:Factory/foo records no devel for devel:languages:python/foo"
                     .to_string(),
+                no_recorded_devel: Some(NoRecordedDevel::new(
+                    "devel:languages:python",
+                    "foo",
+                    "openSUSE:Factory",
+                    "foo",
+                )),
             }]
         );
     }
@@ -5438,6 +5487,12 @@ mod tests {
                     source: "devel:languages:python/bar".to_string(),
                     reason: "openSUSE:Factory/bar records no devel for devel:languages:python/bar"
                         .to_string(),
+                    no_recorded_devel: Some(NoRecordedDevel::new(
+                        "devel:languages:python",
+                        "bar",
+                        "openSUSE:Factory",
+                        "bar",
+                    )),
                 },
             ]
         );
@@ -5700,6 +5755,52 @@ mod tests {
                 source: "devel:languages:python/foo".to_string(),
                 reason: "openSUSE:Factory/foo records no devel for devel:languages:python/foo"
                     .to_string(),
+                no_recorded_devel: Some(NoRecordedDevel::new(
+                    "devel:languages:python",
+                    "foo",
+                    "openSUSE:Factory",
+                    "foo",
+                )),
+            }
+        );
+    }
+
+    #[test]
+    fn forward_package_skips_a_home_branch_package_without_a_link() {
+        // A home/branch source is not a devel project: the skip
+        // proposes no devel.
+        let http = FakeHttp::new()
+            .with_get(
+                FORWARD_DIR_HOME_URL,
+                "<directory><entry name=\"foo.spec\" /></directory>",
+            )
+            .with_get(
+                FORWARD_FACTORY_PUBLIC_META_URL,
+                FORWARD_FACTORY_PUBLIC_META_NO_DEVEL,
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(true);
+        let action = client
+            .forward_package(
+                "home:alice:branches:openSUSE:Factory",
+                "foo",
+                FORWARD_PACKAGE_DESCRIPTION,
+                FORWARD_PACKAGE_CHANGES_ENTRY,
+                &dry_run,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            ForwardActionResult::Skipped {
+                source: "home:alice:branches:openSUSE:Factory/foo".to_string(),
+                reason: "openSUSE:Factory/foo records no devel for home:alice:branches:openSUSE:Factory/foo"
+                    .to_string(),
+                no_recorded_devel: Some(NoRecordedDevel::new(
+                    "home:alice:branches:openSUSE:Factory",
+                    "foo",
+                    "openSUSE:Factory",
+                    "foo",
+                )),
             }
         );
     }

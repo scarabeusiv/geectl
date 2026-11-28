@@ -192,6 +192,7 @@ pub use self::payload::MaintainedInstance;
 pub use self::payload::MaintenanceBranchOptions;
 pub use self::payload::MaintenanceBranchResult;
 pub use self::payload::MaintenanceIncidentPayload;
+pub use self::payload::NoRecordedDevel;
 pub use self::payload::SourceUpdate;
 pub use self::payload::SrFiling;
 pub use self::payload::SrPayload;

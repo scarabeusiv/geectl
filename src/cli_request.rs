@@ -72,9 +72,9 @@ use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{
     AcceptCleanup, AcceptInfo, AddRolePayload, ChangeDevelPayload, CleanupStep, CveId,
     DeletePayload, DeleteTarget, DryRun, FiledRequest, ForwardActionResult, ForwardResult,
-    MaintenanceIncidentPayload, ObsClient, Request, RequestAction, RequestComment, RequestHistory,
-    RequestReview, RequestSearch, RequestState, RequestStateInfo, ReviewState, ReviewTarget,
-    SrFiling, SrPayload,
+    MaintenanceIncidentPayload, NoRecordedDevel, ObsClient, Request, RequestAction, RequestComment,
+    RequestHistory, RequestReview, RequestSearch, RequestState, RequestStateInfo, ReviewState,
+    ReviewTarget, SrFiling, SrPayload,
 };
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
@@ -1270,18 +1270,40 @@ fn file_request(
         // other requests says so, instead of reporting only the new
         // id.
         let id = filed_request.as_ref().map(|filed| filed.id.clone());
-        let filed = filed_payload(&id, &dry_run, |id| {
-            file_request_json(id, filed_request.as_ref(), file, &cves)
+        // The no-recorded-devel outcome, from the filing in either
+        // mode: live it rides `FiledRequest`, dry-run the filing
+        // object records it, since the dry-run path returns none.
+        let no_recorded_devel = filing.no_recorded_devel();
+        let remediation = no_recorded_devel
+            .as_ref()
+            .map(|data| no_devel_remediation_line(data, live));
+        let json_remediation = if live { remediation.as_deref() } else { None };
+        let mut filed = filed_payload(&id, &dry_run, |id| {
+            file_request_json(id, filed_request.as_ref(), file, &cves, json_remediation)
         });
-        let text = file_request_text(
-            id.as_deref(),
-            supersede,
-            filed_request
-                .as_ref()
-                .map(|filed| filed.superseded.as_slice()),
-            file,
-            &cves,
+        let text = append_no_devel_remediation(
+            file_request_text(
+                id.as_deref(),
+                supersede,
+                filed_request
+                    .as_ref()
+                    .map(|filed| filed.superseded.as_slice()),
+                file,
+                &cves,
+            ),
+            remediation.as_deref(),
         );
+        // In dry-run the dedicated field stays null — nothing was
+        // filed — and the remedy rides the plan instead.
+        if !live {
+            if let Some(line) = &remediation {
+                if let Value::Object(map) = &mut filed {
+                    if let Some(Value::Array(plan)) = map.get_mut("plan") {
+                        plan.push(Value::String(format!("[dry-run] {line}")));
+                    }
+                }
+            }
+        }
         Ok((filed, text))
     })
 }
@@ -1291,12 +1313,15 @@ fn file_request(
 /// coordinates, the parsed CVE ids, and the cleanup choice. The CVEs
 /// are the parsed ids, never the raw `--cve` strings. The superseded
 /// ids are null in dry-run — the open requests are unknown there —
-/// and an array in live mode, empty when nothing was open.
+/// and an array in live mode, empty when nothing was open. The
+/// change-devel remediation is the rendered command in live mode
+/// and null in dry-run, where the remedy rides the plan instead.
 fn file_request_json(
     id: Option<&str>,
     filed: Option<&FiledRequest>,
     file: &FileArgs,
     cves: &[CveId],
+    remediation: Option<&str>,
 ) -> Value {
     let cve_strings: Vec<&str> = cves.iter().map(CveId::as_str).collect();
     let superseded = filed.map_or(Value::Null, |filed| {
@@ -1319,7 +1344,66 @@ fn file_request_json(
         "changes_entry": file.changes_entry,
         "cve": cve_strings,
         "without_cleanup": file.without_cleanup,
+        "no_recorded_devel_remediation": remediation,
     })
+}
+
+/// Quote one word for a shell command: single-quote it, escaping
+/// an embedded single quote, so a value can never split into
+/// words or redirect.
+fn shell_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// The exact change-devel command for a Factory target that
+/// records no devel project: complete and shell-safe, with the
+/// description the leaf requires and `--live` so it files. The
+/// proposed devel is the submit's source project, or the
+/// `<devel-project>` placeholder when the source is a home/branch
+/// project and proposes none.
+fn change_devel_command(data: &NoRecordedDevel) -> String {
+    let source_project = data.proposed_devel_project().unwrap_or("<devel-project>");
+    let description = match data.proposed_devel_project() {
+        Some(proposed) => format!(
+            "Record {proposed} as the devel project of {}/{}",
+            data.target_project, data.target_package
+        ),
+        None => format!(
+            "Record the devel project of {}/{}",
+            data.target_project, data.target_package
+        ),
+    };
+    format!(
+        "geectl request file-change-devel --source-project {} --source-package {} --target-project {} --target-package {} --description {} --live",
+        shell_quote(source_project),
+        shell_quote(&data.source_package),
+        shell_quote(&data.target_project),
+        shell_quote(&data.target_package),
+        shell_quote(&description),
+    )
+}
+
+/// The remediation line for a no-recorded-devel outcome: the
+/// exact command with a lead-in that fits the mode. After a live
+/// filing the devel is recorded next; in dry-run it is recorded
+/// before the filing.
+fn no_devel_remediation_line(data: &NoRecordedDevel, live: bool) -> String {
+    let lead = if live {
+        "remediation: record the devel project:"
+    } else {
+        "remediation: record the devel project first:"
+    };
+    format!("{lead} {}", change_devel_command(data))
+}
+
+/// Append the no-recorded-devel remediation to a filing text,
+/// when the Factory target recorded no devel project. The
+/// remediation is its own line; without one the text is unchanged.
+fn append_no_devel_remediation(text: String, remediation: Option<&str>) -> String {
+    match remediation {
+        Some(remediation) => format!("{text}\n{remediation}"),
+        None => text,
+    }
 }
 
 /// The filing text for `file` / `refile`: the filed (or
@@ -1774,7 +1858,11 @@ pub(crate) fn forward(
 fn forward_json(result: &ForwardResult, dry_run: &DryRun) -> Value {
     let mut payload = json!({
         "id": result.id,
-        "actions": result.actions.iter().map(forward_action_json).collect::<Vec<_>>(),
+        "actions": result
+            .actions
+            .iter()
+            .map(|action| forward_action_json(action, dry_run))
+            .collect::<Vec<_>>(),
         "dry_run": dry_run.enabled(),
     });
     add_plan(&mut payload, dry_run);
@@ -1785,8 +1873,10 @@ fn forward_json(result: &ForwardResult, dry_run: &DryRun) -> Value {
 /// target — the maintenance project for an incident, with the
 /// maintained hop target as `release_project` — the outcome, the
 /// new request id when one was filed, and the skip reason when the
-/// action was not forwarded.
-pub(crate) fn forward_action_json(action: &ForwardActionResult) -> Value {
+/// action was not forwarded. A skip for a Factory target that
+/// records no devel project also carries the change-devel
+/// remediation as its own field, never embedded in the reason.
+pub(crate) fn forward_action_json(action: &ForwardActionResult, dry_run: &DryRun) -> Value {
     match action {
         ForwardActionResult::Forwarded {
             source,
@@ -1812,12 +1902,19 @@ pub(crate) fn forward_action_json(action: &ForwardActionResult) -> Value {
             "new_id": new_id.as_ref().map(|id| request_id_json(id)).unwrap_or(Value::Null),
             "reason": Value::Null,
         }),
-        ForwardActionResult::Skipped { source, reason } => json!({
+        ForwardActionResult::Skipped {
+            source,
+            reason,
+            no_recorded_devel,
+        } => json!({
             "source": source,
             "target": Value::Null,
             "outcome": "skipped",
             "new_id": Value::Null,
             "reason": reason,
+            "no_recorded_devel_remediation": no_recorded_devel
+                .as_ref()
+                .map(|data| no_devel_remediation_line(data, !dry_run.enabled())),
         }),
     }
 }
@@ -1897,9 +1994,17 @@ pub(crate) fn forward_action_text(action: &ForwardActionResult, dry_run: &DryRun
                 )
             }
         }
-        ForwardActionResult::Skipped { source, reason } => {
-            format!("skipped {source}: {reason}")
-        }
+        ForwardActionResult::Skipped {
+            source,
+            reason,
+            no_recorded_devel,
+        } => match no_recorded_devel {
+            Some(data) => format!(
+                "skipped {source}: {reason}\n{}",
+                no_devel_remediation_line(data, !dry_run.enabled())
+            ),
+            None => format!("skipped {source}: {reason}"),
+        },
     }
 }
 
@@ -3939,14 +4044,131 @@ mod tests {
     }
 
     #[test]
+    fn file_request_text_appends_no_devel_remediation() {
+        let base = "filed request 123 for devel:tools/foo to openSUSE:Factory/foo".to_string();
+        assert_eq!(
+            append_no_devel_remediation(
+                base.clone(),
+                Some("remediation: record the devel project: geectl request file-change-devel --source-project 'devel:tools' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:tools as the devel project of openSUSE:Factory/foo' --live")
+            ),
+            "filed request 123 for devel:tools/foo to openSUSE:Factory/foo\nremediation: record the devel project: geectl request file-change-devel --source-project 'devel:tools' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:tools as the devel project of openSUSE:Factory/foo' --live"
+        );
+        assert_eq!(append_no_devel_remediation(base.clone(), None), base);
+    }
+
+    #[test]
+    fn change_devel_command_is_complete_and_shell_safe() {
+        let data = NoRecordedDevel::new("devel:tools", "foo", "openSUSE:Factory", "foo");
+        assert_eq!(
+            change_devel_command(&data),
+            "geectl request file-change-devel --source-project 'devel:tools' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:tools as the devel project of openSUSE:Factory/foo' --live"
+        );
+        // A home/branch source proposes no devel: the placeholder
+        // is quoted, so it cannot parse as a redirection.
+        let home = NoRecordedDevel::new(
+            "home:alice:branches:openSUSE:Factory",
+            "foo",
+            "openSUSE:Factory",
+            "foo",
+        );
+        assert_eq!(
+            change_devel_command(&home),
+            "geectl request file-change-devel --source-project '<devel-project>' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record the devel project of openSUSE:Factory/foo' --live"
+        );
+        assert_eq!(
+            no_devel_remediation_line(&data, true),
+            "remediation: record the devel project: geectl request file-change-devel --source-project 'devel:tools' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:tools as the devel project of openSUSE:Factory/foo' --live"
+        );
+        assert!(
+            no_devel_remediation_line(&data, false).starts_with(
+                "remediation: record the devel project first: geectl request file-change-devel"
+            ),
+            "{}",
+            no_devel_remediation_line(&data, false)
+        );
+    }
+
+    #[test]
+    fn shell_quote_escapes_a_single_quote() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn forward_action_json_and_text_carry_the_remediation_as_its_own_field() {
+        let action = ForwardActionResult::Skipped {
+            source: "devel:languages:python/foo".to_string(),
+            reason: "openSUSE:Factory/foo records no devel for devel:languages:python/foo"
+                .to_string(),
+            no_recorded_devel: Some(NoRecordedDevel::new(
+                "devel:languages:python",
+                "foo",
+                "openSUSE:Factory",
+                "foo",
+            )),
+        };
+        let dry_run = DryRun::new(false);
+        let value = forward_action_json(&action, &dry_run);
+        assert_eq!(value["outcome"], "skipped");
+        assert_eq!(
+            value["reason"],
+            "openSUSE:Factory/foo records no devel for devel:languages:python/foo"
+        );
+        assert!(
+            value["no_recorded_devel_remediation"]
+                .as_str()
+                .unwrap()
+                .starts_with(
+                    "remediation: record the devel project: geectl request file-change-devel"
+                ),
+            "{value}"
+        );
+        assert!(
+            forward_action_text(&action, &dry_run).ends_with(
+                "remediation: record the devel project: geectl request file-change-devel --source-project 'devel:languages:python' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:languages:python as the devel project of openSUSE:Factory/foo' --live"
+            ),
+            "{}",
+            forward_action_text(&action, &dry_run)
+        );
+        // A skip with no coordinates carries no remediation.
+        let plain = ForwardActionResult::Skipped {
+            source: "devel:languages:python/foo".to_string(),
+            reason: "the action names no target project".to_string(),
+            no_recorded_devel: None,
+        };
+        assert_eq!(
+            forward_action_json(&plain, &dry_run)["no_recorded_devel_remediation"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            forward_action_text(&plain, &dry_run),
+            "skipped devel:languages:python/foo: the action names no target project"
+        );
+        // In dry-run the same skip names the command with the
+        // before-filing lead-in.
+        let planned = DryRun::new(true);
+        assert!(
+            forward_action_json(&action, &planned)["no_recorded_devel_remediation"]
+                .as_str()
+                .unwrap()
+                .starts_with(
+                    "remediation: record the devel project first: geectl request file-change-devel"
+                ),
+            "{}",
+            forward_action_json(&action, &planned)
+        );
+    }
+
+    #[test]
     fn file_request_json_carries_normalized_cves() {
         let file = sample_file_args();
         let cves = parse_cves(&file);
         let filed = FiledRequest {
             id: "123".to_string(),
             superseded: vec!["122".to_string()],
+            no_recorded_devel: None,
         };
-        let value = file_request_json(Some("123"), Some(&filed), &file, &cves);
+        let value = file_request_json(Some("123"), Some(&filed), &file, &cves, None);
         assert_eq!(value["id"], json!(123));
         assert_eq!(value["superseded"], json!([122]));
         // No superseded requests: an empty array, not null — the
@@ -3954,21 +4176,46 @@ mod tests {
         let empty = FiledRequest {
             id: "123".to_string(),
             superseded: vec![],
+            no_recorded_devel: None,
         };
         assert_eq!(
-            file_request_json(Some("123"), Some(&empty), &file, &cves)["superseded"],
+            file_request_json(Some("123"), Some(&empty), &file, &cves, None)["superseded"],
             json!([])
         );
         // A dry-run id of None reads as null, and so do the
         // superseded ids — the open requests are unknown there.
         assert_eq!(
-            file_request_json(None, None, &file, &cves)["superseded"],
+            file_request_json(None, None, &file, &cves, None)["superseded"],
             serde_json::Value::Null
         );
         assert_eq!(value["source_project"], "home:alice:branches:test");
         assert_eq!(value["target_project"], "devel:languages:python");
         assert_eq!(value["cve"], json!(["CVE-2026-1234"]));
         assert_eq!(value["without_cleanup"], false);
+        // The Factory target recorded no devel project: the JSON
+        // carries the rendered change-devel command in live mode.
+        let data = NoRecordedDevel::new("devel:tools", "foo", "openSUSE:Factory", "foo");
+        let line = no_devel_remediation_line(&data, true);
+        let with_remediation = FiledRequest {
+            id: "123".to_string(),
+            superseded: vec![],
+            no_recorded_devel: Some(data),
+        };
+        assert_eq!(
+            file_request_json(
+                Some("123"),
+                Some(&with_remediation),
+                &file,
+                &cves,
+                Some(&line)
+            )["no_recorded_devel_remediation"],
+            "remediation: record the devel project: geectl request file-change-devel --source-project 'devel:tools' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:tools as the devel project of openSUSE:Factory/foo' --live"
+        );
+        assert_eq!(
+            file_request_json(Some("123"), Some(&filed), &file, &cves, None)
+                ["no_recorded_devel_remediation"],
+            serde_json::Value::Null
+        );
         // Lowercase input normalizes to uppercase in the JSON,
         // matching the text.
         let lower = FileArgs {
@@ -3977,7 +4224,7 @@ mod tests {
         };
         let lower_cves = parse_cves(&lower);
         assert_eq!(
-            file_request_json(Some("123"), Some(&filed), &lower, &lower_cves)["cve"],
+            file_request_json(Some("123"), Some(&filed), &lower, &lower_cves, None)["cve"],
             json!(["CVE-2026-1234"])
         );
         // No CVE claimed: an empty list.
@@ -3986,12 +4233,12 @@ mod tests {
             ..sample_file_args()
         };
         assert_eq!(
-            file_request_json(Some("123"), Some(&filed), &plain, &[])["cve"],
+            file_request_json(Some("123"), Some(&filed), &plain, &[], None)["cve"],
             json!([])
         );
         // A dry-run id of None reads as null.
         assert_eq!(
-            file_request_json(None, None, &file, &cves)["id"],
+            file_request_json(None, None, &file, &cves, None)["id"],
             serde_json::Value::Null
         );
     }

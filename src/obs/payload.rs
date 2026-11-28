@@ -17,6 +17,7 @@ use crate::error::GeectlError;
 use crate::gitea::GiteaClient;
 use crate::http::HttpClient;
 use crate::xml::xml_escape;
+use std::cell::RefCell;
 
 /// What OBS does with the source branch when a submit request is
 /// accepted. The values are exactly the server's
@@ -149,7 +150,8 @@ impl SrPayload {
     /// target is the link parent of a devel-project package. A
     /// Factory target is permitted here exactly as for a direct
     /// filing — when the source is the recorded devel project and
-    /// package of the target — and the filing path verifies that
+    /// package of the target, or when the target records no devel
+    /// project at all — and the filing path verifies that
     /// live against the target package meta, like any direct filing
     /// (see [`SrPayload::new`]). There is no forward-only Factory
     /// bypass: the regular constructor permits the same target.
@@ -192,7 +194,8 @@ impl SrPayload {
     /// `.changes` entry must be non-empty, and the `.changes` entry
     /// must name every CVE in `cves`. A Factory target passes here:
     /// the rule is that Factory takes submissions only from the
-    /// recorded devel project and package, and that needs a live
+    /// recorded devel project and package, or when the target
+    /// records no devel project at all, and that needs a live
     /// read of the target package meta, so the filing path checks
     /// it ([`SrFiling::file`]). [`SrFiling::file`] runs the same
     /// checks again on the filing path, so a payload that reaches
@@ -1585,28 +1588,90 @@ pub struct SrFiling<'a> {
     gitea_http: Option<&'a dyn HttpClient>,
     dry_run: &'a DryRun,
     debug: Debug,
+    /// The no-recorded-devel outcome of the last filing on this
+    /// object, when the Factory target recorded no devel project:
+    /// the dry-run path returns no `FiledRequest`, so the CLI
+    /// reads the outcome here to render the remedy.
+    no_recorded_devel: RefCell<Option<NoRecordedDevel>>,
+}
+
+/// The change-devel coordinates for a Factory target that records
+/// no devel project: the source and target of the submit. The
+/// command that records the devel is rendered from these in the
+/// CLI layer; the library never formats the command itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoRecordedDevel {
+    /// The project the submit came from.
+    pub source_project: String,
+    /// The package the submit came from.
+    pub source_package: String,
+    /// The project the submit targets.
+    pub target_project: String,
+    /// The package the submit targets.
+    pub target_package: String,
+}
+
+impl NoRecordedDevel {
+    /// The coordinates of a no-recorded-devel outcome.
+    pub fn new(
+        source_project: &str,
+        source_package: &str,
+        target_project: &str,
+        target_package: &str,
+    ) -> Self {
+        NoRecordedDevel {
+            source_project: source_project.to_string(),
+            source_package: source_package.to_string(),
+            target_project: target_project.to_string(),
+            target_package: target_package.to_string(),
+        }
+    }
+
+    /// The devel project the change-devel command proposes: the
+    /// source project, unless it is a home/branch project, which
+    /// is not a devel project — then there is no proposal and the
+    /// command names a placeholder instead.
+    pub fn proposed_devel_project(&self) -> Option<&str> {
+        if self.source_project.starts_with("home:") || self.source_project.starts_with("branches:")
+        {
+            None
+        } else {
+            Some(&self.source_project)
+        }
+    }
 }
 
 /// The result of filing a submit request: the new request id, and
 /// the open submit requests it superseded — every open submit
 /// request for the package from the authenticated user, in the order
-/// they were superseded. Empty when nothing was open.
+/// they were superseded. Empty when nothing was open. When the
+/// Factory target recorded no devel project, the result also
+/// carries the change-devel coordinates.
 #[derive(Debug, PartialEq, Eq)]
 pub struct FiledRequest {
     /// The new submit request id.
     pub id: String,
     /// The ids superseded with the new request, in supersede order.
     pub superseded: Vec<String>,
+    /// The change-devel coordinates, when the Factory target
+    /// recorded no devel project. `None` otherwise.
+    pub no_recorded_devel: Option<NoRecordedDevel>,
 }
 
 /// The outcome of the Factory devel-record check: the target
-/// package records the source as its devel, or the target package
-/// does not exist yet and the first submission proceeds.
+/// package records the source as its devel, the target package
+/// does not exist yet and the first submission proceeds, or the
+/// target package records no devel project at all and the submit
+/// proceeds with the change-devel command named.
 enum FactoryDevelCheck {
     /// The target package records the source as its devel project and package.
     RecordedDevelMatches,
     /// The target package does not exist yet.
     NoTargetPackage,
+    /// The target package exists but records no devel project: the
+    /// submit is allowed and the output names the change-devel
+    /// command that records the source as the devel.
+    NoRecordedDevel,
 }
 
 impl<'a> SrFiling<'a> {
@@ -1617,6 +1682,7 @@ impl<'a> SrFiling<'a> {
             gitea_http: None,
             dry_run,
             debug: Debug::disabled(),
+            no_recorded_devel: RefCell::new(None),
         }
     }
 
@@ -1649,6 +1715,12 @@ impl<'a> SrFiling<'a> {
     pub fn with_gitea_http(mut self, http: Option<&'a dyn HttpClient>) -> Self {
         self.gitea_http = http;
         self
+    }
+
+    /// The no-recorded-devel outcome of the last filing on this
+    /// object, if the Factory target recorded no devel project.
+    pub fn no_recorded_devel(&self) -> Option<NoRecordedDevel> {
+        self.no_recorded_devel.borrow().clone()
     }
 
     /// File `payload`. Returns the filed request in live mode, or
@@ -1770,17 +1842,31 @@ impl<'a> SrFiling<'a> {
         // payload by both measures.
         payload.validate_semantics()?;
         payload.validate_xml()?;
-        // A Factory target files only from the recorded devel
-        // project and package: the source must be what the target
-        // package meta records as its devel, project and package
-        // both. The check runs here, before the dry-run branch, so
-        // a dry-run plan never prints "would file" for a submission
-        // the check refuses; the outcome is recorded in the plan.
+        // A Factory target files from the recorded devel
+        // project and package when one is recorded; with no devel
+        // recorded the filing proceeds and the output names the
+        // change-devel command. The check runs here, before
+        // the dry-run branch, so a dry-run plan never prints "would
+        // file" for a submission the check refuses; the outcome is
+        // recorded in the plan.
         let factory_check = if payload.target_project == FACTORY_PROJECT {
             Some(self.check_factory_target(payload)?)
         } else {
             None
         };
+        // The no-recorded-devel outcome, recorded for the caller:
+        // the live path carries it in `FiledRequest`, the dry-run
+        // path returns none, so the CLI reads it here.
+        let no_recorded_devel = matches!(factory_check, Some(FactoryDevelCheck::NoRecordedDevel))
+            .then(|| {
+                NoRecordedDevel::new(
+                    &payload.source_project,
+                    &payload.source_package,
+                    &payload.target_project,
+                    &payload.target_package,
+                )
+            });
+        *self.no_recorded_devel.borrow_mut() = no_recorded_devel.clone();
         if !self.dry_run.allow(&format!(
             "file submit request for {} to {}",
             payload.target_package, payload.target_project
@@ -1804,6 +1890,18 @@ impl<'a> SrFiling<'a> {
                 Some(FactoryDevelCheck::NoTargetPackage) => {
                     self.dry_run.note(&format!(
                         "{}/{} has no package yet: first submission from {}/{} proceeds",
+                        payload.target_project,
+                        payload.target_package,
+                        payload.source_project,
+                        payload.source_package
+                    ));
+                }
+                Some(FactoryDevelCheck::NoRecordedDevel) => {
+                    // The plan records the outcome, not the command:
+                    // the CLI renders the command from the recorded
+                    // coordinates into the filing output and the plan.
+                    self.dry_run.note(&format!(
+                        "{}/{} records no devel project for {}/{}",
                         payload.target_project,
                         payload.target_package,
                         payload.source_project,
@@ -1859,7 +1957,11 @@ impl<'a> SrFiling<'a> {
         }
         let id = self.obs.create_request(payload)?;
         let superseded = self.supersede_all(&supersede, &id)?;
-        Ok(Some(FiledRequest { id, superseded }))
+        Ok(Some(FiledRequest {
+            id,
+            superseded,
+            no_recorded_devel,
+        }))
     }
 
     /// Verify the source is current before filing from a git-backed
@@ -1985,9 +2087,13 @@ impl<'a> SrFiling<'a> {
     /// to prevent. A 404 on the authenticated read means the package
     /// really is missing for this caller, so the first submission
     /// from devel proceeds. A recorded devel that names another
-    /// project or package, or no devel at all, refuses the filing
-    /// with the rule named. The same 100% rule the forward applies
-    /// on its coordinates.
+    /// project or package refuses the filing with the rule named.
+    /// No devel at all allows the filing instead: with nothing
+    /// recorded there is nothing to contradict the source, so the
+    /// submit proceeds and the output names the change-devel
+    /// command that records the source as the devel. A
+    /// home/branch source proposes no devel — the command names a
+    /// placeholder and leaves the choice to the submitter.
     ///
     /// The check runs on the filing path, live and dry-run alike:
     /// a dry-run plan never prints "would file" for a submission
@@ -2025,12 +2131,7 @@ impl<'a> SrFiling<'a> {
                         "refusing to submit {source} to openSUSE:Factory: {target} records devel {recorded_project}/{recorded_package}, not {source}"
                     ),
                 )),
-                None => Err(GeectlError::new(
-                    ErrorKind::InvalidInput,
-                    format!(
-                        "refusing to submit {source} to openSUSE:Factory: {target} records no devel project"
-                    ),
-                )),
+                None => Ok(FactoryDevelCheck::NoRecordedDevel),
             },
         }
     }
@@ -2661,7 +2762,8 @@ mod tests {
     fn new_accepts_factory_as_target() {
         // Construction does not refuse a Factory target: the rule
         // is that Factory takes submissions only from the recorded
-        // devel project and package, and that needs a live read of
+        // devel project and package, or when the target records no
+        // devel project at all, and that needs a live read of
         // the target package meta, so the filing path checks it.
         assert!(SrPayload::new(
             "devel:languages:python",
@@ -3089,6 +3191,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec![],
+                no_recorded_devel: None,
             })
         );
         // The open-request search ran first, then the filing POST.
@@ -3137,6 +3240,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec![],
+                no_recorded_devel: None,
             })
         );
         // The devel check read the target meta first, then the
@@ -3177,6 +3281,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec![],
+                no_recorded_devel: None,
             })
         );
         assert_eq!(http.post_calls().len(), 1);
@@ -3271,27 +3376,188 @@ mod tests {
     }
 
     #[test]
-    fn file_live_factory_target_without_recorded_devel_refuses() {
-        // The target records no devel project at all: the source
-        // cannot be its devel, so the filing is refused.
+    fn file_live_factory_target_without_recorded_devel_files_with_coordinates() {
+        // The target records no devel project at all: the submit is
+        // allowed and the filed request carries the change-devel
+        // coordinates.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><title>Foo package</title></package>",
+            )
+            .with_get(
+                &factory_search_url(),
+                "<collection matches=\"0\"></collection>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing.file(&factory_payload()).unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec![],
+                no_recorded_devel: Some(NoRecordedDevel::new(
+                    "devel:languages:python",
+                    "foo",
+                    "openSUSE:Factory",
+                    "foo",
+                )),
+            })
+        );
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_dry_run_factory_target_without_recorded_devel_records_the_outcome() {
+        // No devel recorded: the dry-run proceeds and the plan
+        // records the outcome; the CLI renders the command.
         let http = FakeHttp::new().with_get(
             "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
             "<package name=\"foo\" project=\"openSUSE:Factory\"><title>Foo package</title></package>",
         );
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::default();
+        let filing = SrFiling::new(&obs, &dry);
+        let payload = factory_payload();
+        assert_eq!(filing.file(&payload).unwrap(), None);
+        assert!(http.post_calls().is_empty());
+        assert_eq!(
+            filing.no_recorded_devel(),
+            Some(NoRecordedDevel::new(
+                "devel:languages:python",
+                "foo",
+                "openSUSE:Factory",
+                "foo",
+            ))
+        );
+        assert_eq!(
+            dry.plan(),
+            vec![
+                "[dry-run] would: file submit request for foo to openSUSE:Factory".to_string(),
+                "[dry-run] --- would-be submit request (dry-run) ---".to_string(),
+                "[dry-run] source: devel:languages:python/foo".to_string(),
+                "[dry-run] target: openSUSE:Factory/foo".to_string(),
+                "[dry-run] description: Update foo to 2.0".to_string(),
+                format!("[dry-run] changes entry: {}", payload.changes_entry()),
+                format!("[dry-run] {}", payload.to_xml()),
+                "[dry-run] --- end of would-be submit request ---".to_string(),
+                "[dry-run] openSUSE:Factory/foo records no devel project for devel:languages:python/foo".to_string(),
+                "[dry-run] would: supersede all open submit requests targeting foo with the new request".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_recorded_devel_proposes_no_devel_for_home_sources() {
+        assert_eq!(
+            NoRecordedDevel::new("devel:tools", "rpmcrab", "openSUSE:Factory", "rpmcrab")
+                .proposed_devel_project(),
+            Some("devel:tools")
+        );
+        assert_eq!(
+            NoRecordedDevel::new(
+                "home:alice:branches:openSUSE:Factory",
+                "foo",
+                "openSUSE:Factory",
+                "foo"
+            )
+            .proposed_devel_project(),
+            None
+        );
+        assert_eq!(
+            NoRecordedDevel::new("branches:foo", "foo", "openSUSE:Factory", "foo")
+                .proposed_devel_project(),
+            None
+        );
+    }
+
+    #[test]
+    fn file_live_factory_target_without_recorded_devel_from_home_names_no_proposed_devel() {
+        // A home/branch source is not a devel project: the submit
+        // is allowed, but the outcome proposes no devel.
+        let payload = SrPayload::new(
+            "home:scarabeus_iv:branches:openSUSE:Factory",
+            "foo",
+            "openSUSE:Factory",
+            "foo",
+            "Update foo to 2.0",
+            "- Update to version 2.0.\n",
+            &[],
+        )
+        .unwrap();
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><title>Foo package</title></package>",
+            )
+            .with_get(
+                &factory_search_url(),
+                "<collection matches=\"0\"></collection>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let dry = DryRun::new(false);
         let filing = SrFiling::new(&obs, &dry);
-        let err = filing.file(&factory_payload()).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(
-            err.context.contains(
-                "refusing to submit devel:languages:python/foo to openSUSE:Factory: openSUSE:Factory/foo records no devel project"
-            ),
-            "{}",
-            err.context
+        assert_eq!(
+            filing.file(&payload).unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec![],
+                no_recorded_devel: Some(NoRecordedDevel::new(
+                    "home:scarabeus_iv:branches:openSUSE:Factory",
+                    "foo",
+                    "openSUSE:Factory",
+                    "foo",
+                )),
+            })
         );
-        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_dry_run_factory_target_without_recorded_devel_from_home_names_no_proposed_devel() {
+        let payload = SrPayload::new(
+            "home:scarabeus_iv:branches:openSUSE:Factory",
+            "foo",
+            "openSUSE:Factory",
+            "foo",
+            "Update foo to 2.0",
+            "- Update to version 2.0.\n",
+            &[],
+        )
+        .unwrap();
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><title>Foo package</title></package>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::default();
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(filing.file(&payload).unwrap(), None);
         assert!(http.post_calls().is_empty());
+        assert!(
+            dry.plan().iter().any(|line| line
+                == "[dry-run] openSUSE:Factory/foo records no devel project for home:scarabeus_iv:branches:openSUSE:Factory/foo"),
+            "plan: {:?}",
+            dry.plan()
+        );
+        assert_eq!(
+            filing.no_recorded_devel(),
+            Some(NoRecordedDevel::new(
+                "home:scarabeus_iv:branches:openSUSE:Factory",
+                "foo",
+                "openSUSE:Factory",
+                "foo",
+            ))
+        );
     }
 
     #[test]
@@ -3483,6 +3749,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec![],
+                no_recorded_devel: None,
             })
         );
         assert_eq!(http.post_calls().len(), 1);
@@ -3715,6 +3982,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec![],
+                no_recorded_devel: None,
             })
         );
         assert_eq!(http.get_calls().len(), 4);
@@ -3745,6 +4013,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec![],
+                no_recorded_devel: None,
             })
         );
         assert_eq!(http.get_calls().len(), 2);
@@ -3774,6 +4043,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec![],
+                no_recorded_devel: None,
             })
         );
         assert_eq!(http.get_calls().len(), 1);
@@ -3899,6 +4169,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec![],
+                no_recorded_devel: None,
             })
         );
         // Source meta, obsinfo, open-request search — no branch
@@ -3937,6 +4208,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec!["1398492".to_string()],
+                no_recorded_devel: None,
             })
         );
         // The open-request search ran first, then the filing POST,
@@ -3987,6 +4259,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec!["1398492".to_string()],
+                no_recorded_devel: None,
             })
         );
         // The search ran against the hop-scoped URL, then the
@@ -4045,6 +4318,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec![],
+                no_recorded_devel: None,
             })
         );
         // Only the filing POST: nothing was superseded.
@@ -4162,6 +4436,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec!["1397357".to_string()],
+                no_recorded_devel: None,
             })
         );
         // Open-request search first, then the filing POST, then the
@@ -4208,6 +4483,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec!["1397357".to_string()],
+                no_recorded_devel: None,
             })
         );
         assert_eq!(http.post_calls().len(), 2);
@@ -4247,6 +4523,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec!["1397357".to_string(), "1398492".to_string()],
+                no_recorded_devel: None,
             })
         );
         // Filing POST first, then both supersedes in order — file
@@ -5060,6 +5337,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec![],
+                no_recorded_devel: None,
             })
         );
         let got: Vec<String> = lines.lock().unwrap().clone();
@@ -5100,6 +5378,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec!["1398492".to_string()],
+                no_recorded_devel: None,
             })
         );
         let got: Vec<String> = lines.lock().unwrap().clone();
@@ -5134,6 +5413,7 @@ mod tests {
             Some(FiledRequest {
                 id: "1400001".to_string(),
                 superseded: vec![],
+                no_recorded_devel: None,
             })
         );
         assert!(lines.lock().unwrap().is_empty());

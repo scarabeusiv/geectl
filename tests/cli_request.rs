@@ -2179,6 +2179,10 @@ fn pull_request_merge_obs_live_no_link_parent_forwards_nothing() {
         value["forward"]["actions"][0]["reason"],
         "openSUSE:Factory/foo records no devel for devel:languages:python/foo"
     );
+    assert_eq!(
+        value["forward"]["actions"][0]["no_recorded_devel_remediation"],
+        "remediation: record the devel project: geectl request file-change-devel --source-project 'devel:languages:python' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:languages:python as the devel project of openSUSE:Factory/foo' --live"
+    );
     {
         let seen = seen.lock().unwrap();
         assert!(
@@ -2208,7 +2212,240 @@ fn pull_request_merge_obs_live_no_link_parent_forwards_nothing() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "merged obs:42 (now merged); request 42: nothing forwarded\nskipped devel:languages:python/foo: openSUSE:Factory/foo records no devel for devel:languages:python/foo"
+        "merged obs:42 (now merged); request 42: nothing forwarded\nskipped devel:languages:python/foo: openSUSE:Factory/foo records no devel for devel:languages:python/foo\nremediation: record the devel project: geectl request file-change-devel --source-project 'devel:languages:python' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:languages:python as the devel project of openSUSE:Factory/foo' --live"
+    );
+}
+
+/// The `request file` flags for an OBS-native `foo` source to
+/// openSUSE:Factory.
+fn factory_file_flags(source_project: &'static str) -> Vec<&'static str> {
+    vec![
+        "--source-project",
+        source_project,
+        "--source-package",
+        "foo",
+        "--target-project",
+        "openSUSE:Factory",
+        "--target-package",
+        "foo",
+        "--description",
+        "Update foo to 2.0",
+        "--changes-entry",
+        "- Update to version 2.0.",
+    ]
+}
+
+/// A live `request file` to a Factory target that records no devel
+/// project files and names the exact change-devel command: the
+/// complete, shell-safe command with the required description and
+/// `--live`.
+#[test]
+fn request_file_live_factory_target_without_recorded_devel_names_the_command() {
+    let (obs_addr, obs_seen) = serve_routes(vec![
+        (
+            "/source/devel:tools/foo/_meta".to_string(),
+            "<package name=\"foo\" project=\"devel:tools\"></package>".to_string(),
+        ),
+        (
+            "/source/openSUSE:Factory/foo/_meta".to_string(),
+            "<package name=\"foo\" project=\"openSUSE:Factory\"></package>".to_string(),
+        ),
+        (
+            "/search/request".to_string(),
+            "<collection matches=\"0\"></collection>".to_string(),
+        ),
+        (
+            "/request?cmd=create".to_string(),
+            "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+        ),
+    ]);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "request", "file"])
+        .args(factory_file_flags("devel:tools"))
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["id"], json!(1400001));
+    assert_eq!(value["dry_run"], false);
+    assert_eq!(
+        value["no_recorded_devel_remediation"],
+        "remediation: record the devel project: geectl request file-change-devel --source-project 'devel:tools' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:tools as the devel project of openSUSE:Factory/foo' --live"
+    );
+    assert!(
+        obs_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t.contains("cmd=create")),
+        "obs requests: {:?}",
+        obs_seen.lock().unwrap()
+    );
+    // Text mode carries the same command as its own line.
+    let out = geectl_isolated(&dir)
+        .args(["--live", "--format", "text", "request", "file"])
+        .args(factory_file_flags("devel:tools"))
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "filed request 1400001 for devel:tools/foo to openSUSE:Factory/foo\nremediation: record the devel project: geectl request file-change-devel --source-project 'devel:tools' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:tools as the devel project of openSUSE:Factory/foo' --live"
+    );
+}
+
+/// A live `request file` from a home/branch source names the
+/// change-devel command with the devel placeholder quoted, so the
+/// printed command cannot parse as a redirection.
+#[test]
+fn request_file_live_factory_target_without_recorded_devel_from_home_names_a_quoted_placeholder() {
+    let (obs_addr, _) = serve_routes(vec![
+        (
+            "/source/home:alice:branches:openSUSE:Factory/foo/_meta".to_string(),
+            "<package name=\"foo\" project=\"home:alice:branches:openSUSE:Factory\"></package>"
+                .to_string(),
+        ),
+        (
+            "/source/openSUSE:Factory/foo/_meta".to_string(),
+            "<package name=\"foo\" project=\"openSUSE:Factory\"></package>".to_string(),
+        ),
+        (
+            "/search/request".to_string(),
+            "<collection matches=\"0\"></collection>".to_string(),
+        ),
+        (
+            "/request?cmd=create".to_string(),
+            "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+        ),
+    ]);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "request", "file"])
+        .args(factory_file_flags("home:alice:branches:openSUSE:Factory"))
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["id"], json!(1400001));
+    assert_eq!(
+        value["no_recorded_devel_remediation"],
+        "remediation: record the devel project: geectl request file-change-devel --source-project '<devel-project>' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record the devel project of openSUSE:Factory/foo' --live"
+    );
+}
+
+/// A dry-run `request file` to a Factory target that records no
+/// devel project files nothing: the dedicated field stays null and
+/// the remedy rides the plan, in both the JSON payload and the text.
+#[test]
+fn request_file_dry_run_factory_target_without_recorded_devel_names_the_command_in_the_plan() {
+    let (obs_addr, _) = serve_routes(vec![(
+        "/source/openSUSE:Factory/foo/_meta".to_string(),
+        "<package name=\"foo\" project=\"openSUSE:Factory\"></package>".to_string(),
+    )]);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "file"])
+        .args(factory_file_flags("devel:tools"))
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["id"], serde_json::Value::Null);
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(
+        value["no_recorded_devel_remediation"],
+        serde_json::Value::Null
+    );
+    let plan = value["plan"].as_array().expect("payload carries a plan");
+    assert!(
+        plan.iter().any(|line| line.as_str()
+            == Some("[dry-run] openSUSE:Factory/foo records no devel project for devel:tools/foo")),
+        "plan: {plan:?}"
+    );
+    assert!(
+        plan.iter().any(|line| line.as_str()
+            == Some("[dry-run] remediation: record the devel project first: geectl request file-change-devel --source-project 'devel:tools' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:tools as the devel project of openSUSE:Factory/foo' --live")),
+        "plan: {plan:?}"
+    );
+    // Text mode carries the same command as its own line.
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "request", "file"])
+        .args(factory_file_flags("devel:tools"))
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "dry-run: would file request for devel:tools/foo to openSUSE:Factory/foo\nremediation: record the devel project first: geectl request file-change-devel --source-project 'devel:tools' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:tools as the devel project of openSUSE:Factory/foo' --live"
+    );
+}
+
+/// A dry-run `request refile` to a Factory target that records no
+/// devel project carries the same null-field / plan remedy contract.
+#[test]
+fn request_refile_dry_run_factory_target_without_recorded_devel_names_the_command_in_the_plan() {
+    let (obs_addr, _) = serve_routes(vec![(
+        "/source/openSUSE:Factory/foo/_meta".to_string(),
+        "<package name=\"foo\" project=\"openSUSE:Factory\"></package>".to_string(),
+    )]);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "refile", "--supersede", "42"])
+        .args(factory_file_flags("devel:tools"))
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["id"], serde_json::Value::Null);
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(
+        value["no_recorded_devel_remediation"],
+        serde_json::Value::Null
+    );
+    let plan = value["plan"].as_array().expect("payload carries a plan");
+    assert!(
+        plan.iter().any(|line| line.as_str()
+            == Some("[dry-run] remediation: record the devel project first: geectl request file-change-devel --source-project 'devel:tools' --source-package 'foo' --target-project 'openSUSE:Factory' --target-package 'foo' --description 'Record devel:tools as the devel project of openSUSE:Factory/foo' --live")),
+        "plan: {plan:?}"
     );
 }
 
