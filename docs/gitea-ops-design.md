@@ -307,11 +307,21 @@ it reads the source meta, answering `InvalidInput` for a source carrying
 no `<scmsync>`, resolves the devel project unless `--no-devel-project` is
 given, forks the repo, and wires the OBS fork to the fork's scmsync URL.
 Then it copies the source project's repositories into the fork's test
-project, the server-resolved target: all of them, verbatim, skipping
-any the target already carries; a repository already there but differing
-from the source is replaced. The server adds no repositories on
-`cmd=fork`, and a source project with no repositories copies nothing.
-A copy failure fails the branch loudly.
+project, the server-resolved target: all of them that can build,
+skipping any the target already carries; a repository already there
+but differing from the copy is replaced. A repository with no `<path>`
+— including a download-only one, which `add_repository` would
+otherwise refuse — gains a path to the same-named repository of the
+source project; a path that does not resolve is dropped from the copy, and a
+repository left with no resolving rebuild source is dropped too — and a
+reused target that still carries it has it removed, reported as a
+user-visible notice as well as on the debug channel. Decisions are
+computed for all repositories before any target mutation, so a path
+resolution never observes a replacement's temporary removal, and
+repositories the target carries but the source does not are left
+alone. The server adds no repositories on `cmd/fork`, and a source
+project with no repositories copies nothing. A copy failure fails
+the branch loudly.
 The scmsync URL carries the fork branch (`url#branch`); when the branch is
 unnamed, the composite resolves it with `repo_get` on the default branch, and
 `--git-branch` names it explicitly. The composite returns, typed, the fork

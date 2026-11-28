@@ -5505,6 +5505,26 @@ fn branch_live_servers() -> (
                 "/source/home:fbui:test:descent3/_meta",
                 &[(200, target_meta)],
             ),
+            // The copy resolves each rebuild source live: the
+            // Factory repo builds against `openSUSE:Factory/snapshot`
+            // and the second repo against
+            // `openSUSE:Tumbleweed/standard`, and both targets exist.
+            (
+                "GET",
+                "/source/openSUSE:Factory/_meta",
+                &[(
+                    200,
+                    "<project name=\"openSUSE:Factory\"><repository name=\"snapshot\"><arch>x86_64</arch></repository></project>",
+                )],
+            ),
+            (
+                "GET",
+                "/source/openSUSE:Tumbleweed/_meta",
+                &[(
+                    200,
+                    "<project name=\"openSUSE:Tumbleweed\"><repository name=\"standard\"><arch>x86_64</arch></repository></project>",
+                )],
+            ),
             (
                 "PUT",
                 "/source/home:fbui:test:descent3/_meta",
