@@ -10,6 +10,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+/// Serializes the tests that read or mutate the process-wide OBS credential variables.
+pub(crate) static OBS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A fake HTTP client with canned responses, for fixtures. GET,
 /// POST, PATCH, and DELETE are keyed separately by URL; a URL with
 /// no canned response is a transport error. Calls are recorded so

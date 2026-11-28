@@ -3708,7 +3708,8 @@ impl<'a> ObsClient<'a> {
     /// here means the package really is missing for this caller; any
     /// other failure fails loudly, like the public read. The
     /// response is the full meta, including the `<scmsync>`
-    /// element when the package is git-backed.
+    /// element when the package is git-backed. Requires credentials;
+    /// without them the read fails before any request.
     pub fn package_meta_authenticated(
         &self,
         project: &str,
@@ -3721,6 +3722,12 @@ impl<'a> ObsClient<'a> {
                     format!("invalid OBS {label} name: {value:?}"),
                 ));
             }
+        }
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "reading package meta requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
         }
         let url = build_url(&self.base, &["source", project, package, "_meta"], &[]);
         let body = self.http.get_with(&url, &self.credentials)?;
@@ -12899,6 +12906,22 @@ mod tests {
                 true
             )]
         );
+    }
+
+    #[test]
+    fn package_meta_authenticated_refuses_without_credentials() {
+        // The authenticated read fails before any request without credentials, not with the server's opaque 401.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+            PACKAGE_META_FIXTURE,
+        );
+        let client = ObsClient::new(&http);
+        let err = client
+            .package_meta_authenticated("openSUSE:Factory", "foo")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("GEECTL_OBS_USERNAME"));
+        assert!(http.get_calls().is_empty());
     }
 
     #[test]
