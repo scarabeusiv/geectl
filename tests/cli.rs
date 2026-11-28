@@ -227,6 +227,23 @@ fn config_show_reports_environment_source() {
     assert_eq!(value["obs_url_source"], "environment");
 }
 
+/// Write a PEM SSH key file into the temp dir (0600 on unix, so
+/// the mode check passes) and return its path.
+fn write_ssh_key(dir: &TempDir, name: &str) -> PathBuf {
+    let path = dir.0.join(name);
+    fs::write(
+        &path,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    path
+}
+
 /// Write a `.env` file into the temp dir (0600 on unix, so the mode
 /// check passes) and return its path.
 fn write_dotenv(dir: &TempDir, content: &str) -> PathBuf {
@@ -942,6 +959,82 @@ fn debug_config_line_reports_alias_credentials() {
         "config: obs api.opensuse.org (auth: basic), gitea src.opensuse.org (auth: none)"
     ));
     assert!(!stderr.contains("target-secret"));
+}
+
+#[test]
+fn debug_config_line_reports_the_flagged_obs_auth() {
+    // With `--instance`, the debug config line resolves OBS auth
+    // with the same strict resolver as `config show`: alias-only
+    // credentials read as `basic` for the flagged host, not `none`.
+    // One alias URL serves both backends, so the Gitea host is the
+    // flagged host too; the Gitea side reads `error` here because
+    // no alias token is set and the strict resolver requires one.
+    let dir = TempDir::new();
+    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    let out = geectl_isolated(&dir)
+        .args(["--instance", "example", "--debug", "version"])
+        .env("GEECTL_OBS_USERNAME_EXAMPLE", "alias-user")
+        .env("GEECTL_OBS_PASSWORD_EXAMPLE", "alias-secret")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(
+        "config: obs api.example.org (auth: basic), gitea api.example.org (auth: error)"
+    ));
+    assert!(!stderr.contains("alias-secret"));
+}
+
+#[test]
+fn debug_config_line_reports_the_flagged_gitea_host() {
+    // With `--instance`, the debug config line names the flagged
+    // alias's Gitea host and the alias token's kind — not the
+    // default host and the plain token.
+    let dir = TempDir::new();
+    write_instances_config(
+        &dir,
+        "[instances]\nexample = \"https://gitea.example.org\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .args(["--instance", "example", "--debug", "version"])
+        .env("GEECTL_GITEA_URL", "https://src.opensuse.org")
+        .env("GEECTL_GITEA_TOKEN", "plain-token")
+        .env("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("gitea gitea.example.org (auth: bearer)"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("alias-token"));
+    assert!(!stderr.contains("plain-token"));
+}
+
+#[test]
+fn debug_config_line_reports_the_alias_ssh_key_kind() {
+    // With `--instance` and an alias key but no token, the debug
+    // config line reads the key for the flagged instance: kind
+    // `ssh` on the alias host, not the plain key or `none`.
+    let dir = TempDir::new();
+    let alias_key = write_ssh_key(&dir, "id_example");
+    write_instances_config(
+        &dir,
+        "[instances]\nexample = \"https://gitea.example.org\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .args(["--instance", "example", "--debug", "version"])
+        .env("GEECTL_GITEA_SSH_KEY_EXAMPLE", &alias_key)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("gitea gitea.example.org (auth: ssh)"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("BEGIN OPENSSH"));
 }
 
 // --- remote-read integration tests ---
@@ -4116,6 +4209,67 @@ fn remote_set_project_meta_from_file_dry_run() {
 }
 
 #[test]
+fn remote_set_project_meta_from_file_json_dry_run() {
+    // The whole-file write takes the typed JSON `remote
+    // project-meta` emits: title, description, URL, devel project,
+    // person, and a repository carrying its full settings.
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.json");
+    fs::write(
+        &file,
+        r#"{"name": "home:alice", "title": "Alice",
+        "description": "Home project", "url": "https://example.org",
+        "scmsync": null, "devel": "openSUSE:Factory",
+        "persons": [{"name": "alice", "role": "maintainer", "email": null}],
+        "groups": [],
+        "repositories": [{"name": "standard",
+        "arch": ["x86_64", "aarch64"],
+        "paths": [{"project": "openSUSE:Factory", "repository": "standard"}],
+        "rebuild": "local", "block": "all", "linkedbuild": "all",
+        "downloads": [{"arch": "x86_64", "url": "https://example.org/repo",
+        "repotype": "rpm-md", "archfilter": null, "pubkey": null,
+        "master": {"url": "https://example.org/master", "sslfingerprint": "AA:BB"}}],
+        "release_targets": [{"project": "openSUSE:Factory", "repository": "snapshot", "trigger": "manual"}],
+        "hostsystem": [{"project": "openSUSE:Factory", "repository": "standard"}]}]}"#,
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["name"], "home:alice");
+    assert_eq!(value["title"], "Alice");
+    assert_eq!(value["description"], "Home project");
+    assert_eq!(value["url"], "https://example.org");
+    assert_eq!(value["devel"], "openSUSE:Factory");
+    assert_eq!(value["persons"][0]["name"], "alice");
+    let repo = &value["repositories"][0];
+    assert_eq!(repo["name"], "standard");
+    assert_eq!(repo["arch"][1], "aarch64");
+    assert_eq!(repo["rebuild"], "local");
+    assert_eq!(repo["downloads"][0]["master"]["sslfingerprint"], "AA:BB");
+    assert_eq!(repo["release_targets"][0]["trigger"], "manual");
+    assert_eq!(
+        value["plan"],
+        serde_json::json!(["[dry-run] would: set project meta of home:alice"])
+    );
+}
+
+#[test]
 fn remote_set_package_meta_from_file_dry_run() {
     // The whole-file write plans the file's meta: title, URL,
     // release name, devel pair, and person.
@@ -4130,6 +4284,56 @@ fn remote_set_package_meta_from_file_dry_run() {
          <devel project=\"devel:languages:vim\" package=\"vim\"/>\
          <person userid=\"alice\" role=\"maintainer\"/>\
          </package>",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-package-meta",
+            "home:alice",
+            "vim",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["project"], "home:alice");
+    assert_eq!(value["name"], "vim");
+    assert_eq!(value["title"], "Vim");
+    assert_eq!(value["url"], "https://example.org/vim");
+    assert_eq!(value["releasename"], "vim");
+    assert_eq!(value["devel"]["project"], "devel:languages:vim");
+    assert_eq!(value["devel"]["package"], "vim");
+    assert_eq!(value["persons"][0]["name"], "alice");
+    assert_eq!(
+        value["plan"],
+        serde_json::json!(["[dry-run] would: set package meta of home:alice/vim"])
+    );
+}
+
+#[test]
+fn remote_set_package_meta_from_file_json_dry_run() {
+    // The whole-file write takes the typed JSON `remote
+    // package-meta` emits: title, URL, release name, devel pair,
+    // and person.
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.json");
+    fs::write(
+        &file,
+        r#"{"name": "vim", "project": "home:alice", "title": "Vim",
+        "description": null, "url": "https://example.org/vim",
+        "scmsync": null, "releasename": "vim",
+        "devel": {"project": "devel:languages:vim", "package": "vim"},
+        "persons": [{"name": "alice", "role": "maintainer", "email": null}],
+        "groups": []}"#,
     )
     .unwrap();
     let out = geectl_isolated(&dir)
@@ -6346,9 +6550,125 @@ fn meta_set_help_names_the_target_and_field_flags() {
     let out = geectl().args(["meta", "set", "--help"]).output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    for flag in ["--project", "--package", "--repo", "--description", "--url"] {
+    for flag in [
+        "--project",
+        "--package",
+        "--repo",
+        "--description",
+        "--url",
+        "--from-file",
+    ] {
         assert!(text.contains(flag), "meta set --help misses {flag}");
     }
+}
+
+#[test]
+fn meta_set_from_file_dry_run() {
+    // The unified leaf writes a whole OBS project meta from the
+    // typed JSON file: description and URL come from the file, and
+    // the plan names the file.
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.json");
+    fs::write(
+        &file,
+        r#"{"name": "home:alice", "title": "Alice",
+        "description": "Whole description", "url": "https://example.org/whole",
+        "scmsync": null, "devel": null,
+        "persons": [], "groups": [], "repositories": []}"#,
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "meta",
+            "set",
+            "--project",
+            "home:alice",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["backend"], "obs");
+    assert_eq!(value["project"], "home:alice");
+    assert_eq!(value["description"], "Whole description");
+    assert_eq!(value["url"], "https://example.org/whole");
+    assert_eq!(
+        value["fields"],
+        serde_json::json!([format!("from-file: {}", file.display())])
+    );
+    assert_eq!(
+        value["plan"],
+        serde_json::json!(["[dry-run] would: set project meta of home:alice"])
+    );
+}
+
+#[test]
+fn meta_set_from_file_refuses_a_gitea_target() {
+    // Gitea has no whole-file meta concept: the flag refuses
+    // before any client is built, naming it.
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.json");
+    fs::write(
+        &file,
+        r#"{"name": "home:alice", "title": "Alice",
+        "description": "Whole description", "url": null,
+        "scmsync": null, "devel": null,
+        "persons": [], "groups": [], "repositories": []}"#,
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "meta",
+            "set",
+            "--repo",
+            "pool/systemd",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("no whole-file meta concept"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn meta_set_from_file_conflicts_with_description() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "meta",
+            "set",
+            "--project",
+            "home:alice",
+            "--from-file",
+            "meta.json",
+            "--description",
+            "New description",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
 }
 
 #[test]
@@ -6941,6 +7261,131 @@ fn serve_obs_gitea_merge_forward_ambiguous(
         }
     });
     (addr, seen)
+}
+
+/// A combined OBS+Gitea stub on one address: one `[instances]`
+/// alias URL serves both backends under `--instance`, so the stub
+/// answers the OBS filing calls and the Gitea branch read the
+/// freshness check makes. The source package syncs from the stub's
+/// own Gitea repo on `factory`, with the obsinfo commit matching
+/// the branch head.
+fn serve_obs_gitea_aliased_filing() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_thread = std::sync::Arc::clone(&seen);
+    let head = "2ec4b574be01c905f83a91b026682b839cfce0521a5b24d164c818d54d0880ec";
+    let source_meta = format!(
+        "<package name=\"gsl\" project=\"science\"><scmsync>http://{addr}/adamm/gsl.git#factory</scmsync></package>"
+    );
+    let obsinfo = format!(
+        "mtime: 1774534342\ncommit: {head}\nurl: http://{addr}/adamm/gsl.git\nrevision: factory\n"
+    );
+    let branch = format!(
+        "{{\"name\": \"factory\", \"commit\": {{\"id\": \"{head}\", \"message\": \"OBS bridge sync\"}}, \"protected\": false}}"
+    );
+    let empty_collection = "<collection matches=\"0\"></collection>";
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            seen_in_thread
+                .lock()
+                .unwrap()
+                .push(text.lines().next().unwrap_or("").to_string());
+            let mut parts = text.lines().next().unwrap_or("").split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let (status, body) = if method == "POST" && target.contains("cmd=create") {
+                (
+                    200,
+                    "<request id=\"1400001\" creator=\"alice\"></request>".to_string(),
+                )
+            } else if target.contains("/api/v1/repos/adamm/gsl/branches/factory") {
+                (200, branch.clone())
+            } else if target.contains("/_scmsync.obsinfo") {
+                (200, obsinfo.clone())
+            } else if target.contains("/_meta") {
+                (200, source_meta.clone())
+            } else if target.contains("search/request") {
+                (200, empty_collection.to_string())
+            } else {
+                (404, "<status code=\"not_found\" />".to_string())
+            };
+            let reason = http_reason(status);
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, seen)
+}
+
+#[test]
+fn request_file_aliased_filing_uses_the_flagged_gitea_host() {
+    // The freshness check's lazy Gitea client must resolve through
+    // the flagged instance: the branch read goes to the alias host
+    // (this stub), never the default Gitea host. A lazy client
+    // ignoring `--instance` would read the branch from
+    // src.opensuse.org and the filing would fail.
+    let (addr, seen) = serve_obs_gitea_aliased_filing();
+    let dir = TempDir::new();
+    write_instances_config(&dir, &format!("[instances]\nexample = \"http://{addr}\"\n"));
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "--instance",
+            "example",
+            "request",
+            "file",
+            "--source-project",
+            "science",
+            "--source-package",
+            "gsl",
+            "--target-project",
+            "devel:languages:python",
+            "--target-package",
+            "gsl",
+            "--description",
+            "Update gsl to 2.0",
+            "--changes-entry",
+            "- Update to version 2.0.",
+        ])
+        .env("GEECTL_OBS_USERNAME_EXAMPLE", "alice")
+        .env("GEECTL_OBS_PASSWORD_EXAMPLE", "test-password")
+        .env("GEECTL_GITEA_TOKEN_EXAMPLE", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["id"], 1400001);
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|r| r.contains("/api/v1/repos/adamm/gsl/branches/factory")),
+        "requests: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|r| r.contains("cmd=create")),
+        "requests: {seen:?}"
+    );
 }
 
 #[test]
@@ -8073,7 +8518,10 @@ fn pull_request_submit_gitea_instance_flag_uses_the_alias_token() {
         &checkout,
         &["config", "--local", "remote.origin.url", origin.as_str()],
     );
-    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    // The flagged alias's URL is the Gitea base: the alias names
+    // the mock server, and the flag beats the configured URL in
+    // the environment.
+    write_instances_config(&dir, &format!("[instances]\nexample = \"http://{addr}\"\n"));
     let out = geectl_isolated(&dir)
         .current_dir(&checkout)
         .args([
@@ -8086,7 +8534,7 @@ fn pull_request_submit_gitea_instance_flag_uses_the_alias_token() {
             "--title",
             "Update foo",
         ])
-        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
+        .env("GEECTL_GITEA_URL", "https://gitea.example.org")
         .env("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token")
         .output()
         .unwrap();
@@ -8118,7 +8566,10 @@ fn pull_request_submit_gitea_instance_flag_never_borrows_the_plain_token() {
         &checkout,
         &["config", "--local", "remote.origin.url", origin.as_str()],
     );
-    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    // The flagged alias's URL is the Gitea base (the mock server),
+    // so the origin-host check passes and the token resolution is
+    // what fails: the plain token never serves the flagged alias.
+    write_instances_config(&dir, &format!("[instances]\nexample = \"http://{addr}\"\n"));
     let out = geectl_isolated(&dir)
         .current_dir(&checkout)
         .args([
@@ -10602,6 +11053,42 @@ fn changelog_identity_instance_flag_resolves_the_author_on_the_flagged_instance(
 }
 
 #[test]
+fn changelog_identity_instance_flag_never_borrows_the_plain_obs_credentials() {
+    // The flagged alias names the default OBS URL, so a lenient
+    // per-URL identity lookup would borrow the plain credentials
+    // and contact the default host. The strict per-instance path
+    // fails first, naming the alias variables, before any server
+    // contact — so no mock server is needed here.
+    let dir = TempDir::new();
+    let pkg = dir.0.join("pkg");
+    fs::create_dir_all(&pkg).unwrap();
+    write_instances_config(
+        &dir,
+        "[instances]\nexample = \"https://api.opensuse.org\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&pkg)
+        .args(["--instance", "example", "changelog", "identity", "."])
+        .env("GEECTL_OBS_USERNAME", "plain-user")
+        .env("GEECTL_OBS_PASSWORD", "plain-secret")
+        .env_remove("VC_REALNAME")
+        .env_remove("VC_MAILADDR")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    let message = value["error"]["context"].as_str().unwrap();
+    assert!(
+        message.contains("GEECTL_OBS_USERNAME_EXAMPLE"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("plain-user"));
+    assert!(!stderr.contains("plain-secret"));
+}
+
+#[test]
 fn changelog_generate_message_hotfix_skips_news() {
     // The hotfix shape with upstream NEWS: the version is
     // unchanged, so no NEWS is extracted — no highlights slot, no
@@ -11544,6 +12031,356 @@ fn instance_flag_beats_environment_in_config_show() {
 }
 
 #[test]
+fn instance_flag_selects_the_gitea_host_in_config_show() {
+    // The flag selects the Gitea host and the Gitea account
+    // together, like the OBS side: `config show --instance
+    // example` reports the alias URL with source `flag` and the
+    // alias token's status — not the default instance's.
+    let dir = TempDir::new();
+    write_instances_config(
+        &dir,
+        "[instances]\nexample = \"https://gitea.example.org\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .args(["--instance", "example", "config", "show"])
+        .env("GEECTL_GITEA_URL", "https://src.opensuse.org")
+        .env("GEECTL_GITEA_TOKEN", "plain-token")
+        .env("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["gitea_url"], "https://gitea.example.org");
+    assert_eq!(value["gitea_url_source"], "flag");
+    assert_eq!(value["gitea_auth"]["status"], "configured");
+    assert!(!stdout.contains("alias-token"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("alias-token"));
+}
+
+#[test]
+fn config_show_with_instance_never_borrows_the_plain_obs_credentials() {
+    // The flagged alias names the default OBS URL, so a lenient
+    // per-URL status would match the plain credentials. The strict
+    // per-instance path reports the flagged alias as an error
+    // instead, naming its own variables — and no plain credential
+    // value leaks into the output.
+    let dir = TempDir::new();
+    write_instances_config(
+        &dir,
+        "[instances]\nexample = \"https://api.opensuse.org\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .args(["--instance", "example", "config", "show"])
+        .env("GEECTL_OBS_USERNAME", "plain-user")
+        .env("GEECTL_OBS_PASSWORD", "plain-secret")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["obs_auth"]["status"], "error");
+    assert!(
+        value["obs_auth"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("GEECTL_OBS_USERNAME_EXAMPLE"),
+        "obs_auth: {}",
+        value["obs_auth"]
+    );
+    assert!(!stdout.contains("plain-user"));
+    assert!(!stdout.contains("plain-secret"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("plain-secret"));
+}
+
+#[test]
+fn config_show_reports_the_config_identity_level() {
+    // The `[identity]` section wins the funnel, and `config show`
+    // reports it with its source.
+    let dir = TempDir::new();
+    write_instances_config(
+        &dir,
+        "[identity]\nname = \"Config Author\"\nemail = \"config@example.com\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["identity"], "Config Author <config@example.com>");
+    assert_eq!(value["identity_source"], "config");
+}
+
+#[test]
+fn config_show_reports_the_env_identity_level() {
+    // No `[identity]` in the config: the `VC_REALNAME` /
+    // `VC_MAILADDR` environment is the level reported.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["config", "show"])
+        .env("VC_REALNAME", "Env Author")
+        .env("VC_MAILADDR", "env@example.com")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["identity"], "Env Author <env@example.com>");
+    assert_eq!(value["identity_source"], "env");
+}
+
+#[test]
+fn config_show_reports_env_unresolved_for_a_half_set_env_identity() {
+    // VC_REALNAME without VC_MAILADDR is a refused env level, not
+    // a fatal error: the show reports `env (unresolved)` and exits 0.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["config", "show"])
+        .env("VC_REALNAME", "Half Author")
+        .env_remove("VC_MAILADDR")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert!(value["identity"].is_null());
+    assert_eq!(value["identity_source"], "env (unresolved)");
+}
+
+#[test]
+fn config_show_reports_no_identity_when_nothing_identifies() {
+    // Isolated, no config or env identity, no OBS username, and
+    // the working directory is no repo: no level yields one.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert!(value["identity"].is_null());
+    assert_eq!(value["identity_source"], "none");
+}
+
+#[test]
+fn config_show_reports_obs_unresolved_without_the_flag() {
+    // No config or env identity, but the flagged alias carries an
+    // OBS username: OBS might still identify the author, so the
+    // level reports `obs (unresolved)` — and no whois call is
+    // made, so no mock server is needed here. No credential value
+    // leaks into the output.
+    let dir = TempDir::new();
+    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["--instance", "example", "config", "show"])
+        .env("GEECTL_OBS_USERNAME_EXAMPLE", "alias-user")
+        .env("GEECTL_OBS_PASSWORD_EXAMPLE", "alias-secret")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(value["identity"].is_null());
+    assert_eq!(value["identity_source"], "obs (unresolved)");
+    // The username is reported by `obs_auth` by design; the
+    // password must never appear.
+    assert_eq!(value["obs_auth"]["username"], "alias-user");
+    assert!(!stdout.contains("alias-secret"));
+}
+
+#[test]
+fn config_show_reports_obs_error_for_a_misconfigured_obs_credential() {
+    // A half-configured OBS credential is a read error, not an
+    // absence: the OBS level reports `obs (error)` instead of
+    // falling through to git and misattributing the level.
+    let dir = TempDir::new();
+    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["--instance", "example", "config", "show"])
+        .env("GEECTL_OBS_USERNAME_EXAMPLE", "alias-user")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert!(value["identity"].is_null());
+    assert_eq!(value["identity_source"], "obs (error)");
+}
+
+#[test]
+fn config_show_resolve_identity_reports_the_obs_identity_level() {
+    // With `--resolve-identity` the OBS lookup runs over the
+    // network, like a generate: the fixture is the flagged
+    // instance only, so success proves the author came from the
+    // flagged instance's whois.
+    let addr = serve_routes(&[("/person/Admin", ADMIN_PERSON_BODY)]);
+    let dir = TempDir::new();
+    write_instances_config(&dir, &format!("[instances]\nexample = \"http://{addr}\"\n"));
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args([
+            "--instance",
+            "example",
+            "config",
+            "show",
+            "--resolve-identity",
+        ])
+        .env("GEECTL_OBS_USERNAME_EXAMPLE", "Admin")
+        .env("GEECTL_OBS_PASSWORD_EXAMPLE", "secret")
+        .env_remove("VC_REALNAME")
+        .env_remove("VC_MAILADDR")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["identity"], "Admin User <admin@example.com>");
+    assert_eq!(value["identity_source"], "obs");
+    assert!(!stdout.contains("secret"));
+}
+
+#[test]
+fn config_show_reports_the_git_identity_level() {
+    // No config, env, or OBS identity: the working copy's local
+    // git identity is the level reported.
+    let dir = TempDir::new();
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git_in(&repo, &["init", "--quiet"]);
+    git_in(&repo, &["config", "--local", "user.name", "Git Author"]);
+    git_in(
+        &repo,
+        &["config", "--local", "user.email", "git@example.com"],
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&repo)
+        .args(["config", "show"])
+        .env_remove("VC_REALNAME")
+        .env_remove("VC_MAILADDR")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["identity"], "Git Author <git@example.com>");
+    assert_eq!(value["identity_source"], "git");
+}
+
+#[test]
+fn config_show_with_instance_reports_the_alias_ssh_key() {
+    // With `--instance`, the flagged alias's own key variable is
+    // the key reported — not the plain key — and only the path is
+    // shown, never the key itself.
+    let dir = TempDir::new();
+    let alias_key = write_ssh_key(&dir, "id_example");
+    let plain_key = write_ssh_key(&dir, "id_plain");
+    write_instances_config(
+        &dir,
+        "[instances]\nexample = \"https://gitea.example.org\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["--instance", "example", "config", "show"])
+        .env("GEECTL_GITEA_SSH_KEY_EXAMPLE", &alias_key)
+        .env("GEECTL_GITEA_SSH_KEY", &plain_key)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["gitea_ssh_key"]["status"], "configured");
+    assert_eq!(
+        value["gitea_ssh_key"]["path"].as_str(),
+        Some(alias_key.to_str().unwrap())
+    );
+    assert!(!stdout.contains("BEGIN OPENSSH"));
+}
+
+#[test]
+fn config_show_with_instance_falls_back_to_the_plain_ssh_key() {
+    // An alias without its own key keeps using the single
+    // configured git key: the alias form overrides, it does not
+    // strictly replace.
+    let dir = TempDir::new();
+    let plain_key = write_ssh_key(&dir, "id_plain");
+    write_instances_config(
+        &dir,
+        "[instances]\nexample = \"https://gitea.example.org\"\n",
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&dir.0)
+        .args(["--instance", "example", "config", "show"])
+        .env("GEECTL_GITEA_SSH_KEY", &plain_key)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["gitea_ssh_key"]["status"], "configured");
+    assert_eq!(
+        value["gitea_ssh_key"]["path"].as_str(),
+        Some(plain_key.to_str().unwrap())
+    );
+}
+
+#[test]
 fn instance_flag_with_missing_credentials_fails_closed() {
     // Plain credentials and another instance's credentials are set;
     // neither may serve the flagged instance: the call fails naming
@@ -11631,12 +12468,14 @@ fn instance_flag_obs_leaf_success_reads_from_the_flagged_endpoint() {
 
 #[test]
 fn instance_flag_gitea_leaf_uses_the_alias_token() {
-    // The flag selects the account on every Gitea leaf, not just on
+    // The flag selects the instance on every Gitea leaf, not just on
     // pull-request filing: with only the alias token set, a `gitea`
-    // read succeeds and returns the fixture's repository.
+    // read succeeds and returns the fixture's repository. The
+    // flagged alias's URL is the base (the mock server), and the
+    // flag beats the configured URL in the environment.
     let addr = serve_routes(&[("/api/v1/repos/owner/repo", SUBMIT_FORK_REPO_JSON)]);
     let dir = TempDir::new();
-    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    write_instances_config(&dir, &format!("[instances]\nexample = \"http://{addr}\"\n"));
     let out = geectl_isolated(&dir)
         .args([
             "--instance",
@@ -11646,7 +12485,7 @@ fn instance_flag_gitea_leaf_uses_the_alias_token() {
             "owner",
             "repo",
         ])
-        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
+        .env("GEECTL_GITEA_URL", "https://gitea.example.org")
         .env("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token")
         .output()
         .unwrap();
@@ -11691,12 +12530,17 @@ fn instance_flag_gitea_leaf_never_borrows_the_plain_token() {
 #[test]
 fn instance_flag_person_search_gitea_uses_the_alias_token() {
     // `person search --backend gitea` builds its own Gitea client:
-    // the flag selects the account there too.
+    // the flag selects the instance there too — the alias URL is
+    // the base (the mock server), and the flag beats the configured
+    // URL in the environment.
     let gitea_addr = serve_once(
         r#"{"ok": true, "data": [{"login": "alice", "full_name": "Alice", "email": "alice@example.com"}]}"#,
     );
     let dir = TempDir::new();
-    write_instances_config(&dir, "[instances]\nexample = \"https://api.example.org\"\n");
+    write_instances_config(
+        &dir,
+        &format!("[instances]\nexample = \"http://{gitea_addr}\"\n"),
+    );
     let out = geectl_isolated(&dir)
         .args([
             "--instance",
@@ -11707,7 +12551,7 @@ fn instance_flag_person_search_gitea_uses_the_alias_token() {
             "--backend",
             "gitea",
         ])
-        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_URL", "https://gitea.example.org")
         .env("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token")
         .output()
         .unwrap();

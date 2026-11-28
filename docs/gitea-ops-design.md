@@ -375,17 +375,26 @@ shape.
 ## Configuration and auth
 
 `gitea_url` in the config file, default `https://src.opensuse.org`, with
-the `GEECTL_GITEA_URL` environment override. One configured Gitea instance
-per client; a repo URL on another host answers `ConfigError` naming the
-configured host. Named instances live in the config `[instances]` table;
-the identity is scheme, host, and effective port.
+the `GEECTL_GITEA_URL` environment override. Named instances live in the
+config `[instances]` table; the identity is scheme, host, and effective
+port. `--instance` selects the alias's URL as the Gitea base, like the
+OBS side, and only the alias's token variables authenticate the call —
+the flag selects the host and the account together.
 
 `EnvGiteaAuth` carries the Bearer token from `GEECTL_GITEA_TOKEN` or
 `GEECTL_GITEA_TOKEN_FILE`, exactly one, or from the matching alias's
 `GEECTL_GITEA_TOKEN_<ALIAS>` and `GEECTL_GITEA_TOKEN_FILE_<ALIAS>` when
 the URL is named in `[instances]`, resolved per URL by
 `resolve_gitea_bearer_for_url`. `GiteaSshKey` carries the private-key path
-from `GEECTL_GITEA_SSH_KEY` for the agent's `git clone` over SSH.
+from `GEECTL_GITEA_SSH_KEY`, or from `GEECTL_GITEA_SSH_KEY_<ALIAS>` when
+the flagged alias sets one: the key rides into `GIT_SSH_COMMAND` as
+`-o IdentityFile=<key> -o IdentitiesOnly=yes`, but only for a checkout
+whose origin names the configured Gitea host — the key is scoped
+host-wise like the token, so an SSH origin on another forge, or a
+checkout with no recorded origin, authenticates with the agent and
+the default keys as before, never with this key. HTTPS remotes ignore
+the command, and a checkout with no configured key uses the agent
+and the default keys as before.
 `GiteaClient` construction requires a token, including in dry-run.
 
 Typed package and project meta carry `scmsync: Option<String>`

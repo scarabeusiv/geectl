@@ -894,11 +894,12 @@ fn git_network(
     subcommand: &str,
     args: &[&str],
     extra_env: &[(&str, &str)],
+    ssh_key: Option<&Path>,
 ) -> Result<String, GeectlError> {
     // The ssh command is owned here: the combined environment
     // borrows it, so it outlives the git run below.
     ensure_ssh_dir();
-    let command = ssh_network_command();
+    let command = ssh_network_command(ssh_key);
     let env = network_git_env(extra_env, Some(&command));
     let output = run_git_inner(dir, &[], subcommand, args, &env, git_network_timeout())?;
     if output.success {
@@ -1008,6 +1009,27 @@ fn ssh_control_dir() -> Option<PathBuf> {
     }
 }
 
+/// Double-quote one value for a shell command line, escaping
+/// quote, backslash, `$` and backtick — the characters the shell
+/// still expands inside double quotes. `!` is deliberately not
+/// escaped: a non-interactive shell performs no history expansion,
+/// and a backslash before `!` inside double quotes is preserved
+/// literally by POSIX sh, which would put a backslash into the
+/// value ssh sees.
+fn shell_double_quote(value: &str) -> String {
+    let quote = char::from(34);
+    let backslash = char::from(92);
+    let mut quoted = String::from(quote);
+    for c in value.chars() {
+        if c == quote || c == backslash || c == '$' || c == '`' {
+            quoted.push(backslash);
+        }
+        quoted.push(c);
+    }
+    quoted.push(quote);
+    quoted
+}
+
 /// Build the sharing command for `dir`: the ssh invocation with
 /// the multiplexing options and the control socket under `dir`.
 /// Split out of `ssh_multiplex_command` so the value is testable
@@ -1016,23 +1038,8 @@ fn ssh_multiplex_command_for(dir: &Path) -> String {
     // The ControlPath is double-quoted: the temp directory may
     // contain spaces, and git splits GIT_SSH_COMMAND shell-style.
     // `%C` stays literal here — ssh expands it, not the shell.
-    // Inside the quotes the shell still expands `$` and backtick,
-    // so those are backslash-escaped too, alongside quote and
-    // backslash. `!` is deliberately not escaped: a non-interactive
-    // shell performs no history expansion, and a backslash before
-    // `!` inside double quotes is preserved literally by POSIX sh,
-    // which would put a backslash into the socket path ssh sees.
     let path = format!("{}/%C", dir.display());
-    let quote = char::from(34);
-    let backslash = char::from(92);
-    let mut quoted = String::from(quote);
-    for c in path.chars() {
-        if c == quote || c == backslash || c == '$' || c == '`' {
-            quoted.push(backslash);
-        }
-        quoted.push(c);
-    }
-    quoted.push(quote);
+    let quoted = shell_double_quote(&path);
     format!(
         "ssh -o ControlMaster=auto -o ControlPath={quoted} -o ControlPersist={} -o StrictHostKeyChecking=accept-new",
         PRECOMMIT_TIMEOUT_SECS
@@ -1068,19 +1075,81 @@ fn ssh_multiplex_command() -> Option<String> {
 const SSH_PLAIN_COMMAND: &str = "ssh -o StrictHostKeyChecking=accept-new";
 
 /// The `GIT_SSH_COMMAND` for a network git operation: the sharing
-/// command when available, else a plain ssh. Split out of
-/// `ssh_network_command` so the fallback is testable without
-/// creating the control directory.
-fn ssh_network_command_with(multiplex: Option<String>) -> String {
-    multiplex.unwrap_or_else(|| SSH_PLAIN_COMMAND.to_string())
+/// command when available, else a plain ssh. A configured SSH key
+/// rides along as `-o IdentityFile=<key> -o IdentitiesOnly=yes`,
+/// so an SSH remote authenticates with it; HTTPS remotes ignore
+/// the command. The key arrives pre-scoped by the caller (see
+/// `ssh_key_for_origin`): it is only passed when the checkout's
+/// origin names the configured Gitea host, so a key for one forge
+/// never disables the agent fallback on another host's SSH remote.
+/// Split out of `ssh_network_command` so the fallback is testable
+/// without creating the control directory.
+fn ssh_network_command_with(multiplex: Option<String>, ssh_key: Option<&Path>) -> String {
+    let mut command = multiplex.unwrap_or_else(|| SSH_PLAIN_COMMAND.to_string());
+    if let Some(key) = ssh_key {
+        command.push_str(" -o IdentityFile=");
+        command.push_str(&shell_double_quote(&key.to_string_lossy()));
+        command.push_str(" -o IdentitiesOnly=yes");
+    }
+    command
 }
 
 /// The `GIT_SSH_COMMAND` for a network git operation. Sharing is
 /// best-effort; the host-key provisioning is not — every network
 /// operation runs ssh with `StrictHostKeyChecking=accept-new`,
 /// whether the connection is shared or not.
-fn ssh_network_command() -> String {
-    ssh_network_command_with(ssh_multiplex_command())
+fn ssh_network_command(ssh_key: Option<&Path>) -> String {
+    ssh_network_command_with(ssh_multiplex_command(), ssh_key)
+}
+
+/// The host of a git remote URL, for scoping the configured SSH
+/// key: `https://host/org/repo`, `ssh://git@host/org/repo`, and
+/// `git@host:org/repo` all yield `host`, lowercased, without a
+/// port. `None` when the URL names no host (a local path, or a
+/// URL with no authority) — the caller then withholds the key.
+fn remote_host(url: &str) -> Option<String> {
+    let url = url.split('#').next().unwrap_or(url);
+    let after_scheme = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => {
+            // An scp-like `user@host:path` names its host between
+            // the `@` and the `:`; anything else is a local path.
+            let after_user = url.split('@').nth(1)?;
+            return after_user
+                .split(':')
+                .next()
+                .filter(|host| !host.is_empty())
+                .map(|host| host.to_lowercase());
+        }
+    };
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let authority = authority.split('@').next_back().unwrap_or(authority);
+    let host = authority.split(':').next().unwrap_or(authority);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_lowercase())
+    }
+}
+
+/// The configured SSH key for a network operation against
+/// `origin_url`: the key only when the origin names the Gitea host
+/// the key belongs to. A key for one forge must never ride into an
+/// SSH origin on another — with `IdentitiesOnly=yes` the agent and
+/// the default keys stop authenticating there — so a foreign or
+/// unknown origin runs with the agent and the default keys exactly
+/// as before the key was configured.
+fn ssh_key_for_origin<'a>(
+    key: Option<&'a Path>,
+    gitea_url: &str,
+    origin_url: Option<&str>,
+) -> Option<&'a Path> {
+    let key = key?;
+    let origin = origin_url?;
+    match (remote_host(origin), remote_host(gitea_url)) {
+        (Some(origin_host), Some(gitea_host)) if origin_host == gitea_host => Some(key),
+        _ => None,
+    }
 }
 
 /// Ensure the user's `.ssh` directory exists so ssh can store a
@@ -1453,12 +1522,15 @@ fn git_status(
 /// `http.extraHeader`, without putting it in argv: the header is
 /// never logged, and a git error never echoes it. `header` holds
 /// the formatted header line and must outlive the call.
-/// The Gitea credentials for a git-backed operation: the token and
-/// the instance URL it belongs to. The URL scopes the token (see
+/// The Gitea credentials for a git-backed operation: the token
+/// (when one is configured) and the instance URL it belongs to,
+/// plus the SSH key (when one is configured) for checkouts whose
+/// origin is an SSH remote. The URL scopes the token (see
 /// `token_env`): git only sends it to that instance.
 pub struct GiteaAuth<'a> {
-    pub token: &'a str,
+    pub token: Option<&'a str>,
     pub url: &'a str,
+    pub ssh_key: Option<&'a Path>,
 }
 
 /// The git environment carrying the Gitea token, scoped to the
@@ -1466,15 +1538,19 @@ pub struct GiteaAuth<'a> {
 /// under that instance. An unscoped `http.extraHeader` would go to
 /// whatever host the scmsync URL names — a maintainer-controlled
 /// value — leaking the token there, and a bogus token would break a
-/// public clone on a host that needs none.
+/// public clone on a host that needs none. Empty when no token is
+/// configured: a public operation carries no header at all.
 fn token_env<'a>(
     auth: &GiteaAuth<'a>,
     header: &'a mut String,
     key: &'a mut String,
-) -> [(&'a str, &'a str); 3] {
-    *header = format!("Authorization: token {}", auth.token);
+) -> Vec<(&'a str, &'a str)> {
+    let Some(token) = auth.token else {
+        return Vec::new();
+    };
+    *header = format!("Authorization: token {token}");
     *key = format!("http.{}.extraHeader", auth.url);
-    [
+    vec![
         ("GIT_CONFIG_COUNT", "1"),
         ("GIT_CONFIG_KEY_0", key.as_str()),
         ("GIT_CONFIG_VALUE_0", header.as_str()),
@@ -2673,7 +2749,7 @@ fn checkout_git(
     let mut header = String::new();
     let mut key = String::new();
     let mut env: Vec<(&str, &str)> = match gitea_auth {
-        Some(auth) => token_env(auth, &mut header, &mut key).to_vec(),
+        Some(auth) => token_env(auth, &mut header, &mut key),
         None => Vec::new(),
     };
     // Belt and braces with the scheme check above: only http(s)
@@ -2695,7 +2771,13 @@ fn checkout_git(
     args.push("--");
     args.push(clone_url);
     args.push(&target_str);
-    git_network(dir, "clone", &args, &env)?;
+    git_network(
+        dir,
+        "clone",
+        &args,
+        &env,
+        gitea_auth.and_then(|auth| ssh_key_for_origin(auth.ssh_key, auth.url, Some(clone_url))),
+    )?;
     let head = git(&target, "rev-parse", &["HEAD"], &[])?
         .trim()
         .to_string();
@@ -5194,18 +5276,26 @@ fn commit_git(
     // The client must be the checkout's own instance before any
     // other check reads the server.
     wc.check_apiurl(&client.base)?;
-    let auth = gitea_auth.ok_or_else(|| {
-        GeectlError::new(
-            ErrorKind::ConfigError,
-            "a git-backed commit needs a Gitea token: the push authenticates with it",
-        )
-    })?;
+    let auth = gitea_auth
+        .filter(|auth| auth.token.is_some() || auth.ssh_key.is_some())
+        .ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ConfigError,
+                "a git-backed commit needs a Gitea token or SSH key: the push authenticates with one of them",
+            )
+        })?;
     let mut header = String::new();
     let mut key = String::new();
     let env = token_env(auth, &mut header, &mut key);
     // The outdated check: fetch first, then refuse when the
     // upstream has commits the checkout does not have.
-    git_network(&wc.root, "fetch", &["origin"], &env)?;
+    git_network(
+        &wc.root,
+        "fetch",
+        &["origin"],
+        &env,
+        ssh_key_for_origin(auth.ssh_key, auth.url, wc.scmsync_url.as_deref()),
+    )?;
     refuse_when_remote_ahead(wc)?;
     refuse_on_conflicts(wc)?;
     let staged = git(
@@ -5296,7 +5386,13 @@ fn commit_git(
         // exists, so it checks every commit the push would send,
         // and before the push: a failed check blocks the push.
         run_pre_push_gate(&wc.root, &wc.base_rev, &head)?;
-        git_network(&wc.root, "push", &["--no-verify", "origin", "HEAD"], &env)?;
+        git_network(
+            &wc.root,
+            "push",
+            &["--no-verify", "origin", "HEAD"],
+            &env,
+            ssh_key_for_origin(auth.ssh_key, auth.url, wc.scmsync_url.as_deref()),
+        )?;
         head
     };
     // The push landed; the OBS side picks it up through scmsync.
@@ -5950,16 +6046,24 @@ pub fn refuse_not_submittable_git(
         verify_git_submit_target(wc, target)?;
     }
     if !dry_run.enabled() {
-        let auth = gitea_auth.ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::ConfigError,
-                "a git-backed submit needs a Gitea token: the fetch authenticates with it",
-            )
-        })?;
+        let auth = gitea_auth
+            .filter(|auth| auth.token.is_some() || auth.ssh_key.is_some())
+            .ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ConfigError,
+                    "a git-backed submit needs a Gitea token or SSH key: the fetch authenticates with one of them",
+                )
+            })?;
         let mut header = String::new();
         let mut key = String::new();
         let env = token_env(auth, &mut header, &mut key);
-        git_network(&wc.root, "fetch", &["origin"], &env)?;
+        git_network(
+            &wc.root,
+            "fetch",
+            &["origin"],
+            &env,
+            ssh_key_for_origin(auth.ssh_key, auth.url, wc.scmsync_url.as_deref()),
+        )?;
     }
     refuse_when_remote_ahead(wc)?;
     refuse_on_conflicts(wc)?;
@@ -6196,10 +6300,17 @@ fn update_git(
     let mut header = String::new();
     let mut key = String::new();
     let env: Vec<(&str, &str)> = match gitea_auth {
-        Some(auth) => token_env(auth, &mut header, &mut key).to_vec(),
+        Some(auth) => token_env(auth, &mut header, &mut key),
         None => Vec::new(),
     };
-    git_network(&wc.root, "fetch", &["origin"], &env)?;
+    git_network(
+        &wc.root,
+        "fetch",
+        &["origin"],
+        &env,
+        gitea_auth
+            .and_then(|auth| ssh_key_for_origin(auth.ssh_key, auth.url, wc.scmsync_url.as_deref())),
+    )?;
     let target = match git(&wc.root, "rev-parse", &["@{u}"], &[]) {
         Ok(sha) => sha.trim().to_string(),
         Err(_) => {
@@ -11161,8 +11272,9 @@ mod tests {
     /// instance.
     fn test_auth() -> GiteaAuth<'static> {
         GiteaAuth {
-            token: "token",
+            token: Some("token"),
             url: "https://src.opensuse.org",
+            ssh_key: None,
         }
     }
 
@@ -11184,8 +11296,9 @@ mod tests {
     #[test]
     fn token_env_scopes_the_header_to_the_gitea_instance() {
         let auth = GiteaAuth {
-            token: "SECRET",
+            token: Some("SECRET"),
             url: "https://src.opensuse.org",
+            ssh_key: None,
         };
         let mut header = String::new();
         let mut key = String::new();
@@ -11300,15 +11413,182 @@ mod tests {
     }
 
     #[test]
+    fn token_env_without_a_token_carries_no_header() {
+        let auth = GiteaAuth {
+            token: None,
+            url: "https://src.opensuse.org",
+            ssh_key: None,
+        };
+        let mut header = String::new();
+        let mut key = String::new();
+        let env = token_env(&auth, &mut header, &mut key);
+        assert!(env.is_empty());
+    }
+
+    #[test]
     fn ssh_network_command_falls_back_to_plain_ssh_without_sharing() {
         assert_eq!(
-            ssh_network_command_with(None),
+            ssh_network_command_with(None, None),
             "ssh -o StrictHostKeyChecking=accept-new"
         );
         assert_eq!(
-            ssh_network_command_with(Some("ssh -o ControlMaster=auto".to_string())),
+            ssh_network_command_with(Some("ssh -o ControlMaster=auto".to_string()), None),
             "ssh -o ControlMaster=auto"
         );
+    }
+
+    #[test]
+    fn ssh_network_command_appends_the_configured_key() {
+        let key = Path::new("/home/user/.ssh/id_example");
+        assert_eq!(
+            ssh_network_command_with(None, Some(key)),
+            "ssh -o StrictHostKeyChecking=accept-new -o IdentityFile=\"/home/user/.ssh/id_example\" -o IdentitiesOnly=yes"
+        );
+        assert_eq!(
+            ssh_network_command_with(None, None),
+            "ssh -o StrictHostKeyChecking=accept-new"
+        );
+    }
+
+    #[test]
+    fn ssh_network_command_quotes_a_key_path_with_spaces() {
+        let key = Path::new("/home/user/my keys/id_example");
+        let command = ssh_network_command_with(None, Some(key));
+        assert!(
+            command.contains("-o IdentityFile=\"/home/user/my keys/id_example\""),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn remote_host_reads_the_host_from_every_remote_shape() {
+        assert_eq!(
+            remote_host("https://src.opensuse.org/adamm/gsl.git"),
+            Some("src.opensuse.org".to_string())
+        );
+        assert_eq!(
+            remote_host("https://src.opensuse.org:443/adamm/gsl.git#factory"),
+            Some("src.opensuse.org".to_string())
+        );
+        assert_eq!(
+            remote_host("ssh://git@src.opensuse.org/adamm/gsl.git"),
+            Some("src.opensuse.org".to_string())
+        );
+        assert_eq!(
+            remote_host("git@src.opensuse.org:adamm/gsl.git"),
+            Some("src.opensuse.org".to_string())
+        );
+        assert_eq!(
+            remote_host("https://SRC.OPENSUSE.ORG/adamm/gsl.git"),
+            Some("src.opensuse.org".to_string())
+        );
+        assert_eq!(remote_host("/tmp/origin"), None);
+        assert_eq!(remote_host("relative/path"), None);
+        assert_eq!(remote_host(""), None);
+    }
+
+    #[test]
+    fn ssh_key_for_origin_scopes_the_key_to_the_gitea_host() {
+        let key = Path::new("/home/user/.ssh/id_example");
+        assert_eq!(
+            ssh_key_for_origin(
+                Some(key),
+                "https://src.opensuse.org",
+                Some("git@src.opensuse.org:adamm/gsl.git")
+            ),
+            Some(key)
+        );
+        assert_eq!(
+            ssh_key_for_origin(
+                Some(key),
+                "https://src.opensuse.org",
+                Some("https://src.opensuse.org/adamm/gsl.git")
+            ),
+            Some(key)
+        );
+        // A foreign origin keeps the agent and the default keys:
+        // the configured key never rides along there.
+        assert_eq!(
+            ssh_key_for_origin(
+                Some(key),
+                "https://src.opensuse.org",
+                Some("git@github.com:scarabeusiv/geectl.git")
+            ),
+            None
+        );
+        assert_eq!(
+            ssh_key_for_origin(Some(key), "https://src.opensuse.org", None),
+            None
+        );
+        assert_eq!(
+            ssh_key_for_origin(
+                None,
+                "https://src.opensuse.org",
+                Some("git@src.opensuse.org:adamm/gsl.git")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn git_network_passes_the_configured_key_to_ssh() {
+        // A fake `ssh` on PATH records its argv: the fetch must
+        // reach it with the configured key, and without a key the
+        // options must be absent. The fetch itself fails (no
+        // server) — the log is the assertion. The key path need
+        // not exist: it is only ever passed to ssh as an option.
+        let dir = TempDirGuard::new("git-network-ssh-key");
+        let bin = dir.path.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = dir.path.join("ssh-argv.log");
+        std::fs::write(
+            bin.join("ssh"),
+            format!("#!/bin/sh\necho \"$@\" >> \"{}\"\nexit 1\n", log.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        init_repo(&dir.path);
+        git(
+            &dir.path,
+            "remote",
+            &["add", "origin", "ssh://git@127.0.0.1:22/owner/repo"],
+            &[],
+        )
+        .unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let key = dir.path.join("id_example");
+        let _ = git_network(
+            &dir.path,
+            "fetch",
+            &["origin"],
+            &[("PATH", path.as_str())],
+            Some(&key),
+        );
+        let logged = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(logged.contains("-o IdentityFile="), "{logged}");
+        assert!(
+            logged.contains(&key.to_string_lossy().into_owned()),
+            "{logged}"
+        );
+        assert!(logged.contains("-o IdentitiesOnly=yes"), "{logged}");
+        // And without a key, neither option appears.
+        std::fs::remove_file(&log).unwrap();
+        let _ = git_network(
+            &dir.path,
+            "fetch",
+            &["origin"],
+            &[("PATH", path.as_str())],
+            None,
+        );
+        let logged = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!logged.contains("IdentityFile"), "{logged}");
+        assert!(!logged.contains("IdentitiesOnly"), "{logged}");
     }
 
     #[test]
@@ -11392,8 +11672,9 @@ mod tests {
             ),
         );
         let auth = GiteaAuth {
-            token: "SECRET-TOKEN-123",
+            token: Some("SECRET-TOKEN-123"),
             url: "https://src.opensuse.org",
+            ssh_key: None,
         };
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let _ = checkout(
@@ -11423,8 +11704,9 @@ mod tests {
             ),
         );
         let auth = GiteaAuth {
-            token: "SECRET-TOKEN-123",
+            token: Some("SECRET-TOKEN-123"),
             url: &format!("http://127.0.0.1:{port}"),
+            ssh_key: None,
         };
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let _ = checkout(

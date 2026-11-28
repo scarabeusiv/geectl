@@ -362,42 +362,151 @@ fn run_validate(
 /// levels yield nothing, so a half-configured OBS credential
 /// never breaks a generate the config or env already identifies;
 /// a failed OBS lookup propagates instead of reading as no
-/// identity. `env` is a snapshot (see [`snapshot_env`]).
+/// identity. `env_identity` is the env level already resolved by
+/// the caller from an env snapshot (see [`snapshot_env`]): a
+/// refused peek (a half-set `VC_REALNAME`/`VC_MAILADDR` pair)
+/// propagates here — the strict funnel fails on it — while the
+/// lenient caller (`show_identity`) passes `Ok(None)` for it
+/// and reports the level itself.
+/// Resolve the identity with the level it came from: `"config"`,
+/// `"env"`, `"obs"`, `"git"`, or `"obs (unresolved)"` when no
+/// lookup is supplied and the config and env levels miss — OBS
+/// might still identify the author, but resolving it needs the
+/// network, so the caller reports it unresolved rather than
+/// falling through to git and misattributing the level. With a
+/// lookup, `None` from it falls through to git; a lookup error
+/// propagates instead of reading as no identity.
+pub(crate) fn resolve_identity_with_source(
+    config: &Config,
+    env_identity: Result<Option<Identity>, GeectlError>,
+    dir: &Path,
+    obs_lookup: Option<impl FnOnce() -> Result<Option<Identity>, GeectlError>>,
+) -> Result<(Option<String>, &'static str), GeectlError> {
+    if let Some(identity) = &config.identity {
+        return Ok((Some(identity.format()), "config"));
+    }
+    if let Some(identity) = env_identity? {
+        return Ok((Some(identity.format()), "env"));
+    }
+    match obs_lookup {
+        Some(lookup) => {
+            if let Some(identity) = lookup()? {
+                return Ok((Some(identity.format()), "obs"));
+            }
+        }
+        None => return Ok((None, "obs (unresolved)")),
+    }
+    if let Some(identity) = crate::working_copy::git_identity(dir)? {
+        return Ok((Some(identity.format()), "git"));
+    }
+    Ok((None, "none"))
+}
+
 pub(crate) fn resolve_changelog_identity(
     config: &Config,
     env: &HashMap<String, String>,
     dir: &Path,
     obs_lookup: impl FnOnce() -> Result<Option<Identity>, GeectlError>,
 ) -> Result<String, GeectlError> {
-    if let Some(identity) = &config.identity {
-        return Ok(identity.format());
+    match resolve_identity_with_source(
+        config,
+        crate::config::identity_from_env_map(env),
+        dir,
+        Some(obs_lookup),
+    )? {
+        (Some(identity), _) => Ok(identity),
+        (None, _) => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "no changelog identity found: set [identity] name and email in the config file, VC_REALNAME and VC_MAILADDR in the environment, or pass --author 'Name <email>'",
+        )),
     }
-    if let Some(identity) = crate::config::identity_from_env_map(env)? {
-        return Ok(identity.format());
-    }
-    if let Some(identity) = obs_lookup()? {
-        return Ok(identity.format());
-    }
-    if let Some(identity) = crate::working_copy::git_identity(dir)? {
-        return Ok(identity.format());
-    }
-    Err(GeectlError::new(
-        ErrorKind::InvalidInput,
-        "no changelog identity found: set [identity] name and email in the config file, VC_REALNAME and VC_MAILADDR in the environment, or pass --author 'Name <email>'",
-    ))
 }
 
 /// The OBS-account level of the identity chain: the authenticated
 /// user's real name and email from `whois`. No username in the
 /// credentials (API-key auth carries none) yields nothing — the
-/// chain falls through to git.
+/// chain falls through to git. With `--instance`, strictly the
+/// flagged alias's variables: the identity path must not borrow
+/// the default credentials where a `--live` leaf would refuse.
 fn obs_identity(debug: &Debug, instance: Option<&str>) -> Result<Option<Identity>, GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let (base, instances) = crate::cli_remote::obs_endpoint(instance)?;
-    let credentials = crate::auth::EnvObsAuth::credentials_for_url(&base, &base, &instances)?;
+    let credentials = match instance {
+        Some(alias) => crate::auth::EnvObsAuth::credentials_for_instance(alias, &instances)?,
+        None => crate::auth::EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
+    };
     let client =
         ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
     identity_from_obs_client(&client)
+}
+
+/// The identity `config show` reports, with the level it came
+/// from — the same funnel as [`resolve_changelog_identity`], but
+/// without taking the network by default: `resolve_obs` runs the
+/// OBS lookup over the network (errors propagate, like a
+/// generate); without it, a credential carrying a username means
+/// OBS might still identify the author, so the level reports
+/// `"obs (unresolved)"` instead of git's answer — and a
+/// credential with no username (or none readable at all) yields
+/// no OBS identity without a call, so the funnel falls through
+/// to git. A misconfigured level never fails the show: a half-set
+/// env identity reports `"env (unresolved)"`, a credential that
+/// cannot even be read reports `"obs (error)"`, and `obs_auth`
+/// already reports the misconfiguration.
+pub fn show_identity(
+    config: &Config,
+    instance: Option<&str>,
+    debug: &Debug,
+    resolve_obs: bool,
+) -> Result<(Option<String>, &'static str), GeectlError> {
+    let env = crate::auth::snapshot_env(&[VC_REALNAME_VAR, VC_MAILADDR_VAR])?;
+    let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // The env level is peeked leniently: a half-set identity never
+    // fails the show — the level reports `env (unresolved)` instead.
+    // The config level wins over env, so a broken env only matters
+    // when no config identity is set.
+    let env_peek = crate::config::identity_from_env_map(&env);
+    if config.identity.is_none() && env_peek.is_err() {
+        return Ok((None, "env (unresolved)"));
+    }
+    let env_identity = env_peek.ok().flatten();
+    if resolve_obs {
+        return resolve_identity_with_source(
+            config,
+            Ok(env_identity),
+            &dir,
+            Some(|| obs_identity(debug, instance)),
+        );
+    }
+    if config.identity.is_none() && env_identity.is_none() {
+        match obs_username_available(instance) {
+            Ok(true) => return Ok((None, "obs (unresolved)")),
+            Err(_) => return Ok((None, "obs (error)")),
+            Ok(false) => {}
+        }
+    }
+    resolve_identity_with_source(config, Ok(env_identity), &dir, Some(|| Ok(None)))
+}
+
+/// Whether the OBS credentials resolve to a username at all —
+/// the no-network peek for [`show_identity`]: only a username
+/// could identify the author over `whois`, so a credential
+/// without one (API-key auth, or nothing configured) yields no
+/// OBS identity without a call. A credential that cannot even be
+/// read is an error, not an absence: the caller reports the OBS
+/// level as `"obs (error)"` instead of falling through to git
+/// and misattributing the level — `generate` would fail closed
+/// on the same credential. An unresolvable endpoint still yields
+/// nothing: the show already fails on it before peeking.
+fn obs_username_available(instance: Option<&str>) -> Result<bool, GeectlError> {
+    let Ok((base, instances)) = crate::cli_remote::obs_endpoint(instance) else {
+        return Ok(false);
+    };
+    let resolved = match instance {
+        Some(alias) => crate::auth::EnvObsAuth::credentials_for_instance(alias, &instances),
+        None => crate::auth::EnvObsAuth::credentials_for_url(&base, &base, &instances),
+    }?;
+    Ok(resolved.username().is_some())
 }
 
 fn identity_from_obs_client(client: &ObsClient) -> Result<Option<Identity>, GeectlError> {
@@ -871,6 +980,86 @@ mod tests {
         assert!(err.context.contains("[identity]"), "{}", err.context);
         assert!(err.context.contains("VC_REALNAME"), "{}", err.context);
         assert!(err.context.contains("--author"), "{}", err.context);
+    }
+
+    #[test]
+    fn resolve_identity_with_source_reports_each_level() {
+        // The source is the level the identity came from, and the
+        // lookup runs only when the config and env levels miss —
+        // the same funnel `config show` reports.
+        let missing = Path::new("/definitely/not/a/real/dir");
+        let (identity, source) = resolve_identity_with_source(
+            &identity_config(),
+            crate::config::identity_from_env_map(&env_identity()),
+            missing,
+            Some(|| Ok(Some(obs_identity()))),
+        )
+        .unwrap();
+        assert_eq!(
+            identity.as_deref(),
+            Some("Config Author <config@example.com>")
+        );
+        assert_eq!(source, "config");
+        let (identity, source) = resolve_identity_with_source(
+            &Config::default(),
+            crate::config::identity_from_env_map(&env_identity()),
+            missing,
+            Some(|| Ok(Some(obs_identity()))),
+        )
+        .unwrap();
+        assert_eq!(identity.as_deref(), Some("Env Author <env@example.com>"));
+        assert_eq!(source, "env");
+        let (identity, source) = resolve_identity_with_source(
+            &Config::default(),
+            crate::config::identity_from_env_map(&HashMap::new()),
+            missing,
+            Some(|| Ok(Some(obs_identity()))),
+        )
+        .unwrap();
+        assert_eq!(identity.as_deref(), Some("Obs Author <obs@example.com>"));
+        assert_eq!(source, "obs");
+        let (identity, source) = resolve_identity_with_source(
+            &Config::default(),
+            crate::config::identity_from_env_map(&HashMap::new()),
+            missing,
+            Some(|| Ok(None)),
+        )
+        .unwrap();
+        assert_eq!(identity, None);
+        assert_eq!(source, "none");
+    }
+
+    #[test]
+    fn resolve_identity_with_source_without_lookup_reports_obs_unresolved() {
+        // No lookup means OBS might still win: the level reports
+        // `obs (unresolved)` without consulting git — a git answer
+        // must never be misattributed to OBS.
+        let (identity, source) = resolve_identity_with_source(
+            &Config::default(),
+            crate::config::identity_from_env_map(&HashMap::new()),
+            Path::new("/definitely/not/a/real/dir"),
+            None::<fn() -> Result<Option<Identity>, GeectlError>>,
+        )
+        .unwrap();
+        assert_eq!(identity, None);
+        assert_eq!(source, "obs (unresolved)");
+    }
+
+    #[test]
+    fn resolve_identity_with_source_propagates_a_refused_env_peek() {
+        // The strict funnel (generate) fails on a half-set env
+        // identity instead of reading it as no identity: only
+        // `show_identity` peeks leniently.
+        let mut env = HashMap::new();
+        env.insert(VC_REALNAME_VAR.to_string(), "Half Author".to_string());
+        let err = resolve_identity_with_source(
+            &Config::default(),
+            crate::config::identity_from_env_map(&env),
+            Path::new("/definitely/not/a/real/dir"),
+            Some(|| Ok(Some(obs_identity()))),
+        )
+        .unwrap_err();
+        assert!(err.context.contains(VC_MAILADDR_VAR), "{}", err.context);
     }
 
     fn test_person(realname: Option<&str>, email: Option<&str>) -> Person {

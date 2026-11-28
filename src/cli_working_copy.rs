@@ -18,8 +18,8 @@
 //! coordinate header, then `dry_run:`, then the result line and the
 //! plan.
 
-use crate::auth::{Credentials, EnvGiteaAuth, EnvObsAuth};
-use crate::config::{self, DEFAULT_GITEA_URL};
+use crate::auth::{AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth, GiteaSshKey};
+use crate::config;
 use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{HttpClient, Timeout, UreqClient};
@@ -31,11 +31,13 @@ use crate::working_copy::{
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-/// The resolved endpoints: the OBS base URL, the config file's
-/// instances, the flagged instance when `--instance` names one,
-/// and the effective config (for the commit service gate).
+/// The resolved endpoints: the OBS base URL, the Gitea base URL,
+/// the config file's instances, the flagged instance when
+/// `--instance` names one, and the effective config (for the commit
+/// service gate).
 struct Endpoints {
     obs_base: String,
+    gitea_base: String,
     instances: Vec<(String, String)>,
     instance: Option<String>,
     config: config::Config,
@@ -53,8 +55,12 @@ fn endpoints(instance: Option<&str>) -> Result<Endpoints, GeectlError> {
             .clone()
             .unwrap_or_else(|| OBS_API_BASE.to_string()),
     };
+    // The Gitea base honours `--instance` like the OBS base: the
+    // flagged alias's URL, else the effective Gitea URL.
+    let gitea_base = config::gitea_base_url(instance, &file_config)?;
     Ok(Endpoints {
         obs_base,
+        gitea_base,
         instances: file_config.instances,
         instance: instance.map(str::to_string),
         config: effective.config,
@@ -108,30 +114,82 @@ fn obs_client<'a>(
         .map(|client| client.with_debug(debug.clone()))
 }
 
-/// The Gitea credentials for the configured instance: the token
-/// and the instance URL it belongs to. `None` when no token is
-/// configured: a public git-backed checkout needs none, and the
-/// push is what fails closed without one. The URL scopes the token
-/// (see `working_copy::GiteaAuth`): git only sends it to that
-/// instance.
-fn gitea_auth(endpoints: &Endpoints) -> Result<Option<(String, String)>, GeectlError> {
-    let url = endpoints
-        .config
-        .gitea_url
-        .clone()
-        .unwrap_or_else(|| DEFAULT_GITEA_URL.to_string());
-    match EnvGiteaAuth::credentials_for_url(&url, &url, &endpoints.instances)? {
-        Credentials::Bearer { token } => Ok(Some((token, url))),
-        _ => Ok(None),
+/// The Gitea credentials for a git-backed operation: the token
+/// (when one is configured) and the instance URL it belongs to,
+/// plus the SSH key (when one is configured) for checkouts whose
+/// origin is an SSH remote. The key applies only when the
+/// checkout's origin names this instance's host (see
+/// `working_copy::ssh_key_for_origin`); a foreign origin keeps the
+/// agent and the default keys.
+struct GiteaCredentials {
+    token: Option<String>,
+    url: String,
+    ssh_key: Option<PathBuf>,
+}
+
+/// The Gitea credentials for the configured instance. `None` when
+/// neither a token nor a key is configured: a public git-backed
+/// checkout needs neither, and the push is what fails closed
+/// without a token. The URL scopes the token (see
+/// `working_copy::GiteaAuth`): git only sends it to that
+/// instance. With `--instance`, the flagged alias's URL is the
+/// base and only the alias's token variables authenticate — but
+/// the token stays optional: an alias with no token variables
+/// reads as no token (a public checkout), while a set-but-
+/// misconfigured alias token fails closed. The key follows the
+/// same instance (see `gitea_ssh_key_path`).
+fn gitea_auth(endpoints: &Endpoints) -> Result<Option<GiteaCredentials>, GeectlError> {
+    let url = endpoints.gitea_base.clone();
+    let token = match &endpoints.instance {
+        Some(alias) => {
+            match EnvGiteaAuth::credentials_for_instance_optional(alias, &endpoints.instances)? {
+                Some(Credentials::Bearer { token }) => Some(token),
+                _ => None,
+            }
+        }
+        None => match EnvGiteaAuth::credentials_for_url(&url, &url, &endpoints.instances)? {
+            Credentials::Bearer { token } => Some(token),
+            _ => None,
+        },
+    };
+    let ssh_key = gitea_ssh_key_path(endpoints.instance.as_deref(), &endpoints.instances)?;
+    if token.is_none() && ssh_key.is_none() {
+        return Ok(None);
     }
+    Ok(Some(GiteaCredentials {
+        token,
+        url,
+        ssh_key,
+    }))
+}
+
+/// The configured Gitea SSH key path for `instance`: the alias's
+/// own variable (`GEECTL_GITEA_SSH_KEY_<ALIAS>`) wins when set,
+/// else the plain variable — the key is a git-transport
+/// credential, not an API credential, so an alias without its own
+/// key keeps using the single configured git key. `None` when
+/// neither is set. A set-but-misconfigured key fails closed.
+pub(crate) fn gitea_ssh_key_path(
+    instance: Option<&str>,
+    instances: &[(String, String)],
+) -> Result<Option<PathBuf>, GeectlError> {
+    let credentials = match instance {
+        Some(alias) => GiteaSshKey::credentials_for_instance(alias, instances)?,
+        None => GiteaSshKey.credentials()?,
+    };
+    Ok(match credentials {
+        Credentials::SshKey { path } => Some(path),
+        _ => None,
+    })
 }
 
 /// The configured Gitea instance as a `working_copy::GiteaAuth`,
-/// when a token is set.
-fn gitea_auth_ref(auth: &Option<(String, String)>) -> Option<working_copy::GiteaAuth<'_>> {
-    auth.as_ref().map(|(token, url)| working_copy::GiteaAuth {
-        token: token.as_str(),
-        url: url.as_str(),
+/// when a token or a key is set.
+fn gitea_auth_ref(auth: &Option<GiteaCredentials>) -> Option<working_copy::GiteaAuth<'_>> {
+    auth.as_ref().map(|creds| working_copy::GiteaAuth {
+        token: creds.token.as_deref(),
+        url: creds.url.as_str(),
+        ssh_key: creds.ssh_key.as_deref(),
     })
 }
 
@@ -1191,6 +1249,7 @@ mod tests {
         let http = FakeHttp::new();
         let endpoints = Endpoints {
             obs_base: "https://api.example.org".to_string(),
+            gitea_base: "https://gitea.example.org".to_string(),
             instances: vec![("example".to_string(), "https://api.example.org".to_string())],
             instance: Some("example".to_string()),
             config: config::Config {

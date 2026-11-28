@@ -1122,9 +1122,10 @@ pub fn gitea_alias_vars(alias: &str) -> (String, String) {
 /// `ConfigError` naming the variables to set — it fails closed
 /// even when nothing is configured anywhere, unlike
 /// [`resolve_gitea_bearer_for_url`], which returns
-/// [`Credentials::None`] in that case. The alias's URL is not
-/// used: the flag selects the account, not the host — the Gitea
-/// host stays the configured one.
+/// [`Credentials::None`] in that case. The alias's URL is the
+/// host: the caller pairs this with the alias URL from
+/// [`crate::config::gitea_base_url`], so the flag selects the
+/// account and the host together.
 pub fn resolve_gitea_for_instance(
     alias: &str,
     instances: &[(String, String)],
@@ -1142,6 +1143,29 @@ pub fn resolve_gitea_for_instance(
         )),
         creds => Ok(creds),
     }
+}
+
+/// Resolve Gitea credentials strictly for one named instance,
+/// when the alias carries a token at all — the optional-token
+/// form of [`resolve_gitea_for_instance`]. `None` when neither
+/// alias token variable is set: a public operation proceeds
+/// without one, like the no-flag path when nothing is configured
+/// at all. A set-but-misconfigured alias token still fails
+/// closed, and an unknown alias fails naming the known aliases.
+pub fn resolve_gitea_for_instance_optional(
+    alias: &str,
+    instances: &[(String, String)],
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Option<Credentials>, GeectlError> {
+    let _ = url_for_alias(instances, alias)?;
+    let (token_var, token_file_var) = gitea_alias_vars(alias);
+    if vars(&token_var).is_none() && vars(&token_file_var).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(resolve_gitea_for_instance(
+        alias, instances, vars, read_file,
+    )?))
 }
 
 /// Resolve the Gitea API token for one Gitea URL.
@@ -1249,21 +1273,27 @@ fn resolve_gitea_unmatched_url(
 /// public key passed as a private key, is a misconfiguration, not a
 /// key. The key authenticates git operations only; the HTTP client
 /// refuses it.
-pub fn resolve_gitea_ssh_key(
-    vars: VarLookup<'_>,
+/// The SSH key variable for one instance alias: the alias as
+/// written in the config, uppercased (env vars are conventionally
+/// uppercase).
+pub fn gitea_ssh_key_alias_vars(alias: &str) -> String {
+    format!("{GITEA_SSH_KEY_VAR}_{}", alias.to_ascii_uppercase())
+}
+
+/// Validate one SSH key file and return it as a credential: the
+/// file must be a regular file no other user can read, holding a
+/// PEM private-key block.
+fn validate_gitea_ssh_key(
+    path: &Path,
     open_file: SecretFileOpener<'_>,
 ) -> Result<Credentials, GeectlError> {
-    let Some(path) = vars(GITEA_SSH_KEY_VAR) else {
-        return Ok(Credentials::None);
-    };
-    let path = PathBuf::from(path);
     // One open for the mode and the content: the mode is of the file
     // that was opened, so the type and permission checks and the read
     // are on the same file — no second path resolution in between.
     // A key other users can read is a misconfiguration, and it should
     // not even be read — hence the permission check before the PEM
     // validation below.
-    let (mode, content) = open_file(&path).map_err(|e| {
+    let (mode, content) = open_file(path).map_err(|e| {
         GeectlError::new(
             ErrorKind::ConfigError,
             format!("cannot read SSH key {}: {e}", path.display()),
@@ -1313,7 +1343,49 @@ pub fn resolve_gitea_ssh_key(
             ),
         ));
     }
-    Ok(Credentials::SshKey { path })
+    Ok(Credentials::SshKey {
+        path: path.to_path_buf(),
+    })
+}
+
+/// Resolve the Gitea SSH key from the plain variable
+/// (`GEECTL_GITEA_SSH_KEY`): `Credentials::None` when it is not
+/// set, a `ConfigError` when the file it names is not a valid key.
+pub fn resolve_gitea_ssh_key(
+    vars: VarLookup<'_>,
+    open_file: SecretFileOpener<'_>,
+) -> Result<Credentials, GeectlError> {
+    let Some(path) = vars(GITEA_SSH_KEY_VAR) else {
+        return Ok(Credentials::None);
+    };
+    validate_gitea_ssh_key(Path::new(&path), open_file)
+}
+
+/// Resolve the Gitea SSH key for one named instance — the
+/// `--instance` path. The alias's own variable
+/// (`GEECTL_GITEA_SSH_KEY_<ALIAS>`) wins when set, else the plain
+/// variable: the key is a git-transport credential, not an API
+/// credential, so an alias without its own key keeps using the
+/// single configured git key — ssh falls back to the agent and the
+/// default keys, and the alias form exists so different instances
+/// can have different deploy keys. `None` when neither is set. A
+/// set-but-misconfigured key fails closed, never falling back to
+/// the other variable, and an unknown alias fails naming the known
+/// aliases.
+pub fn resolve_gitea_ssh_key_for_instance(
+    alias: &str,
+    instances: &[(String, String)],
+    vars: VarLookup<'_>,
+    open_file: SecretFileOpener<'_>,
+) -> Result<Option<Credentials>, GeectlError> {
+    let _ = url_for_alias(instances, alias)?;
+    let path = vars(&gitea_ssh_key_alias_vars(alias))
+        .or_else(|| vars(GITEA_SSH_KEY_VAR))
+        .map(PathBuf::from);
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    Ok(Some(validate_gitea_ssh_key(&path, open_file)?))
 }
 
 /// The `.env` file name, looked up in the current working directory
@@ -1774,6 +1846,30 @@ impl EnvGiteaAuth {
             &read_secret_file_production,
         )
     }
+
+    /// Gitea credentials strictly for one named instance from the
+    /// process environment, when the alias carries a token at all —
+    /// the `--instance` path for a token that is optional. `None`
+    /// when neither alias token variable is set: a public operation
+    /// proceeds without one, like the no-flag path when nothing is
+    /// configured at all. A set-but-misconfigured alias token (both
+    /// variables set, an unreadable token file) still fails closed,
+    /// like [`credentials_for_instance`], and an unknown alias fails
+    /// naming the known aliases.
+    pub fn credentials_for_instance_optional(
+        alias: &str,
+        instances: &[(String, String)],
+    ) -> Result<Option<Credentials>, GeectlError> {
+        let (token_var, token_file_var) = gitea_alias_vars(alias);
+        let names = [token_var.as_str(), token_file_var.as_str()];
+        let env = snapshot_env(&names)?;
+        resolve_gitea_for_instance_optional(
+            alias,
+            instances,
+            &|name| env.get(name).cloned(),
+            &read_secret_file_production,
+        )
+    }
 }
 
 /// Gitea SSH key from the process environment. See
@@ -1784,6 +1880,32 @@ impl AuthProvider for GiteaSshKey {
     fn credentials(&self) -> Result<Credentials, GeectlError> {
         let env = snapshot_env(&[GITEA_SSH_KEY_VAR])?;
         resolve_gitea_ssh_key(&|name| env.get(name).cloned(), &open_secret_file_production)
+    }
+}
+
+impl GiteaSshKey {
+    /// The Gitea SSH key for one named instance from the process
+    /// environment — the `--instance` path. See
+    /// [`resolve_gitea_ssh_key_for_instance`]: the alias's own
+    /// variable wins when set, else the plain one, and a
+    /// set-but-misconfigured key fails closed. The alias and plain
+    /// variables are snapshotted so resolution sees one consistent
+    /// view of the environment. `Credentials::None` when neither
+    /// variable is set.
+    pub fn credentials_for_instance(
+        alias: &str,
+        instances: &[(String, String)],
+    ) -> Result<Credentials, GeectlError> {
+        let alias_var = gitea_ssh_key_alias_vars(alias);
+        let names = [alias_var.as_str(), GITEA_SSH_KEY_VAR];
+        let env = snapshot_env(&names)?;
+        Ok(resolve_gitea_ssh_key_for_instance(
+            alias,
+            instances,
+            &|name| env.get(name).cloned(),
+            &open_secret_file_production,
+        )?
+        .unwrap_or(Credentials::None))
     }
 }
 
@@ -2093,6 +2215,55 @@ mod tests {
     fn instance_flag_with_no_gitea_token_fails_closed() {
         let map = vars(&[]);
         let err = resolve_gitea_for_instance(
+            "example",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("GEECTL_GITEA_TOKEN_EXAMPLE"));
+    }
+
+    #[test]
+    fn optional_instance_token_is_none_when_the_alias_sets_nothing() {
+        // The public-operation form: neither alias variable set
+        // reads as no token, even with a plain token configured —
+        // the plain token belongs to the default instance and is
+        // never borrowed for the flagged alias.
+        let map = vars(&[(GITEA_TOKEN_VAR, "plain-token")]);
+        let creds = resolve_gitea_for_instance_optional(
+            "example",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(creds.is_none());
+    }
+
+    #[test]
+    fn optional_instance_token_resolves_the_alias_token_when_set() {
+        let map = vars(&[("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token")]);
+        let creds = resolve_gitea_for_instance_optional(
+            "example",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(matches!(creds, Some(Credentials::Bearer { ref token }) if token == "alias-token"));
+    }
+
+    #[test]
+    fn optional_instance_token_fails_closed_on_a_misconfigured_alias() {
+        // Both alias variables set is a misconfiguration, not an
+        // absence: the optional form fails like the strict one.
+        let map = vars(&[
+            ("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token"),
+            ("GEECTL_GITEA_TOKEN_FILE_EXAMPLE", "/tmp/token"),
+        ]);
+        let err = resolve_gitea_for_instance_optional(
             "example",
             &instances(&[("example", "https://api.example.org")]),
             &lookup(&map),
@@ -2631,6 +2802,105 @@ mod tests {
         let files = files(&[(SSH_KEY_PATH, SSH_KEY_PEM)]);
         let creds = resolve_gitea_ssh_key(&lookup(&map), &opener(&files, None)).unwrap();
         assert!(matches!(creds, Credentials::SshKey { .. }));
+    }
+
+    const SSH_KEY_ALIAS_PATH: &str = "/home/user/.ssh/id_example";
+
+    fn ssh_key_instances() -> Vec<(String, String)> {
+        instances(&[("example", "https://gitea.example.org")])
+    }
+
+    #[test]
+    fn gitea_ssh_key_alias_var_wins_over_the_plain_key() {
+        let alias_var = gitea_ssh_key_alias_vars("example");
+        let map = vars(&[
+            (alias_var.as_str(), SSH_KEY_ALIAS_PATH),
+            (GITEA_SSH_KEY_VAR, SSH_KEY_PATH),
+        ]);
+        let files = files(&[
+            (SSH_KEY_ALIAS_PATH, SSH_KEY_PEM),
+            (SSH_KEY_PATH, SSH_KEY_PEM),
+        ]);
+        let creds = resolve_gitea_ssh_key_for_instance(
+            "example",
+            &ssh_key_instances(),
+            &lookup(&map),
+            &opener(&files, Some(0o100600)),
+        )
+        .unwrap();
+        assert!(
+            matches!(creds, Some(Credentials::SshKey { ref path }) if path == Path::new(SSH_KEY_ALIAS_PATH))
+        );
+    }
+
+    #[test]
+    fn gitea_ssh_key_alias_falls_back_to_the_plain_key() {
+        let map = vars(&[(GITEA_SSH_KEY_VAR, SSH_KEY_PATH)]);
+        let files = files(&[(SSH_KEY_PATH, SSH_KEY_PEM)]);
+        let creds = resolve_gitea_ssh_key_for_instance(
+            "example",
+            &ssh_key_instances(),
+            &lookup(&map),
+            &opener(&files, Some(0o100600)),
+        )
+        .unwrap();
+        assert!(
+            matches!(creds, Some(Credentials::SshKey { ref path }) if path == Path::new(SSH_KEY_PATH))
+        );
+    }
+
+    #[test]
+    fn gitea_ssh_key_for_instance_unconfigured_is_none() {
+        let map = vars(&[]);
+        let creds = resolve_gitea_ssh_key_for_instance(
+            "example",
+            &ssh_key_instances(),
+            &lookup(&map),
+            &opener(&empty_files(), None),
+        )
+        .unwrap();
+        assert!(creds.is_none());
+    }
+
+    #[test]
+    fn gitea_ssh_key_alias_misconfigured_fails_closed() {
+        // A group-readable alias key fails naming the alias path —
+        // it never falls back to the valid plain key.
+        let alias_var = gitea_ssh_key_alias_vars("example");
+        let map = vars(&[
+            (alias_var.as_str(), SSH_KEY_ALIAS_PATH),
+            (GITEA_SSH_KEY_VAR, SSH_KEY_PATH),
+        ]);
+        let files = files(&[
+            (SSH_KEY_ALIAS_PATH, SSH_KEY_PEM),
+            (SSH_KEY_PATH, SSH_KEY_PEM),
+        ]);
+        let err = resolve_gitea_ssh_key_for_instance(
+            "example",
+            &ssh_key_instances(),
+            &lookup(&map),
+            &opener(&files, Some(0o100644)),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains(SSH_KEY_ALIAS_PATH));
+        assert!(!err.context.contains(SSH_KEY_PATH));
+    }
+
+    #[test]
+    fn gitea_ssh_key_unknown_alias_names_the_known_aliases() {
+        let map = vars(&[(GITEA_SSH_KEY_VAR, SSH_KEY_PATH)]);
+        let files = files(&[(SSH_KEY_PATH, SSH_KEY_PEM)]);
+        let err = resolve_gitea_ssh_key_for_instance(
+            "other",
+            &ssh_key_instances(),
+            &lookup(&map),
+            &opener(&files, Some(0o100600)),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("other"));
+        assert!(err.context.contains("example"));
     }
 
     #[test]

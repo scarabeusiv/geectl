@@ -1401,29 +1401,52 @@ impl<'a> GiteaClient<'a> {
         http: &'a dyn HttpClient,
         debug: &Debug,
     ) -> Result<Option<Self>, GeectlError> {
+        Self::try_from_config_for(http, None, debug)
+    }
+
+    /// The lazy client for the filing-path freshness check, for one
+    /// instance: with `--instance`, the flagged alias's URL is the
+    /// base and only the alias's token variables authenticate — the
+    /// default host and token must never serve an aliased operation.
+    /// Without it, the effective URL with the per-URL resolution.
+    pub fn try_from_config_for(
+        http: &'a dyn HttpClient,
+        instance: Option<&str>,
+        debug: &Debug,
+    ) -> Result<Option<Self>, GeectlError> {
         let path = config::config_path()?;
         let file_config = config::load_config_at(&path)?;
-        let effective = config::effective_config(&file_config)?;
-        // Unreachable by construction — effective_config always yields
-        // Some(gitea_url) — but kept as a defensive default rather than
-        // an unwrap: a config change must not turn into a panic here.
-        let base = effective
-            .config
-            .gitea_url
-            .as_deref()
-            .unwrap_or(DEFAULT_GITEA_URL);
+        let base = match instance {
+            Some(alias) => config::gitea_base_url(Some(alias), &file_config)?,
+            None => {
+                let effective = config::effective_config(&file_config)?;
+                // Unreachable by construction — effective_config always yields
+                // Some(gitea_url) — but kept as a defensive default rather than
+                // an unwrap: a config change must not turn into a panic here.
+                effective
+                    .config
+                    .gitea_url
+                    .as_deref()
+                    .unwrap_or(DEFAULT_GITEA_URL)
+                    .to_string()
+            }
+        };
         // Both arguments are `base`: it is the effective URL
         // (environment, then config file, then default), so the plain
         // variables belong to it — the same resolution `gitea_client`
-        // performs.
-        let credentials = EnvGiteaAuth::credentials_for_url(base, base, &file_config.instances)?;
+        // performs. With `--instance` the flag selects the account:
+        // strictly the alias's own token variables.
+        let credentials = match instance {
+            Some(alias) => EnvGiteaAuth::credentials_for_instance(alias, &file_config.instances)?,
+            None => EnvGiteaAuth::credentials_for_url(&base, &base, &file_config.instances)?,
+        };
         if matches!(credentials, Credentials::None) {
             debug.emit(
                 "decision: no Gitea token configured; the filing-path freshness check is off",
             );
             return Ok(None);
         }
-        Self::with_base(http, base, credentials)
+        Self::with_base(http, &base, credentials)
             .map(|client| client.with_debug(debug.clone()))
             .map(Some)
     }

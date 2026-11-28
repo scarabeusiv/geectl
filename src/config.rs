@@ -340,6 +340,25 @@ pub fn obs_base_url(instance: Option<&str>, file_config: &Config) -> Result<Stri
     }
 }
 
+/// The Gitea base URL for one call, honouring `--instance`: the
+/// alias's URL when the flag names one (an unknown alias is a
+/// `ConfigError` naming the known aliases), else the effective
+/// Gitea URL — environment, then config file, then the built-in
+/// default. The mirror of [`obs_base_url`]: `--instance` selects
+/// the host on both backends, not the token alone.
+pub fn gitea_base_url(instance: Option<&str>, file_config: &Config) -> Result<String, GeectlError> {
+    match instance {
+        Some(alias) => Ok(url_for_alias(&file_config.instances, alias)?.to_string()),
+        None => {
+            let effective = effective_config(file_config)?;
+            Ok(effective
+                .config
+                .gitea_url
+                .unwrap_or_else(|| DEFAULT_GITEA_URL.to_string()))
+        }
+    }
+}
+
 /// The OBS base URL and credentials for one call, honouring
 /// `--instance`: with the flag, the alias's URL and strictly the
 /// alias's own credential variables (see
@@ -1043,7 +1062,8 @@ pub const CONFIG_TEMPLATE: &str = r#"# geectl configuration — endpoint URLs, t
 #          or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD
 #          (or GEECTL_OBS_PASSWORD_FILE)
 #   Gitea: GEECTL_GITEA_TOKEN (or GEECTL_GITEA_TOKEN_FILE)
-#          GEECTL_GITEA_SSH_KEY for git operations
+#          GEECTL_GITEA_SSH_KEY for git operations over SSH
+#          (or GEECTL_GITEA_SSH_KEY_<ALIAS> for one instance)
 # A credential-shaped key in this file is a refusal to run.
 # A second instance gets one line in [instances] (alias → URL) and
 # its own variables, with the alias uppercased:
@@ -2715,6 +2735,25 @@ mod tests {
     fn obs_base_url_flag_unknown_alias_is_a_config_error() {
         let config = instances_config();
         let err = obs_base_url(Some("missing"), &config).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("missing"));
+        assert!(err.context.contains("example"));
+        assert!(err.context.contains("other"));
+    }
+
+    #[test]
+    fn gitea_base_url_flag_returns_the_alias_url() {
+        let config = instances_config();
+        assert_eq!(
+            gitea_base_url(Some("other"), &config).unwrap(),
+            "https://other.example.org"
+        );
+    }
+
+    #[test]
+    fn gitea_base_url_flag_unknown_alias_is_a_config_error() {
+        let config = instances_config();
+        let err = gitea_base_url(Some("missing"), &config).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(err.context.contains("missing"));
         assert!(err.context.contains("example"));

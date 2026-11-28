@@ -15,7 +15,11 @@
 //! rest of the meta is kept as it is. There is no flag to clear a
 //! field, and no flag names a field the other backend cannot set:
 //! the OBS title, scmsync, devel project, and persons stay on
-//! `remote set-project-meta` / `remote set-package-meta`.
+//! `remote set-project-meta` / `remote set-package-meta` — except
+//! `--from-file`, which writes a whole OBS meta from the typed
+//! JSON `remote project-meta` / `remote package-meta` emits
+//! (Gitea has no whole-file meta concept, so the flag has no
+//! Gitea arm).
 //!
 //! The write is dry-run by default and mutates only with the
 //! global `--live`. A write on an arm needs that arm's credentials
@@ -40,28 +44,33 @@
 //! the JSON payload remains the complete record in every case.
 
 use crate::auth::{Credentials, EnvObsAuth};
+use crate::cli_remote::{read_package_meta_file, read_project_meta_file};
 use crate::config;
 use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{parse_gitea_repo, GiteaClient};
 use crate::http::{Timeout, UreqClient};
-use crate::meta::{MetaClient, MetaFields, MetaTarget, SetMeta};
+use crate::meta::{MetaClient, MetaFields, MetaTarget, SetMeta, WholeMeta};
 use crate::obs::{DryRun, ObsClient};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 
 /// The `meta` subcommands. One operation for both backends: the
 /// target selects the backend.
 #[derive(Debug, Subcommand)]
 pub enum MetaCommand {
     /// Set the meta of an OBS project, an OBS package, or a Gitea
-    /// repository: the description and/or URL. The target selects
-    /// the backend: `--project` (with `--package` for a package)
-    /// writes OBS meta, `--repo` writes Gitea repo settings. A
-    /// mutation: dry-run is the default (only the plan is
-    /// printed); `--live` performs the write. Only the given
-    /// fields change; the rest of the meta is kept as it is. There
-    /// is no flag to clear a field.
+    /// repository: the description and/or URL, or the whole meta
+    /// from a file on the OBS arm. The target selects the backend:
+    /// `--project` (with `--package` for a package) writes OBS
+    /// meta, `--repo` writes Gitea repo settings. A mutation:
+    /// dry-run is the default (only the plan is printed); `--live`
+    /// performs the write. Field flags change only the given
+    /// fields; the rest of the meta is kept as it is.
+    /// `--from-file` instead replaces the whole meta: fields the
+    /// file omits are cleared. There is no field flag to clear a
+    /// field.
     Set(SetMetaArgs),
 }
 
@@ -79,12 +88,20 @@ pub struct SetMetaArgs {
     #[arg(long, conflicts_with = "project")]
     repo: Option<String>,
     /// A short description.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "from_file")]
     description: Option<String>,
     /// A URL with more information; the repository website on the
     /// Gitea arm.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "from_file")]
     url: Option<String>,
+    /// Write the given meta file as the whole meta instead of
+    /// setting fields: the file is the typed JSON `remote
+    /// project-meta` / `remote package-meta` emits (an OBS XML
+    /// document stays accepted as a legacy format). OBS targets
+    /// only: Gitea has no whole-file meta concept. Fields the file
+    /// omits are cleared. Conflicts with --description and --url.
+    #[arg(long, conflicts_with_all = ["description", "url"])]
+    from_file: Option<PathBuf>,
 }
 
 /// Run a `meta` command, returning the JSON payload and its text
@@ -103,24 +120,52 @@ pub fn run_meta(
             // credentials are configured (the pull-request group
             // validates its handles this way).
             let target = set_meta_target(&args)?;
-            let fields = MetaFields {
-                description: args.description.clone(),
-                url: args.url.clone(),
-            };
-            fields.validate()?;
-            let field_list = fields.field_list();
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
-            let set = match &target {
-                MetaTarget::ObsProject { .. } | MetaTarget::ObsPackage { .. } => {
-                    with_obs(debug, live, instance, |obs| {
-                        let client = MetaClient::new(Some(obs), None);
+            let (set, field_list) = if let Some(path) = &args.from_file {
+                // The whole-file write: the file's typed meta
+                // replaces the target's, fields it omits cleared.
+                // A Gitea target has no whole-file concept, so the
+                // flag refuses before any client is built — the
+                // error must not depend on whether a token is set.
+                let whole = match &target {
+                    MetaTarget::ObsProject { .. } => {
+                        WholeMeta::Project(read_project_meta_file(path)?)
+                    }
+                    MetaTarget::ObsPackage { .. } => {
+                        WholeMeta::Package(read_package_meta_file(path)?)
+                    }
+                    MetaTarget::GiteaRepo { .. } => {
+                        return Err(GeectlError::new(
+                            ErrorKind::InvalidInput,
+                            "meta set --from-file has no Gitea arm: Gitea has no whole-file meta concept — repo settings are field-wise only, use --description/--url",
+                        ));
+                    }
+                };
+                let set = with_obs(debug, live, instance, |obs| {
+                    let client = MetaClient::new(Some(obs), None);
+                    client.set_whole_meta(&target, whole, &dry_run)
+                })?;
+                (set, vec![format!("from-file: {}", path.display())])
+            } else {
+                let fields = MetaFields {
+                    description: args.description.clone(),
+                    url: args.url.clone(),
+                };
+                fields.validate()?;
+                let field_list = fields.field_list();
+                let set = match &target {
+                    MetaTarget::ObsProject { .. } | MetaTarget::ObsPackage { .. } => {
+                        with_obs(debug, live, instance, |obs| {
+                            let client = MetaClient::new(Some(obs), None);
+                            client.set_meta(&target, &fields, &dry_run)
+                        })?
+                    }
+                    MetaTarget::GiteaRepo { .. } => with_gitea(debug, instance, |gitea| {
+                        let client = MetaClient::new(None, Some(gitea));
                         client.set_meta(&target, &fields, &dry_run)
-                    })?
-                }
-                MetaTarget::GiteaRepo { .. } => with_gitea(debug, instance, |gitea| {
-                    let client = MetaClient::new(None, Some(gitea));
-                    client.set_meta(&target, &fields, &dry_run)
-                })?,
+                    })?,
+                };
+                (set, field_list)
             };
             let plan = if dry_run.enabled() {
                 Some(dry_run.plan())
@@ -394,6 +439,51 @@ mod tests {
     }
 
     #[test]
+    fn meta_set_parses_from_file() {
+        let MetaCommand::Set(args) = parse(&[
+            "set",
+            "--project",
+            "home:scarabeus_iv",
+            "--from-file",
+            "meta.json",
+        ]);
+        assert_eq!(
+            args.from_file.as_deref(),
+            Some(std::path::Path::new("meta.json"))
+        );
+        assert_eq!(args.description, None);
+        assert_eq!(args.url, None);
+    }
+
+    #[test]
+    fn meta_set_from_file_conflicts_with_description() {
+        let err = parse_err(&[
+            "set",
+            "--project",
+            "home:scarabeus_iv",
+            "--from-file",
+            "meta.json",
+            "--description",
+            "New description",
+        ]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn meta_set_from_file_conflicts_with_url() {
+        let err = parse_err(&[
+            "set",
+            "--project",
+            "home:scarabeus_iv",
+            "--from-file",
+            "meta.json",
+            "--url",
+            "https://example.com",
+        ]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn set_meta_target_needs_a_target_flag() {
         let args = SetMetaArgs {
             project: None,
@@ -401,6 +491,7 @@ mod tests {
             repo: None,
             description: Some("New description".to_string()),
             url: None,
+            from_file: None,
         };
         let err = set_meta_target(&args).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -417,6 +508,7 @@ mod tests {
             repo: Some("pool".to_string()),
             description: Some("New description".to_string()),
             url: None,
+            from_file: None,
         };
         let err = set_meta_target(&args).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);

@@ -72,10 +72,14 @@ flagged alias's URL replaces the configured URL, ahead of the
 `GEECTL_OBS_URL` environment variable and any working-copy state,
 and credentials resolve only from the flagged alias's own variables.
 A call with the flag and no credentials for that alias fails naming
-the variables to set. The Gitea host is unaffected, but the account
-every Gitea call uses is selected the same way: with the flag, the
-call authenticates with the flagged alias's
-`GEECTL_GITEA_TOKEN_<ALIAS>` only.
+the variables to set. The Gitea instance is selected the same way:
+with the flag, the flagged alias's URL replaces the configured Gitea
+URL and the call authenticates with the flagged alias's
+`GEECTL_GITEA_TOKEN_<ALIAS>` only. One alias URL serves both
+backends under the flag: an alias names a single host, so a flagged
+call that mixes OBS and Gitea targets both at that host — for the
+api.opensuse.org/src.opensuse.org split, the other backend goes to
+the wrong host by construction.
 
 The same rule applies to Gitea: `GEECTL_GITEA_TOKEN_<ALIAS>` (or
 `GEECTL_GITEA_TOKEN_FILE_<ALIAS>`) for the instance named in
@@ -149,7 +153,7 @@ directory's `.env` only.
 - `geectl prjconf` — Read, validate and clean a project's prjconf.
 - `geectl version` — Print version information as the result payload.
 - `geectl config` — Inspect or initialise the config file.
-- `geectl config show` — Show the effective config: endpoint URLs with their source, the changelog identity with its source (`config` or `none`), and credential status (never a secret value).
+- `geectl config show` — Show the effective config: endpoint URLs with their source, the changelog identity with its source (`config`, `env`, `obs`, `git`, `obs (unresolved)`, `env (unresolved)`, `obs (error)`, or `none`), and credential status (never a secret value). `--resolve-identity` resolves the OBS identity over the network too, like `changelog generate` does; without it the OBS level reports `obs (unresolved)` when the OBS account might still identify the author.
 - `geectl config init` — Write the config template (endpoints only); refuses if the file already exists.
 - `geectl config import-oscrc` — Import one instance mapping from an oscrc file (one-time migration); dry-run is the default, `--live` writes the config.
 

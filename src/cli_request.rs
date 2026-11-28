@@ -1259,7 +1259,8 @@ fn file_request(
     with_client(debug, live, instance, |client| {
         let filing = SrFiling::new(client, &dry_run)
             .with_debug(debug.clone())
-            .with_gitea_http(gitea_http);
+            .with_gitea_http(gitea_http)
+            .with_gitea_instance(instance);
         let filed_request = match supersede {
             Some(old_id) => filing.refile(&payload, old_id)?,
             None => filing.file(&payload)?,

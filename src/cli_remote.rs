@@ -88,16 +88,16 @@ use crate::error::{ErrorKind, GeectlError};
 use crate::http::{Timeout, UreqClient};
 use crate::obs::{
     parse_package_meta, parse_project_meta, valid_obs_name, validate_meta_file_roles,
-    validate_role, AddChannelsOptions, AddContainersOptions, AggregateOptions,
+    validate_role, AddChannelsOptions, AddContainersOptions, AggregateOptions, BuildFlag,
     CreatePackageOptions, CreateTokenOptions, CreatedToken, DeletePackageOptions,
-    DeleteProjectOptions, DryRun, FilePatch, FilePatchStatus, HistoryEntry, NamedRole, ObsClient,
-    Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person, ProjectMatch,
-    ProjectMeta, ReleaseOptions, Repository, RevisionPatch, RevisionRange, RevisionSpec, RoleGrant,
-    ScmsyncProjectList, SourceFile, StagedRequest, StagingProject, StagingReadOptions, TokenEntry,
-    TokenOperation, FACTORY_PROJECT,
+    DeleteProjectOptions, DownloadMaster, DryRun, FilePatch, FilePatchStatus, HistoryEntry,
+    NamedRole, ObsClient, Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person,
+    ProjectMatch, ProjectMeta, ReleaseOptions, ReleaseTarget, Repository, RepositoryDownload,
+    RevisionPatch, RevisionRange, RevisionSpec, RoleGrant, ScmsyncProjectList, SourceFile,
+    StagedRequest, StagingProject, StagingReadOptions, TokenEntry, TokenOperation, FACTORY_PROJECT,
 };
 use clap::Subcommand;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
 /// The `remote` command group: inspection of the OBS source tree,
@@ -232,10 +232,12 @@ pub enum RemoteCommand {
     /// meta instead: the file's title, description, URL, scmsync,
     /// devel project, persons, groups, and repositories replace
     /// what the server holds, and fields the file omits are cleared.
-    /// The file's project name must match the project. Settings
-    /// outside the typed meta (locks, publish and build flags)
-    /// survive, as in the field-wise write. `--from-file` conflicts
-    /// with every field and person flag.
+    /// The file is the typed JSON `remote project-meta` emits (an
+    /// OBS XML `<project>` document stays accepted as a legacy
+    /// format). The file's project name must match the project.
+    /// Settings outside the typed meta (locks, publish and build
+    /// flags) survive, as in the field-wise write. `--from-file`
+    /// conflicts with every field and person flag.
     ///
     /// `--add-person LOGIN:ROLE` grants a role to a person;
     /// `--remove-person LOGIN` removes every role that login holds.
@@ -263,31 +265,32 @@ pub enum RemoteCommand {
         /// The project whose meta is written.
         project: String,
         /// Write the given meta file as the whole meta instead of
-        /// setting fields: the file is a `<project>` document whose
-        /// name matches the project. Conflicts with every field
-        /// and person flag.
+        /// setting fields: the file is the typed JSON `remote
+        /// project-meta` emits (an OBS XML `<project>` document
+        /// stays accepted as a legacy format) whose name matches
+        /// the project. Conflicts with every field and person flag.
         #[arg(long, conflicts_with_all = ["title", "description", "url", "scmsync", "devel_project", "add_person", "remove_person"])]
         from_file: Option<PathBuf>,
         /// The new title.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         title: Option<String>,
         /// The new description.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         description: Option<String>,
         /// The new URL.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         url: Option<String>,
         /// The new scmsync URL.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         scmsync: Option<String>,
         /// The new devel project.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         devel_project: Option<String>,
         /// Grant a role to a person: `LOGIN:ROLE`, repeatable.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         add_person: Vec<String>,
         /// Remove a person: every role the login holds, repeatable.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         remove_person: Vec<String>,
     },
     /// Show a package's meta (title, description, persons, devel project).
@@ -307,7 +310,9 @@ pub enum RemoteCommand {
     /// meta instead: the file's title, description, URL, scmsync,
     /// release name, devel project and package, persons, groups, and
     /// build flags replace what the server holds, and fields the file
-    /// omits are cleared. The file's package name and project must
+    /// omits are cleared. The file is the typed JSON `remote package-meta`
+    /// emits (an OBS XML `<package>` document stays accepted as a
+    /// legacy format). The file's package name and project must
     /// match the package. Settings outside the typed meta survive,
     /// as in the field-wise write. `--from-file` conflicts with
     /// every field and person flag.
@@ -335,38 +340,40 @@ pub enum RemoteCommand {
         /// The package whose meta is written.
         package: String,
         /// Write the given meta file as the whole meta instead of
-        /// setting fields: the file is a `<package>` document whose
-        /// name and project match the package. Conflicts with every
-        /// field and person flag.
+        /// setting fields: the file is the typed JSON `remote
+        /// package-meta` emits (an OBS XML `<package>` document
+        /// stays accepted as a legacy format) whose name and
+        /// project match the package. Conflicts with every field
+        /// and person flag.
         #[arg(long, conflicts_with_all = ["title", "description", "url", "scmsync", "releasename", "devel_project", "devel_package", "add_person", "remove_person"])]
         from_file: Option<PathBuf>,
         /// The new title.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         title: Option<String>,
         /// The new description.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         description: Option<String>,
         /// The new URL.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         url: Option<String>,
         /// The new scmsync URL.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         scmsync: Option<String>,
         /// The new release name.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         releasename: Option<String>,
         /// The new devel project.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         devel_project: Option<String>,
         /// The new devel package. Needs `--devel-project` unless the
         /// package already has a devel project.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         devel_package: Option<String>,
         /// Grant a role to a person: `LOGIN:ROLE`, repeatable.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         add_person: Vec<String>,
         /// Remove a person: every role the login holds, repeatable.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
         remove_person: Vec<String>,
     },
     /// Update a package's meta from its spec file. A mutation:
@@ -2587,8 +2594,22 @@ fn meta_parse_detail(context: &str) -> &str {
 /// `<project>` document. A missing or unreadable file, or a file
 /// that is not a project meta document, is an input error naming
 /// the file.
-fn read_project_meta_file(path: &PathBuf) -> Result<ProjectMeta, GeectlError> {
+/// Read a project meta file: the typed JSON `remote project-meta`
+/// emits, or — as a legacy format — an OBS XML `<project>`
+/// document. The format is sniffed on the first non-whitespace
+/// character: `{` is JSON, anything else is XML. A missing or
+/// unreadable file, or a file that is neither, is an input error
+/// naming the file.
+pub(crate) fn read_project_meta_file(path: &PathBuf) -> Result<ProjectMeta, GeectlError> {
     let text = read_local_file_text(path)?;
+    if text.trim_start().starts_with('{') {
+        return project_meta_from_json(&text).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot parse meta file {}: {}", path.display(), err.context),
+            )
+        });
+    }
     let meta = parse_project_meta(&text).map_err(|err| {
         GeectlError::new(
             ErrorKind::InvalidInput,
@@ -2615,8 +2636,22 @@ fn read_project_meta_file(path: &PathBuf) -> Result<ProjectMeta, GeectlError> {
 /// `<package>` document. A missing or unreadable file, or a file
 /// that is not a package meta document, is an input error naming
 /// the file.
-fn read_package_meta_file(path: &PathBuf) -> Result<PackageMeta, GeectlError> {
+/// Read a package meta file: the typed JSON `remote package-meta`
+/// emits, or — as a legacy format — an OBS XML `<package>`
+/// document. The format is sniffed on the first non-whitespace
+/// character: `{` is JSON, anything else is XML. A missing or
+/// unreadable file, or a file that is neither, is an input error
+/// naming the file.
+pub(crate) fn read_package_meta_file(path: &PathBuf) -> Result<PackageMeta, GeectlError> {
     let text = read_local_file_text(path)?;
+    if text.trim_start().starts_with('{') {
+        return package_meta_from_json(&text).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot parse meta file {}: {}", path.display(), err.context),
+            )
+        });
+    }
     let meta = parse_package_meta(&text).map_err(|err| {
         GeectlError::new(
             ErrorKind::InvalidInput,
@@ -2637,6 +2672,407 @@ fn read_package_meta_file(path: &PathBuf) -> Result<PackageMeta, GeectlError> {
         )
     })?;
     Ok(meta)
+}
+
+// ---------------------------------------------------------------------
+// Typed-JSON meta documents: the shape `remote project-meta` /
+// `remote package-meta` emits, parsed strictly so a get
+// round-trips into a whole-file set. Unknown fields are rejected
+// — a typo'd field must not silently drop data — and a missing or
+// mistyped field is an input error. For optional fields and lists,
+// a missing field and an explicit null mean the same thing:
+// absent.
+// ---------------------------------------------------------------------
+
+fn json_meta_error(message: String) -> GeectlError {
+    GeectlError::new(ErrorKind::InvalidInput, message)
+}
+
+fn json_object<'a>(value: &'a Value, what: &str) -> Result<&'a Map<String, Value>, GeectlError> {
+    value
+        .as_object()
+        .ok_or_else(|| json_meta_error(format!("{what} JSON must be an object")))
+}
+
+fn json_check_keys(
+    obj: &Map<String, Value>,
+    allowed: &[&str],
+    what: &str,
+) -> Result<(), GeectlError> {
+    for key in obj.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(json_meta_error(format!(
+                "{what} JSON has unknown field {key:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn json_required_string(
+    obj: &Map<String, Value>,
+    field: &str,
+    what: &str,
+) -> Result<String, GeectlError> {
+    match obj.get(field) {
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(json_meta_error(format!(
+            "{what} JSON field {field:?} must be a string"
+        ))),
+        None => Err(json_meta_error(format!(
+            "{what} JSON field {field:?} is required"
+        ))),
+    }
+}
+
+fn json_optional_string(
+    obj: &Map<String, Value>,
+    field: &str,
+    what: &str,
+) -> Result<Option<String>, GeectlError> {
+    match obj.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(json_meta_error(format!(
+            "{what} JSON field {field:?} must be a string or null"
+        ))),
+    }
+}
+
+fn json_array_field<'a>(
+    obj: &'a Map<String, Value>,
+    field: &str,
+    what: &str,
+) -> Result<Option<&'a Vec<Value>>, GeectlError> {
+    match obj.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => Ok(Some(items)),
+        Some(_) => Err(json_meta_error(format!(
+            "{what} JSON field {field:?} must be an array"
+        ))),
+    }
+}
+
+fn json_string_list(
+    obj: &Map<String, Value>,
+    field: &str,
+    what: &str,
+) -> Result<Vec<String>, GeectlError> {
+    let Some(items) = json_array_field(obj, field, what)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            Value::String(value) => out.push(value.clone()),
+            _ => {
+                return Err(json_meta_error(format!(
+                    "{what} JSON field {field:?} must be an array of strings"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn json_named_role(value: &Value, what: &str) -> Result<NamedRole, GeectlError> {
+    let obj = json_object(value, what)?;
+    json_check_keys(obj, &["name", "role", "email"], what)?;
+    let name = json_required_string(obj, "name", what)?;
+    let role = json_required_string(obj, "role", what)?;
+    // The XML file path validates names and roles before any write;
+    // the JSON path must not let an invalid name or an ungrantable
+    // role reach the PUT.
+    if !valid_obs_name(&name) {
+        return Err(json_meta_error(format!(
+            "invalid OBS {what} name: {name:?}"
+        )));
+    }
+    validate_role(&role, &format!("{what} {name}"))?;
+    // OBS meta carries no email on a role: the XML writer never
+    // persists one, so a JSON file carrying one is not a faithful
+    // typed-meta document.
+    if json_optional_string(obj, "email", what)?.is_some() {
+        return Err(json_meta_error(format!(
+            "{what} JSON field \"email\" is not part of OBS meta and is never persisted; remove it"
+        )));
+    }
+    Ok(NamedRole {
+        name,
+        role,
+        email: None,
+        realname: None,
+    })
+}
+
+fn json_named_roles(
+    obj: &Map<String, Value>,
+    field: &str,
+    what: &str,
+) -> Result<Vec<NamedRole>, GeectlError> {
+    let Some(items) = json_array_field(obj, field, what)? else {
+        return Ok(Vec::new());
+    };
+    items
+        .iter()
+        .map(|item| json_named_role(item, what))
+        .collect()
+}
+
+/// Two strings in one object: a repository path or host system
+/// (`project` + `repository`), or a package devel pair (`project`
+/// + `package`).
+fn json_string_pair(
+    value: &Value,
+    first: &str,
+    second: &str,
+    what: &str,
+) -> Result<(String, String), GeectlError> {
+    let obj = json_object(value, what)?;
+    json_check_keys(obj, &[first, second], what)?;
+    Ok((
+        json_required_string(obj, first, what)?,
+        json_required_string(obj, second, what)?,
+    ))
+}
+
+fn json_download_master(value: &Value) -> Result<DownloadMaster, GeectlError> {
+    let what = "download master";
+    let obj = json_object(value, what)?;
+    json_check_keys(obj, &["url", "sslfingerprint"], what)?;
+    Ok(DownloadMaster {
+        url: json_required_string(obj, "url", what)?,
+        sslfingerprint: json_optional_string(obj, "sslfingerprint", what)?,
+    })
+}
+
+fn json_download(value: &Value) -> Result<RepositoryDownload, GeectlError> {
+    let what = "download";
+    let obj = json_object(value, what)?;
+    json_check_keys(
+        obj,
+        &["arch", "url", "repotype", "archfilter", "pubkey", "master"],
+        what,
+    )?;
+    let master = match obj.get("master") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(json_download_master(value)?),
+    };
+    Ok(RepositoryDownload {
+        arch: json_optional_string(obj, "arch", what)?,
+        url: json_required_string(obj, "url", what)?,
+        repotype: json_optional_string(obj, "repotype", what)?,
+        archfilter: json_optional_string(obj, "archfilter", what)?,
+        pubkey: json_optional_string(obj, "pubkey", what)?,
+        master,
+    })
+}
+
+fn json_release_target(value: &Value) -> Result<ReleaseTarget, GeectlError> {
+    let what = "release target";
+    let obj = json_object(value, what)?;
+    json_check_keys(obj, &["project", "repository", "trigger"], what)?;
+    Ok(ReleaseTarget {
+        project: json_required_string(obj, "project", what)?,
+        repository: json_required_string(obj, "repository", what)?,
+        trigger: json_optional_string(obj, "trigger", what)?,
+    })
+}
+
+fn json_repository(value: &Value) -> Result<Repository, GeectlError> {
+    let what = "repository";
+    let obj = json_object(value, what)?;
+    json_check_keys(
+        obj,
+        &[
+            "name",
+            "arch",
+            "paths",
+            "rebuild",
+            "block",
+            "linkedbuild",
+            "downloads",
+            "release_targets",
+            "hostsystem",
+        ],
+        what,
+    )?;
+    let mut paths = Vec::new();
+    if let Some(items) = json_array_field(obj, "paths", what)? {
+        for item in items {
+            paths.push(json_string_pair(
+                item,
+                "project",
+                "repository",
+                "repository path",
+            )?);
+        }
+    }
+    let mut downloads = Vec::new();
+    if let Some(items) = json_array_field(obj, "downloads", what)? {
+        for item in items {
+            downloads.push(json_download(item)?);
+        }
+    }
+    let mut release_targets = Vec::new();
+    if let Some(items) = json_array_field(obj, "release_targets", what)? {
+        for item in items {
+            release_targets.push(json_release_target(item)?);
+        }
+    }
+    let mut hostsystem = Vec::new();
+    if let Some(items) = json_array_field(obj, "hostsystem", what)? {
+        for item in items {
+            hostsystem.push(json_string_pair(
+                item,
+                "project",
+                "repository",
+                "repository hostsystem",
+            )?);
+        }
+    }
+    Ok(Repository {
+        name: json_required_string(obj, "name", what)?,
+        arch: json_string_list(obj, "arch", what)?,
+        paths,
+        rebuild: json_optional_string(obj, "rebuild", what)?,
+        block: json_optional_string(obj, "block", what)?,
+        linkedbuild: json_optional_string(obj, "linkedbuild", what)?,
+        downloads,
+        release_targets,
+        hostsystem,
+    })
+}
+
+fn json_repositories(obj: &Map<String, Value>) -> Result<Vec<Repository>, GeectlError> {
+    let Some(items) = json_array_field(obj, "repositories", "project meta")? else {
+        return Ok(Vec::new());
+    };
+    items.iter().map(json_repository).collect()
+}
+
+/// Parse a project meta from the typed JSON `remote project-meta`
+/// emits: the same field names and shapes, so a get round-trips
+/// into a whole-file set.
+fn project_meta_from_json(text: &str) -> Result<ProjectMeta, GeectlError> {
+    let value: Value = serde_json::from_str(text)
+        .map_err(|err| json_meta_error(format!("project meta JSON is not valid JSON: {err}")))?;
+    let what = "project meta";
+    let obj = json_object(&value, what)?;
+    json_check_keys(
+        obj,
+        &[
+            "name",
+            "title",
+            "description",
+            "url",
+            "scmsync",
+            "devel",
+            "persons",
+            "groups",
+            "repositories",
+        ],
+        what,
+    )?;
+    Ok(ProjectMeta {
+        name: json_required_string(obj, "name", what)?,
+        title: json_optional_string(obj, "title", what)?,
+        description: json_optional_string(obj, "description", what)?,
+        url: json_optional_string(obj, "url", what)?,
+        scmsync: json_optional_string(obj, "scmsync", what)?,
+        devel: json_optional_string(obj, "devel", what)?,
+        persons: json_named_roles(obj, "persons", "person")?,
+        groups: json_named_roles(obj, "groups", "group")?,
+        repositories: json_repositories(obj)?,
+    })
+}
+
+fn json_build_flag(value: &Value) -> Result<BuildFlag, GeectlError> {
+    let what = "build flag";
+    let obj = json_object(value, what)?;
+    json_check_keys(obj, &["enabled", "repository", "arch"], what)?;
+    let enabled = match obj.get("enabled") {
+        Some(Value::Bool(enabled)) => *enabled,
+        _ => {
+            return Err(json_meta_error(format!(
+                "{what} JSON field \"enabled\" is required and must be a boolean"
+            )));
+        }
+    };
+    let repository = json_optional_string(obj, "repository", what)?;
+    let arch = json_optional_string(obj, "arch", what)?;
+    // A blank scope is no scope: absent means all repositories or
+    // architectures, so a blank string is a misspelling of absent,
+    // not a scope — refuse it rather than emitting an empty
+    // attribute.
+    for (field, value) in [("repository", &repository), ("arch", &arch)] {
+        if matches!(value, Some(value) if value.trim().is_empty()) {
+            return Err(json_meta_error(format!(
+                "{what} JSON field {field:?} must not be blank"
+            )));
+        }
+    }
+    Ok(BuildFlag {
+        enabled,
+        repository,
+        arch,
+    })
+}
+
+fn json_build_flags(obj: &Map<String, Value>) -> Result<Vec<BuildFlag>, GeectlError> {
+    let Some(items) = json_array_field(obj, "build", "package meta")? else {
+        return Ok(Vec::new());
+    };
+    items.iter().map(json_build_flag).collect()
+}
+
+/// Parse a package meta from the typed JSON `remote package-meta`
+/// emits: the same field names and shapes, so a get round-trips
+/// into a whole-file set.
+fn package_meta_from_json(text: &str) -> Result<PackageMeta, GeectlError> {
+    let value: Value = serde_json::from_str(text)
+        .map_err(|err| json_meta_error(format!("package meta JSON is not valid JSON: {err}")))?;
+    let what = "package meta";
+    let obj = json_object(&value, what)?;
+    json_check_keys(
+        obj,
+        &[
+            "name",
+            "project",
+            "title",
+            "description",
+            "url",
+            "scmsync",
+            "releasename",
+            "devel",
+            "persons",
+            "groups",
+            "build",
+        ],
+        what,
+    )?;
+    let devel = match obj.get("devel") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(json_string_pair(
+            value,
+            "project",
+            "package",
+            "package devel",
+        )?),
+    };
+    Ok(PackageMeta {
+        name: json_required_string(obj, "name", what)?,
+        project: json_required_string(obj, "project", what)?,
+        title: json_optional_string(obj, "title", what)?,
+        description: json_optional_string(obj, "description", what)?,
+        url: json_optional_string(obj, "url", what)?,
+        scmsync: json_optional_string(obj, "scmsync", what)?,
+        releasename: json_optional_string(obj, "releasename", what)?,
+        devel,
+        persons: json_named_roles(obj, "persons", "person")?,
+        groups: json_named_roles(obj, "groups", "group")?,
+        build: json_build_flags(obj)?,
+    })
 }
 
 /// The flags of a `set-project-meta` call: one optional value per
@@ -3909,11 +4345,50 @@ fn named_role_json(role: &NamedRole) -> Value {
 }
 
 fn repository_json(repository: &Repository) -> Value {
+    // The full shape: a get must round-trip into a whole-file set
+    // without dropping rebuild/block/linkedbuild, downloads,
+    // release targets, or host systems — a lossy get would silently
+    // drop them on the write.
     json!({
         "name": repository.name,
         "arch": repository.arch,
         "paths": repository
             .paths
+            .iter()
+            .map(|(project, repository)| json!({
+                "project": project,
+                "repository": repository,
+            }))
+            .collect::<Vec<_>>(),
+        "rebuild": repository.rebuild,
+        "block": repository.block,
+        "linkedbuild": repository.linkedbuild,
+        "downloads": repository
+            .downloads
+            .iter()
+            .map(|download| json!({
+                "arch": download.arch,
+                "url": download.url,
+                "repotype": download.repotype,
+                "archfilter": download.archfilter,
+                "pubkey": download.pubkey,
+                "master": download.master.as_ref().map(|master| json!({
+                    "url": master.url,
+                    "sslfingerprint": master.sslfingerprint,
+                })),
+            }))
+            .collect::<Vec<_>>(),
+        "release_targets": repository
+            .release_targets
+            .iter()
+            .map(|target| json!({
+                "project": target.project,
+                "repository": target.repository,
+                "trigger": target.trigger,
+            }))
+            .collect::<Vec<_>>(),
+        "hostsystem": repository
+            .hostsystem
             .iter()
             .map(|(project, repository)| json!({
                 "project": project,
@@ -6475,6 +6950,239 @@ mod tests {
                 path.display()
             )
         );
+    }
+
+    fn full_project_meta() -> ProjectMeta {
+        ProjectMeta {
+            name: "home:alice".to_string(),
+            title: Some("Alice".to_string()),
+            description: Some("Home project".to_string()),
+            url: Some("https://example.org".to_string()),
+            scmsync: None,
+            devel: Some("openSUSE:Factory".to_string()),
+            persons: vec![NamedRole {
+                name: "alice".to_string(),
+                role: "maintainer".to_string(),
+                email: None,
+                realname: None,
+            }],
+            groups: vec![NamedRole {
+                name: "factory".to_string(),
+                role: "reviewer".to_string(),
+                email: None,
+                realname: None,
+            }],
+            repositories: vec![Repository {
+                name: "standard".to_string(),
+                arch: vec!["x86_64".to_string(), "aarch64".to_string()],
+                paths: vec![("openSUSE:Factory".to_string(), "standard".to_string())],
+                rebuild: Some("local".to_string()),
+                block: Some("all".to_string()),
+                linkedbuild: Some("all".to_string()),
+                downloads: vec![RepositoryDownload {
+                    arch: Some("x86_64".to_string()),
+                    url: "https://example.org/repo".to_string(),
+                    repotype: Some("rpm-md".to_string()),
+                    archfilter: None,
+                    pubkey: None,
+                    master: Some(DownloadMaster {
+                        url: "https://example.org/master".to_string(),
+                        sslfingerprint: Some("AA:BB".to_string()),
+                    }),
+                }],
+                release_targets: vec![ReleaseTarget {
+                    project: "openSUSE:Factory".to_string(),
+                    repository: "snapshot".to_string(),
+                    trigger: Some("manual".to_string()),
+                }],
+                hostsystem: vec![("openSUSE:Factory".to_string(), "standard".to_string())],
+            }],
+        }
+    }
+
+    #[test]
+    fn repository_json_carries_the_full_shape() {
+        let meta = full_project_meta();
+        let payload = project_meta_json(&meta);
+        let repo = &payload["repositories"][0];
+        assert_eq!(repo["rebuild"], "local");
+        assert_eq!(repo["block"], "all");
+        assert_eq!(repo["linkedbuild"], "all");
+        assert_eq!(repo["downloads"][0]["url"], "https://example.org/repo");
+        assert_eq!(repo["downloads"][0]["repotype"], "rpm-md");
+        assert_eq!(repo["downloads"][0]["master"]["sslfingerprint"], "AA:BB");
+        assert_eq!(repo["release_targets"][0]["trigger"], "manual");
+        assert_eq!(repo["hostsystem"][0]["project"], "openSUSE:Factory");
+    }
+
+    #[test]
+    fn project_meta_json_round_trips_through_the_file() {
+        // The get side and the whole-file set side agree: the
+        // emitted JSON parses back to the meta it came from, with
+        // no field dropped.
+        let meta = full_project_meta();
+        let text = serde_json::to_string(&project_meta_json(&meta)).unwrap();
+        let parsed = project_meta_from_json(&text).unwrap();
+        assert_eq!(parsed, meta);
+    }
+
+    #[test]
+    fn read_project_meta_file_parses_the_typed_json() {
+        let path = write_temp_meta_file(
+            r#"{"name": "home:alice", "title": "Alice",
+            "description": "Home project", "url": "https://example.org",
+            "scmsync": null, "devel": "openSUSE:Factory",
+            "persons": [{"name": "alice", "role": "maintainer", "email": null}],
+            "groups": [{"name": "factory", "role": "reviewer", "email": null}],
+            "repositories": [{"name": "standard",
+            "arch": ["x86_64", "aarch64"],
+            "paths": [{"project": "openSUSE:Factory", "repository": "standard"}],
+            "rebuild": "local", "block": "all", "linkedbuild": "all",
+            "downloads": [{"arch": "x86_64", "url": "https://example.org/repo",
+            "repotype": "rpm-md", "archfilter": null, "pubkey": null,
+            "master": {"url": "https://example.org/master", "sslfingerprint": "AA:BB"}}],
+            "release_targets": [{"project": "openSUSE:Factory", "repository": "snapshot", "trigger": "manual"}],
+            "hostsystem": [{"project": "openSUSE:Factory", "repository": "standard"}]}]}"#,
+        );
+        let meta = read_project_meta_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(meta, full_project_meta());
+    }
+
+    #[test]
+    fn read_project_meta_file_rejects_an_unknown_json_field() {
+        // A typo'd field must not silently drop data.
+        let path = write_temp_meta_file(r#"{"name": "home:alice", "bogus": "Alice"}"#);
+        let err = read_project_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains("unknown field \"bogus\""),
+            "{}",
+            err.context
+        );
+    }
+
+    #[test]
+    fn read_project_meta_file_rejects_json_with_the_wrong_type() {
+        let path = write_temp_meta_file(r#"{"name": 42}"#);
+        let err = read_project_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains("field \"name\" must be a string"),
+            "{}",
+            err.context
+        );
+    }
+
+    #[test]
+    fn read_package_meta_file_parses_the_typed_json() {
+        let path = write_temp_meta_file(
+            r#"{"name": "vim", "project": "home:alice", "title": "Vim",
+            "description": null, "url": "https://example.org/vim",
+            "scmsync": null, "releasename": "vim",
+            "devel": {"project": "devel:languages:vim", "package": "vim"},
+            "persons": [{"name": "alice", "role": "maintainer", "email": null}],
+            "groups": [],
+            "build": [{"enabled": false, "repository": "openSUSE_Leap_15.6", "arch": null},
+                      {"enabled": true, "repository": null, "arch": "x86_64"}]}"#,
+        );
+        let meta = read_package_meta_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(meta.name, "vim");
+        assert_eq!(meta.project, "home:alice");
+        assert_eq!(meta.title.as_deref(), Some("Vim"));
+        assert_eq!(meta.url.as_deref(), Some("https://example.org/vim"));
+        assert_eq!(meta.releasename.as_deref(), Some("vim"));
+        assert_eq!(
+            meta.devel,
+            Some(("devel:languages:vim".to_string(), "vim".to_string()))
+        );
+        assert_eq!(meta.persons.len(), 1);
+        assert_eq!(meta.persons[0].name, "alice");
+        assert_eq!(meta.build.len(), 2);
+        assert!(!meta.build[0].enabled);
+        assert_eq!(
+            meta.build[0].repository.as_deref(),
+            Some("openSUSE_Leap_15.6")
+        );
+        assert_eq!(meta.build[0].arch, None);
+        assert!(meta.build[1].enabled);
+        assert_eq!(meta.build[1].repository, None);
+        assert_eq!(meta.build[1].arch.as_deref(), Some("x86_64"));
+        // The emitted JSON parses back to the same meta: a get
+        // round-trips into a whole-file set without dropping a field.
+        let round_tripped = package_meta_from_json(&package_meta_json(&meta).to_string()).unwrap();
+        assert_eq!(round_tripped, meta);
+    }
+
+    #[test]
+    fn read_package_meta_file_rejects_an_ungrantable_json_role() {
+        // The XML file path refuses role="admin"; the JSON path
+        // must refuse it too instead of letting it reach the PUT.
+        let path = write_temp_meta_file(
+            r#"{"name": "vim", "project": "home:alice",
+            "persons": [{"name": "alice", "role": "admin", "email": null}],
+            "groups": [], "build": []}"#,
+        );
+        let err = read_package_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.context.contains("invalid OBS role \"admin\""),
+            "{}",
+            err.context
+        );
+    }
+
+    #[test]
+    fn read_package_meta_file_rejects_an_invalid_json_role_name() {
+        let path = write_temp_meta_file(
+            r#"{"name": "vim", "project": "home:alice",
+            "persons": [{"name": "not a name", "role": "maintainer", "email": null}],
+            "groups": [], "build": []}"#,
+        );
+        let err = read_package_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.context.contains("invalid OBS person name"),
+            "{}",
+            err.context
+        );
+    }
+
+    #[test]
+    fn read_package_meta_file_rejects_a_non_null_json_role_email() {
+        // OBS meta never persists a role email, so a JSON file
+        // carrying one is not a faithful typed-meta document.
+        let path = write_temp_meta_file(
+            r#"{"name": "vim", "project": "home:alice",
+            "persons": [{"name": "alice", "role": "maintainer", "email": "alice@example.com"}],
+            "groups": [], "build": []}"#,
+        );
+        let err = read_package_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.context.contains("never persisted"), "{}", err.context);
+    }
+
+    #[test]
+    fn read_package_meta_file_rejects_a_blank_json_build_flag_scope() {
+        let path = write_temp_meta_file(
+            r#"{"name": "vim", "project": "home:alice",
+            "persons": [], "groups": [],
+            "build": [{"enabled": false, "repository": "", "arch": null}]}"#,
+        );
+        let err = read_package_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.context.contains("must not be blank"), "{}", err.context);
+        let path = write_temp_meta_file(
+            r#"{"name": "vim", "project": "home:alice",
+            "persons": [], "groups": [],
+            "build": [{"enabled": false, "repository": null, "arch": " "}]}"#,
+        );
+        let err = read_package_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.context.contains("must not be blank"), "{}", err.context);
     }
 
     #[test]

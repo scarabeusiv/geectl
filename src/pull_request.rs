@@ -802,6 +802,7 @@ pub struct PullRequestClient<'a> {
     obs: Option<&'a ObsClient<'a>>,
     gitea: Option<&'a GiteaClient<'a>>,
     gitea_http: Option<&'a dyn HttpClient>,
+    gitea_instance: Option<String>,
     debug: Debug,
 }
 
@@ -815,6 +816,7 @@ impl<'a> PullRequestClient<'a> {
             obs,
             gitea,
             gitea_http: None,
+            gitea_instance: None,
             debug: Debug::disabled(),
         }
     }
@@ -834,6 +836,15 @@ impl<'a> PullRequestClient<'a> {
     /// `<scmsync>`. See [`SrFiling::with_gitea_http`].
     pub fn with_gitea_http(mut self, http: Option<&'a dyn HttpClient>) -> Self {
         self.gitea_http = http;
+        self
+    }
+
+    /// The instance the OBS-arm filing path resolves its lazy
+    /// Gitea client for — forwarded to [`SrFiling`], so an aliased
+    /// submit's freshness check uses the flagged alias's host and
+    /// token, never the default's.
+    pub fn with_gitea_instance(mut self, instance: Option<&str>) -> Self {
+        self.gitea_instance = instance.map(str::to_string);
         self
     }
 
@@ -1423,7 +1434,8 @@ impl<'a> PullRequestClient<'a> {
                 let filing = SrFiling::new(obs, dry_run)
                     .with_debug(self.debug.clone())
                     .with_gitea(self.gitea)
-                    .with_gitea_http(self.gitea_http);
+                    .with_gitea_http(self.gitea_http)
+                    .with_gitea_instance(self.gitea_instance.as_deref());
                 let filed = filing.file(payload)?;
                 let Some(filed) = filed else {
                     return Ok(None);
