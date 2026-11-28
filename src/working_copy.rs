@@ -36,6 +36,7 @@ use crate::obs::{
     valid_obs_filename, CommitFileEntry, CommitFilelistOptions, DirectoryListing, DryRun,
     ObsClient, RevisionSpec, ServiceCode,
 };
+use crate::path_encoding::encode_path_segment;
 use crate::xml::XmlDoc;
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
@@ -2127,14 +2128,16 @@ impl Drop for TempCleanup {
     }
 }
 
-/// A path segment for a project or package name: `:` is legal in
-/// an OBS name but not in a Windows path, so it becomes `_`. The
-/// record in the checkout's git config keeps the real name; the
-/// directory name never names the project or package back. Two
-/// names can sanitize to the same directory (`home:foo` and
-/// `home_foo`); the second checkout fails on the existing target.
+/// A path segment for a project or package name: the shared
+/// percent-encoding (`crate::path_encoding::encode_path_segment`).
+/// `:` is legal in an OBS name but not in a Windows path, so it
+/// becomes `%3A` (`%` becomes `%25`). The encoding is injective —
+/// distinct names always map to distinct directories — so `home:foo`
+/// and `home_foo` check out into different directories. The record
+/// in the checkout's git config keeps the real name; the directory
+/// name never names the project or package back.
 fn path_segment(name: &str) -> String {
-    name.replace(':', "_")
+    encode_path_segment(name)
 }
 
 /// Refuse a project or package name that is not a single path
@@ -2154,7 +2157,7 @@ fn check_name_segment(kind: &str, name: &str) -> Result<(), GeectlError> {
 }
 
 /// The checkout directory for a project: `<dir>/<project>/` with
-/// `:` sanitized (see `path_segment`). The CLI renders the same
+/// `:` percent-encoded (see `path_segment`). The CLI renders the same
 /// target for a dry-run project checkout, so the plan names the
 /// directory the live checkout creates.
 pub fn checkout_project_target(dir: &Path, project: &str) -> Result<PathBuf, GeectlError> {
@@ -2163,7 +2166,7 @@ pub fn checkout_project_target(dir: &Path, project: &str) -> Result<PathBuf, Gee
 }
 
 /// The checkout directory for a project and package:
-/// `<dir>/<project>/<package>/` with `:` sanitized (see
+/// `<dir>/<project>/<package>/` with `:` percent-encoded (see
 /// `path_segment`). The CLI renders the same target for a dry-run
 /// checkout, so the plan names the directory the live checkout
 /// creates.
@@ -7527,13 +7530,13 @@ mod tests {
         );
         assert!(dir
             .path
-            .join("home_alice")
+            .join("home%3Aalice")
             .join("foo")
             .join("foo.spec")
             .exists());
         assert!(dir
             .path
-            .join("home_alice")
+            .join("home%3Aalice")
             .join("bar")
             .join("bar.spec")
             .exists());
@@ -7542,7 +7545,7 @@ mod tests {
     #[test]
     fn checkout_project_skips_an_existing_target() {
         let dir = TempDirGuard::new("project-skip");
-        std::fs::create_dir_all(dir.path.join("home_alice").join("foo")).unwrap();
+        std::fs::create_dir_all(dir.path.join("home%3Aalice").join("foo")).unwrap();
         let http = project_http();
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let report =
@@ -7572,7 +7575,7 @@ mod tests {
         assert_eq!(report.skipped[1].package, "foo:flavor2");
         assert!(dir
             .path
-            .join("home_alice")
+            .join("home%3Aalice")
             .join("foo")
             .join("foo.spec")
             .exists());
@@ -7588,7 +7591,7 @@ mod tests {
         assert_eq!(report.packages.len(), 2);
         assert!(report.packages.iter().all(|entry| entry.record.is_none()));
         assert!(report.skipped.is_empty());
-        assert!(!dir.path.join("home_alice").exists());
+        assert!(!dir.path.join("home%3Aalice").exists());
         assert!(
             dry_run
                 .plan()
@@ -8531,6 +8534,23 @@ mod tests {
     }
 
     #[test]
+    fn open_reopens_a_pre_percent_encoding_checkout_directory() {
+        // A checkout recorded before `:` became `%3A` still opens
+        // from its `_` directory: the record is in git config,
+        // the directory name is never read.
+        let http = checkout_http();
+        let (dir, wc) = do_checkout(&http);
+        std::fs::create_dir(dir.path.join("home_alice")).unwrap();
+        let legacy = dir.path.join("home_alice").join("foo");
+        std::fs::rename(&wc.root, &legacy).unwrap();
+        let reopened = open(&legacy).unwrap();
+        assert_eq!(reopened.project, "home:alice");
+        assert_eq!(reopened.package, "foo");
+        assert_eq!(reopened.base, wc.base);
+        let _ = dir;
+    }
+
+    #[test]
     fn mtimes_encode_decode_round_trips() {
         let mtimes = vec![
             FileMtime {
@@ -9037,8 +9057,8 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(!dir.path.join("home_alice").join("evil").exists());
-        assert!(!dir.path.join("home_alice").join("foo").exists());
+        assert!(!dir.path.join("home%3Aalice").join("evil").exists());
+        assert!(!dir.path.join("home%3Aalice").join("foo").exists());
         let _ = dir;
     }
 
@@ -9075,8 +9095,8 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(!dir.path.join("home_alice").join("evil").exists());
-        assert!(!dir.path.join("home_alice").join("foo").exists());
+        assert!(!dir.path.join("home%3Aalice").join("evil").exists());
+        assert!(!dir.path.join("home%3Aalice").join("foo").exists());
         let _ = dir;
     }
 
@@ -9114,14 +9134,14 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(!dir.path.join("home_alice").join("foo").exists());
+        assert!(!dir.path.join("home%3Aalice").join("foo").exists());
         let _ = dir;
     }
 
     #[test]
-    fn checkout_sanitizes_colons_in_the_directory_name() {
+    fn checkout_percent_encodes_colons_in_the_directory_name() {
         // `:` is legal in an OBS name but not in a Windows path:
-        // the checkout lands under the sanitized name, and the
+        // the checkout lands under the percent-encoded name, and the
         // record still carries the real project and package.
         let dir = TempDirGuard::new("checkout-colon");
         let http = checkout_http();
@@ -9137,7 +9157,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(wc.root, dir.path.join("home_alice").join("foo"));
+        assert_eq!(wc.root, dir.path.join("home%3Aalice").join("foo"));
         assert_eq!(wc.project, "home:alice");
         assert_eq!(wc.package, "foo");
         let reopened = open(&wc.root).unwrap();
@@ -10016,7 +10036,7 @@ mod tests {
         let err = update(&mut wc, &client, Some("2"), None, &DryRun::new(false)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert_eq!(wc.base.as_obs().map(|(rev, _)| rev), Some(REV1));
-        assert!(!dir.path.join("home_alice").join("evil").exists());
+        assert!(!dir.path.join("home%3Aalice").join("evil").exists());
         let _ = dir;
     }
 
@@ -11676,7 +11696,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(!dir.path.join("home_alice").join("foo").exists());
+        assert!(!dir.path.join("home%3Aalice").join("foo").exists());
         let _ = dir;
     }
 

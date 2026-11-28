@@ -909,7 +909,7 @@ mod tests {
 
     fn wc() -> WorkingCopy {
         WorkingCopy {
-            root: PathBuf::from("/tmp/home_alice/foo"),
+            root: PathBuf::from("/tmp/home%3Aalice/foo"),
             project: "home:alice".to_string(),
             package: "foo".to_string(),
             apiurl: "https://api.opensuse.org".to_string(),
@@ -928,7 +928,7 @@ mod tests {
     fn checkout_result_live_carries_the_record() {
         let dir = PathBuf::from("/tmp");
         let wc = wc();
-        let target = dir.join("home_alice").join("foo");
+        let target = dir.join("home%3Aalice").join("foo");
         let (_, text) = checkout_result("home:alice", "foo", &target, Some(&wc), false, None);
         assert!(text.contains("project: home:alice package: foo"));
         assert!(text.contains("dry_run: false"));
@@ -941,9 +941,9 @@ mod tests {
     #[test]
     fn checkout_result_dry_run_carries_the_target_and_the_plan() {
         let dir = PathBuf::from("/tmp");
-        // The target names the sanitized directory (`:` becomes
-        // `_`); the separators are the platform's.
-        let target = dir.join("home_alice").join("foo");
+        // The target names the percent-encoded directory
+        // (`:` becomes `%3A`); the separators are the platform's.
+        let target = dir.join("home%3Aalice").join("foo");
         let target_text = target.display().to_string();
         let (payload, text) = checkout_result(
             "home:alice",
@@ -966,7 +966,7 @@ mod tests {
 
     fn wc_for(package: &str) -> WorkingCopy {
         WorkingCopy {
-            root: PathBuf::from("/tmp").join("home_alice").join(package),
+            root: PathBuf::from("/tmp").join("home%3Aalice").join(package),
             project: "home:alice".to_string(),
             package: package.to_string(),
             apiurl: "https://api.opensuse.org".to_string(),
@@ -983,7 +983,7 @@ mod tests {
 
     fn project_report() -> CheckoutProjectReport {
         use crate::working_copy::{CheckoutProjectPackage, ProjectCheckoutSkip};
-        let project_dir = PathBuf::from("/tmp").join("home_alice");
+        let project_dir = PathBuf::from("/tmp").join("home%3Aalice");
         CheckoutProjectReport {
             packages: vec![
                 CheckoutProjectPackage {
@@ -1006,7 +1006,7 @@ mod tests {
 
     #[test]
     fn checkout_project_result_live_lists_packages_and_skips() {
-        let project_dir = PathBuf::from("/tmp").join("home_alice");
+        let project_dir = PathBuf::from("/tmp").join("home%3Aalice");
         let (payload, text) =
             checkout_project_result("home:alice", &project_dir, &project_report(), false, None);
         assert!(text.contains("project: home:alice"));
@@ -1031,7 +1031,7 @@ mod tests {
     #[test]
     fn checkout_project_result_dry_run_carries_the_plan() {
         use crate::working_copy::CheckoutProjectPackage;
-        let project_dir = PathBuf::from("/tmp").join("home_alice");
+        let project_dir = PathBuf::from("/tmp").join("home%3Aalice");
         let report = CheckoutProjectReport {
             packages: vec![CheckoutProjectPackage {
                 package: "foo".to_string(),
