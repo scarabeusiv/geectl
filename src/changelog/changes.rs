@@ -8,6 +8,8 @@
 //! `None`, never a guessed date. No date library is involved: the
 //! civil-date conversion is the standard days-from-civil algorithm.
 
+use crate::text::{decode_mixed, guessed_can_error, split_text_preamble, TextPreamble};
+
 /// The separator length `changelog` writes (67 dashes).
 pub const SEPARATOR_LEN: usize = 67;
 
@@ -346,122 +348,6 @@ pub fn separator_line() -> String {
     "-".repeat(SEPARATOR_LEN)
 }
 
-/// Guess the legacy encoding of `.changes` bytes, or `None` when
-/// the input is valid UTF-8. The guess is computed on the whole
-/// file; each line is then decoded on its own, so a wrong guess
-/// cannot corrupt a line that is valid UTF-8.
-fn guess_legacy_encoding(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
-    if std::str::from_utf8(bytes).is_ok() {
-        return None;
-    }
-    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
-    detector.feed(bytes, true);
-    Some(detector.guess(None, chardetng::Utf8Detection::Allow))
-}
-
-/// Decode `bytes` with one legacy encoding, reporting whether the
-/// decoder had to substitute U+FFFD for bytes it cannot represent.
-/// The substitution stays in the text (never re-decoded as UTF-8);
-/// the flag lets the caller refuse a lossy write instead of
-/// silently keeping it.
-fn decode_with(bytes: &[u8], encoding: &'static encoding_rs::Encoding) -> (String, bool) {
-    let (decoded, _, had_errors) = encoding.decode(bytes);
-    (decoded.into_owned(), had_errors)
-}
-
-/// Decode bytes that mix valid UTF-8 with legacy-encoded bytes,
-/// reporting whether any byte was substituted with U+FFFD. Fully
-/// valid UTF-8 is never re-decoded. Otherwise a line the guessed
-/// encoding decodes cleanly is transcoded whole: that is the only
-/// correct reading when the encoding is multi-byte (Shift_JIS,
-/// EUC-JP, GBK, Big5), since its characters span bytes that
-/// byte-at-a-time slicing would destroy — and a clean decode is
-/// evidence the line is wholly in that encoding. The exception is
-/// a line that itself mixes encodings and happens to decode
-/// cleanly: it is transcoded whole and loses its UTF-8 half.
-/// A single-byte encoding never reports an error, so a clean decode
-/// vouches for nothing there: the whole-line reading is used only
-/// when the line holds no valid multi-byte UTF-8. Any other line
-/// keeps its valid spans verbatim, and each invalid run is
-/// transcoded with the guessed encoding. A wrong-but-decodable
-/// guess keeps that encoding's interpretation of the invalid run
-/// only; the valid spans are never sacrificed to the guess.
-///
-/// The whole-line trust cannot drop the multi-byte case: legacy
-/// multi-byte bytes routinely contain pairs that are coincidentally
-/// valid UTF-8 (`\xCC\x8F` inside Shift_JIS is U+030F), so "no
-/// valid multi-byte UTF-8" alone would send every pure Shift_JIS
-/// or EUC-JP line down the per-run path and corrupt it.
-fn decode_mixed(bytes: &[u8], guessed: &'static encoding_rs::Encoding) -> (String, bool) {
-    // Fully valid UTF-8 is never re-decoded: its bytes can decode
-    // cleanly as half-width katakana in Shift_JIS.
-    if let Ok(text) = std::str::from_utf8(bytes) {
-        return (text.to_string(), false);
-    }
-    let (decoded, _, had_errors) = guessed.decode(bytes);
-    if !had_errors && (guessed_can_error(guessed) || !contains_valid_multibyte_utf8(bytes)) {
-        return (decoded.into_owned(), false);
-    }
-    let mut out = String::new();
-    let mut had_replacement = false;
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        match std::str::from_utf8(rest) {
-            Ok(text) => {
-                out.push_str(text);
-                break;
-            }
-            Err(err) => {
-                let valid_up_to = err.valid_up_to();
-                // The prefix is valid UTF-8 by construction, so
-                // this is verbatim.
-                out.push_str(&String::from_utf8_lossy(&rest[..valid_up_to]));
-                let skip = match err.error_len() {
-                    Some(len) => len,
-                    None => rest.len() - valid_up_to,
-                };
-                let (decoded, had_errors) =
-                    decode_with(&rest[valid_up_to..valid_up_to + skip], guessed);
-                had_replacement |= had_errors;
-                out.push_str(&decoded);
-                rest = &rest[valid_up_to + skip..];
-            }
-        }
-    }
-    (out, had_replacement)
-}
-
-/// Whether the guessed encoding can report a decode error at
-/// all. A single-byte encoding maps every byte, so a clean decode
-/// vouches for nothing; a multi-byte one cannot represent a lone
-/// lead byte. 0x82 is such a byte in every multi-byte encoding
-/// chardetng guesses (UTF-8, Shift_JIS, EUC-JP, GBK, Big5,
-/// UTF-16) and a defined character in every single-byte one.
-/// (0x80 does not work as the probe: Shift_JIS and GBK decode it
-/// as U+0080.)
-fn guessed_can_error(encoding: &'static encoding_rs::Encoding) -> bool {
-    encoding.decode(b"\x82").2
-}
-
-/// Whether `bytes` hold a valid multi-byte UTF-8 sequence
-/// anywhere. A byte >= 0x80 inside valid UTF-8 belongs to a
-/// multi-byte character; ASCII-only and invalid bytes do not count.
-fn contains_valid_multibyte_utf8(bytes: &[u8]) -> bool {
-    let mut rest = bytes;
-    while let Err(err) = std::str::from_utf8(rest) {
-        if rest[..err.valid_up_to()].iter().any(|&byte| byte >= 0x80) {
-            return true;
-        }
-        match err.error_len() {
-            Some(len) => rest = &rest[err.valid_up_to() + len..],
-            // A truncated sequence at the end: no complete
-            // multi-byte character here.
-            None => return false,
-        }
-    }
-    rest.iter().any(|&byte| byte >= 0x80)
-}
-
 /// Strip trailing ASCII whitespace (spaces, tabs, carriage
 /// returns) from one line. Unicode whitespace (NBSP, U+3000) is
 /// content, not trailing whitespace, and a lone `\r` inside a line
@@ -491,43 +377,6 @@ pub struct NormalizeReport {
     pub guessed_single_byte: bool,
 }
 
-/// Detect UTF-16 without a BOM from the NUL pattern: ASCII-heavy
-/// UTF-16LE carries a NUL at every odd byte, UTF-16BE at every
-/// even byte, and a `.changes` file never holds NULs otherwise —
-/// so a file that is at least a quarter NULs, with the NULs almost
-/// all on one parity, is UTF-16. A file that full of NULs is
-/// unusable as UTF-8 text anyway, so the UTF-16 reading is
-/// preferred over keeping the NULs. chardetng does not reliably
-/// guess BOM-less UTF-16, so this runs before the guess. CJK-only
-/// UTF-16 without a BOM has too few NULs to see and is not
-/// detected.
-fn detect_utf16_without_bom(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
-    if bytes.len() < 4 {
-        return None;
-    }
-    let (mut even, mut odd) = (0, 0);
-    for (i, &byte) in bytes.iter().enumerate() {
-        if byte == 0 {
-            if i % 2 == 0 {
-                even += 1;
-            } else {
-                odd += 1;
-            }
-        }
-    }
-    let total = even + odd;
-    if total * 4 < bytes.len() {
-        return None;
-    }
-    if odd * 10 >= total * 9 {
-        Some(encoding_rs::UTF_16LE)
-    } else if even * 10 >= total * 9 {
-        Some(encoding_rs::UTF_16BE)
-    } else {
-        None
-    }
-}
-
 /// Normalize `.changes` content for writing: transcode to UTF-8 and
 /// strip trailing whitespace on every line, preserved entries
 /// included. Decoding is per line, so a valid UTF-8 line is never
@@ -543,54 +392,28 @@ pub fn normalize_changes_content(bytes: &[u8]) -> String {
 
 /// [`normalize_changes_content`], also reporting undecodable bytes.
 pub fn normalize_changes_content_checked(bytes: &[u8]) -> NormalizeReport {
-    // A UTF-8 BOM is stripped on every path: it is not `.changes`
-    // content, and keeping it only on the valid-UTF-8 path was
-    // inconsistent with the legacy path stripping it.
-    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    // A UTF-32 BOM is not UTF-16: `\xFF\xFE\x00\x00` would
-    // otherwise be misread as UTF-16LE below. There is no UTF-32
-    // decoder here, so the file is reported undecodable rather
-    // than mangled.
-    if bytes.starts_with(b"\xFF\xFE\x00\x00") || bytes.starts_with(b"\x00\x00\xFE\xFF") {
-        return NormalizeReport {
-            text: String::from_utf8_lossy(bytes).into_owned(),
-            had_undecodable_bytes: true,
-            source_encoding: None,
-            guessed_single_byte: false,
-        };
-    }
-    let guessed = guess_legacy_encoding(bytes);
-    // UTF-16 (BOM or guessed) is decoded whole, before any
-    // bytewise `\n` split; the decoded text is valid UTF-8, so
-    // normalizing it recurses with no legacy guess left. The BOM
-    // bytes are skipped before decoding rather than relying on the
-    // decoder to strip them.
-    let utf16 = if bytes.starts_with(b"\xFF\xFE") {
-        Some((encoding_rs::UTF_16LE, &bytes[2..]))
-    } else if bytes.starts_with(b"\xFE\xFF") {
-        Some((encoding_rs::UTF_16BE, &bytes[2..]))
-    } else if let Some(encoding) = detect_utf16_without_bom(bytes) {
-        Some((encoding, bytes))
-    } else {
-        match guessed {
-            Some(encoding)
-                if encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE =>
-            {
-                Some((encoding, bytes))
-            }
-            _ => None,
+    // The BOM/UTF-16 preamble is shared with the server-text decoder (see [`split_text_preamble`]).
+    let (bytes, guessed) = match split_text_preamble(bytes) {
+        TextPreamble::Utf32(bytes) => {
+            return NormalizeReport {
+                text: String::from_utf8_lossy(bytes).into_owned(),
+                had_undecodable_bytes: true,
+                source_encoding: None,
+                guessed_single_byte: false,
+            };
         }
+        TextPreamble::Utf16(encoding, input) => {
+            let (decoded, _, had_errors) = encoding.decode(input);
+            let mut report = normalize_changes_content_checked(decoded.as_bytes());
+            report.had_undecodable_bytes |= had_errors;
+            report.source_encoding = Some(encoding.name());
+            // UTF-16 was detected, not guessed as a single-byte
+            // encoding; the recursive report already says so.
+            report.guessed_single_byte = false;
+            return report;
+        }
+        TextPreamble::Plain(bytes, guessed) => (bytes, guessed),
     };
-    if let Some((encoding, input)) = utf16 {
-        let (decoded, _, had_errors) = encoding.decode(input);
-        let mut report = normalize_changes_content_checked(decoded.as_bytes());
-        report.had_undecodable_bytes |= had_errors;
-        report.source_encoding = Some(encoding.name());
-        // UTF-16 was detected, not guessed as a single-byte
-        // encoding; the recursive report already says so.
-        report.guessed_single_byte = false;
-        return report;
-    }
     let trailing_newline = bytes.ends_with(b"\n");
     let mut segments: Vec<&[u8]> = bytes.split(|&byte| byte == b'\n').collect();
     if trailing_newline {
@@ -628,6 +451,7 @@ pub fn normalize_changes_content_checked(bytes: &[u8]) -> NormalizeReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text::decode_with;
 
     #[test]
     fn parse_header_accepts_the_canonical_form() {

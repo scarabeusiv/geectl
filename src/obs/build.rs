@@ -3119,7 +3119,8 @@ impl<'a> ObsClient<'a> {
     /// With `query.strip_time` the leading `[timestamp] ` is stripped
     /// from each line client-side before the text is returned.
     /// Requires OBS credentials. The log is capped by the
-    /// transport's body limit, like every read.
+    /// transport's body limit, like every read. A log that is not
+    /// valid UTF-8 still reads: invalid bytes transcode as Windows-1252.
     pub fn build_log(
         &self,
         project: &str,
@@ -3152,7 +3153,7 @@ impl<'a> ObsClient<'a> {
             &["build", project, repository, arch, package, "_log"],
             &pairs,
         );
-        match self.http.get_with(&url, &self.credentials) {
+        match self.http.get_transcoded(&url, &self.credentials) {
             Ok(body) => Ok(Some(if query.strip_time {
                 strip_log_timestamps(&body)
             } else {
@@ -5287,9 +5288,9 @@ mod tests {
             last: true,
             ..BuildLogQuery::default()
         };
-        let http = FakeHttp::new().with_get(
+        let http = FakeHttp::new().with_get_bytes(
             "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1&start=100&last=1",
-            "build log text",
+            "build log text".as_bytes(),
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert_eq!(
@@ -5299,7 +5300,7 @@ mod tests {
             Some("build log text".to_string())
         );
         assert_eq!(
-            http.get_calls(),
+            http.get_bytes_calls(),
             vec![(
                 "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1&start=100&last=1"
                     .to_string(),
@@ -5310,9 +5311,9 @@ mod tests {
 
     #[test]
     fn build_log_keeps_the_multibuild_flavor_in_the_path() {
-        let http = FakeHttp::new().with_get(
+        let http = FakeHttp::new().with_get_bytes(
             "https://api.opensuse.org/build/testproject/standard/x86_64/foo:flavor1/_log?nostream=1&lastsucceeded=1",
-            "flavor log",
+            "flavor log".as_bytes(),
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let query = BuildLogQuery {
@@ -5386,9 +5387,9 @@ mod tests {
 
     #[test]
     fn build_log_strip_time_strips_the_timestamp_prefix() {
-        let http = FakeHttp::new().with_get(
+        let http = FakeHttp::new().with_get_bytes(
             "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1",
-            "[12:00:01] first line\nplain line\n[12:00:02] second line\n",
+            "[12:00:01] first line\nplain line\n[12:00:02] second line\n".as_bytes(),
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let query = BuildLogQuery {
@@ -5405,9 +5406,9 @@ mod tests {
 
     #[test]
     fn build_log_without_strip_time_keeps_the_timestamps() {
-        let http = FakeHttp::new().with_get(
+        let http = FakeHttp::new().with_get_bytes(
             "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1",
-            "[12:00:01] first line\n",
+            "[12:00:01] first line\n".as_bytes(),
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert_eq!(
@@ -5421,6 +5422,28 @@ mod tests {
                 )
                 .unwrap(),
             Some("[12:00:01] first line\n".to_string())
+        );
+    }
+
+    #[test]
+    fn build_log_transcodes_non_utf8_bytes() {
+        // A log carrying a Latin-1 changelog line reads instead of failing: the read transcodes the bad byte to the character it is.
+        let http = FakeHttp::new().with_get_bytes(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1",
+            b"Tom\xe1s Chv\xe1tal\nok\n",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .build_log(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    "x86_64",
+                    &BuildLogQuery::default()
+                )
+                .unwrap(),
+            Some("Tom\u{e1}s Chv\u{e1}tal\nok\n".to_string())
         );
     }
 
