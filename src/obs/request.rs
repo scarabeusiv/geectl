@@ -58,6 +58,33 @@ pub(crate) fn validate_request_id(id: &str) -> Result<u64, GeectlError> {
     Ok(number)
 }
 
+/// The state name a changestate accepts for `state`: `new`, `review`,
+/// `accepted`, `declined`, or `revoked`. `superseded` is refused:
+/// superseding needs a replacement id, and
+/// [`ObsClient::supersede_request`] is the path that carries it.
+/// `deleted` is refused as well: deleting a request is an admin-only
+/// server operation, and revoking is the agent's way to withdraw one.
+/// One source of truth for [`ObsClient::change_state`] and
+/// [`ObsClient::try_change_state`], so both refuse an unusable target
+/// before any read or POST.
+fn change_state_target_name(state: RequestState) -> Result<&'static str, GeectlError> {
+    match state {
+        RequestState::New
+        | RequestState::Review
+        | RequestState::Accepted
+        | RequestState::Declined
+        | RequestState::Revoked => Ok(state.as_str()),
+        RequestState::Superseded => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "superseding a submit request needs a replacement id; use supersede_request",
+        )),
+        RequestState::Deleted => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "deleting a submit request is an admin-only server operation; revoke it instead",
+        )),
+    }
+}
+
 /// A single XML element found by scanning: its tag name, the raw
 /// attribute text between the tag name and the closing `>` (without a
 /// trailing `/` for a self-closing tag), and its inner XML (empty for
@@ -4296,25 +4323,7 @@ impl<'a> ObsClient<'a> {
         dry_run: &DryRun,
     ) -> Result<(), GeectlError> {
         let id = validate_request_id(id)?;
-        let state_name = match state {
-            RequestState::New
-            | RequestState::Review
-            | RequestState::Accepted
-            | RequestState::Declined
-            | RequestState::Revoked => state.as_str(),
-            RequestState::Superseded => {
-                return Err(GeectlError::new(
-                    ErrorKind::InvalidInput,
-                    "superseding a submit request needs a replacement id; use supersede_request",
-                ));
-            }
-            RequestState::Deleted => {
-                return Err(GeectlError::new(
-                    ErrorKind::InvalidInput,
-                    "deleting a submit request is an admin-only server operation; revoke it instead",
-                ));
-            }
-        };
+        let state_name = change_state_target_name(state)?;
         if !dry_run.allow(&format!(
             "change state of submit request {id} to {state_name}"
         )) {
@@ -4414,8 +4423,19 @@ impl<'a> ObsClient<'a> {
     /// fail the read too), propagates the auth failure. A caller bug
     /// does not get swallowed either: a malformed id or state, and
     /// missing credentials ([`ErrorKind::ConfigError`]), still return
-    /// an error. In dry-run the change is recorded in the plan (as
-    /// [`ObsClient::change_state`] does) and this returns `true`.
+    /// an error. In dry-run no POST happens, so nothing validates the
+    /// request: this reads it back first, as [`ObsClient::show_request`]
+    /// does. A request that does not exist is `NotFound`; a request
+    /// already in the target state is a no-op that reports `false`
+    /// (and notes the skip in the plan); only a request in another
+    /// state has its change recorded in the plan and reports `true`.
+    /// The read needs credentials, so a dry run without them fails
+    /// closed — a dry run that cannot read the request cannot say
+    /// what would happen. What the dry-run does not check is whether
+    /// the server accepts the move: a request in `accepted` cannot
+    /// change state at all, and accepting a request in `review`
+    /// needs `force` — that stays the server's call, as in the live
+    /// run.
     pub fn try_change_state(
         &self,
         id: &str,
@@ -4424,6 +4444,37 @@ impl<'a> ObsClient<'a> {
         force: bool,
         dry_run: &DryRun,
     ) -> Result<bool, GeectlError> {
+        // The target is validated before anything else — a superseded
+        // or deleted target is refused in both modes, so a dry-run
+        // never reports a no-op for a transition the live run would
+        // refuse outright.
+        change_state_target_name(state)?;
+        if dry_run.enabled() {
+            // No POST happens in a dry-run, so nothing validates the
+            // request: read it back first. A request that does not
+            // exist is not_found (as `request show` reports it), and
+            // a request already in the target state is a no-op that
+            // reports false; only a request in another state would
+            // change, so only then is the change recorded in the
+            // plan. The read needs credentials, as the read itself
+            // does — a dry run that cannot read the request cannot
+            // say what would happen.
+            match self.show_request(id) {
+                Ok(request) if request.state.name == state => {
+                    self.debug.emit(&format!(
+                        "decision: submit request {id} already {}; not re-issuing",
+                        state.as_str()
+                    ));
+                    dry_run.note(&format!(
+                        "request {id} already {}; nothing to change",
+                        state.as_str()
+                    ));
+                    return Ok(false);
+                }
+                Ok(_) => {}
+                Err(err) => return Err(err),
+            }
+        }
         match self.change_state(id, state, comment, force, dry_run) {
             Ok(()) => Ok(true),
             Err(err)
@@ -6446,6 +6497,25 @@ very long
 description</description>
 </request>"#;
 
+    const REQUEST_SUPERSEDED_XML: &str = r#"<request creator="creator" id="42">
+  <action type="submit">
+    <source package="bar" project="foo" rev="1" />
+    <target package="bar" project="foobar" />
+  </action>
+  <action type="delete">
+    <target project="deleteme" />
+  </action>
+  <state name="superseded" when="2010-12-27T01:36:29" who="user1" />
+  <history when="2010-12-13T13:02:03" who="creator">
+    <description>Create Request</description>
+    <comment>foobar</comment>
+  </history>
+  <title>title of the request</title>
+  <description>this is a
+very long
+description</description>
+</request>"#;
+
     const REQUEST2_XML: &str = r#"<request creator="creator" id="123">
   <action type="submit">
     <source package="abc" project="xyz" />
@@ -8230,13 +8300,162 @@ description</description>
 
     #[test]
     fn try_change_state_true_in_dry_run() {
-        let http = FakeHttp::new();
+        // The dry-run reads the request back first: request 123 is
+        // in review, not accepted, so the change would happen and
+        // the plan records it — with no POST.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/request/123?withhistory=1",
+            REQUEST2_XML,
+        );
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let dry = DryRun::new(true);
         assert!(obs
+            .try_change_state("123", RequestState::Accepted, "ok", false, &dry)
+            .unwrap());
+        assert!(http.post_calls().is_empty());
+        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] would: change state of submit request 123 to accepted".to_string()]
+        );
+    }
+
+    #[test]
+    fn try_change_state_dry_run_false_when_already_in_the_target_state() {
+        // The dry-run reads the request back first: request 42 is
+        // already accepted, so the change is a no-op that reports
+        // false — and the plan carries the skip, not the change.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/request/42?withhistory=1",
+            REQUEST1_XML,
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(true);
+        assert!(!obs
             .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
             .unwrap());
         assert!(http.post_calls().is_empty());
+        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] request 42 already accepted; nothing to change".to_string()]
+        );
+    }
+
+    #[test]
+    fn try_change_state_dry_run_not_found_when_request_missing() {
+        // A request that does not exist is not_found in a dry-run
+        // too: the read fails before anything is planned.
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/request/999999999?withhistory=1",
+            ErrorKind::NotFound,
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(true);
+        let err = obs
+            .try_change_state("999999999", RequestState::Declined, "ok", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(http.post_calls().is_empty());
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(dry.plan().is_empty());
+    }
+
+    #[test]
+    fn try_change_state_dry_run_propagates_a_caller_bug() {
+        // A malformed id is refused client-side before any request,
+        // in a dry-run as in a live run.
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(true);
+        let err = obs
+            .try_change_state("not-an-id", RequestState::Accepted, "ok", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn try_change_state_dry_run_without_credentials_fails_closed() {
+        // The dry-run reads the request back first, and the read
+        // needs credentials: without them the dry run fails closed
+        // instead of planning a change it cannot verify.
+        let http = FakeHttp::new();
+        let obs = ObsClient::new(&http);
+        let dry = DryRun::new(true);
+        let err = obs
+            .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn try_change_state_dry_run_refuses_superseded_target() {
+        // The target is validated before the read: superseding needs
+        // a replacement id, so even a request already superseded is
+        // refused instead of reporting a no-op — with zero GETs.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/request/42?withhistory=1",
+            REQUEST_SUPERSEDED_XML,
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(true);
+        let err = obs
+            .try_change_state("42", RequestState::Superseded, "ok", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn try_change_state_dry_run_refuses_deleted_target() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(true);
+        let err = obs
+            .try_change_state("42", RequestState::Deleted, "ok", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn try_change_state_live_refuses_superseded_target() {
+        // The hoisted validation refuses in live mode too, before
+        // any read or POST.
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let err = obs
+            .try_change_state("42", RequestState::Superseded, "ok", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn try_change_state_dry_run_propagates_a_transient_read_failure() {
+        // A transient failure of the read fails the preview fast:
+        // the dry-run never retries the read, and nothing is planned.
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/request/42?withhistory=1",
+            ErrorKind::ServerError,
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(true);
+        let err = obs
+            .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(http.post_calls().is_empty());
+        assert!(dry.plan().is_empty());
     }
 
     #[test]

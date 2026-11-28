@@ -16,18 +16,25 @@
 //! `--live` performs them. A dry-run mutation prints its plan on stderr (the
 //! library's `[dry-run]` narration) and returns a payload with
 //! `dry_run: true`, the recorded `plan`, and no id. In a dry run
-//! `try-change-state` reports `changed: true`: that is the library's
-//! would-change answer, not a change that happened — read it together
-//! with `dry_run`. The one exception is `request supersede`: the
-//! library's raw supersede has no dry-run, so without `--live` that
-//! command refuses — `request refile --supersede` is the
-//! dry-runnable supersede flow.
+//! `try-change-state` reports `changed` as the would-change answer:
+//! true only when the request exists and is in another state — a
+//! request already in the target state reports `false`, and a
+//! request that does not exist is `not_found`. The one exception is
+//! `request supersede`: the library's raw supersede has no dry-run,
+//! so without `--live` that command refuses — `request refile
+//! --supersede` is the dry-runnable supersede flow.
 //!
 //! Credentials in dry-run: this group swallows a half-configured
 //! credential pair in dry-run (the plan prints without credentials;
 //! the dropped error goes to the debug channel and to stderr as a
 //! warning), so a request preview
-//! never needs credentials at all. A live run — and every read —
+//! never needs credentials at all — except `try-change-state`, which
+//! reads the request first and so needs credentials like the reads,
+//! `request accept`'s cleanup leg, which reads the request first and
+//! reports an error in its cleanup section without them, and with
+//! `--instance`, whose credentials are strict and whose
+//! resolution error propagates even in dry-run.
+//! A live run — and every read —
 //! still resolves credentials up front and fails fast. How the other
 //! groups handle a half-configured pair is stated in `docs/cli.md`.
 //!
@@ -724,8 +731,8 @@ pub fn run(
             with_client(debug, live, instance, |client| {
                 let changed = client.try_change_state(&id, state, &comment, force, &dry_run)?;
                 // `changed` is the library's would-change answer: in
-                // a dry run it is true by design (the change is only
-                // planned, not performed), so read it together with
+                // a dry run it is true only when the request exists
+                // and is in another state, so read it together with
                 // `dry_run`, never as "the state changed".
                 let mut payload = json!({
                     "id": request_id_json(&id),
@@ -735,15 +742,21 @@ pub fn run(
                     "dry_run": dry_run.enabled(),
                 });
                 add_plan(&mut payload, &dry_run);
-                let mut text = if dry_run.enabled() {
-                    format!(
+                let mut text = match (dry_run.enabled(), changed) {
+                    (true, true) => format!(
                         "dry-run: would try to change request {id} to {}",
                         state.as_str()
-                    )
-                } else if changed {
-                    format!("changed request {id} to {}", state.as_str())
-                } else {
-                    format!("request {id} not changed to {}", state.as_str())
+                    ),
+                    (true, false) => format!(
+                        "dry-run: request {id} already {}; nothing to change",
+                        state.as_str()
+                    ),
+                    (false, true) => {
+                        format!("changed request {id} to {}", state.as_str())
+                    }
+                    (false, false) => {
+                        format!("request {id} not changed to {}", state.as_str())
+                    }
                 };
                 if !comment.is_empty() {
                     text.push_str(&format!(" — {comment}"));
@@ -1898,10 +1911,18 @@ pub(crate) fn forward_action_text(action: &ForwardActionResult, dry_run: &DryRun
 /// scope and the caller runs inside it.
 ///
 /// `live` says whether this run may perform live work. A dry-run
-/// mutation never touches the server, so a half-configured
-/// credential set (a username without a password source, or the
-/// reverse) must not fail it: the resolution error is replaced with
-/// no credentials and the plan prints. The dropped error is reported
+/// mutation that plans from flags alone never touches the server, so
+/// a half-configured credential set (a username without a password
+/// source, or the reverse) must not fail it: the resolution error is
+/// replaced with no credentials and the plan prints. Three exceptions:
+/// with `--instance` the credentials are strict and the resolution
+/// error propagates even in dry-run, `try-change-state` reads the
+/// request back first in its dry run and fails closed without
+/// credentials (see `ObsClient::try_change_state`), and `request
+/// accept`'s cleanup leg reads the request back first in its dry run
+/// too — without credentials only its cleanup section carries an
+/// error, the plan still prints (see `accept_cleanup`). The dropped
+/// error is reported
 /// as a stderr warning (and on the debug channel), so a dry run still
 /// shows that the same credentials would fail a `--live` run — the
 /// debug channel alone would leave it silent without `--debug`.
