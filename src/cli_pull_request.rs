@@ -1214,7 +1214,7 @@ fn refuse_factory_base(base: &str) -> Result<(), GeectlError> {
     if base.eq_ignore_ascii_case("factory") {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "the factory branch does not take pull requests: target the devel branch with --base instead, and file the Factory leg as an OBS submit request (`osc sr`)",
+            "the factory branch does not take pull requests: target the devel branch with --base instead, and file the Factory leg as an OBS submit request (`geectl request file`)",
         ));
     }
     Ok(())
@@ -4277,7 +4277,10 @@ mod tests {
                 .contains("the factory branch does not take pull requests"),
             "err: {err}"
         );
-        assert!(err.to_string().contains("osc sr"), "err: {err}");
+        assert!(
+            err.to_string().contains("geectl request file"),
+            "err: {err}"
+        );
     }
 
     #[test]
