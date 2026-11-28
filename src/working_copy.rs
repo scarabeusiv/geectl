@@ -5527,9 +5527,14 @@ fn commit_git(
         ],
         &[],
     )?;
+    // The open-requests report is informational: the commit landed,
+    // so a failing search does not fail the commit.
+    let open_requests = client
+        .open_requests_for_package(&wc.project, &wc.package)
+        .unwrap_or_default();
     Ok(CommitReport {
         landed: Base::Git { head },
-        open_requests: Vec::new(),
+        open_requests,
         files: split_nul(&changed),
     })
 }
@@ -12323,6 +12328,52 @@ mod tests {
             .trim()
             .to_string();
         assert_eq!(origin_head, head);
+    }
+
+    #[test]
+    fn commit_git_reports_open_requests() {
+        let dir = TempDirGuard::new("git-commit-requests");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        // The OBS side already synced the pushed head: the poll
+        // finds it on the first read.
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search_url = client
+            .package_requests_search_url("home:alice", "foo")
+            .unwrap();
+        let http = http.with_get(
+            &search_url,
+            "<collection matches=\"1\"><request id=\"42\" /></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.open_requests, vec!["42".to_string()]);
+        let _ = origin;
     }
 
     #[test]
