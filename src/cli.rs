@@ -221,6 +221,11 @@ pub enum Command {
     Pull,
     /// Stage the resolved files and continue a stopped rebase.
     Resolve,
+    /// Push the working copy's branch to its origin: the leaf
+    /// that completes a rebase (`update`, then `resolve`, then
+    /// `push`). Lease-guarded: a rebase rewrites commits the
+    /// remote already has, so the push forces with a lease.
+    Push,
     /// Read, validate and clean a project's prjconf.
     Prjconf {
         #[command(subcommand)]

@@ -3,9 +3,9 @@
 The command reference for the geectl binary: one subcommand per
 operation, grouped under a top-level noun (`remote`, `request`,
 `branch`, `build`, `local-build`, `maintenance`, `service`, `gitea`, `pull-request`, `person`, `meta`, `changelog`, `prjconf`), plus `version`
-and `config`, plus the ten working-copy leaves (`checkout`, `update`,
+and `config`, plus the eleven working-copy leaves (`checkout`, `update`,
 `status`, `diff`, `add`, `rm`, `addremove`, `commit`, `pull`,
-`resolve`) that operate on the checkout in the current directory.
+`resolve`, `push`) that operate on the checkout in the current directory.
 The reference below lists every command with what it does
 and its key flags. The binary's `--help` is the source of
 truth for the full text: run `geectl --help` or
@@ -380,6 +380,7 @@ config (`geectl.apiurl`, `geectl.project`, `geectl.package`,
 - `geectl commit --message <MESSAGE>` — Commit the staged changes; key flags: --noservice
 - `geectl pull` — Pull a linked package to the link target's latest revision.
 - `geectl resolve` — Stage the resolved files and continue a stopped rebase.
+- `geectl push` — Push the working copy's branch to its origin, lease-guarded; the leaf that completes a rebase.
 
 ## `prjconf` — project-config reads and cleanup
 

@@ -6,8 +6,8 @@ Depends on: https://github.com/scarabeusiv/geectl/issues/20 (Gitea ops surface),
 
 ## The layer, up front
 
-The 10 operation groups (`checkout`, `update`, `status`, `diff`,
-`add`/`rm`/`addremove`, `commit`, `changelog`, `mkpac`, `pull`, `resolve`) are one design
+The 11 operation groups (`checkout`, `update`, `status`, `diff`,
+`add`/`rm`/`addremove`, `commit`, `changelog`, `mkpac`, `pull`, `resolve`, `push`) are one design
 decision: geectl keeps a working copy, and the working
 copy is a git repository.
 
@@ -19,7 +19,7 @@ through the commit protocol. The agent's call is the same for either
 backend: one operation per verb, and the backend kind recorded at
 checkout routes writes only.
 
-## The 10 operations, mapped
+## The 11 operations, mapped
 
 All reads use the typed API; the only new server calls the layer needs are
 the two commit-protocol calls (see "Commit protocol").
@@ -36,6 +36,7 @@ the two commit-protocol calls (see "Commit protocol").
 | `mkpac` | `create_package` (exists) + `checkout` | The checkout holds the state. |
 | `pull` | Expanded directory read (`list_files` with expand) + expanded file downloads + `update` | Only for linked packages with a baserev and a clean WC: zero uncommitted changes, zero untracked files (local commits are rebased). A pull needs a baserev. The clean-tree check reads the untracked half with plain `ls-files --others` (no `--exclude-standard`): `status` hides ignored untracked files, and an ignored file blocks the pull like any other untracked file. Rebases link-target changes into the WC, like `update`. The server's expanded tree excludes `_link`, so pull fetches `_link` through the unexpanded route and rewrites its baserev to the target's latest srcmd5. Expanded downloads are pinned to the expanded listing's revision and md5-verified. A directory read that comes back revision-less is waited for (bounded retry of the revision read only); after the budget the pull errors. The pin is a revision spec (a number, or the expanded content's md5 for a linked package); `_link` downloads pinned to the link package's own revision. |
 | `resolve` | Local git only | Stage the resolved files and continue a stopped rebase. A file that still holds conflict markers (`<<<<<<<` / `=======` / `>>>>>>>`) fails resolve. A successful continue adopts the new base — OBS-native from the new root commit's message, git-backed from the rebase target — on disk and in the checkout — and refreshes the mtimes record with the new base. Unstaged edits are stashed around the continue and restored after; a failed restore strands them in the stash (named in the error) with the base already adopted. An autostash entry left by an earlier stopped update is restored at the end of `resolve` (or immediately when resolve is a no-op). |
+| `push` | Git-backed: fetch from the Gitea remote + `_scmsync.obsinfo` poll when the checkout records a non-empty scmsync URL | Pushes the branch to its origin with `--force-with-lease`, under the commit lock and after the pre-push gate; the pushed head becomes the new base. No-op when the branch is already up to date with its upstream. Refuses when the remote moved since the checkout last synced it: the lease pins the remote at the head last seen. Refuses when the local HEAD is behind its upstream (a reset checkout): the push would rewind the remote branch. The poll is skipped when the checkout records no (or an empty) scmsync URL. An OBS-native checkout refuses: its changes go out through `commit`. |
 
 ## The base record
 
@@ -191,7 +192,7 @@ coordinates only.
 The layer exposes one operation per verb, and the backend kind leaves
 the call the agent makes unchanged:
 
-The 10 operations are the same verbs with the same arguments for both backends. `checkout` and `update` populate the base differently per backend (clone vs synthesized repository; fetch vs download), and `commit` dispatches on the backend kind. `status` and `diff` run the same local git operations against the base in both cases: the OBS source API serves the synced tree of a git-backed package exactly like an OBS-native one, so the same code path runs. The backend kind is recorded in the checkout at checkout time, for routing writes only.
+The 11 operations are the same verbs with the same arguments for both backends. `checkout` and `update` populate the base differently per backend (clone vs synthesized repository; fetch vs download), and `commit` dispatches on the backend kind. `status` and `diff` run the same local git operations against the base in both cases: the OBS source API serves the synced tree of a git-backed package exactly like an OBS-native one, so the same code path runs. The backend kind is recorded in the checkout at checkout time, for routing writes only.
 The layer operates on the checkout through git, via a small `Git` wrapper around the git binary (argv-only, no shell). The wrapper passes `-c commit.gpgsign=false -c core.autocrlf=false -c core.hooksPath=/dev/null -c protocol.ext.allow=never`, so the working copy holds the server bytes exactly on every platform. It scrubs `GIT_*` environment variables (directory, config, identity, and transport variables) before every spawn, so the user's environment leaves every call unaffected; a call carries only the `GIT_*` the layer sets itself (the token header, a temporary index). Mutating git calls add `--no-verify`; diff output adds `--no-ext-diff --no-color --no-textconv`; pathspecs are literal (`--literal-pathspecs`), so a file named like a glob is treated as a path. Clone, fetch, and push use a configurable network timeout (`GEectl_GIT_NETWORK_TIMEOUT_SECS`, seconds, default 300); local git operations use the fixed 300 s timeout.
 
 ## Conflicts, DryRun, errors

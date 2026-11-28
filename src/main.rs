@@ -128,6 +128,7 @@ fn run(
         }
         Some(Command::Pull) => geectl::cli_working_copy::pull(debug, cli.live, instance)?,
         Some(Command::Resolve) => geectl::cli_working_copy::resolve(debug, cli.live)?,
+        Some(Command::Push) => geectl::cli_working_copy::push(debug, cli.live, instance)?,
         Some(Command::Prjconf { command }) => {
             geectl::cli_prjconf::run_prjconf(command, debug, cli.live, instance)?
         }
