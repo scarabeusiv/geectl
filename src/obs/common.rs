@@ -912,6 +912,10 @@ pub(crate) fn filter_history(
     let resolve = |spec: &RevisionSpec| -> Result<u64, GeectlError> {
         match spec {
             RevisionSpec::Rev(number) => Ok(*number),
+            RevisionSpec::Sha(_) => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "a git SHA is not an OBS revision: a history range names revision numbers or md5s",
+            )),
             RevisionSpec::Md5(md5) => entries
                 .iter()
                 .find(|entry| entry.srcmd5.as_deref() == Some(md5.as_str()))

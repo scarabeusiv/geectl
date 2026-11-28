@@ -167,24 +167,31 @@ impl Default for DryRun {
     }
 }
 
-/// A single revision specifier: a revision number, or a source md5.
-/// The `rev` parameter the API takes on source reads (`?rev=N`) is a
-/// number; an md5 names the same revision by content hash. Parsed by
-/// [`RevisionSpec::parse`]; a string that is neither a positive number
-/// nor a 32-hex md5 is invalid, never silently a revision.
+/// A single revision specifier: a revision number, a source md5,
+/// or a git commit SHA. The `rev` parameter the API takes on source
+/// reads (`?rev=N`) is a number; an md5 names the same revision by
+/// content hash; a SHA pins a git-backed checkout or update to a
+/// commit. Parsed by [`RevisionSpec::parse`]; a string that is
+/// neither a positive number nor a 32-hex md5 nor a 40-hex SHA is
+/// invalid, never silently a revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevisionSpec {
     /// Revision number (`rev` attribute).
     Rev(u64),
     /// Source md5 (32 hex digits, normalized to lowercase).
     Md5(String),
+    /// Git commit SHA (40 hex digits, normalized to lowercase).
+    Sha(String),
 }
 
 impl RevisionSpec {
     /// Parse a single revision specifier: `"1"` → `Rev(1)`; a 32-hex
-    /// md5 → `Md5`. Anything else (empty, `0`, a short hash, a
-    /// non-hex string) is an error.
+    /// md5 → `Md5`; a 40-hex SHA → `Sha`. Anything else (empty, `0`,
+    /// a short hash, a non-hex string) is an error.
     pub fn parse(s: &str) -> Result<Self, GeectlError> {
+        if s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(RevisionSpec::Sha(s.to_ascii_lowercase()));
+        }
         if s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit()) {
             return Ok(RevisionSpec::Md5(s.to_ascii_lowercase()));
         }
@@ -202,10 +209,15 @@ impl std::fmt::Display for RevisionSpec {
     /// Render the specifier the way it goes into a `rev` query
     /// parameter: a number renders as itself, an md5 renders
     /// lowercase (already normalized by [`RevisionSpec::parse`]).
+    /// A SHA renders the same way, but no OBS route accepts one
+    /// (see the `Sha` guards on the source reads): the rendering
+    /// exists so a parsed pin still prints, never so a SHA reaches
+    /// the server.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RevisionSpec::Rev(n) => write!(f, "{n}"),
             RevisionSpec::Md5(md5) => write!(f, "{md5}"),
+            RevisionSpec::Sha(sha) => write!(f, "{sha}"),
         }
     }
 }
@@ -247,7 +259,12 @@ impl RevisionRange {
             if part.is_empty() {
                 Ok(None)
             } else {
-                RevisionSpec::parse(part).map(Some).map_err(|_| invalid())
+                // A SHA is not a range bound: OBS ranges name
+                // revision numbers and md5s only.
+                match RevisionSpec::parse(part).map_err(|_| invalid())? {
+                    RevisionSpec::Sha(_) => Err(invalid()),
+                    spec => Ok(Some(spec)),
+                }
             }
         };
         let from = parse_part(parts[0])?;
@@ -1622,6 +1639,18 @@ mod tests {
             RevisionSpec::parse("0123456789ABCDEF0123456789ABCDEF").unwrap(),
             RevisionSpec::Md5(md5.to_string())
         );
+        // A 40-hex SHA parses, normalizing to lowercase.
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            RevisionSpec::parse(sha).unwrap(),
+            RevisionSpec::Sha(sha.to_string())
+        );
+        assert_eq!(
+            RevisionSpec::parse("0123456789ABCDEF0123456789ABCDEF01234567").unwrap(),
+            RevisionSpec::Sha(sha.to_string())
+        );
+        // A 39-hex string is neither an md5 nor a SHA.
+        assert!(RevisionSpec::parse("0123456789abcdef0123456789abcdef0123456").is_err());
         assert!(RevisionSpec::parse("").is_err());
         assert!(RevisionSpec::parse("0").is_err());
         assert!(RevisionSpec::parse("abc").is_err());
@@ -1678,6 +1707,8 @@ mod tests {
                 to: Some(RevisionSpec::Md5(hash2.to_string()))
             }
         );
+        // A SHA is not a range bound.
+        assert!(RevisionRange::parse("0123456789abcdef0123456789abcdef01234567").is_err());
     }
 
     #[test]
@@ -1692,6 +1723,10 @@ mod tests {
                 .unwrap()
                 .to_string(),
             "aabbccddaabbccddaabbccddaabbccdd"
+        );
+        assert_eq!(
+            RevisionSpec::Sha("0123456789abcdef0123456789abcdef01234567".to_string()).to_string(),
+            "0123456789abcdef0123456789abcdef01234567"
         );
     }
 

@@ -175,16 +175,18 @@ pub enum Command {
         project: String,
         /// The OBS package. The whole project when omitted.
         package: Option<String>,
-        /// The revision to check out (a number or a source md5).
-        /// The latest when omitted. Needs a package.
+        /// The revision to check out: an OBS revision number or
+        /// source md5 for an OBS-native package, a git SHA for a
+        /// git-backed package. The latest when omitted. Needs a package.
         #[arg(long)]
         rev: Option<String>,
     },
     /// Update the working copy in the current directory to the
     /// latest base.
     Update {
-        /// The revision to update to (a number or a source md5).
-        /// The latest when omitted.
+        /// The revision to update to: an OBS revision number or
+        /// source md5 for an OBS-native package, a git SHA for a
+        /// git-backed package. The latest when omitted.
         #[arg(long)]
         rev: Option<String>,
     },

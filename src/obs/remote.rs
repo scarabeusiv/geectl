@@ -2262,6 +2262,26 @@ fn validate_login(login: &str) -> Result<(), GeectlError> {
     Ok(())
 }
 
+/// Refuse a revision no `?rev=` read can carry: a git SHA is not
+/// an OBS revision, and revision 0 names nothing. The one guard
+/// for every revision-carrying leaf, so the wording changes in
+/// one place instead of once per leaf.
+fn assert_obs_revision(rev: Option<&RevisionSpec>) -> Result<(), GeectlError> {
+    if let Some(RevisionSpec::Rev(0)) = rev {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "invalid revision: 0",
+        ));
+    }
+    if let Some(RevisionSpec::Sha(_)) = rev {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "a git SHA is not an OBS revision: pin an OBS revision number or srcmd5",
+        ));
+    }
+    Ok(())
+}
+
 impl<'a> ObsClient<'a> {
     /// Return the devel (project, package) pair for `package` in
     /// project `project`, or None when no devel mapping is
@@ -2998,12 +3018,7 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
-        if let Some(RevisionSpec::Rev(0)) = rev {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                "invalid revision: 0",
-            ));
-        }
+        assert_obs_revision(rev)?;
         let mut query: Vec<(&str, &str)> = Vec::new();
         let rev_text;
         if let Some(rev) = rev {
@@ -3119,12 +3134,7 @@ impl<'a> ObsClient<'a> {
                 format!("invalid OBS filename: {file:?}"),
             ));
         }
-        if let Some(RevisionSpec::Rev(0)) = rev {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                "invalid revision: 0",
-            ));
-        }
+        assert_obs_revision(rev.as_ref())?;
         let mut query: Vec<(&str, &str)> = Vec::new();
         let rev_text;
         if let Some(rev) = rev {
@@ -3167,12 +3177,7 @@ impl<'a> ObsClient<'a> {
                 format!("invalid OBS filename: {file:?}"),
             ));
         }
-        if let Some(RevisionSpec::Rev(0)) = rev {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                "invalid revision: 0",
-            ));
-        }
+        assert_obs_revision(rev.as_ref())?;
         let mut query: Vec<(&str, &str)> = Vec::new();
         let rev_text;
         if let Some(rev) = rev {
@@ -3251,12 +3256,7 @@ impl<'a> ObsClient<'a> {
                 format!("invalid OBS filename: {file:?}"),
             ));
         }
-        if let Some(RevisionSpec::Rev(0)) = rev {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                "invalid revision: 0",
-            ));
-        }
+        assert_obs_revision(rev)?;
         let mut query: Vec<(&str, &str)> = Vec::new();
         let rev_text;
         if let Some(rev) = rev {
@@ -3303,12 +3303,7 @@ impl<'a> ObsClient<'a> {
                 format!("invalid OBS filename: {file:?}"),
             ));
         }
-        if let Some(RevisionSpec::Rev(0)) = rev {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                "invalid revision: 0",
-            ));
-        }
+        assert_obs_revision(rev)?;
         let mut query: Vec<(&str, &str)> = vec![("expand", "1")];
         let rev_text;
         if let Some(rev) = rev {
@@ -3347,6 +3342,7 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
+        assert_obs_revision(rev)?;
         let mut query: Vec<(&str, &str)> = Vec::new();
         let rev_text;
         if let Some(rev) = rev {
@@ -3388,12 +3384,7 @@ impl<'a> ObsClient<'a> {
         rev: Option<&RevisionSpec>,
         include_deleted: bool,
     ) -> Result<Vec<SourceFile>, GeectlError> {
-        if let Some(RevisionSpec::Rev(0)) = rev {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                "invalid revision: 0",
-            ));
-        }
+        assert_obs_revision(rev)?;
         Ok(self
             .directory_listing(project, package, rev, include_deleted)?
             .entries)
@@ -10180,6 +10171,48 @@ mod tests {
                 Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string()),
             )
         );
+    }
+
+    #[test]
+    fn directory_listing_refuses_a_sha_and_zero() {
+        // The shared listing leaf guards like its siblings: a SHA
+        // or a zero revision never reaches the server as `?rev=`.
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let err = client
+            .directory_listing(
+                "home:alice",
+                "foo",
+                Some(&RevisionSpec::Sha("a".repeat(40))),
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let err = client
+            .directory_listing("home:alice", "foo", Some(&RevisionSpec::Rev(0)), false)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn directory_listing_rev_refuses_a_sha_and_zero() {
+        // The pinned-revision leaf guards like the shared listing
+        // leaf: a SHA or a zero revision never reaches the server
+        // as `?rev=`.
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let err = client
+            .directory_listing_rev(
+                "home:alice",
+                "foo",
+                Some(&RevisionSpec::Sha("a".repeat(40))),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let err = client
+            .directory_listing_rev("home:alice", "foo", Some(&RevisionSpec::Rev(0)))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]
