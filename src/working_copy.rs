@@ -10273,6 +10273,30 @@ mod tests {
     }
 
     #[test]
+    fn update_obs_refuses_a_sha() {
+        // A git SHA is not an OBS revision: the update is refused
+        // before anything is read, and the base does not move.
+        let http = checkout_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        let reads_before = http.get_calls().len();
+        let downloads_before = http.get_to_file_calls().len();
+        let err = update(
+            &mut wc,
+            &client,
+            Some(&"a".repeat(40)),
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(http.get_calls().len(), reads_before);
+        assert_eq!(http.get_to_file_calls().len(), downloads_before);
+        assert_eq!(wc.base.as_obs().map(|(rev, _)| rev), Some(REV1));
+        let _ = dir;
+    }
+
+    #[test]
     fn resolve_finishes_a_conflicted_rebase() {
         let http = checkout_http()
             .with_get(
