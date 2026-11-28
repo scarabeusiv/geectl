@@ -2131,11 +2131,12 @@ fn forward_gitea(
                     "no OBS package is synced from {}#{}",
                     inputs.repo_url, inputs.base_branch
                 ),
+                no_recorded_devel: None,
             }),
         }
     })?;
     let payload = json!({
-        "actions": [crate::cli_request::forward_action_json(&action)],
+        "actions": [crate::cli_request::forward_action_json(&action, &dry_run)],
         "dry_run": false,
     });
     let text = crate::cli_request::forward_action_text(&action, &dry_run);
