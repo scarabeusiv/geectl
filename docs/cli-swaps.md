@@ -193,7 +193,7 @@ layout. Incident filing lives with the other filings under `geectl request`
 | osc | geectl | Why |
 |---|---|---|
 | — | `geectl service list` / `geectl service state` | New surface: read a package's `_service` file and its last run state |
-| `osc service remoterun [PROJECT PACKAGE]` | `geectl service trigger PROJECT PACKAGE [--service NAME]` | Same server-side trigger (`POST /source/<project>/<package>?cmd=runservice`): the server runs the package's whole service set; `--service` names the service the trigger is for; a service name outside the stored `_service` fails closed. The trigger queues the run; the outcome is read with `geectl service state`. Dry-run is the default (the plan is printed); `--live` performs the trigger |
+| `osc service remoterun [PROJECT PACKAGE]` | `geectl service trigger PROJECT PACKAGE [--service NAME]` | Same server-side trigger (`POST /source/<project>/<package>?cmd=runservice`): the server runs the package's whole service set; `--service` names the service the trigger is for; a service name outside the stored `_service` fails closed, as does a package with no `_service` file. The trigger queues the run; the outcome is read with `geectl service state`. Dry-run is the default (the plan is printed); `--live` performs the trigger |
 
 ## `gitea` — Gitea operations
 

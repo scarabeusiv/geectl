@@ -470,9 +470,9 @@ impl ObsClient<'_> {
     /// the run was queued, not that it finished; the outcome is read
     /// with `service_state`. Requires credentials; without them the
     /// call fails loudly before any mutation — live, the credentials
-    /// check runs before the name check, so a live trigger without
-    /// credentials fails as a configuration error instead of
-    /// reporting the stored file as not found. In dry-run the
+    /// check runs before the `_service` check, so a live trigger
+    /// without credentials fails as a configuration error instead
+    /// of reporting the stored file as not found. In dry-run the
     /// trigger is recorded in the plan and nothing is triggered,
     /// and the result is `None`.
     ///
@@ -485,11 +485,12 @@ impl ObsClient<'_> {
     /// package with no `_service` file is likewise
     /// [`ErrorKind::NotFound`]: the server has nothing to run. A
     /// missing package is [`ErrorKind::NotFound`]; any other server
-    /// refusal is the transport's error, never success. The name
-    /// check runs before the dry-run guard, so a dry-run trigger
-    /// with a mistyped service fails instead of reporting a clean
-    /// plan; the check reads the stored file through the
-    /// authenticated endpoints when the client has credentials.
+    /// refusal is the transport's error, never success. The
+    /// `_service` check runs before the dry-run guard, so a dry-run
+    /// trigger for a package with no `_service` file, or with a
+    /// mistyped service, fails instead of reporting a clean plan;
+    /// the check reads the stored file through the authenticated
+    /// endpoints when the client has credentials.
     /// A stored file that cannot be read at all — a missing
     /// package, a package that is not publicly readable without
     /// credentials — defers the check in dry-run: the plan must
@@ -497,7 +498,7 @@ impl ObsClient<'_> {
     /// read error. A stored `_service` that cannot be parsed fails
     /// the validation closed with [`ErrorKind::ServerError`] before
     /// any POST when live; in dry-run the failed validation is
-    /// deferred and the plan is recorded without the name check.
+    /// deferred and the plan is recorded without the `_service` check.
     ///
     /// The `_project` package is rejected: the server's `runservice`
     /// behaviour on a project's own services is untested.
@@ -533,7 +534,7 @@ impl ObsClient<'_> {
                 ));
             }
         }
-        // Live, the credentials check runs before the name
+        // Live, the credentials check runs before the `_service`
         // check: without credentials the public-path read of a
         // credentials-only package would 404 and mask the
         // configuration error as not-found. Dry-run skips it —
@@ -544,34 +545,37 @@ impl ObsClient<'_> {
                 "cannot trigger services without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
-        // The name check runs before the dry-run guard: a
-        // mistyped service fails the dry-run plan instead of
-        // passing it and failing only live. A stored file that
+        // The `_service` check runs before the dry-run guard,
+        // with or without a named service: a package with no
+        // `_service` file fails the dry-run plan instead of
+        // passing it and failing only live, and a mistyped
+        // service name does the same. A stored file that
         // cannot be read at all defers the check in dry-run —
         // the plan must not fail on a read it cannot make —
         // and fails live on the read error.
-        if let Some(service) = service {
-            match self.list_services_for_trigger(project, package) {
-                Ok(None) => {
-                    return Err(GeectlError::new(
-                        ErrorKind::NotFound,
-                        format!("package {project}/{package} has no _service file"),
-                    ));
-                }
-                Ok(Some(services)) if !services.iter().any(|defined| defined.name == service) => {
-                    return Err(GeectlError::new(
-                        ErrorKind::NotFound,
-                        format!("service {service} is not defined in {project}/{package}"),
-                    ));
-                }
-                Ok(Some(_)) => {}
-                Err(_) if dry_run.enabled() => {
-                    self.debug.emit(&format!(
-                        "trigger_service {project}/{package}: _service unreadable in dry-run, planning without the name check"
-                    ));
-                }
-                Err(err) => return Err(err),
+        match self.list_services_for_trigger(project, package) {
+            Ok(None) => {
+                return Err(GeectlError::new(
+                    ErrorKind::NotFound,
+                    format!("package {project}/{package} has no _service file"),
+                ));
             }
+            Ok(Some(services)) => {
+                if let Some(service) = service {
+                    if !services.iter().any(|defined| defined.name == service) {
+                        return Err(GeectlError::new(
+                            ErrorKind::NotFound,
+                            format!("service {service} is not defined in {project}/{package}"),
+                        ));
+                    }
+                }
+            }
+            Err(_) if dry_run.enabled() => {
+                self.debug.emit(&format!(
+                    "trigger_service {project}/{package}: _service unreadable in dry-run, planning without the _service check"
+                ));
+            }
+            Err(err) => return Err(err),
         }
         let action = match service {
             Some(service) => {
@@ -1549,7 +1553,8 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
 
     #[test]
     fn trigger_posts_runservice_and_returns_ok() {
-        let http = FakeHttp::new().with_post(TRIGGER_URL, "<status code=\"ok\"/>");
+        let http = fake_with_authed(DIR_WITH_SERVICE, Some(SV_MIXED_ALL))
+            .with_post(TRIGGER_URL, "<status code=\"ok\"/>");
         let client = authed_client(&http);
         assert_eq!(
             client
@@ -1560,13 +1565,19 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
                 code: "ok".to_string(),
             })
         );
-        // One authed POST, no reads: the trigger needs no `_service`
-        // lookup when no service is named.
+        // The stored file is read first (authed reads: the client
+        // has credentials), then the trigger posts.
+        assert_eq!(
+            http.get_calls(),
+            vec![
+                (AUTHED_DIRECTORY_URL.to_string(), true),
+                (AUTHED_SERVICE_URL.to_string(), true),
+            ]
+        );
         assert_eq!(
             http.post_calls(),
             vec![(TRIGGER_URL.to_string(), String::new(), true)]
         );
-        assert!(http.get_calls().is_empty());
     }
 
     #[test]
@@ -1642,10 +1653,12 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
     }
 
     #[test]
-    fn trigger_without_service_file_fails_on_the_server_refusal() {
-        // No `--service` to validate, so the POST goes out and the
-        // server refuses: no service defined is its 404.
-        let http = FakeHttp::new().with_post_error(TRIGGER_URL, ErrorKind::NotFound);
+    fn trigger_without_service_file_is_not_found_without_a_post() {
+        // The `_service` check runs with no `--service` named too:
+        // a package with no `_service` file fails closed before
+        // any POST, instead of posting and failing on the server's
+        // refusal.
+        let http = fake_with_authed(DIR_NO_SERVICE, None);
         let client = authed_client(&http);
         assert_eq!(
             client
@@ -1654,15 +1667,14 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
                 .kind(),
             ErrorKind::NotFound
         );
-        assert_eq!(
-            http.post_calls(),
-            vec![(TRIGGER_URL.to_string(), String::new(), true)]
-        );
+        assert!(http.post_calls().is_empty());
     }
 
     #[test]
     fn trigger_missing_package_is_not_found() {
-        let http = FakeHttp::new().with_post_error(TRIGGER_URL, ErrorKind::NotFound);
+        // The directory listing itself 404s, so the `_service`
+        // check fails closed before any POST.
+        let http = FakeHttp::new().with_get_error(AUTHED_DIRECTORY_URL, ErrorKind::NotFound);
         let client = authed_client(&http);
         assert_eq!(
             client
@@ -1671,18 +1683,14 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
                 .kind(),
             ErrorKind::NotFound
         );
-        // The POST went out: the 404 is the server's answer, not a
-        // client-side refusal before any request.
-        assert_eq!(
-            http.post_calls(),
-            vec![(TRIGGER_URL.to_string(), String::new(), true)]
-        );
+        assert!(http.post_calls().is_empty());
     }
 
     #[test]
     fn trigger_non_ok_answer_is_a_server_error() {
         for body in ["<status code=\"error\"/>", ""] {
-            let http = FakeHttp::new().with_post(TRIGGER_URL, body);
+            let http =
+                fake_with_authed(DIR_WITH_SERVICE, Some(SV_MIXED_ALL)).with_post(TRIGGER_URL, body);
             let client = authed_client(&http);
             assert_eq!(
                 client
@@ -1774,10 +1782,18 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
             vec!["[dry-run] would: trigger services for openSUSE:Factory/foo".to_string()]
         );
         assert!(http.post_calls().is_empty());
-        assert!(http.get_calls().is_empty());
+        // The `_service` validation read runs for the unnamed
+        // form too (read-only, before the dry-run guard), but
+        // nothing is posted.
+        assert_eq!(
+            http.get_calls(),
+            vec![
+                (AUTHED_DIRECTORY_URL.to_string(), true),
+                (AUTHED_SERVICE_URL.to_string(), true),
+            ]
+        );
         // The named form plans the name too — the `_service`
-        // validation read still runs (read-only, before the
-        // dry-run guard), but nothing is posted.
+        // validation read runs again, but nothing is posted.
         let dry_run = DryRun::new(true);
         assert_eq!(
             client
@@ -1796,6 +1812,8 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
         assert_eq!(
             http.get_calls(),
             vec![
+                (AUTHED_DIRECTORY_URL.to_string(), true),
+                (AUTHED_SERVICE_URL.to_string(), true),
                 (AUTHED_DIRECTORY_URL.to_string(), true),
                 (AUTHED_SERVICE_URL.to_string(), true),
             ]
@@ -1822,12 +1840,96 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
     }
 
     #[test]
-    fn trigger_dry_run_with_unreadable_service_file_plans_without_the_check() {
+    fn trigger_dry_run_without_service_file_is_not_found() {
+        // The `_service` check runs before the dry-run guard with
+        // no `--service` named either: a package with no `_service`
+        // file fails the dry-run plan instead of reporting a clean
+        // plan, and no plan is recorded.
+        let http = fake_with_authed(DIR_NO_SERVICE, None);
+        let client = authed_client(&http);
+        let dry_run = DryRun::new(true);
+        assert_eq!(
+            client
+                .trigger_service("openSUSE:Factory", "foo", None, &dry_run,)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+        assert!(dry_run.plan().is_empty());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn trigger_dry_run_without_service_file_is_not_found_on_the_public_path() {
+        // No credentials, so the existence check reads the public
+        // `_service`: the listing alone shows there is no file to
+        // read, and the dry-run fails closed.
+        let http = fake_with(DIR_NO_SERVICE, None);
+        let client = ObsClient::new(&http);
+        let dry_run = DryRun::new(true);
+        assert_eq!(
+            client
+                .trigger_service("openSUSE:Factory", "foo", None, &dry_run,)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+        assert!(dry_run.plan().is_empty());
+        assert_eq!(http.get_calls(), vec![(DIRECTORY_URL.to_string(), false)]);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn trigger_dry_run_unreadable_service_listing_plans_without_the_check() {
         // The stored file cannot be read (no canned response: the
         // package is missing or not readable): dry-run plans
-        // without the name check instead of failing the plan on a
+        // without the check instead of failing the plan on a
         // read it cannot make. Live still fails on the read error.
         let http = FakeHttp::new();
+        let client = authed_client(&http);
+        let dry_run = DryRun::new(true);
+        assert_eq!(
+            client
+                .trigger_service("openSUSE:Factory", "foo", None, &dry_run)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: trigger services for openSUSE:Factory/foo".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+        let err = client
+            .trigger_service("openSUSE:Factory", "foo", None, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NetworkError);
+        // The same deferral on the public path: no credentials, so
+        // the existence check reads the public listing, and an
+        // unreadable listing still plans instead of failing.
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let dry_run = DryRun::new(true);
+        assert_eq!(
+            client
+                .trigger_service("openSUSE:Factory", "foo", None, &dry_run)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: trigger services for openSUSE:Factory/foo".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn trigger_dry_run_with_unreadable_service_file_plans_without_the_check() {
+        // The stored `_service` file cannot be read (no canned
+        // response for the file: the listing is readable, the file
+        // is not): dry-run plans without the `_service` check
+        // instead of failing the plan on a read it cannot make.
+        // Live still fails on the read error.
+        let http = fake_with_authed(DIR_WITH_SERVICE, None);
         let client = authed_client(&http);
         let dry_run = DryRun::new(true);
         assert_eq!(
@@ -1919,6 +2021,7 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
         assert_eq!(
             captured_lines(&lines),
             vec![
+                "list_services openSUSE:Factory/foo: 6 service(s)".to_string(),
                 "trigger_service openSUSE:Factory/foo: ok".to_string(),
                 "list_services openSUSE:Factory/foo: 6 service(s)".to_string(),
                 "trigger_service openSUSE:Factory/foo: ok (service download_url)".to_string(),
