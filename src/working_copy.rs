@@ -3263,8 +3263,9 @@ pub fn diff(
 /// Whether the checkout is a linked OBS package: the OBS backend
 /// with a `_link` file in the index. A git-backed checkout never
 /// counts, even when it carries a file named `_link` — such a
-/// checkout is refused by `diff`/`commit`/`pull` (`refuse_git_link`)
-/// before this is consulted, so the link is never silently ignored.
+/// checkout is refused by `diff`/`commit`/`pull`/`submit`
+/// (`refuse_git_link`) before the link section consults this, so
+/// the link is never silently ignored.
 pub fn is_linked(wc: &WorkingCopy) -> Result<bool, GeectlError> {
     Ok(wc.backend == Backend::Obs && index_has(wc, "_link")?)
 }
@@ -4938,14 +4939,16 @@ fn refuse_link_to_other_project(wc: &WorkingCopy) -> Result<(), GeectlError> {
     Ok(())
 }
 
-/// Refuse a git-backed checkout carrying a staged `_link`: the
-/// scmsync sync never carries a `_link` at HEAD to OBS, so a link
-/// in a git-backed checkout is honoured nowhere — `diff` shows no
-/// link section, `commit` pushes the file as ordinary content, and
-/// `pull` has no link to follow. Refusing here makes the
-/// constraint visible in every leaf instead of silent in most and
-/// loud in one. Remove the `_link`, or check the package out
-/// OBS-native to follow the link.
+/// Refuse a git-backed checkout carrying a `_link` in its index:
+/// the scmsync sync never carries a `_link` at HEAD to OBS, so a
+/// link in a git-backed checkout is honoured nowhere — `diff`
+/// shows no link section, `commit` pushes the file as ordinary
+/// content, `pull` has no link to follow, and `submit` would file
+/// a pull request carrying the link as ordinary content. Refusing
+/// here makes the constraint visible in `diff`, `commit`, `pull`
+/// and `submit` instead of silent in most and loud in one.
+/// Remove the `_link`, or check the package out OBS-native to
+/// follow the link.
 fn refuse_git_link(wc: &WorkingCopy) -> Result<(), GeectlError> {
     if wc.backend == Backend::Git && index_has(wc, "_link")? {
         return Err(GeectlError::new(
@@ -6117,12 +6120,15 @@ fn verify_git_submit_target(
 }
 
 /// Refuse to file from a git-backed checkout that is not ready:
-/// the filed target is verified first (when one is given) — the
+/// a `_link` is refused before anything else in this function — a
+/// link is honoured nowhere on the git path (see `refuse_git_link`)
+/// — then the filed target is verified (when one is given): the
 /// target repo is the parent of the checkout's origin and the base
-/// exists on the target — then a remote ahead of the checkout,
-/// conflicts, or changes against the base. The order after the
-/// verification mirrors `commit_git`: the remote check first, then
-/// conflicts, then the uncommitted check. Live, the remote is fetched first, so the
+/// exists on the target. After
+/// the verification, a remote ahead of the checkout, conflicts, or
+/// changes against the base. The order after the verification
+/// mirrors `commit_git`: the remote check first, then conflicts,
+/// then the uncommitted check. Live, the remote is fetched first, so the
 /// check judges the current remote; the dry-run plan does not
 /// fetch, so it refuses only when the checkout is behind what was
 /// last fetched — like the commit plan. The fetch only refreshes
@@ -6135,6 +6141,11 @@ pub fn refuse_not_submittable_git(
     target: Option<&GitTargetVerification<'_>>,
     dry_run: &DryRun,
 ) -> Result<(), GeectlError> {
+    // A `_link` is honoured nowhere on the git path: refuse before
+    // the target verification and the fetch, so this function spends
+    // no further server read on a filing that can never land (see
+    // `refuse_git_link`).
+    refuse_git_link(wc)?;
     if let Some(target) = target {
         verify_git_submit_target(wc, target)?;
     }
@@ -16645,6 +16656,92 @@ mod tests {
         let err = refuse_not_submittable_git(&wc, None, None, &DryRun::new(true)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(err.to_string().contains("commit them first"));
+        let _ = origin;
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_refuses_a_staged_link() {
+        let dir = TempDirGuard::new("submit-git-link");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        write_file(
+            &wc.root,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        add(&wc, &["_link".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let err = refuse_not_submittable_git(&wc, None, None, &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("scmsync never syncs a _link"),
+            "message: {}",
+            err
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_refuses_a_committed_link() {
+        // The `_link` is committed, but `status` compares the
+        // index against the recorded base, not HEAD, so pre-fix the
+        // uncommitted check refused it with the unactionable
+        // "commit them first" message. This pins that submit
+        // readiness refuses with the link error instead.
+        let dir = TempDirGuard::new("submit-git-link-committed");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        write_file(
+            &wc.root,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        add(&wc, &["_link".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "link"]);
+        let err = refuse_not_submittable_git(&wc, None, None, &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("scmsync never syncs a _link"),
+            "message: {}",
+            err
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_refuses_a_link_at_the_base() {
+        // The configuration that genuinely passed pre-fix: the
+        // `_link` is already at the recorded base, so the index
+        // matches the base, status is clean, and the remote is not
+        // ahead — only the link refusal catches it.
+        let dir = TempDirGuard::new("submit-git-link-base");
+        let origin = git_origin(&dir.path);
+        let work = dir.path.join("work");
+        write_file(
+            &work,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "link"]);
+        git_ok(&work, &["push", "--quiet", "origin", "main"]);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        // The premise: the link sits at the recorded base, so
+        // status is clean and only the link refusal catches it.
+        assert!(status(&wc).unwrap().is_empty());
+        let err = refuse_not_submittable_git(&wc, None, None, &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("scmsync never syncs a _link"),
+            "message: {}",
+            err
+        );
         let _ = origin;
     }
 
