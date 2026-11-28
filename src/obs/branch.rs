@@ -332,17 +332,20 @@ impl<'a> ObsClient<'a> {
     /// would resolve to, if it is one: the source package itself, or
     /// its devel package when one is registered and
     /// `no_devel_project` is false. The scmsync URL is the resolved
-    /// source meta's `<scmsync>` text; a blank value counts as none.
-    /// Both metas are read authenticated: a package that exists but
-    /// is hidden from the public read is still refused here, where a
-    /// public read would have answered NotFound and let the branch
-    /// freeze a snapshot. None when neither meta carries one, and
-    /// None when an authenticated read answers NotFound — a genuinely
-    /// missing source is not refused here; the branch POST produces
-    /// the authoritative error. Any other meta-read error propagates.
+    /// source meta's `<scmsync>` text, or its `_scmsync.obsinfo`
+    /// `url` + `revision` when the meta carries none — Factory
+    /// packages carry no `<scmsync>` in meta; a blank value counts
+    /// as none. Both metas are read authenticated: a package that
+    /// exists but is hidden from the public read is still refused
+    /// here, where a public read would have answered NotFound and
+    /// let the branch freeze a snapshot. None when neither the meta
+    /// nor the `_scmsync.obsinfo` carries one, and None when an
+    /// authenticated read answers NotFound — a genuinely missing
+    /// source is not refused here; the branch POST produces the
+    /// authoritative error. Any other meta-read error propagates.
     /// A project-level scmsync with no per-package `<scmsync>` marker
     /// is deliberately not detected: only the resolved source's own
-    /// meta decides.
+    /// meta or its `_scmsync.obsinfo` decides.
     fn scmsync_managed_branch_source(
         &self,
         project: &str,
@@ -361,10 +364,12 @@ impl<'a> ObsClient<'a> {
             _ => (project.to_string(), package.to_string()),
         };
         let scmsync = if source_project == project && source_package == package {
-            meta.scmsync
+            self.package_scmsync(meta.scmsync, &source_project, &source_package)?
         } else {
             match self.package_meta_authenticated(&source_project, &source_package) {
-                Ok(devel_meta) => devel_meta.scmsync,
+                Ok(devel_meta) => {
+                    self.package_scmsync(devel_meta.scmsync, &source_project, &source_package)?
+                }
                 Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
                 Err(err) => return Err(err),
             }
@@ -404,12 +409,17 @@ impl<'a> ObsClient<'a> {
     /// A scmsync-managed source is refused before any POST: the
     /// source meta is read authenticated first (and the devel source's
     /// meta when a devel project is registered and `no_devel_project`
-    /// is not set), and a non-empty `<scmsync>` on the resolved source
-    /// fails with `InvalidInput` naming the source, the scmsync URL,
-    /// and the fork route. A source whose authenticated meta read
-    /// answers NotFound proceeds to the branch POST, which produces
-    /// the authoritative error. A plain branch of a non-SCM source is
-    /// one meta GET plus one POST.
+    /// is not set), and a non-empty scmsync on the resolved source —
+    /// its `<scmsync>`, or its `_scmsync.obsinfo` when the meta
+    /// carries none — fails with `InvalidInput` naming the source,
+    /// the scmsync URL, and the fork route. The obsinfo fallback
+    /// reads only the resolved source, not both source and devel.
+    /// A source whose authenticated meta read answers NotFound
+    /// proceeds to the branch POST, which produces the authoritative
+    /// error. A plain branch of a non-SCM source is one meta GET,
+    /// one obsinfo GET, and one POST; a devel branch adds the devel
+    /// source's meta read (and its obsinfo read when its meta
+    /// carries no scmsync).
     ///
     /// Success is the server's `<status code="ok"/>` carrying the
     /// branch target as `<data>` elements; any other body is a server
@@ -2306,6 +2316,7 @@ mod tests {
                 "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
                 "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test package</title></package>",
             )
+            .with_get_error("https://api.opensuse.org/source/test:factory/test-pkgA/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_post(
                 "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
                 body,
@@ -2341,8 +2352,9 @@ mod tests {
         assert_eq!(posts[0].1, "");
         assert!(posts[0].2);
         // A plain branch reads the source meta first (the scmsync
-        // check), then makes a single POST.
-        assert_eq!(http.get_calls().len(), 1);
+        // check, plus the obsinfo fallback read when the meta
+        // carries no scmsync), then makes a single POST.
+        assert_eq!(http.get_calls().len(), 2);
     }
 
     #[test]
@@ -2392,6 +2404,7 @@ mod tests {
                 "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
                 "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test package</title></package>",
             )
+            .with_get_error("https://api.opensuse.org/source/test:factory/test-pkgA/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_get(
                 "https://api.opensuse.org/source/test:factory/test-pkgA",
                 "<directory name=\"test-pkgA\" />",
@@ -2409,7 +2422,7 @@ mod tests {
             .branch_package("test:factory", "test-pkgA", &options, &DryRun::new(false))
             .unwrap();
         assert!(result.is_some());
-        assert_eq!(http.get_calls().len(), 2);
+        assert_eq!(http.get_calls().len(), 3);
         assert_eq!(http.post_calls().len(), 1);
     }
 
@@ -2425,6 +2438,7 @@ mod tests {
                 "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
                 "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test package</title></package>",
             )
+            .with_get_error("https://api.opensuse.org/source/test:factory/test-pkgA/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_post(
                 "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch&ignoredevel=1",
                 body,
@@ -2451,6 +2465,7 @@ mod tests {
                 "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
                 "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test package</title></package>",
             )
+            .with_get_error("https://api.opensuse.org/source/test:factory/test-pkgA/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_post(
             "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch&target_project=home%3Aalice%3Abranches%3Atest%3Afactory&target_package=renamed&ignoredevel=1&force=1&rev=42&linkrev=abc123&comment=test-branch&noaccess=1&add_repositories=1&add_repositories_block=standard&add_repositories_rebuild=standard&extend_package_names=1&maintenance=1",
             body,
@@ -2488,6 +2503,7 @@ mod tests {
                 "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
                 "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test package</title></package>",
             )
+            .with_get_error("https://api.opensuse.org/source/test:factory/test-pkgA/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_post_error(
                 "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch&maintenance=1",
                 ErrorKind::AuthFailed,
@@ -2517,6 +2533,7 @@ mod tests {
                 "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
                 "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test package</title></package>",
             )
+            .with_get_error("https://api.opensuse.org/source/test:factory/test-pkgA/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_post_error(
                 "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
                 ErrorKind::AuthFailed,
@@ -2667,6 +2684,7 @@ mod tests {
                 "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
                 "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test package</title></package>",
             )
+            .with_get_error("https://api.opensuse.org/source/test:factory/test-pkgA/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_post(
             "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
             "<status code=\"error\"><summary>nope</summary></status>",
@@ -2720,6 +2738,84 @@ mod tests {
         assert!(
             err.to_string().contains("repo-fork"),
             "refusal names the fork route: {err}"
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn branch_package_refuses_scmsync_managed_source_via_obsinfo() {
+        // A Factory package carries no `<scmsync>` in meta, but
+        // its `_scmsync.obsinfo` names the repo: the guard still
+        // refuses, naming the resolved scmsync URL.
+        let scmsync = "https://src.opensuse.org/test/test-pkgA#main";
+        let meta = "<package name=\"test-pkgA\" project=\"test:factory\"></package>";
+        let obsinfo = "mtime: 1774534342\ncommit: abcdef1234567890abcdef1234567890abcdef12\nurl: https://src.opensuse.org/test/test-pkgA\nrevision: main\n";
+        let body = "<status code=\"ok\"><summary>Ok</summary>\n            <data name=\"target_project\">home:scarabeus_iv:branches:test:factory</data>\n            <data name=\"target_package\">test-pkgA</data>\n            <data name=\"project\">test:factory</data>\n            <data name=\"package\">test-pkgA</data></status>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_scmsync.obsinfo",
+                obsinfo,
+            )
+            .with_post(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
+                body,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .branch_package(
+                "test:factory",
+                "test-pkgA",
+                &BranchOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains(scmsync),
+            "refusal names the scmsync URL: {err}"
+        );
+        assert!(
+            err.to_string().contains("repo-fork"),
+            "refusal names the fork route: {err}"
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn branch_package_refuses_a_malformed_obsinfo() {
+        // The meta carries no `<scmsync>` and the obsinfo is
+        // present but unusable (no revision): the branch fails
+        // closed instead of treating the source as plain and
+        // freezing a snapshot.
+        let meta = "<package name=\"test-pkgA\" project=\"test:factory\"></package>";
+        let obsinfo = "mtime: 1774534342\ncommit: abcdef1234567890abcdef1234567890abcdef12\nurl: https://src.opensuse.org/test/test-pkgA\n";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_scmsync.obsinfo",
+                obsinfo,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .branch_package(
+                "test:factory",
+                "test-pkgA",
+                &BranchOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(
+            err.to_string()
+                .contains("without a usable url and revision"),
+            "refusal names the malformed record: {err}"
         );
         assert!(http.post_calls().is_empty());
     }
@@ -2845,6 +2941,10 @@ mod tests {
                 "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
                 source_meta,
             )
+            .with_get_error(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_scmsync.obsinfo",
+                ErrorKind::NotFound,
+            )
             .with_post(
                 "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch&ignoredevel=1",
                 body,
@@ -2858,7 +2958,7 @@ mod tests {
             .branch_package("test:factory", "test-pkgA", &options, &DryRun::new(false))
             .unwrap();
         assert!(result.is_some());
-        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(http.get_calls().len(), 2);
         assert_eq!(http.post_calls().len(), 1);
     }
 

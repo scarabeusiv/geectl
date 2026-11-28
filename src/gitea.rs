@@ -1393,7 +1393,7 @@ impl<'a> GiteaClient<'a> {
     /// filing-path freshness check is off without a client) — but a
     /// misconfigured credential set still fails closed. The caller
     /// resolves the client only when it will be used: the filing path
-    /// resolves it after the source meta says `<scmsync>`, so a
+    /// resolves it after the source is found git-backed, so a
     /// malformed `gitea_url`/instance config never fails an
     /// OBS-native filing that never reaches Gitea; a dry-run plan
     /// reads nothing, so no client is built there either.
@@ -3768,12 +3768,18 @@ impl<'a> GiteaClient<'a> {
     ///
     /// Steps: read the OBS package (or project, for package
     /// `"_project"`) meta and refuse with `InvalidInput` when it
-    /// carries no `<scmsync>`; resolve the devel project unless
+    /// carries no `<scmsync>` — a package with none falls back to
+    /// its `_scmsync.obsinfo` (`url` + `revision`), since Factory
+    /// packages carry no `<scmsync>` in meta; resolve the devel
+    /// project unless
     /// `no_devel_project` — fork from the devel source, never
     /// silently from the named project when a devel exists; parse
     /// the scmsync URL and resolve the branch (the explicit
-    /// `fork_branch`, else the source branch, else the source
-    /// repo's default branch via `repo_get`); Gitea fork (reuse
+    /// `fork_branch`, else the source branch — unless it pins a
+    /// commit, in which case the tracking branch when one is
+    /// named, else the source repo's default branch, matching
+    /// forward resolution — else the source repo's default branch
+    /// via `repo_get`); Gitea fork (reuse
     /// when it already exists); ensure the target project exists —
     /// the explicit target, or the server default
     /// `home:<user>:branches:<source project>` when the acting
@@ -3907,11 +3913,12 @@ impl<'a> GiteaClient<'a> {
                 _ => (project.to_string(), package.to_string()),
             };
             let scmsync = if source_project == project && source_package == package {
-                meta.scmsync
+                obs.package_scmsync(meta.scmsync, &source_project, &source_package)?
             } else {
                 // The devel source's meta carries its own scmsync.
-                obs.package_meta_authenticated(&source_project, &source_package)?
-                    .scmsync
+                let devel_meta =
+                    obs.package_meta_authenticated(&source_project, &source_package)?;
+                obs.package_scmsync(devel_meta.scmsync, &source_project, &source_package)?
             };
             let scmsync = match scmsync {
                 Some(url) => url,
@@ -3960,17 +3967,27 @@ impl<'a> GiteaClient<'a> {
             ));
         }
         // Resolve the branch: the explicit fork branch, else the
-        // source branch, else the source repo's default branch.
+        // source branch — unless it pins a commit, which names no
+        // branch to fork: then the tracking branch when one is
+        // named, else the source repo's default branch, matching
+        // forward resolution — else the source repo's default branch.
+        let default_branch = |reason: &str| -> Result<String, GeectlError> {
+            let default = self.repo_get(&parsed.owner, &parsed.repo)?.default_branch;
+            self.debug.emit(&format!(
+                "decision: {reason}; using the default branch {default}"
+            ));
+            Ok(default)
+        };
         let source_branch = match (&options.fork_branch, &parsed.branch) {
             (Some(explicit), _) => explicit.clone(),
-            (None, Some(branch)) => branch.clone(),
-            (None, None) => {
-                let default = self.repo_get(&parsed.owner, &parsed.repo)?.default_branch;
-                self.debug.emit(&format!(
-                    "decision: no branch named in the scmsync URL; using the default branch {default}"
-                ));
-                default
+            (None, Some(branch)) if looks_like_commit_sha(branch) => {
+                match &parsed.tracking_branch {
+                    Some(tracked) => tracked.clone(),
+                    None => default_branch("the scmsync fragment pins a commit")?,
+                }
             }
+            (None, Some(branch)) => branch.clone(),
+            (None, None) => default_branch("no branch named in the scmsync URL")?,
         };
         // The resolved branch is validated before it is embedded
         // in the fork's scmsync URL: the explicit fork branch was
@@ -5224,8 +5241,10 @@ fn percent_decode(value: &str) -> String {
 /// True when `value` is a full git commit SHA (40 hex for SHA-1,
 /// 64 hex for SHA-256): a scmsync fragment shaped like this pins a
 /// commit instead of naming a branch — the `trackingbranch` query
-/// names the branch it tracks.
-fn looks_like_commit_sha(value: &str) -> bool {
+/// names the branch it tracks. A branch literally named 40 or 64
+/// hex digits would read as a pin; no such branch exists in
+/// practice, and the server's own fixtures pin full SHAs.
+pub(crate) fn looks_like_commit_sha(value: &str) -> bool {
     (value.len() == 40 || value.len() == 64) && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -5381,8 +5400,10 @@ mod tests {
     ///   `pool/systemd` is fed by the OBS-to-Git bridge (commits
     ///   authored by "Git OBS Bridge", `OBS-URL:` in the
     ///   message); neither `openSUSE:Factory/systemd` nor
-    ///   `Base:System/systemd` carries `<scmsync>`, so `branch`
-    ///   on systemd correctly refuses. The `leap-16.0` branch
+    ///   `Base:System/systemd` carries `<scmsync>`, and the
+    ///   devel source's `_scmsync.obsinfo` answers 404, so
+    ///   `branch` on systemd correctly refuses. The `leap-16.0`
+    ///   branch
     ///   does not exist on `pool/systemd` — it lives on
     ///   `openSUSE/Leap` (branches `leap-16.0`, `leap-16.1`,
     ///   `leap-16.2`, default `leap-16.1`).
@@ -5407,8 +5428,11 @@ mod tests {
     ///   syncs via `?subdir=`).
     /// - `openSUSE:Factory/libstrophe` carries neither
     ///   `<scmsync>` nor `<devel>` — its git management lives
-    ///   only in project scmsync / `_scmsync.obsinfo`, which
-    ///   `branch` does not read, so `branch` on it refuses.
+    ///   only in `_scmsync.obsinfo` (`url` plus a `revision`
+    ///   that is a commit SHA), which `branch` reads as the
+    ///   fallback, so `branch` on it forks from the repo's
+    ///   default branch — the SHA fragment names no branch
+    ///   to fork.
     ///
     /// Constructed cases (no live equivalent found): the renamed
     /// fork `systemd-slfo` (no renamed fork exists on the
@@ -9784,6 +9808,96 @@ mod tests {
     }
 
     #[test]
+    fn branch_forks_a_package_from_obsinfo_with_a_sha_revision() {
+        // The live libstrophe shape: `openSUSE:Factory/libstrophe`
+        // carries neither `<scmsync>` nor `<devel>`; its
+        // `_scmsync.obsinfo` names the repo with a `revision`
+        // that is a commit SHA. The branch reads the obsinfo
+        // fallback and forks from the repo's default branch: a
+        // SHA fragment names no branch to fork, so the target
+        // scmsync must not carry `#SHA` — a checkout of it
+        // would sit detached and refuse commit/submit.
+        const SHA: &str = "345ba614c05cdf125665cd2733c7ba3873b9a9a9d9f46efdad002e3844e3bbf2";
+        let fork_body = repo_json_branch(
+            "fbui",
+            "libstrophe",
+            Some(("xmpp", "libstrophe")),
+            "main",
+            false,
+        );
+        let gitea_http = fork_fixture(
+            FakeHttp::new()
+                .with_get(
+                    "https://src.opensuse.org/api/v1/user",
+                    r#"{"login": "fbui"}"#,
+                )
+                .with_get(
+                    "https://src.opensuse.org/api/v1/repos/xmpp/libstrophe",
+                    &repo_json_branch("xmpp", "libstrophe", None, "main", false),
+                ),
+            "xmpp",
+            "libstrophe",
+            "https://src.opensuse.org/api/v1/repos/fbui/libstrophe",
+            &fork_body,
+        );
+        let meta = package_meta("openSUSE:Factory", "libstrophe", None, None);
+        let obsinfo = format!(
+            "mtime: 1774534342\ncommit: {SHA}\nurl: https://src.opensuse.org/xmpp/libstrophe\nrevision: {SHA}\n"
+        );
+        let fork_url = "https://api.opensuse.org/source/openSUSE:Factory/libstrophe?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Flibstrophe%23main";
+        let obs_http = branch_source_repos_fixture(
+            obs_fork_fixture(
+                branch_target_fixture(FakeHttp::new(), "openSUSE:Factory"),
+                "https://api.opensuse.org/source/openSUSE:Factory/libstrophe/_meta",
+                &meta,
+                fork_url,
+                &fork_status(
+                    "home:fbui:branches:openSUSE:Factory",
+                    "libstrophe",
+                    "openSUSE:Factory",
+                    "libstrophe",
+                ),
+            )
+            .with_get(
+                "https://api.opensuse.org/source/openSUSE:Factory/libstrophe/_scmsync.obsinfo",
+                &obsinfo,
+            ),
+            "openSUSE:Factory",
+            "",
+        );
+        let result = client(&gitea_http)
+            .branch(
+                &obs_client(&obs_http),
+                "openSUSE:Factory",
+                "libstrophe",
+                &ForkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result,
+            ForkResult {
+                owner: "fbui".to_string(),
+                repo: "libstrophe".to_string(),
+                branch: "main".to_string(),
+                scmsync: "https://src.opensuse.org/fbui/libstrophe#main".to_string(),
+                target_project: "home:fbui:branches:openSUSE:Factory".to_string(),
+                target_package: "libstrophe".to_string(),
+                clone_url: "https://src.opensuse.org/fbui/libstrophe.git".to_string(),
+                ssh_url: "gitea@src.opensuse.org:fbui/libstrophe.git".to_string(),
+                first_build: FirstBuild::NoRepositories,
+            }
+        );
+        // The OBS fork POST carries the full scmsync URL,
+        // percent-encoded as a query value, and no target keys —
+        // the server applies its defaults.
+        assert_eq!(obs_http.post_calls().len(), 1);
+        assert_eq!(obs_http.post_calls()[0].0, fork_url);
+        assert!(obs_http.post_calls()[0].2);
+    }
+
+    #[test]
     fn branch_generates_a_missing_target_project() {
         // Branching to a test project that does not exist yet
         // generates it as part of the branch: the explicit target
@@ -12334,6 +12448,10 @@ mod tests {
                 "https://api.opensuse.org/source/Base:System/systemd/_meta",
                 &package_meta("Base:System", "systemd", None, None),
             )
+            .with_get_error(
+                "https://api.opensuse.org/source/Base:System/systemd/_scmsync.obsinfo",
+                ErrorKind::NotFound,
+            )
             .with_get(
                 "https://api.opensuse.org/source/openSUSE:Factory/_meta",
                 &project_meta("openSUSE:Factory", None, None),
@@ -12350,8 +12468,9 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(gitea_http.post_calls().is_empty());
         assert!(obs_http.post_calls().is_empty());
-        // The devel leg ran: named meta, devel meta, then the
-        // project meta for the hint.
+        // The devel leg ran: named meta, devel meta, the obsinfo
+        // fallback read for the devel source, then the project
+        // meta for the hint.
         assert_eq!(
             obs_http
                 .get_calls()
@@ -12361,6 +12480,7 @@ mod tests {
             vec![
                 "https://api.opensuse.org/source/openSUSE:Factory/systemd/_meta",
                 "https://api.opensuse.org/source/Base:System/systemd/_meta",
+                "https://api.opensuse.org/source/Base:System/systemd/_scmsync.obsinfo",
                 "https://api.opensuse.org/source/openSUSE:Factory/_meta",
             ]
         );
@@ -12440,6 +12560,10 @@ mod tests {
             .with_get(
                 "https://api.opensuse.org/source/openSUSE:Factory/systemd/_meta",
                 &package_meta("openSUSE:Factory", "systemd", None, None),
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/openSUSE:Factory/systemd/_scmsync.obsinfo",
+                ErrorKind::NotFound,
             )
             .with_get(
                 "https://api.opensuse.org/source/openSUSE:Factory/_meta",

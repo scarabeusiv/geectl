@@ -1885,7 +1885,7 @@ impl<'a> SrFiling<'a> {
     /// The check runs on the live path only: dry-run reads nothing,
     /// so a dry-run plan prints "would file" for a filing the live
     /// check would refuse. The Gitea client resolves lazily, only
-    /// after the source meta says `<scmsync>`: an explicit client
+    /// after the source is found git-backed: an explicit client
     /// wired in ([`SrFiling::with_gitea`]) is used as-is, otherwise
     /// the HTTP client wired in ([`SrFiling::with_gitea_http`])
     /// resolves one through [`GiteaClient::try_from_config`]. A
@@ -1914,7 +1914,12 @@ impl<'a> SrFiling<'a> {
         let meta = self
             .obs
             .package_meta_authenticated(&payload.source_project, &payload.source_package)?;
-        let Some(scmsync) = meta.scmsync else {
+        let Some((scmsync, obsinfo_body)) = self.obs.package_scmsync_with_obsinfo(
+            meta.scmsync,
+            &payload.source_project,
+            &payload.source_package,
+        )?
+        else {
             return Ok(());
         };
         // The source is git-backed: only now does the Gitea client
@@ -1942,21 +1947,27 @@ impl<'a> SrFiling<'a> {
             }
         };
         let expected = gitea.expected_head_for_scmsync(&scmsync)?;
-        let obsinfo = match self.obs.authed_cat(
-            &payload.source_project,
-            &payload.source_package,
-            "_scmsync.obsinfo",
-        ) {
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                return Err(GeectlError::new(
+        // The obsinfo body the fallback already read is reused:
+        // a git-backed source whose meta carries no `<scmsync>`
+        // costs one obsinfo read for the whole filing, not two.
+        let obsinfo = match obsinfo_body {
+            Some(body) => body,
+            None => match self.obs.authed_cat(
+                &payload.source_project,
+                &payload.source_package,
+                "_scmsync.obsinfo",
+            ) {
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    return Err(GeectlError::new(
                     ErrorKind::InvalidInput,
                     format!(
                         "refusing to submit {source} to {target}: the OBS side has no _scmsync.obsinfo yet — the git→OBS sync has not landed the source; wait for the sync and retry"
                     ),
                 ));
-            }
-            Err(err) => return Err(err),
-            Ok(body) => body,
+                }
+                Err(err) => return Err(err),
+                Ok(body) => body,
+            },
         };
         match parse_obsinfo_commit(&obsinfo) {
             Some(synced) if synced == expected => Ok(()),
@@ -3722,14 +3733,24 @@ mod tests {
     }
 
     #[test]
-    fn file_live_obs_native_source_files_with_only_the_meta_read() {
-        // No `<scmsync>` on the source: not git-backed, so the
-        // check costs exactly the source-meta read and the filing
-        // proceeds.
+    fn file_live_current_git_backed_source_via_obsinfo_files() {
+        // The source meta carries no `<scmsync>`, but the
+        // `_scmsync.obsinfo` names the repo: the fallback detects
+        // the git-backed source, the freshness check runs, and
+        // the filing proceeds. The obsinfo is read once: the
+        // fallback's body is reused for the `commit:` check.
         let http = FakeHttp::new()
             .with_get(
                 "https://api.opensuse.org/source/science/gsl/_meta",
                 "<package name=\"gsl\" project=\"science\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/science/gsl/_scmsync.obsinfo",
+                &gsl_obsinfo(GSL_HEAD),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/adamm/gsl/branches/factory",
+                &freshness_branch_json("factory", GSL_HEAD),
             )
             .with_get(&gsl_search_url(), "<collection matches=\"0\"></collection>")
             .with_post(
@@ -3747,7 +3768,58 @@ mod tests {
                 superseded: vec![],
             })
         );
-        assert_eq!(http.get_calls().len(), 2);
+        assert_eq!(
+            http.get_calls(),
+            vec![
+                (
+                    "https://api.opensuse.org/source/science/gsl/_meta".to_string(),
+                    true
+                ),
+                (
+                    "https://api.opensuse.org/source/science/gsl/_scmsync.obsinfo".to_string(),
+                    true
+                ),
+                (
+                    "https://src.opensuse.org/api/v1/repos/adamm/gsl/branches/factory".to_string(),
+                    true
+                ),
+                (gsl_search_url(), true),
+            ]
+        );
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_live_obs_native_source_files_with_the_meta_and_obsinfo_reads() {
+        // No `<scmsync>` on the source and no `_scmsync.obsinfo`:
+        // not git-backed, so the check costs the source-meta
+        // read plus the obsinfo read and the filing proceeds.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/science/gsl/_meta",
+                "<package name=\"gsl\" project=\"science\"></package>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/science/gsl/_scmsync.obsinfo",
+                ErrorKind::NotFound,
+            )
+            .with_get(&gsl_search_url(), "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let gitea = freshness_gitea_client(&http);
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry).with_gitea(Some(&gitea));
+        assert_eq!(
+            filing.file(&git_backed_payload()).unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec![],
+            })
+        );
+        assert_eq!(http.get_calls().len(), 3);
         assert_eq!(http.post_calls().len(), 1);
     }
 

@@ -29,7 +29,7 @@ use crate::changelog::changes::normalize_changes_content;
 use crate::changelog::validate::{validate, PackageSnapshot, ValidateOptions};
 use crate::config::{Config, Identity};
 use crate::error::{ErrorKind, GeectlError};
-use crate::gitea::{validate_gitea_name, GiteaClient};
+use crate::gitea::{looks_like_commit_sha, normalize_repo_url, validate_gitea_name, GiteaClient};
 use crate::local_build::LocalBuild;
 use crate::obs::common::parse_obsinfo_commit;
 use crate::obs::{
@@ -2207,7 +2207,13 @@ pub fn checkout(
         ));
     }
     let meta = client.package_meta(project, package)?;
-    if rev.is_some() && meta.scmsync.is_some() {
+    // Factory packages carry no `<scmsync>` in meta: the
+    // `_scmsync.obsinfo` fallback decides git-backed here, or a
+    // Factory scmsync package would check out OBS-native. The
+    // fallback reads the public route, so checkout stays
+    // credential-free.
+    let scmsync = client.package_scmsync_public(meta.scmsync, project, package)?;
+    if rev.is_some() && scmsync.is_some() {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
             "checkout --rev is not supported for a git-backed package",
@@ -2221,7 +2227,7 @@ pub fn checkout(
         // files the checkout would download, or the repository it
         // would clone. The --rev refusal above fires before any
         // plan line, the same as in live mode.
-        match &meta.scmsync {
+        match &scmsync {
             Some(url) => {
                 dry_run.note(&format!("would clone {url} into {}", target.display()));
             }
@@ -2242,7 +2248,7 @@ pub fn checkout(
     // target did not exist on entry (refused above), so anything
     // there on failure is this call's, and the next attempt must
     // not trip over it.
-    let checked_out = match meta.scmsync {
+    let checked_out = match scmsync {
         Some(url) => checkout_git(client, project, package, &url, dir, gitea_auth),
         None => checkout_obs(client, project, package, rev, dir),
     };
@@ -2631,10 +2637,109 @@ fn split_scmsync_url(url: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// The commit SHA a checkout is pinned to, when its scmsync URL
+/// fragment is a commit SHA: the checkout sits on a detached HEAD
+/// with no branch to push to or update from. `None` for a branch
+/// checkout, or one with no fragment at all.
+fn scmsync_pinned_sha(wc: &WorkingCopy) -> Option<&str> {
+    let url = wc.scmsync_url.as_deref()?;
+    let (_, fragment) = split_scmsync_url(url);
+    fragment.filter(|fragment| looks_like_commit_sha(fragment))
+}
+
+/// Re-point a pinned checkout's recorded scmsync URL at `target`:
+/// the URL names the commit the checkout holds, so an update — or
+/// the resolve that finishes one — that moves the base re-points
+/// it. A no-op for a branch checkout.
+fn repoint_pinned_scmsync_url(wc: &mut WorkingCopy, target: &str) -> Result<(), GeectlError> {
+    if scmsync_pinned_sha(wc).is_some() {
+        let url = wc.scmsync_url.clone().unwrap_or_default();
+        let (clone_url, _) = split_scmsync_url(&url);
+        let new_url = format!("{clone_url}#{target}");
+        git_config_set(&wc.root, "scmsync-url", &new_url)?;
+        wc.scmsync_url = Some(new_url);
+    }
+    Ok(())
+}
+
+/// Whether two repo URLs name the same repository: equal
+/// after the parser's normalisation (scheme prefix, userinfo,
+/// default port, trailing `.git`), so a re-spelled origin
+/// still matches.
+fn same_repo_url(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match (normalize_repo_url(left), normalize_repo_url(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// The revision a pinned checkout updates to: the package's
+/// `_scmsync.obsinfo` revision, re-read on the public route —
+/// update stays credential-free — the sync may have landed a
+/// newer commit since the checkout. Refuses when the package
+/// no longer carries a usable obsinfo, or no longer pins a
+/// commit. The obsinfo URL must still name the repo the
+/// checkout was cloned from, and a SHA revision must agree
+/// with the obsinfo `commit:` line: a re-pointed package, or
+/// a revision the sync has not landed, is refused instead of
+/// rebasing onto a foreign or unlanded commit.
+fn pinned_update_target(wc: &WorkingCopy, client: &ObsClient) -> Result<String, GeectlError> {
+    let Some((url, body)) = client.scmsync_url_from_obsinfo_public(&wc.project, &wc.package)?
+    else {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "cannot update {}/{}: the package no longer carries a usable _scmsync.obsinfo, so the pinned checkout has no revision to update to; check the package out again",
+                wc.project, wc.package
+            ),
+        ));
+    };
+    let (obsinfo_url, revision) = split_scmsync_url(&url);
+    let Some(revision) = revision.filter(|revision| looks_like_commit_sha(revision)) else {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "cannot update {}/{}: the package's _scmsync.obsinfo no longer pins a commit, so the pinned checkout has no revision to update to; check the package out again",
+                wc.project, wc.package
+            ),
+        ));
+    };
+    // The package may have been re-pointed at another repo since
+    // the checkout: the update must not rebase onto its commits.
+    let (recorded_clone, _) = split_scmsync_url(wc.scmsync_url.as_deref().unwrap_or(""));
+    if !same_repo_url(obsinfo_url, recorded_clone) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "cannot update {}/{}: the package's _scmsync.obsinfo now names {obsinfo_url}, not the checkout's origin {recorded_clone}; check the package out again",
+                wc.project, wc.package
+            ),
+        ));
+    }
+    // The revision must agree with the synced commit: a SHA the
+    // sync has not landed yet is refused instead of rebased onto.
+    match parse_obsinfo_commit(&body) {
+        Some(commit) if commit == revision => Ok(revision.to_string()),
+        _ => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "cannot update {}/{}: the package's _scmsync.obsinfo revision {revision} does not match its synced commit; check the package out again",
+                wc.project, wc.package
+            ),
+        )),
+    }
+}
+
 /// The git-backed checkout: clone the scmsync repository. The
 /// clone's HEAD is the base. The scmsync URL and the branch its
 /// fragment names are recorded, so the checkout remembers which
-/// branch it tracks.
+/// branch it tracks. A fragment shaped like a commit SHA pins a
+/// commit instead of naming a branch: the clone takes the
+/// default branch and the SHA is checked out afterwards, and no
+/// branch is tracked for the pinned checkout.
 fn checkout_git(
     client: &ObsClient,
     project: &str,
@@ -2649,6 +2754,13 @@ fn checkout_git(
     // the fragment part of the path, and the clone fails. Strip it
     // and check the branch out with `--branch` instead.
     let (clone_url, branch) = split_scmsync_url(url);
+    // A fragment shaped like a commit SHA pins a commit instead
+    // of naming a branch: `git clone --branch <sha>` fails, so
+    // the SHA is checked out after the clone, and no branch is
+    // tracked for the pinned checkout.
+    let pinned_sha = branch.filter(|branch| looks_like_commit_sha(branch));
+    let tracked_branch =
+        branch.filter(|branch| !branch.is_empty() && !looks_like_commit_sha(branch));
     // A scmsync URL comes from the server (`_meta`), so it is
     // maintainer-controlled: only http(s) is accepted. A `file://`
     // URL, a local path, `ssh://` (the user's keys and agent), or
@@ -2682,11 +2794,9 @@ fn checkout_git(
     env.push(("GIT_ALLOW_PROTOCOL", "http:https"));
     let target_str = target.to_string_lossy().into_owned();
     let mut args: Vec<&str> = Vec::new();
-    if let Some(branch) = branch {
-        if !branch.is_empty() {
-            args.push("--branch");
-            args.push(branch);
-        }
+    if let Some(branch) = tracked_branch {
+        args.push("--branch");
+        args.push(branch);
     }
     // The `--` keeps the URL a repository, never an option: the
     // scheme check above already refuses a `-`-prefixed URL, and
@@ -2696,6 +2806,9 @@ fn checkout_git(
     args.push(clone_url);
     args.push(&target_str);
     git_network(dir, "clone", &args, &env)?;
+    if let Some(sha) = pinned_sha {
+        git(&target, "checkout", &[sha], &[])?;
+    }
     let head = git(&target, "rev-parse", &["HEAD"], &[])?
         .trim()
         .to_string();
@@ -2708,7 +2821,7 @@ fn checkout_git(
         &head,
         "",
         Some(url),
-        branch.filter(|branch| !branch.is_empty()),
+        tracked_branch,
     )?;
     Ok(WorkingCopy {
         root: target,
@@ -2720,9 +2833,7 @@ fn checkout_git(
         base_srcmd5: String::new(),
         mtimes,
         scmsync_url: Some(url.to_string()),
-        scmsync_branch: branch
-            .filter(|branch| !branch.is_empty())
-            .map(str::to_string),
+        scmsync_branch: tracked_branch.map(str::to_string),
     })
 }
 
@@ -4847,6 +4958,9 @@ fn record_commit_plan(
             Ok(())
         }
         Backend::Git => {
+            // The pinned refusal live commit_git runs first: the
+            // plan refuses a commit the live path would refuse.
+            refuse_pinned(wc, "commit", "commit there")?;
             // The outdated check live commit_git runs after its
             // fetch, against the last-fetched upstream: the plan
             // does not fetch, so it refuses only when the checkout
@@ -5173,6 +5287,22 @@ fn commit_obs(
     })
 }
 
+/// Refuse an action on a checkout pinned to a commit: it sits
+/// on a detached HEAD with no branch to push to, so a commit
+/// would strand a local commit the push cannot send, and a
+/// submit would have no pushed head to back it.
+fn refuse_pinned(wc: &WorkingCopy, verb: &str, then: &str) -> Result<(), GeectlError> {
+    if let Some(sha) = scmsync_pinned_sha(wc) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing to {verb} from a checkout pinned to commit {sha}: the checkout sits on a detached HEAD with no branch to push to; check out a branch first (for example the repository's default branch), {then}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The git-backed commit: commit staged changes, push, and poll the
 /// OBS side until the synced commit matches the pushed head. The
 /// refusals run before the service gate, in order: the remote has
@@ -5194,6 +5324,10 @@ fn commit_git(
     // The client must be the checkout's own instance before any
     // other check reads the server.
     wc.check_apiurl(&client.base)?;
+    // A pinned checkout has no branch to push to: refuse before
+    // any staging or commit exists, so a failed push never
+    // strands a local commit on a detached HEAD.
+    refuse_pinned(wc, "commit", "commit there")?;
     let auth = gitea_auth.ok_or_else(|| {
         GeectlError::new(
             ErrorKind::ConfigError,
@@ -5660,7 +5794,7 @@ pub fn update(
     }
     match wc.backend {
         Backend::Obs => update_obs(wc, client, rev).map(Some),
-        Backend::Git => update_git(wc, rev, gitea_auth).map(Some),
+        Backend::Git => update_git(wc, client, rev, gitea_auth).map(Some),
     }
 }
 
@@ -5779,6 +5913,15 @@ fn record_update_plan(
                 ));
             }
             refuse_on_rebase(wc)?;
+            // A pinned checkout has no upstream head: the plan
+            // names the obsinfo revision it would rebase onto.
+            if scmsync_pinned_sha(wc).is_some() {
+                let revision = pinned_update_target(wc, client)?;
+                dry_run.note(&format!(
+                    "would fetch origin and rebase onto the obsinfo revision {revision}"
+                ));
+                return Ok(());
+            }
             // The upstream SHA is not named: the plan does not
             // fetch, so the last-fetched head may not be the head
             // the fetch would rebase onto.
@@ -5946,6 +6089,10 @@ pub fn refuse_not_submittable_git(
     target: Option<&GitTargetVerification<'_>>,
     dry_run: &DryRun,
 ) -> Result<(), GeectlError> {
+    // A pinned checkout has no branch to push to: refuse before
+    // any fetch or verification, so the submission fails early
+    // instead of late on a missing pushed head.
+    refuse_pinned(wc, "submit", "commit there, and submit again")?;
     if let Some(target) = target {
         verify_git_submit_target(wc, target)?;
     }
@@ -6183,6 +6330,7 @@ fn update_obs(
 /// server revision to update to.
 fn update_git(
     wc: &mut WorkingCopy,
+    client: &ObsClient,
     rev: Option<&str>,
     gitea_auth: Option<&GiteaAuth<'_>>,
 ) -> Result<UpdateReport, GeectlError> {
@@ -6200,14 +6348,19 @@ fn update_git(
         None => Vec::new(),
     };
     git_network(&wc.root, "fetch", &["origin"], &env)?;
-    let target = match git(&wc.root, "rev-parse", &["@{u}"], &[]) {
-        Ok(sha) => sha.trim().to_string(),
-        Err(_) => {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                "the working copy has no upstream branch to update from",
-            ));
-        }
+    // A pinned checkout has no upstream branch: the OBS sync's
+    // revision is the target instead.
+    let target = match scmsync_pinned_sha(wc) {
+        Some(_) => pinned_update_target(wc, client)?,
+        None => match git(&wc.root, "rev-parse", &["@{u}"], &[]) {
+            Ok(sha) => sha.trim().to_string(),
+            Err(_) => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "the working copy has no upstream branch to update from",
+                ));
+            }
+        },
     };
     if target == wc.base_rev {
         return Ok(UpdateReport {
@@ -6224,6 +6377,7 @@ fn update_git(
     match outcome.conflicts {
         None => {
             git_config_set(&wc.root, "base-rev", &target)?;
+            repoint_pinned_scmsync_url(wc, &target)?;
             refresh_mtimes(wc)?;
             let report = UpdateReport {
                 updated: true,
@@ -6878,6 +7032,7 @@ pub fn resolve(wc: &mut WorkingCopy, dry_run: &DryRun) -> Result<Option<Vec<Stri
             }
             Backend::Git => {
                 git_config_set(&wc.root, "base-rev", &target)?;
+                repoint_pinned_scmsync_url(wc, &target)?;
                 wc.base_rev = target;
             }
         }
@@ -7192,6 +7347,10 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
+            )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
                 &listing_rev1(),
@@ -7247,6 +7406,10 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
+            )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
                 &listing("1", SRCMD5_1, "b256e7fa23f105539085c7c895557c41"),
@@ -7298,6 +7461,10 @@ mod tests {
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
             )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
@@ -7368,6 +7535,10 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
+            )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
                 &listing_rev1(),
@@ -7383,6 +7554,10 @@ mod tests {
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/bar/_meta",
                 "<package name=\"bar\" project=\"home:alice\"></package>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/bar/_scmsync.obsinfo",
+                ErrorKind::NotFound,
             )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/bar",
@@ -7700,6 +7875,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
+            .with_get_error("https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
                 &foo_rev1,
@@ -7744,6 +7920,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
+            .with_get_error("https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
                 &foo_rev1,
@@ -7775,6 +7952,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
+            .with_get_error("https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
                 &foo_rev1,
@@ -7814,6 +7992,10 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
+            )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
                 &foo_rev1,
@@ -7843,6 +8025,10 @@ mod tests {
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
             )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
@@ -7881,6 +8067,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
+            .with_get_error("https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
                 &foo_rev1,
@@ -7921,6 +8108,10 @@ mod tests {
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
             )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
@@ -8591,6 +8782,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo-link/_meta",
                 "<package name=\"foo-link\" project=\"home:alice\"></package>",
             )
+            .with_get_error("https://api.opensuse.org/public/source/home:alice/foo-link/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo-link?rev=1",
                 &format!(
@@ -8634,6 +8826,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo-link/_meta",
                 "<package name=\"foo-link\" project=\"home:alice\"></package>",
             )
+            .with_get_error("https://api.opensuse.org/public/source/home:alice/foo-link/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo-link?rev=1",
                 &format!(
@@ -8693,6 +8886,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo-link/_meta",
                 "<package name=\"foo-link\" project=\"home:alice\"></package>",
             )
+            .with_get_error("https://api.opensuse.org/public/source/home:alice/foo-link/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo-link?rev=1",
                 &format!(
@@ -8735,6 +8929,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo-link/_meta",
                 "<package name=\"foo-link\" project=\"home:alice\"></package>",
             )
+            .with_get_error("https://api.opensuse.org/public/source/home:alice/foo-link/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo-link?rev=1",
                 &format!(
@@ -8892,6 +9087,10 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
+            )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
                 &listing,
@@ -8929,6 +9128,10 @@ mod tests {
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
             )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
@@ -8968,6 +9171,10 @@ mod tests {
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
             )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
@@ -9025,6 +9232,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
+            .with_get_error("https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
                 &format!("<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\"></directory>"),
@@ -9606,6 +9814,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
+            .with_get_error("https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
                 &listing_failed,
@@ -9681,6 +9890,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
+            .with_get_error("https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_get_sequence(
                 "https://api.opensuse.org/public/source/home:alice/foo",
                 &[&listing, &listing, &listing],
@@ -9742,6 +9952,10 @@ mod tests {
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
             )
             .with_get_sequence(
                 "https://api.opensuse.org/public/source/home:alice/foo",
@@ -10875,6 +11089,10 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
+            )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
                 &listing_rev1(),
@@ -11517,6 +11735,124 @@ mod tests {
     }
 
     #[test]
+    fn checkout_git_clones_from_obsinfo_when_meta_has_no_scmsync() {
+        // A Factory package carries no `<scmsync>` in meta, but
+        // its `_scmsync.obsinfo` names the repo and branch: the
+        // fallback detects it as git-backed and the checkout
+        // clones that branch.
+        let dir = TempDirGuard::new("git-checkout-obsinfo");
+        let origin = git_origin(&dir.path);
+        let main_head = origin.head.clone();
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                &format!(
+                    "mtime: 1774534342\ncommit: {main_head}\nurl: {}\nrevision: main\n",
+                    origin.url
+                ),
+            );
+        let wc = do_git_checkout(&http, &dir);
+        assert_eq!(wc.backend, Backend::Git);
+        assert_eq!(wc.base_rev, main_head);
+        assert_eq!(read_file(&wc.root, "foo.spec"), "Name: foo\n");
+        let expected_url = format!("{}#main", origin.url);
+        assert_eq!(wc.scmsync_url.as_deref(), Some(expected_url.as_str()));
+        assert_eq!(wc.scmsync_branch.as_deref(), Some("main"));
+        let reopened = open(&wc.root).unwrap();
+        assert_eq!(reopened, wc);
+    }
+
+    #[test]
+    fn checkout_git_checks_out_a_sha_revision_from_obsinfo() {
+        // The live libstrophe shape: the obsinfo `revision` is a
+        // commit SHA, not a branch. A second branch, `other`,
+        // becomes the origin's default, so the clone must still
+        // check out the pinned SHA, not the default — and no
+        // branch is tracked for the pinned checkout.
+        let dir = TempDirGuard::new("git-checkout-obsinfo-sha");
+        let origin = git_origin(&dir.path);
+        let main_head = origin.head.clone();
+        let work = dir.path.join("work");
+        git_ok(&work, &["checkout", "--quiet", "-b", "other"]);
+        write_file(&work, "foo.spec", "Name: other\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "other branch"]);
+        git_ok(&work, &["push", "--quiet", "origin", "other"]);
+        git(
+            &origin.path,
+            "symbolic-ref",
+            &["HEAD", "refs/heads/other"],
+            &[],
+        )
+        .unwrap();
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                &format!(
+                    "mtime: 1774534342\ncommit: {main_head}\nurl: {}\nrevision: {main_head}\n",
+                    origin.url
+                ),
+            );
+        let wc = do_git_checkout(&http, &dir);
+        assert_eq!(wc.backend, Backend::Git);
+        assert_eq!(wc.base_rev, main_head);
+        assert_eq!(read_file(&wc.root, "foo.spec"), "Name: foo\n");
+        let expected_url = format!("{}#{main_head}", origin.url);
+        assert_eq!(wc.scmsync_url.as_deref(), Some(expected_url.as_str()));
+        assert_eq!(wc.scmsync_branch, None);
+        let reopened = open(&wc.root).unwrap();
+        assert_eq!(reopened, wc);
+    }
+
+    #[test]
+    fn checkout_git_refuses_a_malformed_obsinfo() {
+        // The meta carries no `<scmsync>` and the obsinfo is
+        // present but unusable (no revision): the checkout fails
+        // closed instead of checking the package out OBS-native
+        // and skipping the git-backed checks.
+        let dir = TempDirGuard::new("git-checkout-obsinfo-malformed");
+        let origin = git_origin(&dir.path);
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                &format!(
+                    "mtime: 1774534342\ncommit: {}\nurl: {}\n",
+                    origin.head, origin.url
+                ),
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            None,
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(
+            err.to_string()
+                .contains("without a usable url and revision"),
+            "refusal names the malformed record: {err}"
+        );
+        let _ = origin;
+    }
+
+    #[test]
     fn checkout_git_clones_with_an_empty_fragment() {
         let dir = TempDirGuard::new("git-checkout-empty-frag");
         let origin = git_origin(&dir.path);
@@ -11757,6 +12093,74 @@ mod tests {
     }
 
     #[test]
+    fn commit_git_refuses_a_pinned_checkout_before_any_local_commit() {
+        // The libstrophe shape: the checkout is pinned to the
+        // obsinfo revision, on a detached HEAD with no branch to
+        // push to. The commit refuses before any staging or local
+        // commit exists, so nothing is stranded.
+        let dir = TempDirGuard::new("git-commit-pinned");
+        let origin = git_origin(&dir.path);
+        let main_head = origin.head.clone();
+        // A second branch, `other`, becomes the origin's default,
+        // so the checkout is pinned to the main commit, not the
+        // default.
+        let work = dir.path.join("work");
+        git_ok(&work, &["checkout", "--quiet", "-b", "other"]);
+        write_file(&work, "foo.spec", "Name: other\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "other branch"]);
+        git_ok(&work, &["push", "--quiet", "origin", "other"]);
+        git(
+            &origin.path,
+            "symbolic-ref",
+            &["HEAD", "refs/heads/other"],
+            &[],
+        )
+        .unwrap();
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                &format!(
+                    "mtime: 1774534342\ncommit: {main_head}\nurl: {}\nrevision: {main_head}\n",
+                    origin.url
+                ),
+            );
+        let mut wc = do_git_checkout(&http, &dir);
+        assert_eq!(wc.base_rev, main_head);
+        write_file(&wc.root, "foo.spec", "Name: staged\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("pinned to commit"),
+            "refusal names the pinned state: {err}"
+        );
+        // No local commit was created: HEAD is still the base.
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(head, main_head);
+        let _ = origin;
+    }
+
+    #[test]
     fn commit_git_skips_the_outdated_check_without_an_upstream() {
         let dir = TempDirGuard::new("git-no-upstream");
         let origin = git_origin(&dir.path);
@@ -11858,6 +12262,279 @@ mod tests {
     }
 
     #[test]
+    fn update_git_rebases_a_pinned_checkout_onto_the_new_obsinfo_revision() {
+        // The libstrophe shape: the checkout is pinned to the
+        // obsinfo revision, on a detached HEAD with no upstream
+        // branch. The update re-reads the obsinfo revision and
+        // rebases onto it; the recorded scmsync URL follows.
+        let dir = TempDirGuard::new("git-update-pinned");
+        let origin = git_origin(&dir.path);
+        let main_head = origin.head.clone();
+        // A second branch, `other`, becomes the origin's default,
+        // so the checkout is pinned to the main commit, not the
+        // default.
+        let work = dir.path.join("work");
+        git_ok(&work, &["checkout", "--quiet", "-b", "other"]);
+        write_file(&work, "foo.spec", "Name: other\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "other branch"]);
+        git_ok(&work, &["push", "--quiet", "origin", "other"]);
+        git(
+            &origin.path,
+            "symbolic-ref",
+            &["HEAD", "refs/heads/other"],
+            &[],
+        )
+        .unwrap();
+        // The remote moves: a new commit on main.
+        git_ok(&work, &["checkout", "--quiet", "main"]);
+        write_file(&work, "foo.spec", "Name: remote\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "remote change"]);
+        git_ok(&work, &["push", "--quiet", "origin", "main"]);
+        let new_head = git(&work, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let obsinfo_at = |revision: &str| {
+            format!(
+                "mtime: 1774534342\ncommit: {revision}\nurl: {}\nrevision: {revision}\n",
+                origin.url
+            )
+        };
+        let first = obsinfo_at(&main_head);
+        let second = obsinfo_at(&new_head);
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_sequence(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                &[&first, &second],
+            );
+        let mut wc = do_git_checkout(&http, &dir);
+        assert_eq!(wc.base_rev, main_head);
+        assert_eq!(wc.scmsync_branch, None);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let report = update(&mut wc, &client, None, None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.updated);
+        assert_eq!(report.new_base_rev, new_head);
+        assert!(report.conflicts.is_empty());
+        assert_eq!(read_file(&wc.root, "foo.spec"), "Name: remote\n");
+        let reopened = open(&wc.root).unwrap();
+        assert_eq!(reopened.base_rev, new_head);
+        assert_eq!(
+            reopened.scmsync_url.as_deref(),
+            Some(format!("{}#{new_head}", origin.url).as_str())
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn update_git_refuses_a_pinned_checkout_without_a_usable_obsinfo() {
+        // The checkout is pinned, but the package's obsinfo is
+        // gone: the update refuses up front instead of failing
+        // on the missing upstream branch, and the base is
+        // untouched.
+        let dir = TempDirGuard::new("git-update-pinned-gone");
+        let origin = git_origin(&dir.path);
+        let main_head = origin.head.clone();
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                &format!(
+                    "mtime: 1774534342\ncommit: {main_head}\nurl: {}\nrevision: {main_head}\n",
+                    origin.url
+                ),
+            );
+        let mut wc = do_git_checkout(&http, &dir);
+        assert_eq!(wc.base_rev, main_head);
+        // The update re-reads the obsinfo and finds it absent.
+        let update_http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
+            );
+        let client = ObsClient::with_credentials(&update_http, basic_credentials()).unwrap();
+        let err = update(&mut wc, &client, None, None, &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string()
+                .contains("no longer carries a usable _scmsync.obsinfo"),
+            "refusal names the missing obsinfo: {err}"
+        );
+        assert_eq!(wc.base_rev, main_head);
+        let _ = origin;
+    }
+
+    #[test]
+    fn update_git_refuses_a_pinned_checkout_whose_obsinfo_no_longer_pins_a_commit() {
+        // The checkout is pinned, but the package's obsinfo now
+        // names a branch instead of a commit: the update refuses
+        // up front instead of rebasing onto a branch head it
+        // never tracked, and the base is untouched.
+        let dir = TempDirGuard::new("git-update-pinned-branch");
+        let origin = git_origin(&dir.path);
+        let main_head = origin.head.clone();
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_sequence(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                &[
+                    &format!(
+                        "mtime: 1774534342\ncommit: {main_head}\nurl: {}\nrevision: {main_head}\n",
+                        origin.url
+                    ),
+                    &format!(
+                        "mtime: 1774534342\ncommit: {main_head}\nurl: {}\nrevision: main\n",
+                        origin.url
+                    ),
+                ],
+            );
+        let mut wc = do_git_checkout(&http, &dir);
+        assert_eq!(wc.base_rev, main_head);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = update(&mut wc, &client, None, None, &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("no longer pins a commit"),
+            "refusal names the branch revision: {err}"
+        );
+        assert_eq!(wc.base_rev, main_head);
+        let _ = origin;
+    }
+
+    #[test]
+    fn update_git_refuses_a_pinned_checkout_with_a_malformed_obsinfo() {
+        // The obsinfo is present on the re-read but unusable (no
+        // revision): the fail-closed read errors instead of the
+        // update treating the package as plain, and the base is
+        // untouched.
+        let dir = TempDirGuard::new("git-update-pinned-malformed");
+        let origin = git_origin(&dir.path);
+        let main_head = origin.head.clone();
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_sequence(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                &[
+                    &format!(
+                        "mtime: 1774534342\ncommit: {main_head}\nurl: {}\nrevision: {main_head}\n",
+                        origin.url
+                    ),
+                    "mtime: 1774534342\ncommit: abcdef1234567890abcdef1234567890abcdef12\n",
+                ],
+            );
+        let mut wc = do_git_checkout(&http, &dir);
+        assert_eq!(wc.base_rev, main_head);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = update(&mut wc, &client, None, None, &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(
+            err.to_string()
+                .contains("without a usable url and revision"),
+            "refusal names the malformed record: {err}"
+        );
+        assert_eq!(wc.base_rev, main_head);
+        let _ = origin;
+    }
+
+    #[test]
+    fn update_git_refuses_a_pinned_checkout_whose_obsinfo_names_another_repo() {
+        // The obsinfo now names a different repo: the update
+        // refuses instead of rebasing onto foreign commits, and
+        // the base is untouched.
+        let dir = TempDirGuard::new("git-update-pinned-repointed");
+        let origin = git_origin(&dir.path);
+        let main_head = origin.head.clone();
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_sequence(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                &[
+                    &format!(
+                        "mtime: 1774534342\ncommit: {main_head}\nurl: {}\nrevision: {main_head}\n",
+                        origin.url
+                    ),
+                    &format!(
+                        "mtime: 1774534342\ncommit: {main_head}\nurl: https://src.opensuse.org/xmpp/other\nrevision: {main_head}\n"
+                    ),
+                ],
+            );
+        let mut wc = do_git_checkout(&http, &dir);
+        assert_eq!(wc.base_rev, main_head);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = update(&mut wc, &client, None, None, &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("not the checkout's origin"),
+            "refusal names the re-pointed origin: {err}"
+        );
+        assert_eq!(wc.base_rev, main_head);
+        let _ = origin;
+    }
+
+    #[test]
+    fn update_git_refuses_a_pinned_checkout_whose_obsinfo_revision_disagrees_with_its_commit() {
+        // The obsinfo revision is a SHA the sync has not landed:
+        // its `commit:` line still names the old head. The update
+        // refuses instead of rebasing onto an unlanded commit,
+        // and the base is untouched.
+        let dir = TempDirGuard::new("git-update-pinned-unlanded");
+        let origin = git_origin(&dir.path);
+        let main_head = origin.head.clone();
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_sequence(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                &[
+                    &format!(
+                        "mtime: 1774534342\ncommit: {main_head}\nurl: {}\nrevision: {main_head}\n",
+                        origin.url
+                    ),
+                    &format!(
+                        "mtime: 1774534342\ncommit: {main_head}\nurl: {}\nrevision: abcdef1234567890abcdef1234567890abcdef12\n",
+                        origin.url
+                    ),
+                ],
+            );
+        let mut wc = do_git_checkout(&http, &dir);
+        assert_eq!(wc.base_rev, main_head);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = update(&mut wc, &client, None, None, &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("does not match its synced commit"),
+            "refusal names the revision/commit disagreement: {err}"
+        );
+        assert_eq!(wc.base_rev, main_head);
+        let _ = origin;
+    }
+
+    #[test]
     fn update_git_stops_on_a_conflict() {
         let dir = TempDirGuard::new("git-update-conflict");
         let origin = git_origin(&dir.path);
@@ -11930,6 +12607,91 @@ mod tests {
             .map(|entry| (entry.path, entry.code))
             .collect();
         assert_eq!(found, vec![("foo.spec".to_string(), StatusCode::Modified)]);
+        let _ = origin;
+    }
+
+    #[test]
+    fn resolve_repoints_the_scmsync_url_on_a_pinned_checkout() {
+        // The libstrophe shape on the conflict path: a pinned
+        // checkout whose update stopped on a conflict, then the
+        // resolve finishes the rebase. The record adopts the new
+        // base and re-points the scmsync URL at it, so the URL
+        // still names the commit the checkout holds.
+        let dir = TempDirGuard::new("git-resolve-pinned");
+        let origin = git_origin(&dir.path);
+        let main_head = origin.head.clone();
+        // A second branch, `other`, becomes the origin's default,
+        // so the checkout is pinned to the main commit, not the
+        // default.
+        let work = dir.path.join("work");
+        git_ok(&work, &["checkout", "--quiet", "-b", "other"]);
+        write_file(&work, "foo.spec", "Name: other\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "other branch"]);
+        git_ok(&work, &["push", "--quiet", "origin", "other"]);
+        git(
+            &origin.path,
+            "symbolic-ref",
+            &["HEAD", "refs/heads/other"],
+            &[],
+        )
+        .unwrap();
+        // The remote moves on the same line the local commit
+        // changed, and the obsinfo revision moves with it: the
+        // rebase stops with the conflict.
+        git_ok(&work, &["checkout", "--quiet", "main"]);
+        write_file(&work, "foo.spec", "Name: remote\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "remote change"]);
+        git_ok(&work, &["push", "--quiet", "origin", "main"]);
+        let new_head = git(&work, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let obsinfo_at = |revision: &str| {
+            format!(
+                "mtime: 1774534342\ncommit: {revision}\nurl: {}\nrevision: {revision}\n",
+                origin.url
+            )
+        };
+        let first = obsinfo_at(&main_head);
+        let second = obsinfo_at(&new_head);
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_sequence(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                &[&first, &second],
+            );
+        let mut wc = do_git_checkout(&http, &dir);
+        assert_eq!(wc.base_rev, main_head);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let report = update(&mut wc, &client, None, None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.conflicts, vec!["foo.spec".to_string()]);
+        assert!(rebase_in_progress(&wc).unwrap());
+        write_file(&wc.root, "foo.spec", "Name: resolved\n");
+        let resolved = resolve(&mut wc, &DryRun::new(false)).unwrap().unwrap();
+        assert_eq!(resolved, vec!["foo.spec".to_string()]);
+        assert!(!rebase_in_progress(&wc).unwrap());
+        // The record adopted the new base and re-pointed the
+        // scmsync URL at it, on disk and in this checkout.
+        let reopened = open(&wc.root).unwrap();
+        assert_eq!(reopened.base_rev, new_head);
+        assert_eq!(
+            reopened.scmsync_url.as_deref(),
+            Some(format!("{}#{new_head}", origin.url).as_str())
+        );
+        assert_eq!(wc.base_rev, new_head);
+        assert_eq!(wc.scmsync_url, reopened.scmsync_url);
         let _ = origin;
     }
 
@@ -12106,6 +12868,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
             )
+            .with_get_error("https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo", ErrorKind::NotFound)
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
                 &foo_rev1,
@@ -12700,6 +13463,63 @@ mod tests {
     }
 
     #[test]
+    fn update_dry_run_names_the_obsinfo_revision_for_a_pinned_checkout() {
+        // The plan for a pinned checkout names the obsinfo
+        // revision it would rebase onto: a pinned checkout has
+        // no upstream head to name.
+        let dir = TempDirGuard::new("git-update-dry-run-pinned");
+        let origin = git_origin(&dir.path);
+        let main_head = origin.head.clone();
+        // The remote moves, and the obsinfo revision moves with
+        // it: the plan names the new revision.
+        let work = dir.path.join("work");
+        write_file(&work, "foo.spec", "Name: remote\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "remote change"]);
+        git_ok(&work, &["push", "--quiet", "origin", "main"]);
+        let new_head = git(&work, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let obsinfo_at = |revision: &str| {
+            format!(
+                "mtime: 1774534342\ncommit: {revision}\nurl: {}\nrevision: {revision}\n",
+                origin.url
+            )
+        };
+        let first = obsinfo_at(&main_head);
+        let second = obsinfo_at(&new_head);
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_sequence(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                &[&first, &second],
+            );
+        let mut wc = do_git_checkout(&http, &dir);
+        assert_eq!(wc.base_rev, main_head);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let out = update(&mut wc, &client, None, None, &dry_run).unwrap();
+        assert!(out.is_none());
+        let plan = dry_run.plan();
+        assert!(
+            plan.iter().any(|line| line.contains(&format!(
+                "would fetch origin and rebase onto the obsinfo revision {new_head}"
+            ))),
+            "plan: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.contains("upstream head")),
+            "plan: {plan:?}"
+        );
+        assert_eq!(open(&wc.root).unwrap().base_rev, main_head);
+        let _ = origin;
+    }
+
+    #[test]
     fn update_dry_run_lists_the_files_it_would_change() {
         let http = checkout_http().with_get(
             "https://api.opensuse.org/public/source/home:alice/foo?rev=2",
@@ -12997,6 +13817,10 @@ mod tests {
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
             )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
@@ -13372,6 +14196,10 @@ mod tests {
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo/_meta",
                 "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                ErrorKind::NotFound,
             )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
@@ -15559,6 +16387,38 @@ mod tests {
         let http = git_checkout_http(&origin.url);
         let wc = do_git_checkout(&http, &dir);
         assert!(refuse_not_submittable_git(&wc, None, None, &DryRun::new(true)).is_ok());
+        let _ = origin;
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_refuses_a_pinned_checkout() {
+        // A checkout pinned to a commit has no branch to push
+        // to: the submit gate refuses it before any fetch, so
+        // the submission fails early instead of late on a
+        // missing pushed head.
+        let dir = TempDirGuard::new("git-submit-pinned");
+        let origin = git_origin(&dir.path);
+        let main_head = origin.head.clone();
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+                &format!(
+                    "mtime: 1774534342\ncommit: {main_head}\nurl: {}\nrevision: {main_head}\n",
+                    origin.url
+                ),
+            );
+        let wc = do_git_checkout(&http, &dir);
+        assert_eq!(wc.base_rev, main_head);
+        let err = refuse_not_submittable_git(&wc, None, None, &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("pinned to commit"),
+            "refusal names the pinned state: {err}"
+        );
         let _ = origin;
     }
 

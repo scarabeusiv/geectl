@@ -153,6 +153,37 @@ pub(crate) fn parse_obsinfo_commit(body: &str) -> Option<String> {
     })
 }
 
+/// The scmsync URL from a `_scmsync.obsinfo` body (`key: value`
+/// lines): `url#revision` when the body carries both a non-empty
+/// `url` and a non-empty `revision`. `None` otherwise. The parse
+/// rules the `commit:` reader shares, adopted from osc's
+/// `test_scmsync_obsinfo.py` — including first-wins on a
+/// duplicated key, even when the first value is empty. A Factory
+/// package carries no `<scmsync>` in meta, so this is the
+/// fallback that detects it as git-backed.
+pub(crate) fn parse_obsinfo_scmsync(body: &str) -> Option<String> {
+    let mut url = None;
+    let mut revision = None;
+    for line in body.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        // First wins, like the `commit:` reader: a duplicated key
+        // keeps its first value.
+        match key.trim() {
+            "url" if url.is_none() => url = Some(value.trim().to_string()),
+            "revision" if revision.is_none() => revision = Some(value.trim().to_string()),
+            _ => {}
+        }
+    }
+    match (url, revision) {
+        (Some(url), Some(revision)) if !url.is_empty() && !revision.is_empty() => {
+            Some(format!("{url}#{revision}"))
+        }
+        _ => None,
+    }
+}
+
 /// Build a request URL from a base, path segments, and query pairs,
 /// using the encoders from `url.rs`. Segments are encoded as exactly
 /// one element each; query pairs as `name=value`.
@@ -1922,6 +1953,48 @@ mod tests {
             Some("abcdef1234567890abcdef1234567890abcdef12".to_string())
         );
         assert_eq!(parse_obsinfo_commit("mtime: 1\n"), None);
+    }
+
+    #[test]
+    fn parse_obsinfo_scmsync_reads_url_and_revision() {
+        // The live libstrophe shape: the revision is a commit SHA.
+        let body = "mtime: 1774534342\ncommit: abcdef1234567890abcdef1234567890abcdef12\nurl: https://src.opensuse.org/xmpp/libstrophe\nrevision: 345ba614c05cdf125665cd2733c7ba3873b9a9a9d9f46efdad002e3844e3bbf2\n";
+        assert_eq!(
+            parse_obsinfo_scmsync(body),
+            Some(
+                "https://src.opensuse.org/xmpp/libstrophe#345ba614c05cdf125665cd2733c7ba3873b9a9a9d9f46efdad002e3844e3bbf2"
+                    .to_string()
+            )
+        );
+        // Missing or empty either key is None, never a half URL.
+        assert_eq!(
+            parse_obsinfo_scmsync("url: https://example.com/foo\n"),
+            None
+        );
+        assert_eq!(parse_obsinfo_scmsync("revision: main\n"), None);
+        assert_eq!(parse_obsinfo_scmsync("url: \nrevision: main\n"), None);
+        assert_eq!(
+            parse_obsinfo_scmsync("url: https://example.com/foo\nrevision: \n"),
+            None
+        );
+        // Whitespace around keys and values is trimmed; CRLF line
+        // endings are fine; a commit-only body carries no scmsync.
+        assert_eq!(
+            parse_obsinfo_scmsync("  url : https://example.com/foo \r\n revision : main \r\n"),
+            Some("https://example.com/foo#main".to_string())
+        );
+        assert_eq!(
+            parse_obsinfo_scmsync("commit: abcdef1234567890abcdef1234567890abcdef12\n"),
+            None
+        );
+        // A duplicated key keeps the first value, like the
+        // `commit:` reader.
+        assert_eq!(
+            parse_obsinfo_scmsync(
+                "url: https://example.com/first\nurl: https://example.com/second\nrevision: main\n"
+            ),
+            Some("https://example.com/first#main".to_string())
+        );
     }
 
     #[test]
