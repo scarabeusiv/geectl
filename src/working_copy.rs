@@ -3200,6 +3200,9 @@ pub fn diff(
     wc: &WorkingCopy,
     client: Option<&ObsClient>,
 ) -> Result<(String, Option<String>), GeectlError> {
+    // A staged `_link` on the git path would show no link section
+    // at all: refuse instead of a diff that silently drops it.
+    refuse_git_link(wc)?;
     let base = wc.base_commit()?;
     let mut out = git(
         &wc.root,
@@ -3260,7 +3263,9 @@ pub fn diff(
 
 /// Whether the checkout is a linked OBS package: the OBS backend
 /// with a `_link` file in the index. A git-backed checkout never
-/// counts, even when it carries a file named `_link`.
+/// counts, even when it carries a file named `_link` — such a
+/// checkout is refused by `diff`/`commit`/`pull` (`refuse_git_link`)
+/// before this is consulted, so the link is never silently ignored.
 pub fn is_linked(wc: &WorkingCopy) -> Result<bool, GeectlError> {
     Ok(wc.backend == Backend::Obs && index_has(wc, "_link")?)
 }
@@ -4934,6 +4939,24 @@ fn refuse_link_to_other_project(wc: &WorkingCopy) -> Result<(), GeectlError> {
     Ok(())
 }
 
+/// Refuse a git-backed checkout carrying a staged `_link`: the
+/// scmsync sync never carries a `_link` at HEAD to OBS, so a link
+/// in a git-backed checkout is honoured nowhere — `diff` shows no
+/// link section, `commit` pushes the file as ordinary content, and
+/// `pull` has no link to follow. Refusing here makes the
+/// constraint visible in every leaf instead of silent in most and
+/// loud in one. Remove the `_link`, or check the package out
+/// OBS-native to follow the link.
+fn refuse_git_link(wc: &WorkingCopy) -> Result<(), GeectlError> {
+    if wc.backend == Backend::Git && index_has(wc, "_link")? {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "refusing a git-backed checkout carrying _link: scmsync never syncs a _link at HEAD to OBS, so the link is honoured nowhere — remove _link, or check the package out OBS-native to follow the link",
+        ));
+    }
+    Ok(())
+}
+
 /// The dry-run plan for a commit: the files it would send, and the
 /// files it would delete (a staged deletion is sent by omission).
 /// A git-backed commit lists the staged files it would commit and
@@ -4963,6 +4986,10 @@ fn record_commit_plan(
             Ok(())
         }
         Backend::Git => {
+            // The plan refuses a commit the live path would
+            // refuse: a staged `_link` is honoured nowhere on the
+            // git path (see `refuse_git_link`).
+            refuse_git_link(wc)?;
             // The outdated check live commit_git runs after its
             // fetch, against the last-fetched upstream: the plan
             // does not fetch, so it refuses only when the checkout
@@ -5317,6 +5344,7 @@ fn commit_git(
     // The client must be the checkout's own instance before any
     // other check reads the server.
     wc.check_apiurl(&client.base)?;
+    refuse_git_link(wc)?;
     let auth = gitea_auth.ok_or_else(|| {
         GeectlError::new(
             ErrorKind::ConfigError,
@@ -6623,6 +6651,9 @@ pub fn pull(
     // on a git-backed checkout or an unlinked package refuses
     // instead of planning a pull that live would never do.
     if wc.backend != Backend::Obs {
+        // A staged `_link` names the scmsync constraint; without
+        // one the checkout keeps the git-backed refusal.
+        refuse_git_link(wc)?;
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
             "pull is for linked OBS packages: this working copy is git-backed",
@@ -12085,6 +12116,168 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let _ = origin;
+    }
+
+    #[test]
+    fn commit_git_refuses_a_staged_link() {
+        let dir = TempDirGuard::new("git-commit-link");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(
+            &wc.root,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        add(&wc, &["_link".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("scmsync never syncs a _link"),
+            "message: {}",
+            err
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn commit_git_dry_run_plan_refuses_a_staged_link() {
+        let dir = TempDirGuard::new("git-commit-link-plan");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(
+            &wc.root,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        add(&wc, &["_link".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            Some(&auth),
+            &DryRun::new(true),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("scmsync never syncs a _link"),
+            "message: {}",
+            err
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn commit_git_allows_an_unstaged_link() {
+        // The refusal is about the staged link: an untracked
+        // `_link` is not sent by the commit, so the commit runs.
+        let dir = TempDirGuard::new("git-commit-link-unstaged");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        write_file(
+            &wc.root,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.landed, Base::Git { head: head.clone() });
+        let _ = origin;
+    }
+
+    #[test]
+    fn diff_refuses_a_staged_link_on_a_git_backed_checkout() {
+        let dir = TempDirGuard::new("git-diff-link");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        write_file(
+            &wc.root,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        add(&wc, &["_link".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let err = diff(&wc, None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("scmsync never syncs a _link"),
+            "message: {}",
+            err
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn pull_on_a_git_backed_checkout_with_a_link_names_the_constraint() {
+        let dir = TempDirGuard::new("pull-git-link");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(
+            &wc.root,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        add(&wc, &["_link".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = pull(&mut wc, &client, &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("scmsync never syncs a _link"),
+            "message: {}",
+            err
+        );
         let _ = origin;
     }
 
