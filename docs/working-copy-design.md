@@ -99,8 +99,8 @@ the old path is absent from the file list and the server deletes it.
 vs git flow via the Gitea ops surface) behind the same operation; the
 agent's call is the same. On a git-backed checkout, `commit` pushes
 with the git binary through the working-copy `Git` wrapper, takes the
-pushed head SHA, and polls the OBS side (`_scmsync.obsinfo` `commit:`)
-until the synced commit matches, bounded 60 s, then reports. The
+pushed head SHA, and polls the synced commit (`scmsync_commit`)
+until it matches the pushed head, bounded 60 s, then reports. The
 synthesized commit is authored with the checkout's repo-local identity
 (`geectl <geectl@localhost>`) and is pushed as such. The push authenticates with the configured Gitea
 token, scoped to the Gitea instance the same way as the clone.

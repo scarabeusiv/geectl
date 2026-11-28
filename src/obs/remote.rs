@@ -2,6 +2,7 @@ use super::build::xml_attr;
 use super::build::xml_split_element;
 use super::build_link_meta;
 use super::build_url;
+use super::common::parse_obsinfo_commit;
 use super::element_text;
 use super::elements;
 use super::filter_history;
@@ -3147,6 +3148,22 @@ impl<'a> ObsClient<'a> {
             &query,
         );
         self.http.get_with(&url, &Credentials::None)
+    }
+
+    /// The commit the OBS side synced a git-backed package to, as
+    /// sync state: `Some(sha)` when the sync record names one,
+    /// `None` when it names none. The `_scmsync.obsinfo` filename
+    /// and its `commit:` field stay in this layer: callers poll
+    /// sync state, never an OBS-internal file. A missing or
+    /// unreadable sync record is an error, never `None` — the
+    /// caller keeps the last failure for the timeout.
+    pub(crate) fn scmsync_commit(
+        &self,
+        project: &str,
+        package: &str,
+    ) -> Result<Option<String>, GeectlError> {
+        let body = self.cat(project, package, "_scmsync.obsinfo", None)?;
+        Ok(parse_obsinfo_commit(&body))
     }
 
     /// Read file `file` of package `package` in project `project`
@@ -11122,6 +11139,29 @@ mod tests {
                 false
             )]
         );
+    }
+
+    #[test]
+    fn scmsync_commit_reads_the_synced_head() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            "mtime: 1\ncommit: abcdef0123456789abcdef0123456789abcdef01\nurl: https://example.com/foo\n",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client.scmsync_commit("home:alice", "foo").unwrap(),
+            Some("abcdef0123456789abcdef0123456789abcdef01".to_string())
+        );
+    }
+
+    #[test]
+    fn scmsync_commit_without_a_commit_line_is_none() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            "mtime: 1\nurl: https://example.com/foo\n",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(client.scmsync_commit("home:alice", "foo").unwrap(), None);
     }
 
     #[test]

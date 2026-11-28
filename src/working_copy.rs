@@ -31,7 +31,6 @@ use crate::config::{Config, Identity};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{validate_gitea_name, GiteaClient};
 use crate::local_build::LocalBuild;
-use crate::obs::common::parse_obsinfo_commit;
 use crate::obs::{
     valid_obs_filename, CommitFileEntry, CommitFilelistOptions, DirectoryListing, DryRun,
     ObsClient, RevisionSpec, ServiceCode,
@@ -5463,20 +5462,20 @@ fn commit_git(
         head
     };
     // The push landed; the OBS side picks it up through scmsync.
-    // Poll `_scmsync.obsinfo` until its `commit:` matches the
-    // pushed head, bounded: a sync that never arrives is a timeout,
-    // not a successful commit. A read that fails (a 401 or 404
-    // while the sync is pending) is kept, not swallowed: the
-    // timeout names the last failure instead of hiding it.
+    // Poll the synced commit until it matches the pushed head,
+    // bounded: a sync that never arrives is a timeout, not a
+    // successful commit. A read that fails (a 401 or 404 while the
+    // sync is pending) is kept, not swallowed: the timeout names
+    // the last failure instead of hiding it.
     let deadline = Instant::now() + POLL_TIMEOUT;
     let mut last_err: Option<String>;
     loop {
-        match client.cat(&wc.project, &wc.package, "_scmsync.obsinfo", None) {
-            Ok(body) => {
+        match client.scmsync_commit(&wc.project, &wc.package) {
+            Ok(synced) => {
                 // A successful read clears the last error: a stale
                 // one would otherwise name a read that recovered.
                 last_err = None;
-                if parse_obsinfo_commit(&body).as_deref() == Some(head.as_str()) {
+                if synced.as_deref() == Some(head.as_str()) {
                     break;
                 }
             }
@@ -5487,11 +5486,14 @@ fn commit_git(
                 ErrorKind::Timeout,
                 match last_err {
                     Some(last) => format!(
-                        "the OBS side did not sync the pushed head within 60 seconds; the last sync read failed: {last}"
+                        "{}/{} did not sync the pushed head within 60 seconds; the last sync read failed: {last}",
+                        wc.project, wc.package
                     ),
                     None => {
-                        "the OBS side did not sync the pushed head within 60 seconds"
-                            .to_string()
+                        format!(
+                            "{}/{} did not sync the pushed head within 60 seconds",
+                            wc.project, wc.package
+                        )
                     }
                 },
             ));
