@@ -57,6 +57,8 @@ commit's message, git-backed from the rebase target — so the record
 points at the new base after the rebase finishes. A root
 commit other than a `geectl base …` commit is `WorkingCopyInconsistent`.
 
+The base is reported in JSON as one object: `{"kind": "obs", "rev": "<number as a string>", "srcmd5": "<32 hex>"}` for OBS-native checkouts, `{"kind": "git", "head": "<40 hex>"}` for git-backed ones — `checkout` reports it as `base`, `update` and `pull` as `old_base`/`new_base`, `commit` as `landed`. The OBS revision is a string, not a JSON number.
+
 ## Commit protocol
 
 A plain file PUT is its own revision; `commitfilelist` finalizes the

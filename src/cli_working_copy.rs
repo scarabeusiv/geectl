@@ -25,7 +25,7 @@ use crate::error::{ErrorKind, GeectlError};
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{DryRun, ObsClient, RevisionSpec, OBS_API_BASE};
 use crate::working_copy::{
-    self, Backend, CheckoutProjectReport, CommitReport, PullReport, StatusCode, UpdateReport,
+    self, Backend, Base, CheckoutProjectReport, CommitReport, PullReport, StatusCode, UpdateReport,
     WorkingCopy,
 };
 use serde_json::{json, Value};
@@ -312,14 +312,13 @@ fn checkout_result(
                 "package": package,
                 "dir": wc.root.to_string_lossy(),
                 "backend": backend_name(wc.backend),
-                "base_rev": wc.base_rev,
-                "base_srcmd5": wc.base_srcmd5,
+                "base": wc.base.to_json(),
             });
             let result_line = format!(
                 "checked out {project}/{package} into {} ({} base {})",
                 wc.root.display(),
                 backend_name(wc.backend),
-                wc.base_rev
+                wc.base.display()
             );
             mutation_result(payload, header, result_line, dry_run, plan)
         }
@@ -359,13 +358,13 @@ fn checkout_project_result(
                     "package": entry.package,
                     "dir": entry.dir.to_string_lossy(),
                     "backend": backend_name(wc.backend),
-                    "base_rev": wc.base_rev,
+                    "base": wc.base.to_json(),
                 }));
                 detail.push(format!(
                     "{} ({} base {})",
                     entry.package,
                     backend_name(wc.backend),
-                    wc.base_rev
+                    wc.base.display()
                 ));
             }
             None => {
@@ -450,10 +449,8 @@ fn update_result(
                 "project": wc.project,
                 "package": wc.package,
                 "updated": report.updated,
-                "old_base_rev": report.old_base_rev,
-                "new_base_rev": report.new_base_rev,
-                "old_base_srcmd5": report.old_base_srcmd5,
-                "new_base_srcmd5": report.new_base_srcmd5,
+                "old_base": report.old_base.to_json(),
+                "new_base": report.new_base.to_json(),
                 "conflicts": report.conflicts,
                 "stash_remaining": report.stash_remaining,
             });
@@ -465,12 +462,16 @@ fn update_result(
             } else if report.updated {
                 format!(
                     "updated {}/{} to base {}",
-                    wc.project, wc.package, report.new_base_rev
+                    wc.project,
+                    wc.package,
+                    report.new_base.display()
                 )
             } else {
                 format!(
                     "{}/{} is already at base {}",
-                    wc.project, wc.package, report.new_base_rev
+                    wc.project,
+                    wc.package,
+                    report.new_base.display()
                 )
             };
             if report.stash_remaining {
@@ -737,21 +738,18 @@ fn commit_result(
             let payload = json!({
                 "project": wc.project,
                 "package": wc.package,
-                "rev": report.rev,
-                "srcmd5": report.srcmd5,
-                "pushed_head": report.pushed_head,
+                "landed": report.landed.to_json(),
                 "open_requests": report.open_requests,
                 "files": report.files,
             });
-            let mut result_line = match (report.rev, &report.pushed_head) {
-                (Some(rev), _) => {
+            let mut result_line = match &report.landed {
+                Base::Obs { rev, .. } => {
                     format!("committed {}/{} (revision {rev})", wc.project, wc.package)
                 }
-                (None, Some(head)) => format!(
+                Base::Git { head } => format!(
                     "committed {}/{} (pushed head {head})",
                     wc.project, wc.package
                 ),
-                (None, None) => format!("committed {}/{}", wc.project, wc.package),
             };
             if !report.open_requests.is_empty() {
                 result_line.push_str(&format!(
@@ -812,8 +810,8 @@ fn pull_result(
                 "updated": report.updated,
                 "old_baserev": report.old_baserev,
                 "new_baserev": report.new_baserev,
-                "old_base_rev": report.old_base_rev,
-                "new_base_rev": report.new_base_rev,
+                "old_base": report.old_base.to_json(),
+                "new_base": report.new_base.to_json(),
                 "conflicts": report.conflicts,
                 "stash_remaining": report.stash_remaining,
             });
@@ -916,8 +914,10 @@ mod tests {
             package: "foo".to_string(),
             apiurl: "https://api.opensuse.org".to_string(),
             backend: Backend::Obs,
-            base_rev: "1".to_string(),
-            base_srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            base: Base::Obs {
+                rev: "1".to_string(),
+                srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            },
             mtimes: Vec::new(),
             scmsync_url: None,
             scmsync_branch: None,
@@ -971,8 +971,10 @@ mod tests {
             package: package.to_string(),
             apiurl: "https://api.opensuse.org".to_string(),
             backend: Backend::Obs,
-            base_rev: "1".to_string(),
-            base_srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            base: Base::Obs {
+                rev: "1".to_string(),
+                srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            },
             mtimes: Vec::new(),
             scmsync_url: None,
             scmsync_branch: None,
@@ -1065,10 +1067,14 @@ mod tests {
     fn update_result_names_the_new_base_and_the_conflicts() {
         let report = UpdateReport {
             updated: true,
-            old_base_rev: "1".to_string(),
-            new_base_rev: "2".to_string(),
-            old_base_srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            new_base_srcmd5: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            old_base: Base::Obs {
+                rev: "1".to_string(),
+                srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            },
+            new_base: Base::Obs {
+                rev: "2".to_string(),
+                srcmd5: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            },
             conflicts: Vec::new(),
             stash_remaining: false,
         };
@@ -1076,10 +1082,14 @@ mod tests {
         assert!(text.contains("updated home:alice/foo to base 2"));
         let conflicted = UpdateReport {
             updated: false,
-            old_base_rev: "1".to_string(),
-            new_base_rev: "2".to_string(),
-            old_base_srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            new_base_srcmd5: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            old_base: Base::Obs {
+                rev: "1".to_string(),
+                srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            },
+            new_base: Base::Obs {
+                rev: "2".to_string(),
+                srcmd5: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            },
             conflicts: vec!["foo.spec".to_string()],
             stash_remaining: false,
         };
@@ -1087,10 +1097,14 @@ mod tests {
         assert!(text.contains("update stopped with conflicts in: foo.spec"));
         let current = UpdateReport {
             updated: false,
-            old_base_rev: "1".to_string(),
-            new_base_rev: "1".to_string(),
-            old_base_srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            new_base_srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            old_base: Base::Obs {
+                rev: "1".to_string(),
+                srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            },
+            new_base: Base::Obs {
+                rev: "1".to_string(),
+                srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            },
             conflicts: Vec::new(),
             stash_remaining: false,
         };
@@ -1137,23 +1151,31 @@ mod tests {
     #[test]
     fn commit_result_names_the_revision_and_the_open_requests() {
         let report = CommitReport {
-            rev: Some(2),
-            srcmd5: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
-            pushed_head: None,
+            landed: Base::Obs {
+                rev: "2".to_string(),
+                srcmd5: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            },
             open_requests: vec!["42".to_string()],
             files: vec!["foo.spec".to_string()],
         };
         let (payload, text) = commit_result(&wc(), Some(&report), false, None);
-        assert_eq!(payload["rev"], json!(2));
+        assert_eq!(
+            payload["landed"],
+            json!({"kind": "obs", "rev": "2", "srcmd5": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"})
+        );
         assert!(text.contains("committed home:alice/foo (revision 2); open requests: 42"));
         let pushed = CommitReport {
-            rev: None,
-            srcmd5: None,
-            pushed_head: Some("abcdef1234567890abcdef1234567890abcdef12".to_string()),
+            landed: Base::Git {
+                head: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
+            },
             open_requests: Vec::new(),
             files: vec!["foo.spec".to_string()],
         };
-        let (_, text) = commit_result(&wc(), Some(&pushed), false, None);
+        let (payload, text) = commit_result(&wc(), Some(&pushed), false, None);
+        assert_eq!(
+            payload["landed"],
+            json!({"kind": "git", "head": "abcdef1234567890abcdef1234567890abcdef12"})
+        );
         assert!(text.contains(
             "committed home:alice/foo (pushed head abcdef1234567890abcdef1234567890abcdef12)"
         ));
@@ -1165,8 +1187,14 @@ mod tests {
             updated: true,
             old_baserev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             new_baserev: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-            old_base_rev: "1".to_string(),
-            new_base_rev: "2".to_string(),
+            old_base: Base::Obs {
+                rev: "1".to_string(),
+                srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            },
+            new_base: Base::Obs {
+                rev: "2".to_string(),
+                srcmd5: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            },
             conflicts: Vec::new(),
             stash_remaining: false,
         };
@@ -1227,10 +1255,14 @@ mod tests {
     fn update_result_names_a_remaining_stash() {
         let report = UpdateReport {
             updated: false,
-            old_base_rev: "1".to_string(),
-            new_base_rev: "2".to_string(),
-            old_base_srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            new_base_srcmd5: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            old_base: Base::Obs {
+                rev: "1".to_string(),
+                srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            },
+            new_base: Base::Obs {
+                rev: "2".to_string(),
+                srcmd5: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            },
             conflicts: vec!["foo.spec".to_string()],
             stash_remaining: true,
         };
