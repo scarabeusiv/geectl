@@ -3863,6 +3863,13 @@ impl<'a> GiteaClient<'a> {
         )) {
             return Ok(None);
         }
+        // The scmsync reads below need the authenticated route, which answers 401 without credentials.
+        if !obs.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot branch a git-backed package or project without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
         // Read the meta of the thing being forked and resolve the
         // source: the package meta, or the project meta for a
         // project fork ("_project"). The reads go through the
@@ -3919,11 +3926,13 @@ impl<'a> GiteaClient<'a> {
                     // The package itself is not git-managed. When
                     // its project is, the actionable alternative
                     // is forking the project.
-                    let hint = match obs.project_meta_authenticated(project) {
-                        Ok(project_meta) if project_meta.scmsync.is_some() => format!(
+                    let project_meta = obs.project_meta_authenticated(project)?;
+                    let hint = if project_meta.scmsync.is_some() {
+                        format!(
                             "; the project {project} is managed in Git — fork the project (package \"_project\") instead"
-                        ),
-                        _ => String::new(),
+                        )
+                    } else {
+                        String::new()
                     };
                     return Err(GeectlError::new(
                         ErrorKind::InvalidInput,
@@ -9781,6 +9790,56 @@ mod tests {
             "the source read must not use the public route: {:?}",
             obs_http.get_calls()
         );
+    }
+
+    #[test]
+    fn branch_without_obs_credentials_fails_before_any_meta_read() {
+        // Without credentials the authenticated reads would 401 — fail closed before any meta read.
+        let gitea_http = FakeHttp::new();
+        let obs_http = FakeHttp::new();
+        let err = client(&gitea_http)
+            .branch(
+                &ObsClient::new(&obs_http),
+                "games",
+                "descent3",
+                &ForkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.to_string().contains("without OBS credentials"));
+        assert!(gitea_http.get_calls().is_empty());
+        assert!(obs_http.get_calls().is_empty());
+        assert!(gitea_http.post_calls().is_empty());
+        assert!(obs_http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn branch_propagates_a_failing_project_hint_read() {
+        // A failing project-meta read for the hint must surface as its own error, not as "not managed in Git".
+        let gitea_http = FakeHttp::new();
+        let obs_http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/games/descent3/_meta",
+                &package_meta("games", "descent3", None, None),
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/games/_meta",
+                ErrorKind::ServerError,
+            );
+        let err = client(&gitea_http)
+            .branch(
+                &obs_client(&obs_http),
+                "games",
+                "descent3",
+                &ForkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(!err.to_string().contains("not managed in Git"));
+        assert!(gitea_http.post_calls().is_empty());
+        assert!(obs_http.post_calls().is_empty());
     }
 
     #[test]
