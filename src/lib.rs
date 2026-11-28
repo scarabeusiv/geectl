@@ -84,6 +84,7 @@ pub mod maintenance;
 pub mod meta;
 pub mod obs;
 pub mod oscrc;
+pub mod path_encoding;
 pub mod periodic;
 pub mod person;
 pub mod pull_request;

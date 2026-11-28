@@ -17,13 +17,13 @@ Local git work runs through the git CLI.
 |---|---|---|
 | `update` | Reads the latest revision through the OBS source API | Fetches the upstream git branch and rebases the working copy onto it, preserving local commits; a rebase that conflicts reports the conflicts |
 | `status` / `diff` | The working copy read against its base | The working copy read against its base |
-| `commit` | `commit_filelist` with staged PUTs, exactly one revision | Push with the git binary, then a bounded poll of the OBS side until the synced commit matches the pushed head |
+| `commit` | `commit_filelist` with staged PUTs, exactly one revision | Push with the git binary, then a bounded poll of the synced commit until it matches the pushed head |
 | `submit` | An OBS submit request, filed through `SrFiling` | A Gitea pull request, opened through `pr_create` |
 | `maintenance maintained-instances` / `maintenance maintenance-branch` | The OBS maintenance flow, addressed by project and package | The OBS maintenance flow, addressed by project and package |
 
 The working copy records the backend kind (`obs` or `git`) in git config
-`geectl.*` at checkout. The commit poll waits on the `_scmsync.obsinfo`
-`commit:` field and runs bounded at 60 seconds.
+`geectl.*` at checkout. The commit poll waits on the synced commit (`scmsync_commit`)
+and runs bounded at 60 seconds.
 
 ## The CLI surface
 
@@ -428,9 +428,8 @@ Filing a submit request from a git-backed package verifies the target and
 the checkout state: the target repo is the parent of the checkout's origin
 and the base exists on the target, then the remote-ahead, conflict, and
 uncommitted checks run. The `commit` dispatch on a git-backed checkout
-polls the OBS side (`_scmsync.obsinfo` `commit:`) until the synced commit
-matches the pushed head, bounded at 60 seconds. The `_scmsync.obsinfo`
-parse rules cover the `commit:` field the poll compares against.
+polls the synced commit (`scmsync_commit`) until it matches
+the pushed head, bounded at 60 seconds.
 
 ## Testing
 

@@ -1630,64 +1630,6 @@ impl<'a> LocalBuild<'a> {
         self.cache_cap_bytes / LOW_WATER_DEN * LOW_WATER_NUM
     }
 
-    /// A path segment for a project, package, repository, arch, or
-    /// flavor name: `:` is legal in an OBS name but not in a Windows
-    /// path, so it is percent-encoded (`:` becomes `%3A`, `%`
-    /// becomes `%25`). The encoding is injective — distinct names
-    /// always map to distinct directories — and reversible (see
-    /// `decode_path_segment`); a name without `%` or `:` is
-    /// unchanged. Only `:` needs encoding: it is the one
-    /// Windows-illegal character a validated OBS name
-    /// (`[A-Za-z0-9_.+-:]`) can carry, and `%` is escaped so the
-    /// encoding stays injective even for unvalidated input. The
-    /// marker in the build root keeps the real name; the directory
-    /// name never names the project or package back. This differs
-    /// from the working copy's lossy `:` to `_` mapping on purpose:
-    /// a second checkout there fails on the existing target, while a
-    /// build here reuses a root by path alone — the marker is never
-    /// compared against the requested build — so a lossy mapping
-    /// would silently run one project's tree as another's.
-    fn encode_path_segment(name: &str) -> String {
-        let mut out = String::with_capacity(name.len());
-        for c in name.chars() {
-            match c {
-                '%' => out.push_str("%25"),
-                ':' => out.push_str("%3A"),
-                c => out.push(c),
-            }
-        }
-        out
-    }
-
-    /// The inverse of `encode_path_segment`: `%25` becomes `%`,
-    /// `%3A` becomes `:`. A `%` not followed by `25`, `3A`, or `3a`
-    /// passes through unchanged, so decoding a directory name the
-    /// encoder never wrote still yields a usable name for a lock
-    /// lookup, never a failure.
-    fn decode_path_segment(segment: &str) -> String {
-        let mut out = String::with_capacity(segment.len());
-        let mut rest = segment;
-        while let Some(at) = rest.find('%') {
-            out.push_str(&rest[..at]);
-            let after = &rest[at + 1..];
-            if let Some(tail) = after.strip_prefix("25") {
-                out.push('%');
-                rest = tail;
-            } else if let Some(tail) = after
-                .strip_prefix("3A")
-                .or_else(|| after.strip_prefix("3a"))
-            {
-                out.push(':');
-                rest = tail;
-            } else {
-                out.push('%');
-                rest = after;
-            }
-        }
-        out.push_str(rest);
-        out
-    }
-
     /// The root's name inside its project/package dirs:
     /// `<repo>-<arch>` plus `-<flavor>` when the build carries one.
     /// Shared by the build-root path and the sccache store path, so
@@ -1695,12 +1637,12 @@ impl<'a> LocalBuild<'a> {
     fn root_name(repo: &str, arch: &str, flavor: &Option<String>) -> String {
         let mut name = format!(
             "{}-{}",
-            Self::encode_path_segment(repo),
-            Self::encode_path_segment(arch)
+            crate::path_encoding::encode_path_segment(repo),
+            crate::path_encoding::encode_path_segment(arch)
         );
         if let Some(flavor) = flavor {
             name.push('-');
-            name.push_str(&Self::encode_path_segment(flavor));
+            name.push_str(&crate::path_encoding::encode_path_segment(flavor));
         }
         name
     }
@@ -1716,8 +1658,8 @@ impl<'a> LocalBuild<'a> {
     ) -> PathBuf {
         self.cache_dir
             .join("build-roots")
-            .join(Self::encode_path_segment(project))
-            .join(Self::encode_path_segment(package))
+            .join(crate::path_encoding::encode_path_segment(project))
+            .join(crate::path_encoding::encode_path_segment(package))
             .join(Self::root_name(repo, arch, flavor))
     }
 
@@ -1739,8 +1681,8 @@ impl<'a> LocalBuild<'a> {
     ) -> PathBuf {
         self.cache_dir
             .join("sccache")
-            .join(Self::encode_path_segment(project))
-            .join(Self::encode_path_segment(package))
+            .join(crate::path_encoding::encode_path_segment(project))
+            .join(crate::path_encoding::encode_path_segment(package))
             .join(Self::root_name(repo, arch, flavor))
     }
 
@@ -1773,7 +1715,7 @@ impl<'a> LocalBuild<'a> {
     /// the caller protects it instead. Both the plan-time retain
     /// and the apply-time re-probe use this one helper, so the two
     /// parses cannot drift apart again. The pair is the encoded
-    /// directory form (see `encode_path_segment`): a store for
+    /// directory form (see `crate::path_encoding::encode_path_segment`): a store for
     /// `home:foo` reads back as `home%3Afoo`, matching the encoded
     /// keys `locked_root_keys` returns.
     fn store_project_package(&self, path: &Path) -> Option<(String, String)> {
@@ -1792,7 +1734,7 @@ impl<'a> LocalBuild<'a> {
     /// `sccache/<project>/<package>/<root-name>/`, and the root of
     /// the same build is `build-roots/<project>/<package>/<root-name>/`.
     /// The components are the encoded directory forms (see
-    /// `encode_path_segment`); they re-join as-is, so no decode is
+    /// `crate::path_encoding::encode_path_segment`); they re-join as-is, so no decode is
     /// needed — the root of the same build sits at the same encoded
     /// path. None for a path of any other shape — the caller never deletes
     /// a store it cannot attribute to a root.
@@ -6167,16 +6109,16 @@ impl<'a> LocalBuild<'a> {
 
     /// The package cache dir for a project, repository and arch:
     /// `pkg/<project>/<repo>/<arch>/`, with every component encoded
-    /// (see `encode_path_segment`). The download/write path builds
+    /// (see `crate::path_encoding::encode_path_segment`). The download/write path builds
     /// its dir through this helper; the lock path builds the same
     /// encoded components itself, so the two can never disagree
     /// about where a project's files live.
     fn pkg_dir(&self, project: &str, repo: &str, arch: &str) -> PathBuf {
         self.cache_dir
             .join("pkg")
-            .join(Self::encode_path_segment(project))
-            .join(Self::encode_path_segment(repo))
-            .join(Self::encode_path_segment(arch))
+            .join(crate::path_encoding::encode_path_segment(project))
+            .join(crate::path_encoding::encode_path_segment(repo))
+            .join(crate::path_encoding::encode_path_segment(arch))
     }
 
     /// The project-repo-arch lock file:
@@ -6184,14 +6126,17 @@ impl<'a> LocalBuild<'a> {
     /// guards. The project is part of the key: the same repo name
     /// in two projects is two different cache dirs, so it needs two
     /// different locks. Every component is encoded (see
-    /// `encode_path_segment`), including the arch in the file name,
+    /// `crate::path_encoding::encode_path_segment`), including the arch in the file name,
     /// so the lock path is the encoded form of the real coordinates.
     fn pkg_lock_path(&self, project: &str, repo: &str, arch: &str) -> PathBuf {
         self.cache_dir
             .join("pkg")
-            .join(Self::encode_path_segment(project))
-            .join(Self::encode_path_segment(repo))
-            .join(format!("{}.lock", Self::encode_path_segment(arch)))
+            .join(crate::path_encoding::encode_path_segment(project))
+            .join(crate::path_encoding::encode_path_segment(repo))
+            .join(format!(
+                "{}.lock",
+                crate::path_encoding::encode_path_segment(arch)
+            ))
     }
 
     /// Open a project-repo-arch lock file (no truncate: the file
@@ -6397,7 +6342,7 @@ impl<'a> LocalBuild<'a> {
     /// The (project, package) pairs with a build root whose lock is
     /// held: a sccache store for such a package is never evicted.
     /// The pairs are the encoded directory forms (see
-    /// `encode_path_segment`), matching what
+    /// `crate::path_encoding::encode_path_segment`), matching what
     /// `store_project_package` reads from a store path — the marker
     /// keeps the real names, so the marker side encodes here. Only
     /// a marker that belongs to its root (see
@@ -6426,8 +6371,8 @@ impl<'a> LocalBuild<'a> {
                     };
                     if root_lock_held(root) {
                         locked.insert((
-                            Self::encode_path_segment(&marker.project),
-                            Self::encode_path_segment(&marker.package),
+                            crate::path_encoding::encode_path_segment(&marker.project),
+                            crate::path_encoding::encode_path_segment(&marker.package),
                         ));
                     }
                 }
@@ -6904,9 +6849,9 @@ impl<'a> LocalBuild<'a> {
         // (`home%3Afoo` becoming `home%253Afoo`) and the lock would
         // never match the one the download holds.
         self.try_pkg_lock(
-            &Self::decode_path_segment(&project),
-            &Self::decode_path_segment(&repo),
-            &Self::decode_path_segment(&arch),
+            &crate::path_encoding::decode_path_segment(&project),
+            &crate::path_encoding::decode_path_segment(&repo),
+            &crate::path_encoding::decode_path_segment(&arch),
         )
     }
 
@@ -7391,8 +7336,8 @@ impl<'a> LocalBuild<'a> {
         let dir = self
             .cache_dir
             .join("build-roots")
-            .join(Self::encode_path_segment(project))
-            .join(Self::encode_path_segment(package));
+            .join(crate::path_encoding::encode_path_segment(project))
+            .join(crate::path_encoding::encode_path_segment(package));
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -9002,8 +8947,8 @@ fn marker_belongs_to_root(roots_base: &Path, marker_path: &Path, marker: &RootMa
         return false;
     }
     // Current spelling: percent-encoded segments.
-    if project == LocalBuild::encode_path_segment(&marker.project)
-        && package == LocalBuild::encode_path_segment(&marker.package)
+    if project == crate::path_encoding::encode_path_segment(&marker.project)
+        && package == crate::path_encoding::encode_path_segment(&marker.package)
         && root_name == LocalBuild::root_name(&marker.repo, &marker.arch, &marker.flavor)
     {
         return true;
@@ -18307,22 +18252,6 @@ exit 0
                 LocalBuild::root_name("standard", "x86_64", &Some("a:b".to_string())),
                 "standard-x86_64-a%3Ab"
             );
-            // Names without `%` or `:` are unchanged.
-            assert_eq!(LocalBuild::encode_path_segment("home_foo"), "home_foo");
-            assert_eq!(LocalBuild::encode_path_segment("home:foo"), "home%3Afoo");
-            // `%` itself is escaped, so a literal `%3A` in a name
-            // cannot collide with an encoded `:`.
-            assert_eq!(
-                LocalBuild::encode_path_segment("home%3Afoo"),
-                "home%253Afoo"
-            );
-            // The encoding round-trips.
-            for name in ["home:foo", "home%3Afoo", "home_foo", "plain"] {
-                assert_eq!(
-                    LocalBuild::decode_path_segment(&LocalBuild::encode_path_segment(name)),
-                    name
-                );
-            }
             // Distinct names stay distinct: `home:foo` and
             // `home_foo` are different projects with different
             // roots — the second build never reuses the first root.

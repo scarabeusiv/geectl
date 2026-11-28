@@ -506,6 +506,10 @@ fn link_revision_value(value: &str) -> Result<String, GeectlError> {
     match RevisionSpec::parse(value)? {
         RevisionSpec::Rev(n) => Ok(n.to_string()),
         RevisionSpec::Md5(md5) => Ok(md5),
+        RevisionSpec::Sha(_) => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "a git SHA is not an OBS revision: a link revision is an OBS revision number or srcmd5",
+        )),
     }
 }
 
@@ -1251,6 +1255,12 @@ mod tests {
 
     fn parse_fails(argv: &[&str]) {
         assert!(TestCli::try_parse_from(argv).is_err(), "argv: {argv:?}");
+    }
+
+    #[test]
+    fn link_revision_value_refuses_a_sha() {
+        let err = link_revision_value("0123456789abcdef0123456789abcdef01234567").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]

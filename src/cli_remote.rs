@@ -977,6 +977,7 @@ pub fn run_remote(
                     None => Value::Null,
                     Some(RevisionSpec::Rev(n)) => json!(n),
                     Some(RevisionSpec::Md5(md5)) => json!(md5),
+                    Some(RevisionSpec::Sha(sha)) => json!(sha),
                 },
                 "include_deleted": include_deleted,
                 "files": files.iter().map(source_file_json).collect::<Vec<_>>(),
@@ -2140,6 +2141,7 @@ fn cat_result(
             None => Value::Null,
             Some(RevisionSpec::Rev(n)) => json!(n),
             Some(RevisionSpec::Md5(md5)) => json!(md5),
+            Some(RevisionSpec::Sha(sha)) => json!(sha),
         },
         "content": content.clone(),
     });
@@ -8476,6 +8478,20 @@ mod tests {
             "Name: vim\n".to_string(),
         );
         assert_eq!(payload["rev"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(text, "Name: vim\n");
+        // The `Sha` arm exists for match exhaustiveness only: the
+        // client refuses a SHA before the result renders, so a live
+        // `cat` never carries one.
+        let (payload, text) = cat_result(
+            "openSUSE:Factory",
+            "vim",
+            "vim.spec",
+            Some(RevisionSpec::Sha(
+                "0123456789abcdef0123456789abcdef01234567".to_string(),
+            )),
+            "Name: vim\n".to_string(),
+        );
+        assert_eq!(payload["rev"], "0123456789abcdef0123456789abcdef01234567");
         assert_eq!(text, "Name: vim\n");
     }
 

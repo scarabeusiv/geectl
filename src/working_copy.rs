@@ -31,11 +31,11 @@ use crate::config::{Config, Identity};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{validate_gitea_name, GiteaClient};
 use crate::local_build::LocalBuild;
-use crate::obs::common::parse_obsinfo_commit;
 use crate::obs::{
     valid_obs_filename, CommitFileEntry, CommitFilelistOptions, DirectoryListing, DryRun,
     ObsClient, RevisionSpec, ServiceCode,
 };
+use crate::path_encoding::encode_path_segment;
 use crate::xml::XmlDoc;
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
@@ -144,6 +144,60 @@ pub struct FileMtime {
     pub nanos: u32,
 }
 
+/// The base a checkout stands on: an OBS revision with its source
+/// md5, or a git head SHA. One value, one meaning, on both
+/// backends — no field whose meaning depends on a sibling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Base {
+    /// An OBS revision: the revision number and its source md5.
+    Obs { rev: String, srcmd5: String },
+    /// A git head SHA.
+    Git { head: String },
+}
+
+impl Base {
+    /// The OBS revision and source md5, when this is an OBS base.
+    pub fn as_obs(&self) -> Option<(&str, &str)> {
+        match self {
+            Base::Obs { rev, srcmd5 } => Some((rev, srcmd5)),
+            Base::Git { .. } => None,
+        }
+    }
+
+    /// The git head SHA, when this is a git base.
+    pub fn as_git(&self) -> Option<&str> {
+        match self {
+            Base::Obs { .. } => None,
+            Base::Git { head } => Some(head),
+        }
+    }
+
+    /// The base as one JSON object: `{"kind": "obs", "rev", "srcmd5"}`
+    /// or `{"kind": "git", "head"}`.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            Base::Obs { rev, srcmd5 } => serde_json::json!({
+                "kind": "obs",
+                "rev": rev,
+                "srcmd5": srcmd5,
+            }),
+            Base::Git { head } => serde_json::json!({
+                "kind": "git",
+                "head": head,
+            }),
+        }
+    }
+
+    /// The base as one short string for human-facing text: the
+    /// revision number for an OBS base, the head SHA for a git one.
+    pub fn display(&self) -> &str {
+        match self {
+            Base::Obs { rev, .. } => rev,
+            Base::Git { head } => head,
+        }
+    }
+}
+
 /// One checked-out package: its root, its coordinates, and its base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkingCopy {
@@ -157,11 +211,8 @@ pub struct WorkingCopy {
     pub apiurl: String,
     /// The backend kind.
     pub backend: Backend,
-    /// The base revision: the OBS revision number, or the pushed
-    /// head SHA for a git-backed checkout.
-    pub base_rev: String,
-    /// The base source md5. Empty for a git-backed checkout.
-    pub base_srcmd5: String,
+    /// The base the checkout stands on.
+    pub base: Base,
     /// The files' mtimes as of the last base move, sorted by
     /// name. Empty for a checkout recorded before mtimes existed.
     pub mtimes: Vec<FileMtime>,
@@ -181,9 +232,9 @@ impl WorkingCopy {
     /// an OBS-native checkout, the recorded head SHA for a
     /// git-backed one.
     pub fn base_commit(&self) -> Result<String, GeectlError> {
-        match self.backend {
-            Backend::Obs => root_commit(&self.root),
-            Backend::Git => Ok(self.base_rev.clone()),
+        match &self.base {
+            Base::Obs { .. } => root_commit(&self.root),
+            Base::Git { head } => Ok(head.clone()),
         }
     }
 
@@ -510,12 +561,9 @@ pub struct StatusEntry {
 /// and the open requests the commit landed under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitReport {
-    /// The new OBS revision number, for an OBS-native commit.
-    pub rev: Option<u64>,
-    /// The new source md5, for an OBS-native commit.
-    pub srcmd5: Option<String>,
-    /// The pushed head SHA, for a git-backed commit.
-    pub pushed_head: Option<String>,
+    /// What the commit landed as: the new OBS revision for an
+    /// OBS-native commit, the pushed head for a git-backed one.
+    pub landed: Base,
     /// The open requests involving the package after the commit, as
     /// request ids. Empty when the search finds none.
     pub open_requests: Vec<String>,
@@ -530,18 +578,12 @@ pub struct CommitReport {
 pub struct UpdateReport {
     /// The base moved and the rebase finished.
     pub updated: bool,
-    /// The base revision before the update.
-    pub old_base_rev: String,
-    /// The base revision after the update — the new base when the
-    /// update completed, the rebase target while a conflicted
-    /// update is stopped.
-    pub new_base_rev: String,
-    /// The base source md5 before the update.
-    pub old_base_srcmd5: String,
-    /// The base source md5 after the update — the target's md5
-    /// while a conflicted update is stopped (unchanged for a
-    /// git-backed checkout, which records no srcmd5).
-    pub new_base_srcmd5: String,
+    /// The base before the update.
+    pub old_base: Base,
+    /// The base after the update — the new base when the update
+    /// completed, the rebase target while a conflicted update is
+    /// stopped.
+    pub new_base: Base,
     /// The files a stopped rebase left conflicted, empty when the
     /// rebase finished. Non-empty means the rebase is still in
     /// progress: resolve the files, then run `resolve`.
@@ -565,12 +607,12 @@ pub struct PullReport {
     pub old_baserev: String,
     /// The link target's source md5 after the pull.
     pub new_baserev: String,
-    /// The base revision before the pull.
-    pub old_base_rev: String,
-    /// The base revision after the pull — the new base when the
-    /// pull completed, the rebase target while a conflicted pull
-    /// is stopped.
-    pub new_base_rev: String,
+    /// The base before the pull.
+    pub old_base: Base,
+    /// The base after the pull — the new base when the pull
+    /// completed, the rebase target while a conflicted pull is
+    /// stopped.
+    pub new_base: Base,
     /// The files a stopped rebase left conflicted, empty when the
     /// rebase finished.
     pub conflicts: Vec<String>,
@@ -1838,14 +1880,23 @@ fn open_inner(dir: &Path, heal: bool) -> Result<WorkingCopy, GeectlError> {
         None => Vec::new(),
         Some(encoded) => decode_mtimes(&encoded)?,
     };
+    // The record keeps the base as two keys (`base-rev` /
+    // `base-srcmd5`); the struct reads them as one base: an OBS
+    // revision with its md5, or a git head SHA.
+    let base = match backend {
+        Backend::Obs => Base::Obs {
+            rev: base_rev,
+            srcmd5: base_srcmd5,
+        },
+        Backend::Git => Base::Git { head: base_rev },
+    };
     let mut working_copy = WorkingCopy {
         root: dir.to_path_buf(),
         project,
         package,
         apiurl,
         backend,
-        base_rev,
-        base_srcmd5,
+        base,
         mtimes,
         scmsync_url: git_config_get(dir, "scmsync-url")?,
         scmsync_branch: git_config_get(dir, "scmsync-branch")?.filter(|branch| !branch.is_empty()),
@@ -1859,13 +1910,12 @@ fn open_inner(dir: &Path, heal: bool) -> Result<WorkingCopy, GeectlError> {
                 "the working copy root commit is not a geectl base commit",
             )
         })?;
-        if rev != working_copy.base_rev || srcmd5 != working_copy.base_srcmd5 {
+        if working_copy.base.as_obs() != Some((rev.as_str(), srcmd5.as_str())) {
             if heal {
                 git_config_set(dir, "base-rev", &rev)?;
                 git_config_set(dir, "base-srcmd5", &srcmd5)?;
             }
-            working_copy.base_rev = rev;
-            working_copy.base_srcmd5 = srcmd5;
+            working_copy.base = Base::Obs { rev, srcmd5 };
         }
     }
     Ok(working_copy)
@@ -2077,14 +2127,16 @@ impl Drop for TempCleanup {
     }
 }
 
-/// A path segment for a project or package name: `:` is legal in
-/// an OBS name but not in a Windows path, so it becomes `_`. The
-/// record in the checkout's git config keeps the real name; the
-/// directory name never names the project or package back. Two
-/// names can sanitize to the same directory (`home:foo` and
-/// `home_foo`); the second checkout fails on the existing target.
+/// A path segment for a project or package name: the shared
+/// percent-encoding (`crate::path_encoding::encode_path_segment`).
+/// `:` is legal in an OBS name but not in a Windows path, so it
+/// becomes `%3A` (`%` becomes `%25`). The encoding is injective —
+/// distinct names always map to distinct directories — so `home:foo`
+/// and `home_foo` check out into different directories. The record
+/// in the checkout's git config keeps the real name; the directory
+/// name never names the project or package back.
 fn path_segment(name: &str) -> String {
-    name.replace(':', "_")
+    encode_path_segment(name)
 }
 
 /// Refuse a project or package name that is not a single path
@@ -2104,7 +2156,7 @@ fn check_name_segment(kind: &str, name: &str) -> Result<(), GeectlError> {
 }
 
 /// The checkout directory for a project: `<dir>/<project>/` with
-/// `:` sanitized (see `path_segment`). The CLI renders the same
+/// `:` percent-encoded (see `path_segment`). The CLI renders the same
 /// target for a dry-run project checkout, so the plan names the
 /// directory the live checkout creates.
 pub fn checkout_project_target(dir: &Path, project: &str) -> Result<PathBuf, GeectlError> {
@@ -2113,7 +2165,7 @@ pub fn checkout_project_target(dir: &Path, project: &str) -> Result<PathBuf, Gee
 }
 
 /// The checkout directory for a project and package:
-/// `<dir>/<project>/<package>/` with `:` sanitized (see
+/// `<dir>/<project>/<package>/` with `:` percent-encoded (see
 /// `path_segment`). The CLI renders the same target for a dry-run
 /// checkout, so the plan names the directory the live checkout
 /// creates.
@@ -2173,9 +2225,11 @@ fn check_file_names(names: &[&str]) -> Result<(), GeectlError> {
 /// `<dir>/<project>/<package>/`. A git-backed package (its `_meta`
 /// carries a scmsync URL) is cloned; an OBS-native package is
 /// downloaded file by file and committed as a synthesized root
-/// commit carrying the base coordinates. `rev` pins the base
-/// revision for an OBS-native checkout; a git-backed checkout does
-/// not take one. Returns `None` in dry-run.
+/// commit carrying the base coordinates. `rev` pins the base:
+/// an OBS revision number or srcmd5 for an OBS-native checkout, a
+/// git SHA for a git-backed checkout (the clone resets to it). A
+/// SHA for an OBS-native package, or a number/md5 for a git-backed
+/// one, is refused. Returns `None` in dry-run.
 pub fn checkout(
     client: &ObsClient,
     project: &str,
@@ -2207,11 +2261,22 @@ pub fn checkout(
         ));
     }
     let meta = client.package_meta(project, package)?;
-    if rev.is_some() && meta.scmsync.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "checkout --rev is not supported for a git-backed package",
-        ));
+    if let Some(spec) = rev {
+        match (spec, &meta.scmsync) {
+            (RevisionSpec::Sha(_), None) => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "checkout --rev with a git SHA is not supported for an OBS-native package: pin an OBS revision number or srcmd5",
+                ));
+            }
+            (RevisionSpec::Rev(_) | RevisionSpec::Md5(_), Some(_)) => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "checkout --rev is not supported for a git-backed package: pin a git SHA",
+                ));
+            }
+            _ => {}
+        }
     }
     if !dry_run.allow(&format!(
         "checkout {project}/{package} into {}",
@@ -2223,7 +2288,14 @@ pub fn checkout(
         // plan line, the same as in live mode.
         match &meta.scmsync {
             Some(url) => {
-                dry_run.note(&format!("would clone {url} into {}", target.display()));
+                // A SHA pin names the commit the fresh clone
+                // resets to; the plan clones nothing, so the pin
+                // is named, never verified.
+                let mut line = format!("would clone {url} into {}", target.display());
+                if let Some(RevisionSpec::Sha(sha)) = rev {
+                    line.push_str(&format!(" and reset to {sha}"));
+                }
+                dry_run.note(&line);
             }
             None => {
                 let (_, _, files) = checkout_file_plan(client, project, package, rev)?;
@@ -2242,8 +2314,12 @@ pub fn checkout(
     // target did not exist on entry (refused above), so anything
     // there on failure is this call's, and the next attempt must
     // not trip over it.
+    let pin = match rev {
+        Some(RevisionSpec::Sha(sha)) => Some(sha.as_str()),
+        _ => None,
+    };
     let checked_out = match meta.scmsync {
-        Some(url) => checkout_git(client, project, package, &url, dir, gitea_auth),
+        Some(url) => checkout_git(client, project, package, &url, dir, gitea_auth, pin),
         None => checkout_obs(client, project, package, rev, dir),
     };
     match checked_out {
@@ -2485,7 +2561,7 @@ fn checkout_file_plan(
         }
         let (target_listing, pin) = match doc.root_attr("baserev") {
             Some(baserev) => {
-                let pin = RevisionSpec::parse(&baserev)?;
+                let pin = parse_link_baserev(&baserev)?;
                 let (listing, _) =
                     client.directory_listing_rev(&link_project, &link_package, Some(&pin))?;
                 (listing, pin)
@@ -2584,8 +2660,10 @@ fn checkout_obs(
         project,
         package,
         Backend::Obs,
-        &rev_number,
-        &srcmd5,
+        &Base::Obs {
+            rev: rev_number.clone(),
+            srcmd5: srcmd5.clone(),
+        },
         None,
         None,
     )?;
@@ -2614,8 +2692,10 @@ fn checkout_obs(
         package: package.to_string(),
         apiurl: client.base.clone(),
         backend: Backend::Obs,
-        base_rev: rev_number,
-        base_srcmd5: srcmd5,
+        base: Base::Obs {
+            rev: rev_number,
+            srcmd5,
+        },
         mtimes,
         scmsync_url: None,
         scmsync_branch: None,
@@ -2635,6 +2715,8 @@ fn split_scmsync_url(url: &str) -> (&str, Option<&str>) {
 /// clone's HEAD is the base. The scmsync URL and the branch its
 /// fragment names are recorded, so the checkout remembers which
 /// branch it tracks.
+/// The git-backed checkout: clone the scmsync branch, then
+/// move the branch to the pinned SHA when one is given.
 fn checkout_git(
     client: &ObsClient,
     project: &str,
@@ -2642,6 +2724,7 @@ fn checkout_git(
     url: &str,
     dir: &Path,
     gitea_auth: Option<&GiteaAuth<'_>>,
+    pin: Option<&str>,
 ) -> Result<WorkingCopy, GeectlError> {
     let target = checkout_target(dir, project, package)?;
     // The `#branch` fragment names the branch to check out, but
@@ -2696,17 +2779,24 @@ fn checkout_git(
     args.push(clone_url);
     args.push(&target_str);
     git_network(dir, "clone", &args, &env)?;
-    let head = git(&target, "rev-parse", &["HEAD"], &[])?
+    let mut head = git(&target, "rev-parse", &["HEAD"], &[])?
         .trim()
         .to_string();
+    if let Some(sha) = pin {
+        // A fresh clone has no local work to rebase: the branch
+        // moves to the pin, keeping its upstream tracking, so a
+        // later update still resolves `@{u}`.
+        refuse_when_pin_not_ancestor(&target, sha, &head)?;
+        git(&target, "reset", &["--hard", sha], &[])?;
+        head = sha.to_string();
+    }
     let mtimes = write_record(
         &target,
         &client.base,
         project,
         package,
         Backend::Git,
-        &head,
-        "",
+        &Base::Git { head: head.clone() },
         Some(url),
         branch.filter(|branch| !branch.is_empty()),
     )?;
@@ -2716,8 +2806,7 @@ fn checkout_git(
         package: package.to_string(),
         apiurl: client.base.clone(),
         backend: Backend::Git,
-        base_rev: head,
-        base_srcmd5: String::new(),
+        base: Base::Git { head },
         mtimes,
         scmsync_url: Some(url.to_string()),
         scmsync_branch: branch
@@ -2737,8 +2826,7 @@ fn write_record(
     project: &str,
     package: &str,
     backend: Backend,
-    base_rev: &str,
-    base_srcmd5: &str,
+    base: &Base,
     scmsync_url: Option<&str>,
     scmsync_branch: Option<&str>,
 ) -> Result<Vec<FileMtime>, GeectlError> {
@@ -2753,6 +2841,13 @@ fn write_record(
     git_config_set(dir, "project", project)?;
     git_config_set(dir, "package", package)?;
     git_config_set(dir, "backend", backend.as_str())?;
+    // The record keeps the two-key form: the revision (or head
+    // SHA) under `base-rev`, the md5 (empty for a git base) under
+    // `base-srcmd5`.
+    let (base_rev, base_srcmd5) = match base {
+        Base::Obs { rev, srcmd5 } => (rev.as_str(), srcmd5.as_str()),
+        Base::Git { head } => (head.as_str(), ""),
+    };
     git_config_set(dir, "base-rev", base_rev)?;
     git_config_set(dir, "base-srcmd5", base_srcmd5)?;
     if let Some(url) = scmsync_url {
@@ -3104,6 +3199,9 @@ pub fn diff(
     wc: &WorkingCopy,
     client: Option<&ObsClient>,
 ) -> Result<(String, Option<String>), GeectlError> {
+    // A staged `_link` on the git path would show no link section
+    // at all: refuse instead of a diff that silently drops it.
+    refuse_git_link(wc)?;
     let base = wc.base_commit()?;
     let mut out = git(
         &wc.root,
@@ -3164,7 +3262,10 @@ pub fn diff(
 
 /// Whether the checkout is a linked OBS package: the OBS backend
 /// with a `_link` file in the index. A git-backed checkout never
-/// counts, even when it carries a file named `_link`.
+/// counts, even when it carries a file named `_link` — such a
+/// checkout is refused by `diff`/`commit`/`pull`/`submit`
+/// (`refuse_git_link`) before the link section consults this, so
+/// the link is never silently ignored.
 pub fn is_linked(wc: &WorkingCopy) -> Result<bool, GeectlError> {
     Ok(wc.backend == Backend::Obs && index_has(wc, "_link")?)
 }
@@ -3279,6 +3380,24 @@ enum LinkSection {
     TargetUnreadable(GeectlError),
 }
 
+/// Parse a `_link` baserev: an OBS revision number or srcmd5. A
+/// git SHA parses as a revision only since pins exist, and the
+/// server would refuse it as `?rev=` — so a SHA baserev fails
+/// here, naming the link, instead of reaching the server read
+/// with a misleading error (in `diff` the failure still degrades
+/// to a note, now correctly attributed).
+fn parse_link_baserev(baserev: &str) -> Result<RevisionSpec, GeectlError> {
+    match RevisionSpec::parse(baserev)? {
+        RevisionSpec::Sha(_) => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "the _link baserev {baserev:?} is a git SHA, not an OBS revision number or srcmd5"
+            ),
+        )),
+        pin => Ok(pin),
+    }
+}
+
 /// The link target coordinates from the staged `_link`: the target
 /// project and package, and the pinned revision when the link
 /// carries a baserev. A local read and parse only — no server
@@ -3292,7 +3411,7 @@ fn link_target_coords(
     let doc = XmlDoc::parse(&link_text)?;
     let (link_project, link_package) = link_target(&doc, &wc.project, &wc.package)?;
     let pin = match doc.root_attr("baserev") {
-        Some(baserev) => Some(RevisionSpec::parse(&baserev)?),
+        Some(baserev) => Some(parse_link_baserev(&baserev)?),
         None => None,
     };
     Ok((link_project, link_package, pin))
@@ -4749,8 +4868,10 @@ fn refresh_base(wc: &mut WorkingCopy, rev: &str, srcmd5: &str) -> Result<(), Gee
     git(&wc.root, "reset", &["--soft", commit.trim()], &[])?;
     git_config_set(&wc.root, "base-rev", rev)?;
     git_config_set(&wc.root, "base-srcmd5", srcmd5)?;
-    wc.base_rev = rev.to_string();
-    wc.base_srcmd5 = srcmd5.to_string();
+    wc.base = Base::Obs {
+        rev: rev.to_string(),
+        srcmd5: srcmd5.to_string(),
+    };
     refresh_mtimes(wc)?;
     Ok(())
 }
@@ -4818,6 +4939,26 @@ fn refuse_link_to_other_project(wc: &WorkingCopy) -> Result<(), GeectlError> {
     Ok(())
 }
 
+/// Refuse a git-backed checkout carrying a `_link` in its index:
+/// the scmsync sync never carries a `_link` at HEAD to OBS, so a
+/// link in a git-backed checkout is honoured nowhere — `diff`
+/// shows no link section, `commit` pushes the file as ordinary
+/// content, `pull` has no link to follow, and `submit` would file
+/// a pull request carrying the link as ordinary content. Refusing
+/// here makes the constraint visible in `diff`, `commit`, `pull`
+/// and `submit` instead of silent in most and loud in one.
+/// Remove the `_link`, or check the package out OBS-native to
+/// follow the link.
+fn refuse_git_link(wc: &WorkingCopy) -> Result<(), GeectlError> {
+    if wc.backend == Backend::Git && index_has(wc, "_link")? {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "refusing a git-backed checkout carrying _link: scmsync never syncs a _link at HEAD to OBS, so the link is honoured nowhere — remove _link, or check the package out OBS-native to follow the link",
+        ));
+    }
+    Ok(())
+}
+
 /// The dry-run plan for a commit: the files it would send, and the
 /// files it would delete (a staged deletion is sent by omission).
 /// A git-backed commit lists the staged files it would commit and
@@ -4847,6 +4988,10 @@ fn record_commit_plan(
             Ok(())
         }
         Backend::Git => {
+            // The plan refuses a commit the live path would
+            // refuse: a staged `_link` is honoured nowhere on the
+            // git path (see `refuse_git_link`).
+            refuse_git_link(wc)?;
             // The outdated check live commit_git runs after its
             // fetch, against the last-fetched upstream: the plan
             // does not fetch, so it refuses only when the checkout
@@ -4871,14 +5016,20 @@ fn record_commit_plan(
             for name in split_nul(&staged) {
                 dry_run.note(&format!("would commit {name}"));
             }
+            let Base::Git { head: base_head } = &wc.base else {
+                return Err(GeectlError::new(
+                    ErrorKind::WorkingCopyInconsistent,
+                    "a git-backed commit plan needs a git base: the recorded base is an OBS revision",
+                ));
+            };
             let head = git(&wc.root, "rev-parse", &["HEAD"], &[])?
                 .trim()
                 .to_string();
-            if head != wc.base_rev {
+            if head != *base_head {
                 let count = git(
                     &wc.root,
                     "rev-list",
-                    &["--count", &format!("{}..HEAD", wc.base_rev)],
+                    &["--count", &format!("{base_head}..HEAD")],
                     &[],
                 )?
                 .trim()
@@ -5165,9 +5316,10 @@ fn commit_obs(
         .open_requests_for_package(&wc.project, &wc.package)
         .unwrap_or_default();
     Ok(CommitReport {
-        rev: Some(new_rev),
-        srcmd5: Some(new_srcmd5),
-        pushed_head: None,
+        landed: Base::Obs {
+            rev: new_rev.to_string(),
+            srcmd5: new_srcmd5,
+        },
         open_requests,
         files: committed_files,
     })
@@ -5194,12 +5346,25 @@ fn commit_git(
     // The client must be the checkout's own instance before any
     // other check reads the server.
     wc.check_apiurl(&client.base)?;
+    refuse_git_link(wc)?;
     let auth = gitea_auth.ok_or_else(|| {
         GeectlError::new(
             ErrorKind::ConfigError,
             "a git-backed commit needs a Gitea token: the push authenticates with it",
         )
     })?;
+    // The base is the pushed head this commit moves from: bind it
+    // once, so the checks below read one value instead of
+    // re-matching the base at every use.
+    let base_head = match &wc.base {
+        Base::Git { head } => head.clone(),
+        Base::Obs { .. } => {
+            return Err(GeectlError::new(
+                ErrorKind::WorkingCopyInconsistent,
+                "a git-backed commit needs a git base: the recorded base is an OBS revision",
+            ));
+        }
+    };
     let mut header = String::new();
     let mut key = String::new();
     let env = token_env(auth, &mut header, &mut key);
@@ -5226,7 +5391,7 @@ fn commit_git(
     let head = git(&wc.root, "rev-parse", &["HEAD"], &[])?
         .trim()
         .to_string();
-    if split_nul(&staged).is_empty() && head == wc.base_rev {
+    if split_nul(&staged).is_empty() && head == base_head {
         return Err(GeectlError::new(
             ErrorKind::NothingToCommit,
             "there is nothing to commit: no local commits ahead of the base",
@@ -5286,7 +5451,7 @@ fn commit_git(
         let head = git(&wc.root, "rev-parse", &["HEAD"], &[])?
             .trim()
             .to_string();
-        if head == wc.base_rev {
+        if head == base_head {
             return Err(GeectlError::new(
                 ErrorKind::NothingToCommit,
                 "there is nothing to commit: no local commits ahead of the base",
@@ -5295,25 +5460,25 @@ fn commit_git(
         // The pre-push gate runs after the synthesized commit
         // exists, so it checks every commit the push would send,
         // and before the push: a failed check blocks the push.
-        run_pre_push_gate(&wc.root, &wc.base_rev, &head)?;
+        run_pre_push_gate(&wc.root, &base_head, &head)?;
         git_network(&wc.root, "push", &["--no-verify", "origin", "HEAD"], &env)?;
         head
     };
     // The push landed; the OBS side picks it up through scmsync.
-    // Poll `_scmsync.obsinfo` until its `commit:` matches the
-    // pushed head, bounded: a sync that never arrives is a timeout,
-    // not a successful commit. A read that fails (a 401 or 404
-    // while the sync is pending) is kept, not swallowed: the
-    // timeout names the last failure instead of hiding it.
+    // Poll the synced commit until it matches the pushed head,
+    // bounded: a sync that never arrives is a timeout, not a
+    // successful commit. A read that fails (a 401 or 404 while the
+    // sync is pending) is kept, not swallowed: the timeout names
+    // the last failure instead of hiding it.
     let deadline = Instant::now() + POLL_TIMEOUT;
     let mut last_err: Option<String>;
     loop {
-        match client.cat(&wc.project, &wc.package, "_scmsync.obsinfo", None) {
-            Ok(body) => {
+        match client.scmsync_commit(&wc.project, &wc.package) {
+            Ok(synced) => {
                 // A successful read clears the last error: a stale
                 // one would otherwise name a read that recovered.
                 last_err = None;
-                if parse_obsinfo_commit(&body).as_deref() == Some(head.as_str()) {
+                if synced.as_deref() == Some(head.as_str()) {
                     break;
                 }
             }
@@ -5324,18 +5489,21 @@ fn commit_git(
                 ErrorKind::Timeout,
                 match last_err {
                     Some(last) => format!(
-                        "the OBS side did not sync the pushed head within 60 seconds; the last sync read failed: {last}"
+                        "{}/{} did not sync the pushed head within 60 seconds; the last sync read failed: {last}",
+                        wc.project, wc.package
                     ),
                     None => {
-                        "the OBS side did not sync the pushed head within 60 seconds"
-                            .to_string()
+                        format!(
+                            "{}/{} did not sync the pushed head within 60 seconds",
+                            wc.project, wc.package
+                        )
                     }
                 },
             ));
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    let old_base = wc.base_rev.clone();
+    let old_base = base_head.clone();
     // The push landed: a failure here must name the pushed head,
     // like the OBS path names the landed revision — otherwise the
     // agent cannot tell the push landed and pushes again.
@@ -5347,7 +5515,7 @@ fn commit_git(
             ),
         )
     })?;
-    wc.base_rev = head.clone();
+    wc.base = Base::Git { head: head.clone() };
     refresh_mtimes(wc)?;
     let changed = git(
         &wc.root,
@@ -5364,11 +5532,14 @@ fn commit_git(
         ],
         &[],
     )?;
+    // The open-requests report is informational: the commit landed,
+    // so a failing search does not fail the commit.
+    let open_requests = client
+        .open_requests_for_package(&wc.project, &wc.package)
+        .unwrap_or_default();
     Ok(CommitReport {
-        rev: None,
-        srcmd5: None,
-        pushed_head: Some(head),
-        open_requests: Vec::new(),
+        landed: Base::Git { head },
+        open_requests,
         files: split_nul(&changed),
     })
 }
@@ -5764,7 +5935,7 @@ fn record_update_plan(
                 "would update {}/{} to revision {} ({})",
                 wc.project, wc.package, rev_number, srcmd5
             ));
-            if rev_number == wc.base_rev && srcmd5 == wc.base_srcmd5 {
+            if wc.base.as_obs() == Some((rev_number.as_str(), srcmd5.as_str())) {
                 dry_run.note("already at the latest base: nothing to update");
                 return Ok(());
             }
@@ -5772,17 +5943,38 @@ fn record_update_plan(
             Ok(())
         }
         Backend::Git => {
-            if rev.is_some() {
-                return Err(GeectlError::new(
-                    ErrorKind::InvalidInput,
-                    "update --rev is not supported for a git-backed package",
-                ));
-            }
+            let pin = match rev {
+                Some(rev) => match RevisionSpec::parse(rev)? {
+                    RevisionSpec::Sha(sha) => Some(sha),
+                    _ => {
+                        return Err(GeectlError::new(
+                            ErrorKind::InvalidInput,
+                            "update --rev for a git-backed package must be a git SHA",
+                        ));
+                    }
+                },
+                None => None,
+            };
             refuse_on_rebase(wc)?;
-            // The upstream SHA is not named: the plan does not
-            // fetch, so the last-fetched head may not be the head
-            // the fetch would rebase onto.
-            dry_run.note("would fetch origin and rebase onto the upstream head");
+            match pin {
+                Some(sha) => {
+                    dry_run.note(&format!("would fetch origin and rebase onto {sha}"));
+                }
+                None => {
+                    // The plan does not fetch, so the last-fetched
+                    // head may not be the head the fetch would
+                    // rebase onto: name it as last fetched.
+                    match git(&wc.root, "rev-parse", &["@{u}"], &[]) {
+                        Ok(sha) => dry_run.note(&format!(
+                            "would fetch origin and rebase onto the upstream head (last fetched: {})",
+                            sha.trim()
+                        )),
+                        Err(_) => dry_run.note(
+                            "would fetch origin and rebase onto the upstream head",
+                        ),
+                    }
+                }
+            }
             Ok(())
         }
     }
@@ -5928,12 +6120,15 @@ fn verify_git_submit_target(
 }
 
 /// Refuse to file from a git-backed checkout that is not ready:
-/// the filed target is verified first (when one is given) — the
+/// a `_link` is refused before anything else in this function — a
+/// link is honoured nowhere on the git path (see `refuse_git_link`)
+/// — then the filed target is verified (when one is given): the
 /// target repo is the parent of the checkout's origin and the base
-/// exists on the target — then a remote ahead of the checkout,
-/// conflicts, or changes against the base. The order after the
-/// verification mirrors `commit_git`: the remote check first, then
-/// conflicts, then the uncommitted check. Live, the remote is fetched first, so the
+/// exists on the target. After
+/// the verification, a remote ahead of the checkout, conflicts, or
+/// changes against the base. The order after the verification
+/// mirrors `commit_git`: the remote check first, then conflicts,
+/// then the uncommitted check. Live, the remote is fetched first, so the
 /// check judges the current remote; the dry-run plan does not
 /// fetch, so it refuses only when the checkout is behind what was
 /// last fetched — like the commit plan. The fetch only refreshes
@@ -5946,6 +6141,11 @@ pub fn refuse_not_submittable_git(
     target: Option<&GitTargetVerification<'_>>,
     dry_run: &DryRun,
 ) -> Result<(), GeectlError> {
+    // A `_link` is honoured nowhere on the git path: refuse before
+    // the target verification and the fetch, so this function spends
+    // no further server read on a filing that can never land (see
+    // `refuse_git_link`).
+    refuse_git_link(wc)?;
     if let Some(target) = target {
         verify_git_submit_target(wc, target)?;
     }
@@ -6031,12 +6231,21 @@ fn refuse_when_outdated_obs(wc: &WorkingCopy, client: &ObsClient) -> Result<(), 
             ),
         )
     })?;
-    if rev != wc.base_rev || server_srcmd5 != wc.base_srcmd5 {
+    let Base::Obs {
+        rev: base_rev,
+        srcmd5: base_srcmd5,
+    } = &wc.base
+    else {
+        return Err(GeectlError::new(
+            ErrorKind::WorkingCopyInconsistent,
+            "the working copy base is not an OBS base: refusing an outdated check against a git base",
+        ));
+    };
+    if rev != *base_rev || server_srcmd5 != *base_srcmd5 {
         return Err(GeectlError::new(
             ErrorKind::WorkingCopyOutdated,
             format!(
-                "the checkout's base revision {}/{} is behind the server's {}/{}; run update first",
-                wc.base_rev, wc.base_srcmd5, rev, server_srcmd5
+                "the checkout's base revision {base_rev}/{base_srcmd5} is behind the server's {rev}/{server_srcmd5}; run update first",
             ),
         ));
     }
@@ -6067,6 +6276,38 @@ fn refuse_when_remote_ahead(wc: &WorkingCopy) -> Result<(), GeectlError> {
                 "the remote has commits the checkout does not have: run update first",
             ));
         }
+    }
+    Ok(())
+}
+
+/// Refuse a pinned SHA that is not in the checkout or not an
+/// ancestor of the given head: a pin the upstream does not have
+/// yet, or one past the head, must not move the base. An unknown
+/// object is invalid input, not a git failure: the SHA names a
+/// commit the checkout never fetched. The existence check is a
+/// `rev-parse --verify --quiet` classified by exit code alone,
+/// so the wording survives git updates (no stderr text is
+/// matched); `^{commit}` requires a commit object, not any object
+/// the SHA happens to name.
+fn refuse_when_pin_not_ancestor(root: &Path, sha: &str, head: &str) -> Result<(), GeectlError> {
+    let spec = format!("{sha}^{{commit}}");
+    let (exists, _, _) = git_status(root, "rev-parse", &["--verify", "--quiet", &spec], &[])?;
+    if !exists {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("no such commit in the checkout: {sha}"),
+        ));
+    }
+    let (is_ancestor, _, stderr) =
+        git_status(root, "merge-base", &["--is-ancestor", sha, head], &[])?;
+    if !stderr.trim().is_empty() {
+        return Err(git_error("merge-base", stderr.as_bytes()));
+    }
+    if !is_ancestor {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("the pinned SHA {sha} is not an ancestor of the upstream head {head}"),
+        ));
     }
     Ok(())
 }
@@ -6103,13 +6344,14 @@ fn update_obs(
             ),
         )
     })?;
-    if rev_number == wc.base_rev && srcmd5 == wc.base_srcmd5 {
+    if wc.base.as_obs() == Some((rev_number.as_str(), srcmd5.as_str())) {
         return Ok(UpdateReport {
             updated: false,
-            old_base_rev: wc.base_rev.clone(),
-            new_base_rev: rev_number,
-            old_base_srcmd5: wc.base_srcmd5.clone(),
-            new_base_srcmd5: srcmd5,
+            old_base: wc.base.clone(),
+            new_base: Base::Obs {
+                rev: rev_number,
+                srcmd5,
+            },
             conflicts: Vec::new(),
             stash_remaining: false,
         });
@@ -6155,23 +6397,27 @@ fn update_obs(
             refresh_mtimes(wc)?;
             let report = UpdateReport {
                 updated: true,
-                old_base_rev: wc.base_rev.clone(),
-                new_base_rev: rev_number.clone(),
-                old_base_srcmd5: wc.base_srcmd5.clone(),
-                new_base_srcmd5: srcmd5.clone(),
+                old_base: wc.base.clone(),
+                new_base: Base::Obs {
+                    rev: rev_number.clone(),
+                    srcmd5: srcmd5.clone(),
+                },
                 conflicts: Vec::new(),
                 stash_remaining: outcome.stash_remaining,
             };
-            wc.base_rev = rev_number;
-            wc.base_srcmd5 = srcmd5;
+            wc.base = Base::Obs {
+                rev: rev_number,
+                srcmd5,
+            };
             Ok(report)
         }
         Some(conflicts) => Ok(UpdateReport {
             updated: false,
-            old_base_rev: wc.base_rev.clone(),
-            new_base_rev: rev_number,
-            old_base_srcmd5: wc.base_srcmd5.clone(),
-            new_base_srcmd5: srcmd5,
+            old_base: wc.base.clone(),
+            new_base: Base::Obs {
+                rev: rev_number,
+                srcmd5,
+            },
             conflicts,
             stash_remaining: outcome.stash_remaining,
         }),
@@ -6179,19 +6425,24 @@ fn update_obs(
 }
 
 /// The git-backed update: fetch, then rebase onto the upstream
-/// head. `--rev` is refused above: a git-backed package names no
-/// server revision to update to.
+/// head, or onto the pinned SHA when `--rev` names one.
 fn update_git(
     wc: &mut WorkingCopy,
     rev: Option<&str>,
     gitea_auth: Option<&GiteaAuth<'_>>,
 ) -> Result<UpdateReport, GeectlError> {
-    if rev.is_some() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "update --rev is not supported for a git-backed package",
-        ));
-    }
+    let pin = match rev {
+        Some(rev) => match RevisionSpec::parse(rev)? {
+            RevisionSpec::Sha(sha) => Some(sha),
+            _ => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "update --rev for a git-backed package must be a git SHA",
+                ));
+            }
+        },
+        None => None,
+    };
     refuse_on_rebase(wc)?;
     let mut header = String::new();
     let mut key = String::new();
@@ -6200,7 +6451,7 @@ fn update_git(
         None => Vec::new(),
     };
     git_network(&wc.root, "fetch", &["origin"], &env)?;
-    let target = match git(&wc.root, "rev-parse", &["@{u}"], &[]) {
+    let upstream = match git(&wc.root, "rev-parse", &["@{u}"], &[]) {
         Ok(sha) => sha.trim().to_string(),
         Err(_) => {
             return Err(GeectlError::new(
@@ -6209,13 +6460,20 @@ fn update_git(
             ));
         }
     };
-    if target == wc.base_rev {
+    // A pin rebase targets the pinned commit, not the upstream
+    // head — but only when the upstream already has it.
+    let target = match &pin {
+        Some(sha) => {
+            refuse_when_pin_not_ancestor(&wc.root, sha, &upstream)?;
+            sha.clone()
+        }
+        None => upstream,
+    };
+    if wc.base.as_git() == Some(target.as_str()) {
         return Ok(UpdateReport {
             updated: false,
-            old_base_rev: wc.base_rev.clone(),
-            new_base_rev: target,
-            old_base_srcmd5: wc.base_srcmd5.clone(),
-            new_base_srcmd5: wc.base_srcmd5.clone(),
+            old_base: wc.base.clone(),
+            new_base: Base::Git { head: target },
             conflicts: Vec::new(),
             stash_remaining: false,
         });
@@ -6227,22 +6485,20 @@ fn update_git(
             refresh_mtimes(wc)?;
             let report = UpdateReport {
                 updated: true,
-                old_base_rev: wc.base_rev.clone(),
-                new_base_rev: target.clone(),
-                old_base_srcmd5: wc.base_srcmd5.clone(),
-                new_base_srcmd5: wc.base_srcmd5.clone(),
+                old_base: wc.base.clone(),
+                new_base: Base::Git {
+                    head: target.clone(),
+                },
                 conflicts: Vec::new(),
                 stash_remaining: outcome.stash_remaining,
             };
-            wc.base_rev = target;
+            wc.base = Base::Git { head: target };
             Ok(report)
         }
         Some(conflicts) => Ok(UpdateReport {
             updated: false,
-            old_base_rev: wc.base_rev.clone(),
-            new_base_rev: target,
-            old_base_srcmd5: wc.base_srcmd5.clone(),
-            new_base_srcmd5: wc.base_srcmd5.clone(),
+            old_base: wc.base.clone(),
+            new_base: Base::Git { head: target },
             conflicts,
             stash_remaining: outcome.stash_remaining,
         }),
@@ -6383,7 +6639,9 @@ fn record_pull_plan(
         "would pull {}/{}: link baserev {} -> {}",
         wc.project, wc.package, old_baserev, new_baserev
     ));
-    if new_baserev == old_baserev && own_rev == wc.base_rev && own_srcmd5 == wc.base_srcmd5 {
+    if new_baserev == old_baserev
+        && wc.base.as_obs() == Some((own_rev.as_str(), own_srcmd5.as_str()))
+    {
         dry_run.note("already at the latest base: nothing to pull");
         return Ok(());
     }
@@ -6411,6 +6669,9 @@ pub fn pull(
     // on a git-backed checkout or an unlinked package refuses
     // instead of planning a pull that live would never do.
     if wc.backend != Backend::Obs {
+        // A staged `_link` names the scmsync constraint; without
+        // one the checkout keeps the git-backed refusal.
+        refuse_git_link(wc)?;
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
             "pull is for linked OBS packages: this working copy is git-backed",
@@ -6475,15 +6736,20 @@ pub fn pull(
             ),
         )
     })?;
-    if new_baserev == old_baserev && own_rev == wc.base_rev && own_srcmd5 == wc.base_srcmd5 {
+    if new_baserev == old_baserev
+        && wc.base.as_obs() == Some((own_rev.as_str(), own_srcmd5.as_str()))
+    {
         // The link already points at the target's latest revision,
         // and the link package itself has not moved: nothing to pull.
         return Ok(Some(PullReport {
             updated: false,
             old_baserev,
             new_baserev,
-            old_base_rev: wc.base_rev.clone(),
-            new_base_rev: own_rev,
+            old_base: wc.base.clone(),
+            new_base: Base::Obs {
+                rev: own_rev,
+                srcmd5: own_srcmd5,
+            },
             conflicts: Vec::new(),
             stash_remaining: false,
         }));
@@ -6559,21 +6825,29 @@ pub fn pull(
                 updated: true,
                 old_baserev,
                 new_baserev,
-                old_base_rev: wc.base_rev.clone(),
-                new_base_rev: own_rev.clone(),
+                old_base: wc.base.clone(),
+                new_base: Base::Obs {
+                    rev: own_rev.clone(),
+                    srcmd5: own_srcmd5.clone(),
+                },
                 conflicts: Vec::new(),
                 stash_remaining: outcome.stash_remaining,
             };
-            wc.base_rev = own_rev;
-            wc.base_srcmd5 = own_srcmd5;
+            wc.base = Base::Obs {
+                rev: own_rev,
+                srcmd5: own_srcmd5,
+            };
             Ok(Some(report))
         }
         Some(conflicts) => Ok(Some(PullReport {
             updated: false,
             old_baserev,
             new_baserev,
-            old_base_rev: wc.base_rev.clone(),
-            new_base_rev: own_rev,
+            old_base: wc.base.clone(),
+            new_base: Base::Obs {
+                rev: own_rev,
+                srcmd5: own_srcmd5,
+            },
             conflicts,
             stash_remaining: outcome.stash_remaining,
         })),
@@ -6873,12 +7147,11 @@ pub fn resolve(wc: &mut WorkingCopy, dry_run: &DryRun) -> Result<Option<Vec<Stri
                 })?;
                 git_config_set(&wc.root, "base-rev", &rev)?;
                 git_config_set(&wc.root, "base-srcmd5", &srcmd5)?;
-                wc.base_rev = rev;
-                wc.base_srcmd5 = srcmd5;
+                wc.base = Base::Obs { rev, srcmd5 };
             }
             Backend::Git => {
                 git_config_set(&wc.root, "base-rev", &target)?;
-                wc.base_rev = target;
+                wc.base = Base::Git { head: target };
             }
         }
         if stashed {
@@ -7141,8 +7414,10 @@ mod tests {
             "home:alice",
             "foo",
             Backend::Obs,
-            rev,
-            srcmd5,
+            &Base::Obs {
+                rev: rev.to_string(),
+                srcmd5: srcmd5.to_string(),
+            },
             None,
             None,
         )
@@ -7415,17 +7690,22 @@ mod tests {
         assert_eq!(report.packages[1].package, "foo");
         let foo = &report.packages[1];
         let record = foo.record.as_ref().unwrap();
-        assert_eq!(record.base_rev, "1");
-        assert_eq!(record.base_srcmd5, SRCMD5_1);
+        assert_eq!(
+            record.base,
+            Base::Obs {
+                rev: "1".to_string(),
+                srcmd5: SRCMD5_1.to_string()
+            }
+        );
         assert!(dir
             .path
-            .join("home_alice")
+            .join("home%3Aalice")
             .join("foo")
             .join("foo.spec")
             .exists());
         assert!(dir
             .path
-            .join("home_alice")
+            .join("home%3Aalice")
             .join("bar")
             .join("bar.spec")
             .exists());
@@ -7434,7 +7714,7 @@ mod tests {
     #[test]
     fn checkout_project_skips_an_existing_target() {
         let dir = TempDirGuard::new("project-skip");
-        std::fs::create_dir_all(dir.path.join("home_alice").join("foo")).unwrap();
+        std::fs::create_dir_all(dir.path.join("home%3Aalice").join("foo")).unwrap();
         let http = project_http();
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let report =
@@ -7464,7 +7744,7 @@ mod tests {
         assert_eq!(report.skipped[1].package, "foo:flavor2");
         assert!(dir
             .path
-            .join("home_alice")
+            .join("home%3Aalice")
             .join("foo")
             .join("foo.spec")
             .exists());
@@ -7480,7 +7760,7 @@ mod tests {
         assert_eq!(report.packages.len(), 2);
         assert!(report.packages.iter().all(|entry| entry.record.is_none()));
         assert!(report.skipped.is_empty());
-        assert!(!dir.path.join("home_alice").exists());
+        assert!(!dir.path.join("home%3Aalice").exists());
         assert!(
             dry_run
                 .plan()
@@ -7500,8 +7780,13 @@ mod tests {
         assert_eq!(wc.project, "home:alice");
         assert_eq!(wc.package, "foo");
         assert_eq!(wc.backend, Backend::Obs);
-        assert_eq!(wc.base_rev, REV1);
-        assert_eq!(wc.base_srcmd5, SRCMD5_1);
+        assert_eq!(
+            wc.base,
+            Base::Obs {
+                rev: REV1.to_string(),
+                srcmd5: SRCMD5_1.to_string()
+            }
+        );
     }
 
     #[test]
@@ -7513,7 +7798,7 @@ mod tests {
         // root is the history, so the record follows it.
         git_config_set(&dir.path, "base-rev", "2").unwrap();
         let wc = open(&dir.path).unwrap();
-        assert_eq!(wc.base_rev, REV1);
+        assert_eq!(wc.base.as_obs().map(|(rev, _)| rev), Some(REV1));
         assert_eq!(
             git_config_get(&dir.path, "base-rev").unwrap(),
             Some("1".to_string())
@@ -7543,8 +7828,13 @@ mod tests {
         let roots = git(&wc.root, "rev-list", &["--max-parents=0", "HEAD"], &[]).unwrap();
         assert_eq!(roots.lines().count(), 2);
         let reopened = open(&wc.root).unwrap();
-        assert_eq!(reopened.base_rev, REV1);
-        assert_eq!(reopened.base_srcmd5, SRCMD5_1);
+        assert_eq!(
+            reopened.base,
+            Base::Obs {
+                rev: REV1.to_string(),
+                srcmd5: SRCMD5_1.to_string()
+            }
+        );
         let _ = dir;
     }
 
@@ -7972,6 +8262,33 @@ mod tests {
     }
 
     #[test]
+    fn diff_degrades_a_sha_link_baserev_to_a_named_note() {
+        // A 40-hex baserev is a git SHA, not an OBS revision: the
+        // diff degrades to a note naming the `_link` baserev,
+        // with the plain halves intact.
+        let http = link_diff_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (_dir, wc) = link_diff_checkout(&http);
+        write_file(&wc.root, "_link", &link_xml(&"a".repeat(40)));
+        add(&wc, &["_link".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        // The section failure degrades to a note — the diff's
+        // documented contract, and the pre-branch behaviour for a
+        // malformed baserev too — but the note now names the
+        // `_link` baserev instead of blaming a user pin.
+        let (out, note) = diff(&wc, Some(&client)).unwrap();
+        assert!(out.contains("diff --git a/_link"), "diff: {out}");
+        let note = note.expect("a note carries the section failure");
+        assert!(note.contains("_link baserev"), "{note}");
+        assert!(note.contains("git SHA"), "{note}");
+        assert!(
+            !note.contains("skipping the link diff"),
+            "a coords failure is not a target read: {note}"
+        );
+    }
+
+    #[test]
     fn diff_on_a_same_name_link_reads_the_link_target() {
         let http = same_name_link_diff_http();
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
@@ -8393,8 +8710,13 @@ mod tests {
         assert_eq!(wc.project, "home:alice");
         assert_eq!(wc.package, "foo");
         assert_eq!(wc.backend, Backend::Obs);
-        assert_eq!(wc.base_rev, REV1);
-        assert_eq!(wc.base_srcmd5, SRCMD5_1);
+        assert_eq!(
+            wc.base,
+            Base::Obs {
+                rev: REV1.to_string(),
+                srcmd5: SRCMD5_1.to_string()
+            }
+        );
         assert_eq!(wc.apiurl, "https://api.opensuse.org");
         let root = root_commit(&wc.root).unwrap();
         assert_eq!(
@@ -8404,6 +8726,23 @@ mod tests {
         // The checkout opens again: the record round-trips.
         let reopened = open(&wc.root).unwrap();
         assert_eq!(reopened, wc);
+        let _ = dir;
+    }
+
+    #[test]
+    fn open_reopens_a_pre_percent_encoding_checkout_directory() {
+        // A checkout recorded before `:` became `%3A` still opens
+        // from its `_` directory: the record is in git config,
+        // the directory name is never read.
+        let http = checkout_http();
+        let (dir, wc) = do_checkout(&http);
+        std::fs::create_dir(dir.path.join("home_alice")).unwrap();
+        let legacy = dir.path.join("home_alice").join("foo");
+        std::fs::rename(&wc.root, &legacy).unwrap();
+        let reopened = open(&legacy).unwrap();
+        assert_eq!(reopened.project, "home:alice");
+        assert_eq!(reopened.package, "foo");
+        assert_eq!(reopened.base, wc.base);
         let _ = dir;
     }
 
@@ -8784,13 +9123,65 @@ mod tests {
             "<link project=\"home:alice\" package=\"foo\" baserev=\"7\"/>"
         );
         // The base stays the link package's own coordinates.
-        assert_eq!(wc.base_rev, "1");
-        assert_eq!(wc.base_srcmd5, SRCMD5_1);
+        assert_eq!(
+            wc.base,
+            Base::Obs {
+                rev: "1".to_string(),
+                srcmd5: SRCMD5_1.to_string()
+            }
+        );
         // The target listing at the baserev pin was actually read.
         assert!(http
             .get_calls()
             .iter()
             .any(|(url, _)| url == "https://api.opensuse.org/public/source/home:alice/foo?rev=7"));
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_rev_refuses_a_sha_link_baserev() {
+        // A 40-hex baserev is a git SHA, not an OBS revision: the
+        // checkout fails naming the link, before any target read.
+        let sha = "a".repeat(40);
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/_meta",
+                "<package name=\"foo-link\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link?rev=1",
+                &format!(
+                    "<directory name=\"foo-link\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+                    <linkinfo project=\"home:alice\" package=\"foo\" baserev=\"7\" xsrcmd5=\"cccccccccccccccccccccccccccccccc\" />\
+                    <entry md5=\"85a0a7eb3eff93b00f71fa802d182254\" mtime=\"1282047302\" name=\"_link\" size=\"54\" />\
+                    <entry md5=\"8151f31f450ddc9a0288454a4732e2a3\" mtime=\"1282047302\" name=\"local.patch\" size=\"11\" />\
+                    </directory>"
+                ),
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/_link?rev=1",
+                &format!("<link project=\"home:alice\" package=\"foo\" baserev=\"{sha}\"/>"),
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/_link?rev=1",
+                format!("<link project=\"home:alice\" package=\"foo\" baserev=\"{sha}\"/>").as_bytes(),
+            );
+        let dir = TempDirGuard::new("checkout-link-sha-baserev");
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = checkout(
+            &client,
+            "home:alice",
+            "foo-link",
+            Some(&RevisionSpec::Rev(1)),
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(message.contains("_link baserev"), "{message}");
+        assert!(message.contains("git SHA"), "{message}");
         let _ = dir;
     }
 
@@ -8807,7 +9198,7 @@ mod tests {
             read_file(&wc.root, "_link"),
             "<link project=\"home:alice\" package=\"bar-link\" baserev=\"3\"/>"
         );
-        assert_eq!(wc.base_rev, "1");
+        assert_eq!(wc.base.as_obs().map(|(rev, _)| rev), Some("1"));
         let _ = dir;
     }
 
@@ -8816,7 +9207,7 @@ mod tests {
         let http = baserevless_checkout_http();
         let (dir, wc) = checkout_linked(&http, "foo-link", RevisionSpec::Rev(1));
         assert_eq!(read_file(&wc.root, "bar.spec"), "Name: bar\n");
-        assert_eq!(wc.base_rev, "1");
+        assert_eq!(wc.base.as_obs().map(|(rev, _)| rev), Some("1"));
         assert!(http
             .get_calls()
             .iter()
@@ -8909,8 +9300,8 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(!dir.path.join("home_alice").join("evil").exists());
-        assert!(!dir.path.join("home_alice").join("foo").exists());
+        assert!(!dir.path.join("home%3Aalice").join("evil").exists());
+        assert!(!dir.path.join("home%3Aalice").join("foo").exists());
         let _ = dir;
     }
 
@@ -8947,8 +9338,8 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(!dir.path.join("home_alice").join("evil").exists());
-        assert!(!dir.path.join("home_alice").join("foo").exists());
+        assert!(!dir.path.join("home%3Aalice").join("evil").exists());
+        assert!(!dir.path.join("home%3Aalice").join("foo").exists());
         let _ = dir;
     }
 
@@ -8986,14 +9377,14 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(!dir.path.join("home_alice").join("foo").exists());
+        assert!(!dir.path.join("home%3Aalice").join("foo").exists());
         let _ = dir;
     }
 
     #[test]
-    fn checkout_sanitizes_colons_in_the_directory_name() {
+    fn checkout_percent_encodes_colons_in_the_directory_name() {
         // `:` is legal in an OBS name but not in a Windows path:
-        // the checkout lands under the sanitized name, and the
+        // the checkout lands under the percent-encoded name, and the
         // record still carries the real project and package.
         let dir = TempDirGuard::new("checkout-colon");
         let http = checkout_http();
@@ -9009,7 +9400,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(wc.root, dir.path.join("home_alice").join("foo"));
+        assert_eq!(wc.root, dir.path.join("home%3Aalice").join("foo"));
         assert_eq!(wc.project, "home:alice");
         assert_eq!(wc.package, "foo");
         let reopened = open(&wc.root).unwrap();
@@ -9042,7 +9433,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(wc.base_rev, REV1);
+        assert_eq!(wc.base.as_obs().map(|(rev, _)| rev), Some(REV1));
         // The root commit exists over the empty tree: the
         // checkout re-opens.
         let root = root_commit(&wc.root).unwrap();
@@ -9050,7 +9441,10 @@ mod tests {
             root_message(&wc.root, &root).unwrap().trim(),
             format!("geectl base {REV1} {SRCMD5_1}")
         );
-        assert_eq!(open(&wc.root).unwrap().base_rev, REV1);
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some(REV1)
+        );
         let _ = dir;
     }
 
@@ -9104,8 +9498,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.rev, Some(2));
-        assert_eq!(report.srcmd5, Some(SRCMD5_2.to_string()));
+        assert_eq!(
+            report.landed,
+            Base::Obs {
+                rev: "2".to_string(),
+                srcmd5: SRCMD5_2.to_string()
+            }
+        );
         assert_eq!(report.open_requests, vec!["42".to_string()]);
         assert_eq!(
             report.files,
@@ -9134,7 +9533,10 @@ mod tests {
             root_message(&wc.root, &root).unwrap().trim(),
             format!("geectl base 2 {SRCMD5_2}")
         );
-        assert_eq!(open(&wc.root).unwrap().base_rev, "2");
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some("2")
+        );
         // The staged PUT went out for the missing file only, with
         // the index content and the credentials.
         let puts = http.put_bytes_calls();
@@ -9174,7 +9576,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.rev, Some(2));
+        assert_eq!(report.landed.as_obs().map(|(rev, _)| rev), Some("2"));
         // The base moved, so the mtimes were re-recorded: the
         // record still names the committed worktree.
         assert_eq!(wc.mtimes, snapshot_mtimes(&wc.root).unwrap());
@@ -9417,7 +9819,7 @@ mod tests {
         // the new root before the config write failed, so the
         // record is stale. That is why the error must name the
         // landed revision.)
-        assert_eq!(wc.base_rev, "1");
+        assert_eq!(wc.base.as_obs().map(|(rev, _)| rev), Some("1"));
         let _ = dir;
     }
 
@@ -9448,8 +9850,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.rev, Some(2));
-        assert_eq!(report.srcmd5, Some(SRCMD5_2.to_string()));
+        assert_eq!(
+            report.landed,
+            Base::Obs {
+                rev: "2".to_string(),
+                srcmd5: SRCMD5_2.to_string()
+            }
+        );
         assert_eq!(report.files, vec!["foo.spec".to_string()]);
         // Exactly one POST: the validate pass committed, so no final
         // pass runs — a final pass would commit a second revision.
@@ -9465,7 +9872,10 @@ mod tests {
             "validate body: {}",
             posts[0].1
         );
-        assert_eq!(open(&wc.root).unwrap().base_rev, "2");
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some("2")
+        );
         let _ = dir;
     }
 
@@ -9496,7 +9906,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.rev, Some(2));
+        assert_eq!(report.landed.as_obs().map(|(rev, _)| rev), Some("2"));
         assert_eq!(report.files, vec!["foo.tar.gz".to_string()]);
         let posts = http.post_calls();
         assert_eq!(posts.len(), 1);
@@ -9506,7 +9916,10 @@ mod tests {
             posts[0].1.as_str(),
             "<directory><entry name=\"foo.spec\" md5=\"9444ad22a238286bca9bf649b2aef01d\" /></directory>"
         );
-        assert_eq!(open(&wc.root).unwrap().base_rev, "2");
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some("2")
+        );
         let _ = dir;
     }
 
@@ -9557,7 +9970,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.rev, Some(2));
+        assert_eq!(report.landed.as_obs().map(|(rev, _)| rev), Some("2"));
         // The stage ran twice (validate + final retry), the final
         // pass ran twice, the validate pass once.
         assert_eq!(http.put_bytes_calls().len(), 2);
@@ -9659,7 +10072,10 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("revision 2"), "message: {message}");
         // The base is unrefreshed: the commit did not complete.
-        assert_eq!(open(&wc.root).unwrap().base_rev, "1");
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some("1")
+        );
         let _ = dir;
     }
 
@@ -9730,7 +10146,10 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("revision 2"), "message: {message}");
         // The base is unrefreshed: the commit did not complete.
-        assert_eq!(open(&wc.root).unwrap().base_rev, "1");
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some("1")
+        );
         let _ = dir;
     }
 
@@ -9822,14 +10241,22 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(report.updated);
-        assert_eq!(report.old_base_rev, REV1);
-        assert_eq!(report.new_base_rev, "2");
+        assert_eq!(report.old_base.as_obs().map(|(rev, _)| rev), Some(REV1));
+        assert_eq!(report.new_base.as_obs().map(|(rev, _)| rev), Some("2"));
         assert!(report.conflicts.is_empty());
         assert_eq!(read_file(&wc.root, "foo.spec"), "Name: server\n");
         assert_eq!(read_file(&wc.root, "bar.txt"), "local\n");
-        assert_eq!(open(&wc.root).unwrap().base_rev, "2");
-        assert_eq!(wc.base_rev, "2");
-        assert_eq!(wc.base_srcmd5, SRCMD5_2);
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some("2")
+        );
+        assert_eq!(
+            wc.base,
+            Base::Obs {
+                rev: "2".to_string(),
+                srcmd5: SRCMD5_2.to_string()
+            }
+        );
         let _ = dir;
     }
 
@@ -9851,8 +10278,32 @@ mod tests {
         let (dir, mut wc) = do_checkout(&http);
         let err = update(&mut wc, &client, Some("2"), None, &DryRun::new(false)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert_eq!(wc.base_rev, REV1);
-        assert!(!dir.path.join("home_alice").join("evil").exists());
+        assert_eq!(wc.base.as_obs().map(|(rev, _)| rev), Some(REV1));
+        assert!(!dir.path.join("home%3Aalice").join("evil").exists());
+        let _ = dir;
+    }
+
+    #[test]
+    fn update_obs_refuses_a_sha() {
+        // A git SHA is not an OBS revision: the update is refused
+        // before anything is read, and the base does not move.
+        let http = checkout_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        let reads_before = http.get_calls().len();
+        let downloads_before = http.get_to_file_calls().len();
+        let err = update(
+            &mut wc,
+            &client,
+            Some(&"a".repeat(40)),
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(http.get_calls().len(), reads_before);
+        assert_eq!(http.get_to_file_calls().len(), downloads_before);
+        assert_eq!(wc.base.as_obs().map(|(rev, _)| rev), Some(REV1));
         let _ = dir;
     }
 
@@ -9892,9 +10343,17 @@ mod tests {
         assert!(!rebase_in_progress(&wc).unwrap());
         // The record adopted the new base, on disk and in this
         // checkout.
-        assert_eq!(open(&wc.root).unwrap().base_rev, "2");
-        assert_eq!(wc.base_rev, "2");
-        assert_eq!(wc.base_srcmd5, SRCMD5_2);
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some("2")
+        );
+        assert_eq!(
+            wc.base,
+            Base::Obs {
+                rev: "2".to_string(),
+                srcmd5: SRCMD5_2.to_string()
+            }
+        );
         let _ = dir;
     }
 
@@ -9945,7 +10404,10 @@ mod tests {
         // update already moved the record to.
         assert!(rebase_in_progress(&wc).unwrap());
         assert_eq!(unmerged_files(&wc).unwrap(), vec!["foo.spec".to_string()]);
-        assert_eq!(open(&wc.root).unwrap().base_rev, "2");
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some("2")
+        );
         let _ = dir;
     }
 
@@ -9999,9 +10461,17 @@ mod tests {
         let resolved = resolve(&mut wc, &DryRun::new(false)).unwrap().unwrap();
         assert!(resolved.is_empty());
         assert!(!rebase_in_progress(&wc).unwrap());
-        assert_eq!(open(&wc.root).unwrap().base_rev, "2");
-        assert_eq!(wc.base_rev, "2");
-        assert_eq!(wc.base_srcmd5, SRCMD5_2);
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some("2")
+        );
+        assert_eq!(
+            wc.base,
+            Base::Obs {
+                rev: "2".to_string(),
+                srcmd5: SRCMD5_2.to_string()
+            }
+        );
         let _ = dir;
     }
 
@@ -10091,9 +10561,17 @@ mod tests {
         // The rebase finished, so the new base was adopted even
         // though the stash is stranded.
         assert!(!rebase_in_progress(&wc).unwrap());
-        assert_eq!(open(&wc.root).unwrap().base_rev, "2");
-        assert_eq!(wc.base_rev, "2");
-        assert_eq!(wc.base_srcmd5, SRCMD5_2);
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some("2")
+        );
+        assert_eq!(
+            wc.base,
+            Base::Obs {
+                rev: "2".to_string(),
+                srcmd5: SRCMD5_2.to_string()
+            }
+        );
         // The stash entry is still there, holding the edit.
         let stash = git(&wc.root, "stash", &["list"], &[]).unwrap();
         assert!(stash.contains("geectl resolve"), "stash: {stash}");
@@ -10265,13 +10743,21 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.rev, Some(2));
-        assert_eq!(report.srcmd5, Some(SRCMD5_2.to_string()));
+        assert_eq!(
+            report.landed,
+            Base::Obs {
+                rev: "2".to_string(),
+                srcmd5: SRCMD5_2.to_string()
+            }
+        );
         // The final pass, not the validate pass, carries
         // `noservice=1`: the server runs no services for it.
         let posts = http.post_calls();
         assert!(posts.iter().any(|(url, _, _)| url == final_url));
-        assert_eq!(open(&wc.root).unwrap().base_rev, "2");
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some("2")
+        );
         let _ = dir;
     }
 
@@ -10309,7 +10795,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.rev, Some(2));
+        assert_eq!(report.landed.as_obs().map(|(rev, _)| rev), Some("2"));
         // The final pass carries the sha256 of the index content
         // of the challenged file.
         let posts = http.post_calls();
@@ -10370,7 +10856,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.rev, Some(2));
+        assert_eq!(report.landed.as_obs().map(|(rev, _)| rev), Some("2"));
         let posts = http.post_calls();
         assert!(posts.iter().any(|(url, _, _)| url == validate_url));
         assert!(posts.iter().any(|(url, _, _)| url == final_url));
@@ -10434,7 +10920,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.rev, Some(2));
+        assert_eq!(report.landed.as_obs().map(|(rev, _)| rev), Some("2"));
         let _ = dir;
     }
 
@@ -10553,7 +11039,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.rev, Some(2));
+        assert_eq!(report.landed.as_obs().map(|(rev, _)| rev), Some("2"));
         assert_eq!(report.files, vec!["foo.changes".to_string()]);
         assert_eq!(http.post_calls().len(), 1);
         let _ = dir;
@@ -10601,7 +11087,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.rev, Some(2));
+        assert_eq!(report.landed.as_obs().map(|(rev, _)| rev), Some("2"));
         let _ = dir;
     }
 
@@ -10675,7 +11161,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.rev, Some(2));
+        assert_eq!(report.landed.as_obs().map(|(rev, _)| rev), Some("2"));
         let _ = dir;
     }
 
@@ -11477,8 +11963,121 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(!dir.path.join("home_alice").join("foo").exists());
+        assert!(!dir.path.join("home%3Aalice").join("foo").exists());
         let _ = dir;
+    }
+
+    #[test]
+    fn checkout_git_pins_to_a_sha() {
+        let dir = TempDirGuard::new("git-checkout-pin");
+        let origin = git_origin(&dir.path);
+        let first = origin.head.clone();
+        // The remote moves: a second commit lands on main, so the
+        // pin is behind the cloned head.
+        let work = dir.path.join("work");
+        write_file(&work, "foo.spec", "Name: remote\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "remote change"]);
+        git_ok(&work, &["push", "--quiet", "origin", "main"]);
+        let http = git_checkout_http(&origin.url);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let pin = RevisionSpec::Sha(first.clone());
+        let wc = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            Some(&pin),
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(wc.base.as_git(), Some(first.as_str()));
+        assert_eq!(read_file(&wc.root, "foo.spec"), "Name: foo\n");
+        // The branch still tracks the upstream: a later update
+        // resolves `@{u}` to the second commit.
+        let second = git(&work, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(
+            git(&wc.root, "rev-parse", &["@{u}"], &[]).unwrap().trim(),
+            second.as_str()
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn checkout_git_refuses_a_revision_number() {
+        let dir = TempDirGuard::new("git-checkout-rev");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            Some(&RevisionSpec::Rev(2)),
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let _ = origin;
+    }
+
+    #[test]
+    fn checkout_refuses_a_sha_for_an_obs_native_package() {
+        let dir = TempDirGuard::new("obs-checkout-sha");
+        let http = checkout_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let pin = RevisionSpec::Sha("a".repeat(40));
+        let err = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            Some(&pin),
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_git_dry_run_plan_names_the_pin() {
+        let dir = TempDirGuard::new("git-checkout-pin-plan");
+        let origin = git_origin(&dir.path);
+        let first = origin.head.clone();
+        let http = git_checkout_http(&origin.url);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let pin = RevisionSpec::Sha(first.clone());
+        let report = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            Some(&pin),
+            &dir.path,
+            None,
+            &dry_run,
+        )
+        .unwrap();
+        assert!(report.is_none());
+        assert!(
+            dry_run
+                .plan()
+                .iter()
+                .any(|line| line.contains(&format!("and reset to {first}"))),
+            "plan: {:?}",
+            dry_run.plan()
+        );
+        assert!(!dir.path.join("home%3Aalice").exists());
+        let _ = origin;
     }
 
     #[test]
@@ -11505,7 +12104,7 @@ mod tests {
         let http = git_checkout_http(&origin.url);
         let wc = do_git_checkout(&http, &dir);
         assert_eq!(wc.backend, Backend::Git);
-        assert_eq!(wc.base_rev, main_head);
+        assert_eq!(wc.base.as_git(), Some(main_head.as_str()));
         assert_eq!(read_file(&wc.root, "foo.spec"), "Name: foo\n");
         // The scmsync URL and its branch are recorded, so the
         // checkout remembers which branch it tracks.
@@ -11532,7 +12131,7 @@ mod tests {
         );
         let wc = do_git_checkout(&http, &dir);
         assert_eq!(wc.backend, Backend::Git);
-        assert_eq!(wc.base_rev, main_head);
+        assert_eq!(wc.base.as_git(), Some(main_head.as_str()));
         assert_eq!(read_file(&wc.root, "foo.spec"), "Name: foo\n");
         // An empty fragment names no branch: the URL is recorded,
         // the branch stays unset.
@@ -11559,6 +12158,168 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let _ = origin;
+    }
+
+    #[test]
+    fn commit_git_refuses_a_staged_link() {
+        let dir = TempDirGuard::new("git-commit-link");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(
+            &wc.root,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        add(&wc, &["_link".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("scmsync never syncs a _link"),
+            "message: {}",
+            err
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn commit_git_dry_run_plan_refuses_a_staged_link() {
+        let dir = TempDirGuard::new("git-commit-link-plan");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(
+            &wc.root,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        add(&wc, &["_link".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            Some(&auth),
+            &DryRun::new(true),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("scmsync never syncs a _link"),
+            "message: {}",
+            err
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn commit_git_allows_an_unstaged_link() {
+        // The refusal is about the staged link: an untracked
+        // `_link` is not sent by the commit, so the commit runs.
+        let dir = TempDirGuard::new("git-commit-link-unstaged");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        write_file(
+            &wc.root,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.landed, Base::Git { head: head.clone() });
+        let _ = origin;
+    }
+
+    #[test]
+    fn diff_refuses_a_staged_link_on_a_git_backed_checkout() {
+        let dir = TempDirGuard::new("git-diff-link");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        write_file(
+            &wc.root,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        add(&wc, &["_link".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let err = diff(&wc, None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("scmsync never syncs a _link"),
+            "message: {}",
+            err
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn pull_on_a_git_backed_checkout_with_a_link_names_the_constraint() {
+        let dir = TempDirGuard::new("pull-git-link");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(
+            &wc.root,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        add(&wc, &["_link".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = pull(&mut wc, &client, &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("scmsync never syncs a _link"),
+            "message: {}",
+            err
+        );
         let _ = origin;
     }
 
@@ -11596,15 +12357,60 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.pushed_head, Some(head.clone()));
-        assert_eq!(report.rev, None);
-        assert_eq!(open(&wc.root).unwrap().base_rev, head);
+        assert_eq!(report.landed, Base::Git { head: head.clone() });
+        assert_eq!(open(&wc.root).unwrap().base.as_git(), Some(head.as_str()));
         // The push landed in the origin.
         let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
             .unwrap()
             .trim()
             .to_string();
         assert_eq!(origin_head, head);
+    }
+
+    #[test]
+    fn commit_git_reports_open_requests() {
+        let dir = TempDirGuard::new("git-commit-requests");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        // The OBS side already synced the pushed head: the poll
+        // finds it on the first read.
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search_url = client
+            .package_requests_search_url("home:alice", "foo")
+            .unwrap();
+        let http = http.with_get(
+            &search_url,
+            "<collection matches=\"1\"><request id=\"42\" /></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.open_requests, vec!["42".to_string()]);
+        let _ = origin;
     }
 
     #[test]
@@ -11634,7 +12440,7 @@ mod tests {
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let auth = test_auth();
-        let old_base = wc.base_rev.clone();
+        let old_base = wc.base.display().to_string();
         std::fs::write(wc.root.join(".git").join("config.lock"), "").unwrap();
         let err = commit(
             &mut wc,
@@ -11652,7 +12458,10 @@ mod tests {
             "message: {message}"
         );
         // The base is unrefreshed: the commit did not complete.
-        assert_eq!(open(&wc.root).unwrap().base_rev, old_base);
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_git(),
+            Some(old_base.as_str())
+        );
         let _ = dir;
     }
 
@@ -11747,8 +12556,16 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.pushed_head, Some(expected.clone()));
-        assert_eq!(open(&wc.root).unwrap().base_rev, expected);
+        assert_eq!(
+            report.landed,
+            Base::Git {
+                head: expected.clone()
+            }
+        );
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_git(),
+            Some(expected.as_str())
+        );
         let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
             .unwrap()
             .trim()
@@ -11792,7 +12609,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.pushed_head, Some(head));
+        assert_eq!(report.landed, Base::Git { head });
         let _ = origin;
     }
 
@@ -11850,10 +12667,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(report.updated);
-        assert_eq!(report.new_base_rev, new_head);
+        assert_eq!(report.new_base.as_git(), Some(new_head.as_str()));
         assert!(report.conflicts.is_empty());
         assert_eq!(read_file(&wc.root, "foo.spec"), "Name: remote\n");
-        assert_eq!(open(&wc.root).unwrap().base_rev, new_head);
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_git(),
+            Some(new_head.as_str())
+        );
         let _ = origin;
     }
 
@@ -11883,7 +12703,10 @@ mod tests {
         assert!(!report.updated);
         assert_eq!(report.conflicts, vec!["foo.spec".to_string()]);
         assert!(rebase_in_progress(&wc).unwrap());
-        assert_eq!(open(&wc.root).unwrap().base_rev, initial);
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_git(),
+            Some(initial.as_str())
+        );
         let _ = origin;
     }
 
@@ -11922,8 +12745,11 @@ mod tests {
         assert!(!rebase_in_progress(&wc).unwrap());
         // The record adopted the new base, on disk and in this
         // checkout: the upstream-only bar.txt is not local work.
-        assert_eq!(open(&wc.root).unwrap().base_rev, new_head);
-        assert_eq!(wc.base_rev, new_head);
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_git(),
+            Some(new_head.as_str())
+        );
+        assert_eq!(wc.base.as_git(), Some(new_head.as_str()));
         let found: Vec<(String, StatusCode)> = status(&wc)
             .unwrap()
             .into_iter()
@@ -11963,8 +12789,11 @@ mod tests {
         // The reused checkout's recorded base moved with the
         // update: status compares against the new base, so the
         // upstream-only bar.txt is not local work.
-        assert_eq!(wc.base_rev, new_head);
-        assert_eq!(open(&wc.root).unwrap().base_rev, new_head);
+        assert_eq!(wc.base.as_git(), Some(new_head.as_str()));
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_git(),
+            Some(new_head.as_str())
+        );
         let found: Vec<(String, StatusCode)> = status(&wc)
             .unwrap()
             .into_iter()
@@ -11975,14 +12804,216 @@ mod tests {
     }
 
     #[test]
-    fn update_git_refuses_rev() {
+    fn update_git_refuses_a_number_or_srcmd5() {
+        // A number or a srcmd5 is not a git SHA: the update is
+        // refused before any fetch, and the base does not move.
+        // The refusal also precedes the rebase check: a checkout
+        // mid-rebase reports the bad revision, not the rebase.
         let dir = TempDirGuard::new("git-update-rev");
+        let origin = git_origin(&dir.path);
+        let initial = origin.head.clone();
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let srcmd5 = "e".repeat(32);
+        for rev in ["2", srcmd5.as_str()] {
+            let err = update(&mut wc, &client, Some(rev), None, &DryRun::new(false)).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            let message = err.to_string();
+            assert!(
+                message.contains("update --rev for a git-backed package must be a git SHA"),
+                "{message}"
+            );
+            assert_eq!(wc.base.as_git(), Some(initial.as_str()));
+        }
+        // The dry-run plan refuses the same way, before any plan
+        // line beyond the action itself.
+        let dry_run = DryRun::new(true);
+        let err = update(&mut wc, &client, Some("2"), None, &dry_run).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(
+            message.contains("update --rev for a git-backed package must be a git SHA"),
+            "{message}"
+        );
+        assert!(
+            dry_run
+                .plan()
+                .iter()
+                .all(|line| !line.contains("would fetch origin")),
+            "plan: {:?}",
+            dry_run.plan()
+        );
+        // A checkout mid-rebase still reports the bad revision
+        // first: the rev-shape check precedes the rebase check.
+        let work = dir.path.join("work");
+        write_file(&work, "foo.spec", "Name: remote\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "remote change"]);
+        git_ok(&work, &["push", "--quiet", "origin", "main"]);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let report = update(&mut wc, &client, None, None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(!report.updated);
+        assert_eq!(report.conflicts, vec!["foo.spec".to_string()]);
+        assert!(rebase_in_progress(&wc).unwrap());
+        let err = update(&mut wc, &client, Some("2"), None, &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(
+            message.contains("update --rev for a git-backed package must be a git SHA"),
+            "{message}"
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn update_git_pins_to_a_sha() {
+        let dir = TempDirGuard::new("git-update-pin");
+        let origin = git_origin(&dir.path);
+        let first = origin.head.clone();
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        // The remote moves: a second commit lands on main, and the
+        // checkout follows it — so the pin is behind the base.
+        let work = dir.path.join("work");
+        write_file(&work, "foo.spec", "Name: remote\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "remote change"]);
+        git_ok(&work, &["push", "--quiet", "origin", "main"]);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let report = update(&mut wc, &client, None, None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.updated);
+        // A local commit on a new file: the rebase onto the pin
+        // carries it without touching the spec.
+        write_file(&wc.root, "local.txt", "local\n");
+        add(&wc, &["local.txt".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local file"]);
+        let report = update(
+            &mut wc,
+            &client,
+            Some(first.as_str()),
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(report.updated);
+        assert_eq!(report.new_base.as_git(), Some(first.as_str()));
+        assert!(report.conflicts.is_empty());
+        assert_eq!(read_file(&wc.root, "foo.spec"), "Name: foo\n");
+        assert_eq!(read_file(&wc.root, "local.txt"), "local\n");
+        assert_eq!(open(&wc.root).unwrap().base.as_git(), Some(first.as_str()));
+        let _ = origin;
+    }
+
+    #[test]
+    fn update_git_refuses_a_sha_not_ancestor_of_upstream() {
+        let dir = TempDirGuard::new("git-update-pin-other");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        // A commit on another branch: in the repo after the fetch,
+        // but never an ancestor of the upstream head.
+        let work = dir.path.join("work");
+        git_ok(&work, &["checkout", "--quiet", "-b", "other"]);
+        write_file(&work, "foo.spec", "Name: other\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "other branch"]);
+        git_ok(&work, &["push", "--quiet", "origin", "other"]);
+        let other = git(&work, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = update(
+            &mut wc,
+            &client,
+            Some(other.as_str()),
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(message.contains("is not an ancestor"), "{message}");
+        let _ = origin;
+    }
+
+    #[test]
+    fn update_git_refuses_an_unknown_sha() {
+        let dir = TempDirGuard::new("git-update-pin-unknown");
         let origin = git_origin(&dir.path);
         let http = git_checkout_http(&origin.url);
         let mut wc = do_git_checkout(&http, &dir);
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
-        let err = update(&mut wc, &client, Some("2"), None, &DryRun::new(false)).unwrap_err();
+        let err = update(
+            &mut wc,
+            &client,
+            Some(&"f".repeat(40)),
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(
+            message.contains("no such commit in the checkout"),
+            "{message}"
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn update_git_dry_run_plan_names_the_pin() {
+        let dir = TempDirGuard::new("git-update-pin-plan");
+        let origin = git_origin(&dir.path);
+        let first = origin.head.clone();
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let report = update(&mut wc, &client, Some(first.as_str()), None, &dry_run).unwrap();
+        assert!(report.is_none());
+        assert!(
+            dry_run
+                .plan()
+                .iter()
+                .any(|line| line.contains(&format!("would fetch origin and rebase onto {first}"))),
+            "plan: {:?}",
+            dry_run.plan()
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn update_git_dry_run_plan_names_the_last_fetched_head() {
+        let dir = TempDirGuard::new("git-update-plan-head");
+        let origin = git_origin(&dir.path);
+        let first = origin.head.clone();
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let report = update(&mut wc, &client, None, None, &dry_run).unwrap();
+        assert!(report.is_none());
+        assert!(
+            dry_run
+                .plan()
+                .iter()
+                .any(|line| line.contains(&format!("last fetched: {first}"))),
+            "plan: {:?}",
+            dry_run.plan()
+        );
         let _ = origin;
     }
 
@@ -12071,7 +13102,10 @@ mod tests {
         assert!(split_nul(&cached).is_empty());
         let worktree = git(&wc.root, "diff", &["--name-only", "-z"], &[]).unwrap();
         assert_eq!(split_nul(&worktree), vec!["bar.txt".to_string()]);
-        assert_eq!(open(&wc.root).unwrap().base_rev, "2");
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some("2")
+        );
         let _ = dir;
     }
 
@@ -12231,15 +13265,25 @@ mod tests {
         assert!(report.updated);
         assert_eq!(report.old_baserev, LINK_OLD_BASEREV);
         assert_eq!(report.new_baserev, TARGET_SRCMD5);
-        assert_eq!(report.old_base_rev, "1");
-        assert_eq!(report.new_base_rev, "1");
+        assert_eq!(report.old_base.as_obs().map(|(rev, _)| rev), Some("1"));
+        assert_eq!(report.new_base.as_obs().map(|(rev, _)| rev), Some("1"));
         // The record keeps the link package's own, unexpanded
         // coordinates — not the expanded listing's srcmd5.
         let reopened = open(&wc.root).unwrap();
-        assert_eq!(reopened.base_rev, "1");
-        assert_eq!(reopened.base_srcmd5, SRCMD5_1);
-        assert_eq!(wc.base_rev, "1");
-        assert_eq!(wc.base_srcmd5, SRCMD5_1);
+        assert_eq!(
+            reopened.base,
+            Base::Obs {
+                rev: "1".to_string(),
+                srcmd5: SRCMD5_1.to_string()
+            }
+        );
+        assert_eq!(
+            wc.base,
+            Base::Obs {
+                rev: "1".to_string(),
+                srcmd5: SRCMD5_1.to_string()
+            }
+        );
         // The downloaded _link carries the new baserev.
         let link = String::from_utf8(index_content(&wc, "_link").unwrap()).unwrap();
         assert!(
@@ -12271,10 +13315,18 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.rev, Some(2));
-        assert_eq!(open(&wc.root).unwrap().base_rev, "2");
-        assert_eq!(wc.base_rev, "2");
-        assert_eq!(wc.base_srcmd5, SRCMD5_2);
+        assert_eq!(report.landed.as_obs().map(|(rev, _)| rev), Some("2"));
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some("2")
+        );
+        assert_eq!(
+            wc.base,
+            Base::Obs {
+                rev: "2".to_string(),
+                srcmd5: SRCMD5_2.to_string()
+            }
+        );
         // The commit stages what the validate pass reported missing:
         // the edited spec and the rewritten link.
         let puts = http.put_bytes_calls();
@@ -12722,7 +13774,10 @@ mod tests {
             "plan: {plan:?}"
         );
         assert!(!plan.iter().any(|line| line.contains("foo.tar.gz")));
-        assert_eq!(open(&wc.root).unwrap().base_rev, REV1);
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some(REV1)
+        );
         let _ = dir;
     }
 
@@ -12752,7 +13807,10 @@ mod tests {
                 .any(|line| line.contains("would delete bar.txt")),
             "plan: {plan:?}"
         );
-        assert_eq!(open(&wc.root).unwrap().base_rev, REV1);
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some(REV1)
+        );
         let _ = dir;
     }
 
@@ -12794,7 +13852,10 @@ mod tests {
                 .any(|line| line.contains("would change bar.txt")),
             "plan: {plan:?}"
         );
-        assert_eq!(open(&wc.root).unwrap().base_rev, REV1);
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some(REV1)
+        );
         let _ = dir;
     }
 
@@ -12832,7 +13893,10 @@ mod tests {
                 .any(|line| line.contains("would change foo.spec")),
             "plan: {plan:?}"
         );
-        assert_eq!(open(&wc.root).unwrap().base_rev, REV1);
+        assert_eq!(
+            open(&wc.root).unwrap().base.as_obs().map(|(rev, _)| rev),
+            Some(REV1)
+        );
         let _ = dir;
     }
     #[test]
@@ -12879,7 +13943,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.rev, Some(2));
+        assert_eq!(report.landed.as_obs().map(|(rev, _)| rev), Some("2"));
         assert_eq!(
             report.files,
             vec!["bar.spec".to_string(), "foo.spec".to_string()]
@@ -13586,7 +14650,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.pushed_head, Some(expected));
+        assert_eq!(report.landed, Base::Git { head: expected });
         let _ = origin;
         let _ = dir;
         let _ = home;
@@ -13934,7 +14998,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.pushed_head, Some(head.clone()));
+        assert_eq!(report.landed, Base::Git { head: head.clone() });
         let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
             .unwrap()
             .trim()
@@ -13990,7 +15054,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.pushed_head, Some(head.clone()));
+        assert_eq!(report.landed, Base::Git { head: head.clone() });
         let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
             .unwrap()
             .trim()
@@ -14179,7 +15243,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(report.pushed_head, Some(head.clone()));
+        assert_eq!(report.landed, Base::Git { head: head.clone() });
         let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
             .unwrap()
             .trim()
@@ -15470,7 +16534,7 @@ mod tests {
         // is empty: the failed update did not strand it.
         assert_eq!(read_file(&wc.root, "foo.spec"), "Name: local\n");
         assert!(autostash_entries(&wc).unwrap().is_empty());
-        assert_eq!(wc.base_rev, REV1);
+        assert_eq!(wc.base.as_obs().map(|(rev, _)| rev), Some(REV1));
         let _ = dir;
     }
 
@@ -15596,6 +16660,92 @@ mod tests {
     }
 
     #[test]
+    fn refuse_not_submittable_git_refuses_a_staged_link() {
+        let dir = TempDirGuard::new("submit-git-link");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        write_file(
+            &wc.root,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        add(&wc, &["_link".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let err = refuse_not_submittable_git(&wc, None, None, &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("scmsync never syncs a _link"),
+            "message: {}",
+            err
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_refuses_a_committed_link() {
+        // The `_link` is committed, but `status` compares the
+        // index against the recorded base, not HEAD, so pre-fix the
+        // uncommitted check refused it with the unactionable
+        // "commit them first" message. This pins that submit
+        // readiness refuses with the link error instead.
+        let dir = TempDirGuard::new("submit-git-link-committed");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        write_file(
+            &wc.root,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        add(&wc, &["_link".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "link"]);
+        let err = refuse_not_submittable_git(&wc, None, None, &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("scmsync never syncs a _link"),
+            "message: {}",
+            err
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_refuses_a_link_at_the_base() {
+        // The configuration that genuinely passed pre-fix: the
+        // `_link` is already at the recorded base, so the index
+        // matches the base, status is clean, and the remote is not
+        // ahead — only the link refusal catches it.
+        let dir = TempDirGuard::new("submit-git-link-base");
+        let origin = git_origin(&dir.path);
+        let work = dir.path.join("work");
+        write_file(
+            &work,
+            "_link",
+            "<link project=\"home:alice\" package=\"bar\"/>\n",
+        );
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "link"]);
+        git_ok(&work, &["push", "--quiet", "origin", "main"]);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        // The premise: the link sits at the recorded base, so
+        // status is clean and only the link refusal catches it.
+        assert!(status(&wc).unwrap().is_empty());
+        let err = refuse_not_submittable_git(&wc, None, None, &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("scmsync never syncs a _link"),
+            "message: {}",
+            err
+        );
+        let _ = origin;
+    }
+
+    #[test]
     fn refuse_not_submittable_git_live_fetches_before_judging() {
         // Live, the fetch runs first: the remote moved after the
         // checkout, and no manual fetch happened — the live path
@@ -15679,8 +16829,7 @@ mod tests {
             "home:alice",
             "foo",
             Backend::Git,
-            &head,
-            "",
+            &Base::Git { head: head.clone() },
             None,
             None,
         )
@@ -16004,8 +17153,7 @@ mod tests {
             "home:alice",
             "foo",
             Backend::Git,
-            &head,
-            "",
+            &Base::Git { head: head.clone() },
             None,
             None,
         )

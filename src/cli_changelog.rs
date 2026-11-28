@@ -361,8 +361,10 @@ fn run_validate(
 /// author. The OBS lookup runs only when the config and env
 /// levels yield nothing, so a half-configured OBS credential
 /// never breaks a generate the config or env already identifies;
-/// a failed OBS lookup propagates instead of reading as no
-/// identity. `env` is a snapshot (see [`snapshot_env`]).
+/// a failed OBS lookup reads as no identity at that level: the
+/// chain falls through to git identity, warning on stderr, and
+/// refuses only when no level yields one. `env` is a snapshot
+/// (see [`snapshot_env`]).
 pub(crate) fn resolve_changelog_identity(
     config: &Config,
     env: &HashMap<String, String>,
@@ -375,8 +377,14 @@ pub(crate) fn resolve_changelog_identity(
     if let Some(identity) = crate::config::identity_from_env_map(env)? {
         return Ok(identity.format());
     }
-    if let Some(identity) = obs_lookup()? {
-        return Ok(identity.format());
+    match obs_lookup() {
+        Ok(Some(identity)) => return Ok(identity.format()),
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!(
+                "warning: the OBS identity lookup failed ({err}); falling back to git identity"
+            );
+        }
     }
     if let Some(identity) = crate::working_copy::git_identity(dir)? {
         return Ok(identity.format());
@@ -839,15 +847,52 @@ mod tests {
     }
 
     #[test]
-    fn resolve_identity_obs_error_propagates() {
+    fn resolve_identity_obs_error_falls_through_to_git() {
+        // A failing OBS lookup reads as no identity at that level:
+        // the chain falls through to git identity instead of
+        // failing the whole generate.
         let dir = tempfile::tempdir().unwrap();
-        let err =
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        for (key, value) in [
+            ("user.name", "Git Author"),
+            ("user.email", "git@example.com"),
+        ] {
+            std::process::Command::new("git")
+                .args(["config", "--local", key, value])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+        }
+        let author =
             resolve_changelog_identity(&Config::default(), &HashMap::new(), dir.path(), || {
                 Err(GeectlError::new(ErrorKind::InvalidInput, "whois failed"))
             })
-            .unwrap_err();
+            .unwrap();
+        assert_eq!(author, "Git Author <git@example.com>");
+    }
+
+    #[test]
+    fn resolve_identity_obs_error_still_refuses_when_nothing_found() {
+        // The OBS failure is not the refusal: with no identity at
+        // any level the error is the missing-identity one.
+        let err = resolve_changelog_identity(
+            &Config::default(),
+            &HashMap::new(),
+            Path::new("/definitely/not/a/real/dir"),
+            || Err(GeectlError::new(ErrorKind::InvalidInput, "whois failed")),
+        )
+        .unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidInput);
-        assert!(err.context.contains("whois failed"), "{}", err.context);
+        assert!(
+            err.context.contains("no changelog identity"),
+            "{}",
+            err.context
+        );
+        assert!(!err.context.contains("whois failed"), "{}", err.context);
     }
 
     #[test]

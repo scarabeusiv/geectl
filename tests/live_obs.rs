@@ -8239,7 +8239,7 @@ fn live_working_copy_checkout_edit_commit_update() {
     .expect("checkout the package")
     .expect("checkout is live, not a dry run");
     assert_eq!(wc.backend, working_copy::Backend::Obs);
-    assert_eq!(wc.base_rev, "2");
+    assert_eq!(wc.base.as_obs().map(|(rev, _)| rev), Some("2"));
     let spec_path = wc.root.join(&spec);
     assert_eq!(
         std::fs::read_to_string(&spec_path).expect("read the checked-out spec"),
@@ -8263,7 +8263,10 @@ fn live_working_copy_checkout_edit_commit_update() {
     )
     .expect("commit the edit")
     .expect("commit is live, not a dry run");
-    assert_eq!(report.rev, Some(3), "the commit is revision 3");
+    assert!(
+        matches!(&report.landed, working_copy::Base::Obs { rev, .. } if rev == "3"),
+        "the commit is revision 3"
+    );
     assert_eq!(
         file_content(&base, &source_project, &package, &spec),
         v2,
@@ -8284,7 +8287,7 @@ fn live_working_copy_checkout_edit_commit_update() {
         .expect("update the working copy")
         .expect("update is live, not a dry run");
     assert!(update.updated, "the base moved to revision 4");
-    assert_eq!(update.new_base_rev, "4");
+    assert!(matches!(&update.new_base, working_copy::Base::Obs { rev, .. } if rev == "4"));
     assert_eq!(
         std::fs::read_to_string(&spec_path).expect("read the updated spec"),
         v3
