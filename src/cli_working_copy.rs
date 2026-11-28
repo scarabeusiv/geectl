@@ -1,5 +1,5 @@
 //! Working-copy CLI leaves (`geectl checkout`, `update`, `status`,
-//! `diff`, `add`, `rm`, `addremove`, `commit`, `pull`, `resolve`).
+//! `diff`, `add`, `rm`, `addremove`, `commit`, `pull`, `resolve`, `push`).
 //!
 //! Top-level leaves, not a group: the working copy is the agent's
 //! checkout, and the leaves read like verbs. Each leaf operates on
@@ -7,7 +7,7 @@
 //! creates `<project>/<package>/` under the current directory.
 //! The agent checks out, moves into the checkout, and works there:
 //! `status`, `diff`, `add`, `rm`, `addremove`, `commit`, `pull`,
-//! and `resolve` take no path.
+//! `resolve`, and `push` take no path.
 //!
 //! Coordinate header (design rule 1): every text rendering opens
 //! with one header line echoing the query coordinates
@@ -25,8 +25,8 @@ use crate::error::{ErrorKind, GeectlError};
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{DryRun, ObsClient, RevisionSpec, OBS_API_BASE};
 use crate::working_copy::{
-    self, Backend, CheckoutProjectReport, CommitReport, PullReport, StatusCode, UpdateReport,
-    WorkingCopy,
+    self, Backend, CheckoutProjectReport, CommitReport, PullReport, PushReport, StatusCode,
+    UpdateReport, WorkingCopy,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -903,6 +903,77 @@ fn resolve_result(
     }
 }
 
+/// Push the working copy's branch to its origin: the leaf that
+/// completes a rebase (`update`, then `resolve`, then `push`).
+pub fn push(
+    debug: &Debug,
+    live: bool,
+    instance: Option<&str>,
+) -> Result<(Value, String), GeectlError> {
+    let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+    let endpoints = endpoints(instance)?;
+    let client = obs_client(&http, &endpoints, "push", live, debug)?;
+    let dry_run = DryRun::new(!live).with_debug(debug.clone());
+    // A dry-run push pushes nothing: resolving the Gitea token
+    // here would resolve credentials for a plan.
+    let auth = if live { gitea_auth(&endpoints)? } else { None };
+    let auth = gitea_auth_ref(&auth);
+    let mut wc = open_working_copy(live, Some(&client))?;
+    let pushed = working_copy::push(&mut wc, &client, auth.as_ref(), &dry_run)?;
+    Ok(push_result(
+        &wc,
+        pushed.as_ref(),
+        dry_run.enabled(),
+        plan_of(&dry_run),
+    ))
+}
+
+/// The `push` result: whether the branch moved, the pushed head,
+/// the local branch pushed and the upstream branch on origin it
+/// went to, and whether the OBS side synced the head.
+fn push_result(
+    wc: &WorkingCopy,
+    pushed: Option<&PushReport>,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let header = format!("project: {} package: {}", wc.project, wc.package);
+    match pushed {
+        Some(report) => {
+            let payload = json!({
+                "project": wc.project,
+                "package": wc.package,
+                "pushed": report.pushed,
+                "head": report.head,
+                "branch": report.branch,
+                "remote": report.remote,
+                "upstream_branch": report.upstream_branch,
+                "synced": report.synced,
+            });
+            let result_line = if report.pushed {
+                format!(
+                    "pushed {} to {}/{}",
+                    report.head, report.remote, report.upstream_branch
+                )
+            } else {
+                format!(
+                    "already up to date on {}/{}",
+                    report.remote, report.upstream_branch
+                )
+            };
+            mutation_result(payload, header, result_line, dry_run, plan)
+        }
+        None => {
+            let payload = json!({
+                "project": wc.project,
+                "package": wc.package,
+            });
+            let result_line = format!("dry-run: would push {}/{}", wc.project, wc.package);
+            mutation_result(payload, header, result_line, dry_run, plan)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,6 +993,57 @@ mod tests {
             scmsync_url: None,
             scmsync_branch: None,
         }
+    }
+
+    #[test]
+    fn push_result_live_carries_the_pushed_head() {
+        let wc = wc();
+        let report = PushReport {
+            pushed: true,
+            head: "abc123".to_string(),
+            branch: "feat".to_string(),
+            remote: "origin".to_string(),
+            upstream_branch: "main".to_string(),
+            synced: true,
+        };
+        let (payload, text) = push_result(&wc, Some(&report), false, None);
+        assert_eq!(payload["pushed"], json!(true));
+        assert_eq!(payload["head"], json!("abc123"));
+        assert_eq!(payload["branch"], json!("feat"));
+        assert_eq!(payload["remote"], json!("origin"));
+        assert_eq!(payload["upstream_branch"], json!("main"));
+        assert_eq!(payload["synced"], json!(true));
+        assert!(text.contains("pushed abc123 to origin/main"));
+    }
+
+    #[test]
+    fn push_result_up_to_date_names_the_upstream() {
+        let wc = wc();
+        let report = PushReport {
+            pushed: false,
+            head: "abc123".to_string(),
+            branch: "feat".to_string(),
+            remote: "origin".to_string(),
+            upstream_branch: "main".to_string(),
+            synced: false,
+        };
+        let (_, text) = push_result(&wc, Some(&report), false, None);
+        assert!(text.contains("already up to date on origin/main"));
+    }
+
+    #[test]
+    fn push_result_dry_run_carries_the_plan() {
+        let wc = wc();
+        let (payload, text) = push_result(
+            &wc,
+            None,
+            true,
+            Some(vec![
+                "would push main to origin/main (force-with-lease)".to_string()
+            ]),
+        );
+        assert_eq!(payload["dry_run"], json!(true));
+        assert!(text.contains("dry-run: would push home:alice/foo"));
     }
 
     #[test]
@@ -1211,7 +1333,8 @@ mod tests {
     fn leaf_credential_wiring_pins_which_leaves_need_credentials() {
         // `pull` reads the authed expanded routes and `commit`
         // mutates: without credentials both 401. `checkout`,
-        // `update`, and `diff` read public routes only. `obs_client`
+        // `update`, `diff`, and `push` read public routes only:
+        // the sync poll `push` runs is anonymous. `obs_client`
         // is the single choke point for the table, so this pins the
         // wiring: a leaf names itself there, and the table
         // decides.
@@ -1221,6 +1344,7 @@ mod tests {
         assert!(!needs_obs_credentials("update"));
         assert!(!needs_obs_credentials("status"));
         assert!(!needs_obs_credentials("diff"));
+        assert!(!needs_obs_credentials("push"));
     }
 
     #[test]

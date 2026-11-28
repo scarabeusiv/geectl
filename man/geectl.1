@@ -113,6 +113,9 @@ Pull a linked package to the link target\*(Aqs latest revision
 geectl\-resolve(1)
 Stage the resolved files and continue a stopped rebase
 .TP
+geectl\-push(1)
+Push the working copy\*(Aqs branch to its origin: the leaf that completes a rebase (`update`, then `resolve`, then `push`). Lease\-guarded: a rebase rewrites commits the remote already has, so the push forces with a lease
+.TP
 geectl\-prjconf(1)
 Read, validate and clean a project\*(Aqs prjconf
 .TP

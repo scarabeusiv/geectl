@@ -465,15 +465,28 @@ fn parse_origin_repo(url: &str) -> Option<(String, String)> {
 /// the head branch the pull request comes from when the agent
 /// names no `--head`. A detached HEAD has no branch to file from.
 pub fn current_branch(wc: &WorkingCopy) -> Result<String, GeectlError> {
+    match current_branch_name(wc)? {
+        Some(branch) => Ok(branch),
+        None => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "the checkout is on a detached HEAD: pass --head",
+        )),
+    }
+}
+
+/// The checkout's current branch, or `None` when HEAD is detached:
+/// the typed shape of the detached state, so callers that report it
+/// in their own words match on the value instead of on
+/// `current_branch`'s message — a reword there cannot leak another
+/// flag's phrasing into their error.
+fn current_branch_name(wc: &WorkingCopy) -> Result<Option<String>, GeectlError> {
     let branch = git(&wc.root, "rev-parse", &["--abbrev-ref", "HEAD"], &[])?;
     let branch = branch.trim();
     if branch.is_empty() || branch == "HEAD" {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "the checkout is on a detached HEAD: pass --head",
-        ));
+        Ok(None)
+    } else {
+        Ok(Some(branch.to_string()))
     }
-    Ok(branch.to_string())
 }
 
 /// One file's state against the base, in `git status --porcelain`
@@ -5173,6 +5186,43 @@ fn commit_obs(
     })
 }
 
+/// Poll `_scmsync.obsinfo` until its `commit:` matches the pushed
+/// head, bounded: a sync that never arrives is a timeout, not a
+/// successful push. A read that fails (a 401 or 404 while the sync
+/// is pending) is kept, not swallowed: the timeout names the last
+/// failure instead of hiding it.
+fn poll_scmsync_head(client: &ObsClient, wc: &WorkingCopy, head: &str) -> Result<(), GeectlError> {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    let mut last_err: Option<String>;
+    loop {
+        match client.cat(&wc.project, &wc.package, "_scmsync.obsinfo", None) {
+            Ok(body) => {
+                // A successful read clears the last error: a stale
+                // one would otherwise name a read that recovered.
+                last_err = None;
+                if parse_obsinfo_commit(&body).as_deref() == Some(head) {
+                    return Ok(());
+                }
+            }
+            Err(e) => last_err = Some(e.to_string()),
+        }
+        if Instant::now() >= deadline {
+            return Err(GeectlError::new(
+                ErrorKind::Timeout,
+                match last_err {
+                    Some(last) => format!(
+                        "the push landed (head {head}), but the OBS side did not sync it within 60 seconds; the last sync read failed: {last}"
+                    ),
+                    None => {
+                        format!("the push landed (head {head}), but the OBS side did not sync it within 60 seconds")
+                    }
+                },
+            ));
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
 /// The git-backed commit: commit staged changes, push, and poll the
 /// OBS side until the synced commit matches the pushed head. The
 /// refusals run before the service gate, in order: the remote has
@@ -5300,41 +5350,7 @@ fn commit_git(
         head
     };
     // The push landed; the OBS side picks it up through scmsync.
-    // Poll `_scmsync.obsinfo` until its `commit:` matches the
-    // pushed head, bounded: a sync that never arrives is a timeout,
-    // not a successful commit. A read that fails (a 401 or 404
-    // while the sync is pending) is kept, not swallowed: the
-    // timeout names the last failure instead of hiding it.
-    let deadline = Instant::now() + POLL_TIMEOUT;
-    let mut last_err: Option<String>;
-    loop {
-        match client.cat(&wc.project, &wc.package, "_scmsync.obsinfo", None) {
-            Ok(body) => {
-                // A successful read clears the last error: a stale
-                // one would otherwise name a read that recovered.
-                last_err = None;
-                if parse_obsinfo_commit(&body).as_deref() == Some(head.as_str()) {
-                    break;
-                }
-            }
-            Err(e) => last_err = Some(e.to_string()),
-        }
-        if Instant::now() >= deadline {
-            return Err(GeectlError::new(
-                ErrorKind::Timeout,
-                match last_err {
-                    Some(last) => format!(
-                        "the OBS side did not sync the pushed head within 60 seconds; the last sync read failed: {last}"
-                    ),
-                    None => {
-                        "the OBS side did not sync the pushed head within 60 seconds"
-                            .to_string()
-                    }
-                },
-            ));
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
+    poll_scmsync_head(client, wc, &head)?;
     let old_base = wc.base_rev.clone();
     // The push landed: a failure here must name the pushed head,
     // like the OBS path names the landed revision — otherwise the
@@ -6906,6 +6922,348 @@ pub fn resolve(wc: &mut WorkingCopy, dry_run: &DryRun) -> Result<Option<Vec<Stri
         refresh_mtimes(wc)?;
     }
     Ok(Some(before))
+}
+
+/// The result of a `push`: whether the branch moved, the pushed
+/// head, the local branch pushed and the upstream branch on
+/// origin it went to, and whether the OBS side synced the head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushReport {
+    /// Whether the push sent commits: false when the branch was
+    /// already up to date with its upstream.
+    pub pushed: bool,
+    /// The pushed head SHA (the branch head, pushed or already there).
+    pub head: String,
+    /// The pushed local branch.
+    pub branch: String,
+    /// The remote the branch went to.
+    pub remote: String,
+    /// The upstream branch on origin the push went to — usually
+    /// the same as `branch`.
+    pub upstream_branch: String,
+    /// Whether the OBS sync was waited for and matched. False when
+    /// the branch was already up to date, or when the checkout
+    /// records no (or an empty) scmsync URL and the sync was not
+    /// waited for.
+    pub synced: bool,
+}
+
+/// Refuse a push whose local HEAD is strictly behind its upstream:
+/// HEAD is an ancestor of the head the checkout last synced, so the
+/// push would rewind the remote branch and discard the remote-only
+/// commits. The lease cannot guard this: it pins the remote at the
+/// synced head, and the rewind lands exactly there. A rebase flow
+/// never trips this — its rewritten HEAD is not an ancestor of the
+/// upstream — and neither does a HEAD with local commits ahead of
+/// the upstream. The `--is-ancestor` exit status is the verdict; a
+/// non-empty stderr is a real git failure, not a "not an ancestor"
+/// (exit 1 prints nothing). The caller guarantees `head` differs
+/// from `upstream_before`: an equal HEAD is up to date, and
+/// `--is-ancestor` succeeds for it.
+fn refuse_when_head_behind_upstream(
+    root: &Path,
+    head: &str,
+    upstream_before: &str,
+) -> Result<(), GeectlError> {
+    let (is_ancestor, _, stderr) = git_status(
+        root,
+        "merge-base",
+        &["--is-ancestor", "HEAD", upstream_before],
+        &[],
+    )?;
+    if !stderr.trim().is_empty() {
+        return Err(git_error("merge-base", stderr.as_bytes()));
+    }
+    if is_ancestor {
+        return Err(GeectlError::new(
+            ErrorKind::WorkingCopyOutdated,
+            format!(
+                "refusing to push: the local HEAD ({}) is behind its upstream: the upstream has commits the checkout does not have; run update first",
+                short_sha(head)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Push the working copy's branch to its origin: the leaf that
+/// completes a rebase (`update`, then `resolve`, then `push`).
+/// A rebase rewrites commits the remote already has, so the push
+/// forces — with a lease, never plain `--force`. The lease pins
+/// the remote at the head the checkout last synced: a fetch that
+/// moves the tracking ref refuses first (the remote gained
+/// commits the checkout does not have), and a push that lands
+/// after the remote moved again fails instead of clobbering it.
+/// The push goes to the upstream branch by name, so the leased
+/// ref is the pushed ref.
+/// The pre-push gate runs under the commit lock, like `commit`'s
+/// push. The pushed head becomes the new base.
+/// The OBS sync is waited for only when the checkout records a
+/// non-empty scmsync URL: a pull-request head checkout records
+/// none, and an empty recorded URL is the same no-sync state as
+/// none, so its push lands on the fork, not on any OBS package,
+/// and there is no sync to wait for.
+pub fn push(
+    wc: &mut WorkingCopy,
+    client: &ObsClient,
+    gitea_auth: Option<&GiteaAuth<'_>>,
+    dry_run: &DryRun,
+) -> Result<Option<PushReport>, GeectlError> {
+    // A push sends commits to a git remote: an OBS-native checkout
+    // has none, and its changes go out through `commit` instead.
+    if wc.backend != Backend::Git {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "push needs a git-backed working copy: {}/{} is OBS-native; send its changes with commit",
+                wc.project, wc.package
+            ),
+        ));
+    }
+    // The client must be the checkout's own instance before the
+    // plan reads the server or the push moves the base.
+    wc.check_apiurl(&client.base)?;
+    if !dry_run.allow(&format!("push working copy {}/{}", wc.project, wc.package)) {
+        record_push_plan(wc, dry_run)?;
+        return Ok(None);
+    }
+    // Detached HEAD first: no branch to push, and no fetch or
+    // token resolution for a checkout that cannot push.
+    let branch = push_branch(wc)?;
+    let auth = gitea_auth.ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::ConfigError,
+            "a git-backed push needs a Gitea token: the push authenticates with it",
+        )
+    })?;
+    let mut header = String::new();
+    let mut key = String::new();
+    let env = token_env(auth, &mut header, &mut key);
+    // The outdated check: the remote must not have moved since
+    // the checkout last synced it. A rebase rewrites the branch,
+    // so the remote head is never an ancestor of the new HEAD —
+    // the HEAD-based check `commit` uses would refuse every
+    // rebase. The marker is the tracking ref instead: the value
+    // it had before the fetch is the head the checkout last saw,
+    // and a fetch that moves it means the remote gained commits
+    // the checkout does not have.
+    let upstream_before = match git(&wc.root, "rev-parse", &["@{u}"], &[]) {
+        Ok(sha) => sha.trim().to_string(),
+        Err(_) => {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "the working copy has no upstream branch to push to",
+            ));
+        }
+    };
+    git_network(&wc.root, "fetch", &["origin"], &env)?;
+    let upstream_after = git(&wc.root, "rev-parse", &["@{u}"], &[])?
+        .trim()
+        .to_string();
+    if upstream_after != upstream_before {
+        return Err(GeectlError::new(
+            ErrorKind::WorkingCopyOutdated,
+            "the remote has commits the checkout does not have: run update first",
+        ));
+    }
+    refuse_on_conflicts(wc)?;
+    let upstream_branch = upstream_branch(wc)?;
+    let mut head = git(&wc.root, "rev-parse", &["HEAD"], &[])?
+        .trim()
+        .to_string();
+    let mut up_to_date = head == upstream_before;
+    if up_to_date && head != wc.base_rev {
+        // The push landed on an earlier run but the sync poll
+        // timed out before the base record moved: adopt the
+        // head now, instead of reporting the pushed commit as
+        // still-unpushed local work. The adoption writes the
+        // base record, so it runs under the checkout's commit
+        // lock — the same lock the pushed path holds — and
+        // re-reads HEAD under it. The lock alone cannot order
+        // the two writes: a concurrent commit's base write lands
+        // after it releases the lock, so only the re-read tells
+        // a stale adoption from a live one. A HEAD that moved
+        // while the adoption waited is pushed below instead of
+        // adopted over.
+        let moved = {
+            let _commit_lock = acquire_commit_lock(&wc.root)?;
+            let current = git(&wc.root, "rev-parse", &["HEAD"], &[])?
+                .trim()
+                .to_string();
+            if current == head {
+                git_config_set(&wc.root, "base-rev", &head).map_err(|e| {
+                    GeectlError::new(
+                        e.kind(),
+                        format!(
+                            "the branch is up to date (head {head}), but the base record could not be updated: {e}; run update, then check status"
+                        ),
+                    )
+                })?;
+                wc.base_rev = head.clone();
+                refresh_mtimes(wc)?;
+                None
+            } else {
+                Some(current)
+            }
+        };
+        if let Some(current) = moved {
+            head = current;
+            up_to_date = false;
+        }
+    }
+    if up_to_date {
+        return Ok(Some(PushReport {
+            pushed: false,
+            head,
+            branch,
+            remote: "origin".to_string(),
+            upstream_branch: upstream_branch.clone(),
+            synced: false,
+        }));
+    }
+    // A push with local HEAD strictly behind its upstream would
+    // rewind the remote branch: the gate's `base_rev..head`
+    // range is empty, so it passes, and `--force-with-lease`
+    // rewinds the fork, discarding remote-only commits. The
+    // lease guards other writers, not this one. A rebase flow
+    // never produces a behind-HEAD push — its rewritten HEAD is
+    // not an ancestor of the upstream — so refusing here costs
+    // it nothing.
+    refuse_when_head_behind_upstream(&wc.root, &head, &upstream_before)?;
+    // The lease pins the remote at the head verified above: a
+    // push that lands after the remote moved again fails instead
+    // of clobbering it. A bare `--force-with-lease` after the
+    // fetch would lease against the fetched head and guard only
+    // the fetch-to-push race, not the clobber.
+    let remote_ref = format!("refs/heads/{upstream_branch}");
+    let lease = format!("--force-with-lease={remote_ref}:{upstream_before}");
+    // The refspec pushes HEAD to the upstream branch by name:
+    // `push origin HEAD` would push to the same-named branch
+    // instead, and the lease would guard a ref that isn't pushed.
+    let refspec = format!("HEAD:{remote_ref}");
+    // The gate and the push run under the checkout's commit lock:
+    // without it a concurrent commit could land between the gate
+    // and the push and be sent ungated.
+    {
+        let _commit_lock = acquire_commit_lock(&wc.root)?;
+        run_pre_push_gate(&wc.root, &wc.base_rev, &head)?;
+        git_network(
+            &wc.root,
+            "push",
+            &["--no-verify", &lease, "origin", &refspec],
+            &env,
+        )?;
+    }
+    // The push landed; the OBS side picks it up through scmsync
+    // when the checkout records a non-empty scmsync URL. A
+    // checkout with none — or an empty recorded URL — returns
+    // once the push lands instead of polling a sync that never
+    // arrives.
+    let synced = match &wc.scmsync_url {
+        Some(url) if !url.is_empty() => {
+            poll_scmsync_head(client, wc, &head)?;
+            true
+        }
+        // No URL, or an empty recorded one: no sync to wait for.
+        Some(_) | None => false,
+    };
+    // The push landed: a failure here must name the pushed head,
+    // like the OBS path names the landed revision — otherwise the
+    // agent cannot tell the push landed and pushes again.
+    git_config_set(&wc.root, "base-rev", &head).map_err(|e| {
+        GeectlError::new(
+            e.kind(),
+            format!(
+                "the push landed (head {head}), but the base record could not be updated: {e}; run update, then check status"
+            ),
+        )
+    })?;
+    wc.base_rev = head.clone();
+    refresh_mtimes(wc)?;
+    Ok(Some(PushReport {
+        pushed: true,
+        head,
+        branch,
+        remote: "origin".to_string(),
+        upstream_branch,
+        synced,
+    }))
+}
+
+/// The working copy's branch, with a detached HEAD reported in
+/// push's own words: `current_branch`'s "pass --head" names a
+/// flag push does not take. The detached state is read as a
+/// value (`current_branch_name` returns `None`), not matched
+/// out of `current_branch`'s message: a reword there cannot
+/// leak "--head" phrasing into push, and a git failure
+/// underneath (an unborn branch, a missing binary) is
+/// propagated as-is, not misreported as a detached HEAD.
+fn push_branch(wc: &WorkingCopy) -> Result<String, GeectlError> {
+    match current_branch_name(wc)? {
+        Some(branch) => Ok(branch),
+        None => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "the checkout is on a detached HEAD: check out a branch first",
+        )),
+    }
+}
+
+/// The upstream branch name on origin: the upstream's full name
+/// (`refs/remotes/origin/<branch>`) maps to the remote's branch
+/// of the same name. The push goes to that branch, so the leased
+/// ref is the pushed ref.
+fn upstream_branch(wc: &WorkingCopy) -> Result<String, GeectlError> {
+    let upstream_name = match git(
+        &wc.root,
+        "rev-parse",
+        &["--symbolic-full-name", "@{u}"],
+        &[],
+    ) {
+        Ok(name) => name.trim().to_string(),
+        Err(_) => {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "the working copy has no upstream branch to push to",
+            ));
+        }
+    };
+    upstream_name
+        .strip_prefix("refs/remotes/origin/")
+        .map(str::to_string)
+        .ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("the working copy's upstream {upstream_name} is not a branch on origin"),
+            )
+        })
+}
+
+/// The dry-run plan for a push: the branch it would push to its
+/// upstream branch on origin. The plan refuses a push the live
+/// path would refuse (a rebase in progress, conflicts in the
+/// tree, no upstream branch on origin); the upstream SHA is not
+/// named, because the plan does not fetch.
+fn record_push_plan(wc: &WorkingCopy, dry_run: &DryRun) -> Result<(), GeectlError> {
+    refuse_on_conflicts(wc)?;
+    let branch = push_branch(wc)?;
+    let upstream_branch = upstream_branch(wc)?;
+    // The plan refuses what the live push refuses: HEAD behind
+    // its upstream is readable from the local refs alone, with
+    // no fetch — the same check the live path runs after its
+    // fetch, against the head the checkout last synced.
+    let upstream_before = git(&wc.root, "rev-parse", &["@{u}"], &[])?
+        .trim()
+        .to_string();
+    let head = git(&wc.root, "rev-parse", &["HEAD"], &[])?
+        .trim()
+        .to_string();
+    if head != upstream_before {
+        refuse_when_head_behind_upstream(&wc.root, &head, &upstream_before)?;
+    }
+    dry_run.note(&format!(
+        "would push {branch} to origin/{upstream_branch} (force-with-lease)"
+    ));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -11608,6 +11966,475 @@ mod tests {
     }
 
     #[test]
+    fn push_pushes_local_commits_and_polls_the_sync() {
+        let dir = TempDirGuard::new("git-push");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        // The OBS side already synced the pushed head: the poll
+        // finds it on the first read.
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = push(&mut wc, &client, Some(&auth), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.pushed);
+        assert_eq!(report.head, head);
+        assert_eq!(report.branch, "main");
+        assert_eq!(report.remote, "origin");
+        assert_eq!(report.upstream_branch, "main");
+        assert!(report.synced);
+        assert_eq!(open(&wc.root).unwrap().base_rev, head);
+        // The push landed in the origin.
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, head);
+    }
+
+    #[test]
+    fn push_force_with_lease_pushes_rewritten_commits() {
+        // A rebase rewrites commits the remote already has: the
+        // push must force, and the lease is what keeps it safe.
+        // The amend stands in for the rebase here: same content,
+        // new SHA, remote still on the old one.
+        let dir = TempDirGuard::new("git-push-force");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = push(&mut wc, &client, Some(&auth), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.pushed);
+        // Rewrite the pushed commit: same content, new message,
+        // new SHA. The remote still has the old SHA, so a plain
+        // push would fail non-fast-forward. (The message must
+        // change: the commit dates are process-global and may be
+        // pinned by a concurrent test, so an amend that keeps the
+        // message could reproduce the same SHA.)
+        git_ok(
+            &wc.root,
+            &[
+                "commit",
+                "--quiet",
+                "--amend",
+                "-m",
+                "local change, rewritten",
+            ],
+        );
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let http = git_checkout_http(&origin.url).with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let report = push(&mut wc, &client, Some(&auth), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.pushed);
+        assert_eq!(report.head, head);
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, head);
+    }
+
+    #[test]
+    fn push_reports_already_up_to_date() {
+        let dir = TempDirGuard::new("git-push-current");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = push(&mut wc, &client, Some(&auth), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(!report.pushed);
+        assert_eq!(report.head, origin.head);
+        assert_eq!(report.branch, "main");
+        assert_eq!(report.remote, "origin");
+        assert_eq!(report.upstream_branch, "main");
+        assert!(!report.synced);
+    }
+
+    #[test]
+    fn push_dry_run_pushes_nothing() {
+        let dir = TempDirGuard::new("git-push-dry-run");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let dry_run = DryRun::new(true);
+        let report = push(&mut wc, &client, Some(&auth), &dry_run).unwrap();
+        assert!(report.is_none());
+        assert!(dry_run
+            .plan()
+            .iter()
+            .any(|note| note.contains("would push main to origin/main (force-with-lease)")));
+        // The origin still has the checkout head.
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, origin.head);
+    }
+
+    #[test]
+    fn push_refuses_when_the_remote_moved() {
+        let dir = TempDirGuard::new("git-push-remote-moved");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        // The remote moves: a second clone pushes a new commit.
+        let work = dir.path.join("work");
+        write_file(&work, "foo.spec", "Name: remote\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "remote change"]);
+        git_ok(&work, &["push", "--quiet", "origin", "main"]);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = push(&mut wc, &client, Some(&auth), &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WorkingCopyOutdated);
+    }
+
+    #[test]
+    fn push_refuses_when_head_is_behind_its_upstream() {
+        // A synced checkout reset to an older commit: the push
+        // would rewind the remote branch and discard the
+        // remote-only commits. The lease cannot guard this — it
+        // pins the remote exactly where the rewind lands — so
+        // the push refuses instead.
+        let dir = TempDirGuard::new("git-push-behind");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = push(&mut wc, &client, Some(&auth), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.pushed);
+        // Rewind the checkout to the commit it was synced at:
+        // HEAD is now strictly behind its upstream.
+        git_ok(
+            &wc.root,
+            &["reset", "--hard", "--quiet", origin.head.as_str()],
+        );
+        let err = push(&mut wc, &client, Some(&auth), &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WorkingCopyOutdated);
+        assert!(err.to_string().contains("behind its upstream"));
+        // The origin still has the pushed commit.
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, head);
+        // The dry-run plan refuses the same way.
+        let err = push(&mut wc, &client, Some(&auth), &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WorkingCopyOutdated);
+        assert!(err.to_string().contains("behind its upstream"));
+    }
+
+    #[test]
+    fn push_skips_the_sync_poll_without_a_scmsync_url() {
+        // A pull-request head checkout records no scmsync URL: its
+        // push lands on the fork, not on any OBS package, so there
+        // is no sync to wait for. The fake serves no obsinfo route:
+        // a poll would 404 and time out, so a fast success proves
+        // the poll never ran.
+        let dir = TempDirGuard::new("git-push-no-scmsync");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        git(
+            &wc.root,
+            "config",
+            &["--local", "--unset", "geectl.scmsync-url"],
+            &[],
+        )
+        .unwrap();
+        let mut wc = open(&wc.root).unwrap();
+        assert!(wc.scmsync_url.is_none());
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = push(&mut wc, &client, Some(&auth), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.pushed);
+        assert_eq!(report.head, head);
+        assert!(!report.synced);
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, head);
+    }
+
+    #[test]
+    fn push_skips_the_sync_poll_with_an_empty_scmsync_url() {
+        // An empty recorded scmsync URL is the same no-sync
+        // state as no URL at all. The fake serves no obsinfo
+        // route: a poll would 404 and time out, so a fast
+        // success proves the poll never ran.
+        let dir = TempDirGuard::new("git-push-empty-scmsync");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        git_config_set(&wc.root, "scmsync-url", "").unwrap();
+        let mut wc = open(&wc.root).unwrap();
+        assert_eq!(wc.scmsync_url.as_deref(), Some(""));
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = push(&mut wc, &client, Some(&auth), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.pushed);
+        assert_eq!(report.head, head);
+        assert!(!report.synced);
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, head);
+    }
+
+    #[test]
+    fn push_refuses_an_obs_native_checkout() {
+        let (dir, mut wc) = obs_checkout_current();
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = push(&mut wc, &client, Some(&auth), &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("git-backed"));
+        let _ = dir;
+    }
+
+    #[test]
+    fn push_pushes_to_the_upstream_branch_when_names_differ() {
+        // The lease guards the upstream branch, so the push must
+        // go to that branch too — not to the same-named branch.
+        let dir = TempDirGuard::new("git-push-other-branch");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        git(&wc.root, "checkout", &["-b", "feat"], &[]).unwrap();
+        git(
+            &wc.root,
+            "branch",
+            &["--set-upstream-to=origin/main", "feat"],
+            &[],
+        )
+        .unwrap();
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = push(&mut wc, &client, Some(&auth), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.pushed);
+        assert_eq!(report.branch, "feat");
+        assert_eq!(report.upstream_branch, "main");
+        // The upstream branch moved; no stray branch was created.
+        let origin_main = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_main, head);
+        assert!(git(&origin.path, "rev-parse", &["feat"], &[]).is_err());
+    }
+
+    #[test]
+    fn push_up_to_date_adopts_a_stale_base() {
+        // A push that landed but whose sync poll timed out leaves
+        // the base record on the old head: the retry finds the
+        // branch up to date and must adopt the head as the new
+        // base, instead of reporting the pushed commit as
+        // still-unpushed local work.
+        let dir = TempDirGuard::new("git-push-stale-base");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = push(&mut wc, &client, Some(&auth), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.pushed);
+        // Rewind the base record to the old head: the state a
+        // timed-out poll leaves behind.
+        git_config_set(&wc.root, "base-rev", &origin.head).unwrap();
+        wc.base_rev = origin.head.clone();
+        let report = push(&mut wc, &client, Some(&auth), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(!report.pushed);
+        assert_eq!(report.head, head);
+        assert!(!report.synced);
+        assert_eq!(open(&wc.root).unwrap().base_rev, head);
+    }
+
+    #[test]
+    fn push_refuses_a_detached_head() {
+        let dir = TempDirGuard::new("git-push-detached");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        git(&wc.root, "checkout", &["--detach", "HEAD"], &[]).unwrap();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = push(&mut wc, &client, Some(&auth), &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("detached HEAD"));
+        assert!(!err.to_string().contains("--head"));
+        // The dry-run plan refuses the same way.
+        let err = push(&mut wc, &client, Some(&auth), &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("detached HEAD"));
+    }
+
+    #[test]
+    fn push_refuses_an_upstream_not_on_origin() {
+        let dir = TempDirGuard::new("git-push-foreign-upstream");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        // Point the branch at a second remote's branch: the leaf
+        // only pushes to the recorded origin. The tracking ref is
+        // set directly: a fetch would do the same, without the
+        // network round-trip.
+        git(
+            &wc.root,
+            "remote",
+            &["add", "upstream", origin.url.as_str()],
+            &[],
+        )
+        .unwrap();
+        git(
+            &wc.root,
+            "update-ref",
+            &["refs/remotes/upstream/main", origin.head.as_str()],
+            &[],
+        )
+        .unwrap();
+        git(
+            &wc.root,
+            "branch",
+            &["--set-upstream-to=upstream/main"],
+            &[],
+        )
+        .unwrap();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = push(&mut wc, &client, Some(&auth), &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains(
+            "the working copy's upstream refs/remotes/upstream/main is not a branch on origin"
+        ));
+    }
+
+    #[test]
     fn commit_git_base_record_failure_names_the_pushed_head() {
         // The push lands, then the base record update fails: a
         // stale `.git/config.lock` makes `git config --local`
@@ -16204,6 +17031,20 @@ mod tests {
         let err = current_branch(&wc).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(err.to_string().contains("pass --head"));
+        let _ = origin;
+    }
+
+    #[test]
+    fn current_branch_name_returns_none_on_a_detached_head() {
+        // The typed detached state push matches on, instead of
+        // `current_branch`'s message.
+        let dir = TempDirGuard::new("branch-name-detached");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        assert_eq!(current_branch_name(&wc).unwrap(), Some("main".to_string()));
+        git_ok(&wc.root, &["checkout", "--quiet", "--detach", "HEAD"]);
+        assert_eq!(current_branch_name(&wc).unwrap(), None);
         let _ = origin;
     }
 

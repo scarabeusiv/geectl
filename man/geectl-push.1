@@ -1,0 +1,15 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-push 1  "geectl-push 0.2.4" 
+.SH NAME
+geectl\-push \- Push the working copy\*(Aqs branch to its origin: the leaf that completes a rebase (`update`, then `resolve`, then `push`). Lease\-guarded: a rebase rewrites commits the remote already has, so the push forces with a lease
+.SH SYNOPSIS
+\fBgeectl push\fR [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Push the working copy\*(Aqs branch to its origin: the leaf that completes a rebase (`update`, then `resolve`, then `push`). Lease\-guarded: a rebase rewrites commits the remote already has, so the push forces with a lease
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.4

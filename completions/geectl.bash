@@ -70,6 +70,9 @@ _geectl() {
             geectl,pull-request)
                 cmd="geectl__subcmd__pull__subcmd__request"
                 ;;
+            geectl,push)
+                cmd="geectl__subcmd__push"
+                ;;
             geectl,remote)
                 cmd="geectl__subcmd__remote"
                 ;;
@@ -483,6 +486,9 @@ _geectl() {
                 ;;
             geectl__subcmd__help,pull-request)
                 cmd="geectl__subcmd__help__subcmd__pull__subcmd__request"
+                ;;
+            geectl__subcmd__help,push)
+                cmd="geectl__subcmd__help__subcmd__push"
                 ;;
             geectl__subcmd__help,remote)
                 cmd="geectl__subcmd__help__subcmd__remote"
@@ -1694,7 +1700,7 @@ _geectl() {
 
     case "${cmd}" in
         geectl)
-            opts="-h -V --format --debug --debug-body --live --instance --help --version version config remote request branch build local-build maintenance service gitea pull-request person meta changelog checkout update status diff add rm addremove commit pull resolve prjconf help"
+            opts="-h -V --format --debug --debug-body --live --instance --help --version version config remote request branch build local-build maintenance service gitea pull-request person meta changelog checkout update status diff add rm addremove commit pull resolve push prjconf help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4292,7 +4298,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__help)
-            opts="version config remote request branch build local-build maintenance service gitea pull-request person meta changelog checkout update status diff add rm addremove commit pull resolve prjconf help"
+            opts="version config remote request branch build local-build maintenance service gitea pull-request person meta changelog checkout update status diff add rm addremove commit pull resolve push prjconf help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5722,6 +5728,20 @@ _geectl() {
         geectl__subcmd__help__subcmd__pull__subcmd__request__subcmd__withdraw)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__help__subcmd__push)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -8718,6 +8738,28 @@ _geectl() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --format)
+                    COMPREPLY=($(compgen -W "json text" -- "${cur}"))
+                    return 0
+                    ;;
+                --instance)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__push)
+            opts="-h --format --debug --debug-body --live --instance --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
                 --format)
                     COMPREPLY=($(compgen -W "json text" -- "${cur}"))
                     return 0
