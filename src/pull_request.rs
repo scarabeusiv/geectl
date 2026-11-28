@@ -764,6 +764,35 @@ impl PullRequestSearch {
     }
 }
 
+/// The search answer: the surviving summaries, plus the items the
+/// global Gitea search skipped when their read-back failed as
+/// not-found. Any other read-back failure aborts the search
+/// instead of landing here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestSearchResult {
+    /// The surviving pull requests, OBS first then Gitea.
+    pub summaries: Vec<PullRequestSummary>,
+    /// The global-search items skipped on a failed read-back, in
+    /// search order, each with the error that skipped it.
+    pub skipped: Vec<SkippedSearchItem>,
+}
+
+/// One global-search item skipped on a failed read-back: the
+/// reference the search answer carried, and the error that
+/// skipped it. The kind stays structured — the error is never
+/// reduced to a bare string — so a caller can tell a deleted
+/// pull request from a failure that should have aborted the
+/// search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedSearchItem {
+    /// The skipped pull request.
+    pub reference: PullRequestRef,
+    /// The kind of the error that skipped it.
+    pub kind: ErrorKind,
+    /// Why the read-back failed.
+    pub error: String,
+}
+
 /// What to file: a submit request or a Gitea pull request. The
 /// OBS arm carries the whole payload; the Gitea arm carries the
 /// repo with the create options — the options alone name no repo.
@@ -910,7 +939,28 @@ impl<'a> PullRequestClient<'a> {
         }
     }
 
-    /// Search pull requests as the list shape. With no backend
+    /// Search pull requests as the list shape; see
+    /// [`Self::search_with_skipped`] for the arm and filter
+    /// rules. Items whose Gitea read-back fails as not-found are
+    /// dropped from the list; use `search_with_skipped` to see
+    /// them.
+    pub fn search(
+        &self,
+        query: &PullRequestSearch,
+    ) -> Result<Vec<PullRequestSummary>, GeectlError> {
+        Ok(self.search_with_skipped(query)?.summaries)
+    }
+
+    /// The read-back cap on the global Gitea search: past this
+    /// many read-backs the search fails naming the search to
+    /// narrow instead of reading every surviving item back one
+    /// by one. The verified searches read back a handful of
+    /// items, so 1000 leaves wide headroom while bounding the
+    /// worst case to 1000 sequential reads.
+    const GITEA_SEARCH_READ_BACK_CAP: usize = 1000;
+
+    /// Search pull requests as the list shape, reporting the
+    /// items the global Gitea search skipped. With no backend
     /// both arms run, OBS first then Gitea; a backend scopes the
     /// search to that arm. Both arms filter server-side (the
     /// state mapping and the creator); the reviewer filters
@@ -922,19 +972,23 @@ impl<'a> PullRequestClient<'a> {
     /// states, creator, and repo as a backstop, since the
     /// repo-scoped list has no author filter, the search
     /// endpoint has no repo scope, and the wire states do not
-    /// map one-to-one to the unified states. The global
-    /// search reads each surviving pull request back for its
-    /// endpoints, since the search answer carries no head/base.
-    /// A repo-scoped
-    /// search needs the Gitea backend; without it the search
-    /// fails as invalid input instead of returning unscoped OBS
-    /// hits.
-    pub fn search(
+    /// map one-to-one to the unified states. The global search
+    /// reads each surviving pull request back for its endpoints,
+    /// since the search answer carries no head/base. A read-back
+    /// that fails as not-found skips that item and reports it in
+    /// the answer's `skipped`; any other read-back failure aborts
+    /// the search. Read-backs are bounded: past
+    /// [`Self::GITEA_SEARCH_READ_BACK_CAP`] the search fails
+    /// naming the search to narrow. A repo-scoped search needs
+    /// the Gitea backend; without it the search fails as invalid
+    /// input instead of returning unscoped OBS hits.
+    pub fn search_with_skipped(
         &self,
         query: &PullRequestSearch,
-    ) -> Result<Vec<PullRequestSummary>, GeectlError> {
+    ) -> Result<PullRequestSearchResult, GeectlError> {
         query.validate()?;
         let mut summaries = Vec::new();
+        let mut skipped = Vec::new();
         if query.backend.is_none() || query.backend == Some(PullRequestBackend::Obs) {
             let obs = self.obs.ok_or_else(missing_obs_arm)?;
             let mut search = RequestSearch::new();
@@ -962,6 +1016,7 @@ impl<'a> PullRequestClient<'a> {
                     .collect::<Result<Vec<_>, _>>()?,
                 _ => {
                     let mut items = Vec::new();
+                    let mut read_backs = 0usize;
                     for issue in &gitea.pr_search_scoped(
                         wire,
                         query.creator.as_deref(),
@@ -985,7 +1040,32 @@ impl<'a> PullRequestClient<'a> {
                         else {
                             unreachable!("a Gitea issue-search item always builds a Gitea ref");
                         };
-                        let pr = gitea.pr_get(&owner, &repo, number)?;
+                        if read_backs >= Self::GITEA_SEARCH_READ_BACK_CAP {
+                            return Err(GeectlError::new(
+                                ErrorKind::SearchTooBroad,
+                                format!(
+                                    "the global Gitea search read back more than {} pull requests; narrow the search (a creator, a reviewer, a repo, or a state) and retry",
+                                    Self::GITEA_SEARCH_READ_BACK_CAP
+                                ),
+                            ));
+                        }
+                        read_backs += 1;
+                        let pr = match gitea.pr_get(&owner, &repo, number) {
+                            Ok(pr) => pr,
+                            Err(err) if err.kind() == ErrorKind::NotFound => {
+                                skipped.push(SkippedSearchItem {
+                                    reference: PullRequestRef::Gitea {
+                                        owner: owner.clone(),
+                                        repo: repo.clone(),
+                                        number,
+                                    },
+                                    kind: err.kind(),
+                                    error: err.to_string(),
+                                });
+                                continue;
+                            }
+                            Err(err) => return Err(err),
+                        };
                         items.push(PullRequestSummary::from_gitea(&owner, &repo, &pr)?);
                     }
                     items
@@ -994,7 +1074,7 @@ impl<'a> PullRequestClient<'a> {
             items.retain(|summary| matches_query(summary, query));
             summaries.extend(items);
         }
-        Ok(summaries)
+        Ok(PullRequestSearchResult { summaries, skipped })
     }
 
     /// Approve a pull request as the review asked of `target`:
@@ -2302,6 +2382,22 @@ mod tests {
   <state name="superseded" when="2016-04-15T06:32:27" who="adrianSuSE" />
 </request>"#;
 
+    const RELEASE_REQUEST_XML: &str = r#"<request creator="alice" id="107539">
+  <action type="release">
+    <source project="home:alice" />
+    <target project="openSUSE:Maintenance" />
+  </action>
+  <state name="superseded" when="2016-04-15T06:32:27" who="alice" />
+</request>"#;
+
+    const MAINTENANCE_RELEASE_REQUEST_XML: &str = r#"<request creator="alice" id="107540">
+  <action type="maintenance_release">
+    <source project="home:alice" />
+    <target project="openSUSE:Maintenance" />
+  </action>
+  <state name="superseded" when="2016-04-15T06:32:27" who="alice" />
+</request>"#;
+
     /// A pull-request JSON body, shaped like Gitea 1.24.7 answers.
     const PR_JSON: &str = r#"{"number": 122, "user": {"login": "scarabeusiv"}, "title": "change_review_state", "body": "A test PR body.", "labels": [{"name": "bug"}], "state": "open", "draft": false, "merged": false, "mergeable": true, "head": {"label": "scarabeusiv:change-review-state", "ref": "change-review-state", "sha": "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa", "repo": {"full_name": "scarabeusiv/geectl"}}, "base": {"label": "main", "ref": "main", "sha": "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa", "repo": {"full_name": "openSUSE/geectl"}}}"#;
 
@@ -2668,6 +2764,58 @@ mod tests {
     }
 
     #[test]
+    fn search_obs_reads_a_project_only_release() {
+        // A superseded release over a whole project names no
+        // source package: the search parses it and reports the
+        // project as the source.
+        let collection =
+            format!("<collection matches=\"1\">\n{RELEASE_REQUEST_XML}\n</collection>");
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27superseded%27%5D",
+            &collection,
+        );
+        let obs = obs_client(&http);
+        let client = PullRequestClient::new(Some(&obs), None);
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Obs),
+            states: vec![PullRequestStatus::Superseded],
+            ..Default::default()
+        };
+        let summaries = client.search(&query).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].reference, PullRequestRef::Obs(107539));
+        assert_eq!(summaries[0].status, PullRequestStatus::Superseded);
+        assert_eq!(summaries[0].source.repository, "home:alice");
+        assert_eq!(summaries[0].target.repository, "openSUSE:Maintenance");
+    }
+
+    #[test]
+    fn search_obs_reads_a_project_only_maintenance_release() {
+        // A superseded maintenance release over a whole project
+        // names no source package: the search parses it and
+        // reports the project as the source.
+        let collection =
+            format!("<collection matches=\"1\">\n{MAINTENANCE_RELEASE_REQUEST_XML}\n</collection>");
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27superseded%27%5D",
+            &collection,
+        );
+        let obs = obs_client(&http);
+        let client = PullRequestClient::new(Some(&obs), None);
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Obs),
+            states: vec![PullRequestStatus::Superseded],
+            ..Default::default()
+        };
+        let summaries = client.search(&query).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].reference, PullRequestRef::Obs(107540));
+        assert_eq!(summaries[0].status, PullRequestStatus::Superseded);
+        assert_eq!(summaries[0].source.repository, "home:alice");
+        assert_eq!(summaries[0].target.repository, "openSUSE:Maintenance");
+    }
+
+    #[test]
     fn search_gitea_lists_one_repo_when_scoped() {
         let http = FakeHttp::new().with_get(
             "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls?state=open&page=1&limit=50",
@@ -2750,6 +2898,139 @@ mod tests {
         assert_eq!(summaries[0].target.branch.as_deref(), Some("main"));
         assert_eq!(summaries[1].source.repository, "scarabeusiv/geectl");
         assert_eq!(summaries[1].target.repository, "openSUSE/geectl");
+    }
+
+    #[test]
+    fn search_gitea_skips_a_failed_read_back_and_reports_it() {
+        // A read-back that fails as not-found skips that item and
+        // reports it instead of failing the whole search: the surviving
+        // item still carries its endpoints, and the skipped item
+        // carries the reference and the error.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=all&page=1&limit=50",
+                &format!(
+                    "[{}, {}]",
+                    issue_json(122, "open", false, "scarabeusiv"),
+                    issue_json(123, "open", false, "scarabeusiv"),
+                ),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                PR_JSON,
+            )
+            .with_get_error(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/123",
+                ErrorKind::NotFound,
+            );
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Gitea),
+            states: vec![PullRequestStatus::Open, PullRequestStatus::Merged],
+            ..Default::default()
+        };
+        let result = client.search_with_skipped(&query).unwrap();
+        assert_eq!(result.summaries.len(), 1);
+        assert_eq!(
+            result.summaries[0].reference,
+            PullRequestRef::Gitea {
+                owner: "openSUSE".to_string(),
+                repo: "geectl".to_string(),
+                number: 122,
+            }
+        );
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(
+            result.skipped[0].reference,
+            PullRequestRef::Gitea {
+                owner: "openSUSE".to_string(),
+                repo: "geectl".to_string(),
+                number: 123,
+            }
+        );
+        assert_eq!(result.skipped[0].kind, ErrorKind::NotFound);
+        assert!(
+            !result.skipped[0].error.is_empty(),
+            "the skipped item must carry the error: {:?}",
+            result.skipped[0]
+        );
+    }
+
+    #[test]
+    fn search_gitea_propagates_a_systemic_read_back_failure() {
+        // Only a not-found read-back skips: a server failure
+        // aborts the search instead of landing in `skipped` with
+        // exit 0 and partial results.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=all&page=1&limit=50",
+                &format!(
+                    "[{}, {}]",
+                    issue_json(122, "open", false, "scarabeusiv"),
+                    issue_json(123, "open", false, "scarabeusiv"),
+                ),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                PR_JSON,
+            )
+            .with_get_error(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/123",
+                ErrorKind::ServerError,
+            );
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Gitea),
+            states: vec![PullRequestStatus::Open, PullRequestStatus::Merged],
+            ..Default::default()
+        };
+        let err = client.search(&query).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn search_gitea_read_back_stops_past_the_cap() {
+        // The global search reads each surviving item back, so
+        // the read-backs are bounded: past 1000 the search fails
+        // naming the search to narrow, and the 1001st item is
+        // never read.
+        let mut issues = Vec::new();
+        for number in 1..=1001u64 {
+            issues.push(issue_json(number, "open", false, "scarabeusiv"));
+        }
+        let mut http = FakeHttp::new();
+        for page in 1..=21u32 {
+            let start = ((page - 1) * 50) as usize;
+            let end = (start + 50).min(issues.len());
+            let url = format!(
+                "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=all&page={page}&limit=50"
+            );
+            http = http.with_get(&url, &format!("[{}]", issues[start..end].join(", ")));
+        }
+        for number in 1..=1000u64 {
+            let url =
+                format!("https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/{number}");
+            let pr = PR_JSON.replace("\"number\": 122", &format!("\"number\": {number}"));
+            http = http.with_get(&url, &pr);
+        }
+        let gitea = gitea_client(&http);
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Gitea),
+            states: vec![PullRequestStatus::Open, PullRequestStatus::Merged],
+            ..Default::default()
+        };
+        let err = client.search_with_skipped(&query).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::SearchTooBroad);
+        assert_eq!(
+            http.get_calls()
+                .iter()
+                .filter(|(url, _)| url.contains("/pulls/"))
+                .count(),
+            1000
+        );
     }
 
     #[test]

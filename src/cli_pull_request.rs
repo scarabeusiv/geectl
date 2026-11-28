@@ -62,7 +62,7 @@ use crate::obs::{
 use crate::pull_request::{
     build_comment_body, PullRequest, PullRequestBackend, PullRequestClient, PullRequestEndpoint,
     PullRequestRef, PullRequestSearch, PullRequestStatus, PullRequestSummary, ReviewComment,
-    ReviewOpinion, SubmitTarget, Submitted,
+    ReviewOpinion, SkippedSearchItem, SubmitTarget, Submitted,
 };
 use crate::working_copy::{self, Backend};
 use clap::{Args, Subcommand};
@@ -2911,23 +2911,39 @@ fn show_with(
 }
 
 /// Search pull requests through the uniform client: the JSON
-/// payload is the list shape with a count, the text the header
-/// plus the table.
+/// payload is the list shape with a count plus the skipped
+/// read-backs, the text the header plus the table. Skipped
+/// read-backs are diagnostics, so they go to stderr, never to
+/// the text payload on stdout.
 fn search_with(
     client: &PullRequestClient,
     query: &PullRequestSearch,
     coordinates: &str,
 ) -> Result<(Value, String), GeectlError> {
-    let summaries = client.search(query)?;
+    let result = client.search_with_skipped(query)?;
+    let summaries = &result.summaries;
     let mut items = Vec::new();
-    for summary in &summaries {
+    for summary in summaries {
         items.push(payload_json(summary)?);
     }
     let payload = json!({
         "pull_requests": items,
         "count": summaries.len(),
+        "skipped": result.skipped,
     });
-    Ok((payload, render_search_text(coordinates, &summaries)?))
+    for line in skipped_lines(&result.skipped) {
+        eprintln!("{line}");
+    }
+    Ok((payload, render_search_text(coordinates, summaries)?))
+}
+
+/// One stderr line per skipped read-back: the reference and the
+/// error that skipped it.
+fn skipped_lines(skipped: &[SkippedSearchItem]) -> Vec<String> {
+    skipped
+        .iter()
+        .map(|item| format!("skipped: {}: {}", item.reference, item.error))
+        .collect()
 }
 
 /// Serialize a pull-request shape to its JSON payload value.
@@ -3415,6 +3431,94 @@ mod tests {
         assert_eq!(
             render_search_text(" backend=gitea", &[]).expect("empty table renders"),
             "search backend=gitea (0 pull requests)\nno pull requests"
+        );
+    }
+
+    #[test]
+    fn search_text_omits_skipped_items() {
+        let gitea_pr: GiteaPullRequest = serde_json::from_str(PR_JSON).expect("fixture PR parses");
+        let summary = PullRequestSummary::from_gitea("openSUSE", "geectl", &gitea_pr)
+            .expect("fixture PR maps");
+        let text = render_search_text("", &[summary]).expect("table renders");
+        assert!(
+            !text.contains("skipped:"),
+            "skipped read-backs are stderr diagnostics, never stdout text:\n{text}"
+        );
+        let text = render_search_text("", &[]).expect("empty table renders");
+        assert!(
+            !text.contains("skipped:"),
+            "an empty search still carries no skip lines:\n{text}"
+        );
+    }
+
+    #[test]
+    fn skipped_lines_name_each_skip() {
+        let skipped = vec![SkippedSearchItem {
+            reference: PullRequestRef::Gitea {
+                owner: "openSUSE".to_string(),
+                repo: "geectl".to_string(),
+                number: 123,
+            },
+            kind: ErrorKind::NotFound,
+            error: "not_found: the requested resource does not exist".to_string(),
+        }];
+        assert_eq!(
+            skipped_lines(&skipped),
+            vec!["skipped: gitea:openSUSE/geectl#123: not_found: the requested resource does not exist"]
+        );
+        assert!(skipped_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn search_payload_carries_skipped_items() {
+        let issues = format!(
+            "[{}, {}]",
+            r#"{"number": 122, "user": {"login": "scarabeusiv"}, "title": "change_review_state", "body": "A test PR body.", "labels": [], "state": "open", "pull_request": {"merged": false, "draft": false}, "repository": {"full_name": "openSUSE/geectl"}}"#,
+            r#"{"number": 123, "user": {"login": "scarabeusiv"}, "title": "change_review_state", "body": "A test PR body.", "labels": [], "state": "open", "pull_request": {"merged": false, "draft": false}, "repository": {"full_name": "openSUSE/geectl"}}"#,
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&page=1&limit=50",
+                &issues,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                PR_JSON,
+            )
+            .with_get_error(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/123",
+                ErrorKind::NotFound,
+            );
+        let gitea = GiteaClient::with_base(
+            &http,
+            "https://src.opensuse.org",
+            Credentials::Bearer {
+                token: "test-token".to_string(),
+            },
+        )
+        .unwrap();
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Gitea),
+            ..Default::default()
+        };
+        let (payload, text) = search_with(&client, &query, " backend=gitea").unwrap();
+        assert_eq!(payload["count"], 1);
+        assert_eq!(payload["pull_requests"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["skipped"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            payload["skipped"][0]["reference"],
+            "gitea:openSUSE/geectl#123"
+        );
+        assert_eq!(payload["skipped"][0]["kind"], "not_found");
+        assert!(
+            !payload["skipped"][0]["error"].as_str().unwrap().is_empty(),
+            "the skipped item must carry the error: {}",
+            payload["skipped"][0]
+        );
+        assert!(
+            !text.contains("skipped:"),
+            "skipped read-backs are stderr diagnostics, never stdout text:\n{text}"
         );
     }
 
